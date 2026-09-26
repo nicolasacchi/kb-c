@@ -217,8 +217,8 @@ CMakeFiles/kbc_testing.dir/clean:
 # Target rules for target CMakeFiles/test_app.dir
 
 # All Build rule for target.
-CMakeFiles/test_app.dir/all: CMakeFiles/kbc.dir/all
 CMakeFiles/test_app.dir/all: CMakeFiles/kbc_testing.dir/all
+CMakeFiles/test_app.dir/all: CMakeFiles/kbc.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_app.dir/build.make CMakeFiles/test_app.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_app.dir/build.make CMakeFiles/test_app.dir/build
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/nik/project/kb-c/build-asan/CMakeFiles --progress-num=20,21 "Built target test_app"
@@ -250,8 +250,8 @@ CMakeFiles/test_app.dir/clean:
 # Target rules for target CMakeFiles/test_config.dir
 
 # All Build rule for target.
-CMakeFiles/test_config.dir/all: CMakeFiles/kbc.dir/all
 CMakeFiles/test_config.dir/all: CMakeFiles/kbc_testing.dir/all
+CMakeFiles/test_config.dir/all: CMakeFiles/kbc.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_config.dir/build.make CMakeFiles/test_config.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_config.dir/build.make CMakeFiles/test_config.dir/build
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/nik/project/kb-c/build-asan/CMakeFiles --progress-num=22,23 "Built target test_config"
@@ -283,8 +283,8 @@ CMakeFiles/test_config.dir/clean:
 # Target rules for target CMakeFiles/test_embed.dir
 
 # All Build rule for target.
-CMakeFiles/test_embed.dir/all: CMakeFiles/kbc.dir/all
 CMakeFiles/test_embed.dir/all: CMakeFiles/kbc_testing.dir/all
+CMakeFiles/test_embed.dir/all: CMakeFiles/kbc.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_embed.dir/build.make CMakeFiles/test_embed.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_embed.dir/build.make CMakeFiles/test_embed.dir/build
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/nik/project/kb-c/build-asan/CMakeFiles --progress-num=24,25 "Built target test_embed"
@@ -316,8 +316,8 @@ CMakeFiles/test_embed.dir/clean:
 # Target rules for target CMakeFiles/test_httpd.dir
 
 # All Build rule for target.
-CMakeFiles/test_httpd.dir/all: CMakeFiles/kbc.dir/all
 CMakeFiles/test_httpd.dir/all: CMakeFiles/kbc_testing.dir/all
+CMakeFiles/test_httpd.dir/all: CMakeFiles/kbc.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_httpd.dir/build.make CMakeFiles/test_httpd.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_httpd.dir/build.make CMakeFiles/test_httpd.dir/build
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/nik/project/kb-c/build-asan/CMakeFiles --progress-num=26,27 "Built target test_httpd"
@@ -349,8 +349,8 @@ CMakeFiles/test_httpd.dir/clean:
 # Target rules for target CMakeFiles/test_index.dir
 
 # All Build rule for target.
-CMakeFiles/test_index.dir/all: CMakeFiles/kbc.dir/all
 CMakeFiles/test_index.dir/all: CMakeFiles/kbc_testing.dir/all
+CMakeFiles/test_index.dir/all: CMakeFiles/kbc.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_index.dir/build.make CMakeFiles/test_index.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_index.dir/build.make CMakeFiles/test_index.dir/build
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/nik/project/kb-c/build-asan/CMakeFiles --progress-num=28,29 "Built target test_index"
@@ -382,8 +382,8 @@ CMakeFiles/test_index.dir/clean:
 # Target rules for target CMakeFiles/test_json.dir
 
 # All Build rule for target.
-CMakeFiles/test_json.dir/all: CMakeFiles/kbc.dir/all
 CMakeFiles/test_json.dir/all: CMakeFiles/kbc_testing.dir/all
+CMakeFiles/test_json.dir/all: CMakeFiles/kbc.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_json.dir/build.make CMakeFiles/test_json.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_json.dir/build.make CMakeFiles/test_json.dir/build
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/nik/project/kb-c/build-asan/CMakeFiles --progress-num=30,31 "Built target test_json"
@@ -415,8 +415,8 @@ CMakeFiles/test_json.dir/clean:
 # Target rules for target CMakeFiles/test_mem.dir
 
 # All Build rule for target.
-CMakeFiles/test_mem.dir/all: CMakeFiles/kbc.dir/all
 CMakeFiles/test_mem.dir/all: CMakeFiles/kbc_testing.dir/all
+CMakeFiles/test_mem.dir/all: CMakeFiles/kbc.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_mem.dir/build.make CMakeFiles/test_mem.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_mem.dir/build.make CMakeFiles/test_mem.dir/build
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/nik/project/kb-c/build-asan/CMakeFiles --progress-num=32,33 "Built target test_mem"
@@ -448,8 +448,8 @@ CMakeFiles/test_mem.dir/clean:
 # Target rules for target CMakeFiles/test_parse.dir
 
 # All Build rule for target.
-CMakeFiles/test_parse.dir/all: CMakeFiles/kbc.dir/all
 CMakeFiles/test_parse.dir/all: CMakeFiles/kbc_testing.dir/all
+CMakeFiles/test_parse.dir/all: CMakeFiles/kbc.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_parse.dir/build.make CMakeFiles/test_parse.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_parse.dir/build.make CMakeFiles/test_parse.dir/build
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/nik/project/kb-c/build-asan/CMakeFiles --progress-num=34,35 "Built target test_parse"
@@ -481,8 +481,8 @@ CMakeFiles/test_parse.dir/clean:
 # Target rules for target CMakeFiles/test_search.dir
 
 # All Build rule for target.
-CMakeFiles/test_search.dir/all: CMakeFiles/kbc.dir/all
 CMakeFiles/test_search.dir/all: CMakeFiles/kbc_testing.dir/all
+CMakeFiles/test_search.dir/all: CMakeFiles/kbc.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_search.dir/build.make CMakeFiles/test_search.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_search.dir/build.make CMakeFiles/test_search.dir/build
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/nik/project/kb-c/build-asan/CMakeFiles --progress-num=36,37 "Built target test_search"
@@ -514,8 +514,8 @@ CMakeFiles/test_search.dir/clean:
 # Target rules for target CMakeFiles/test_store.dir
 
 # All Build rule for target.
-CMakeFiles/test_store.dir/all: CMakeFiles/kbc.dir/all
 CMakeFiles/test_store.dir/all: CMakeFiles/kbc_testing.dir/all
+CMakeFiles/test_store.dir/all: CMakeFiles/kbc.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_store.dir/build.make CMakeFiles/test_store.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_store.dir/build.make CMakeFiles/test_store.dir/build
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/nik/project/kb-c/build-asan/CMakeFiles --progress-num=38,39 "Built target test_store"
@@ -547,8 +547,8 @@ CMakeFiles/test_store.dir/clean:
 # Target rules for target CMakeFiles/test_watcher.dir
 
 # All Build rule for target.
-CMakeFiles/test_watcher.dir/all: CMakeFiles/kbc.dir/all
 CMakeFiles/test_watcher.dir/all: CMakeFiles/kbc_testing.dir/all
+CMakeFiles/test_watcher.dir/all: CMakeFiles/kbc.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_watcher.dir/build.make CMakeFiles/test_watcher.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_watcher.dir/build.make CMakeFiles/test_watcher.dir/build
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/nik/project/kb-c/build-asan/CMakeFiles --progress-num=40,41 "Built target test_watcher"

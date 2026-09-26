@@ -17,12 +17,16 @@
  *     bounded min-heap of size `limit`. A 500k-doc corpus must not sort 500k
  *     scores to return 20 hits.
  *
- * The accumulator, the heap and the query dedup set live in kbc_acc, cached on
- * the index and reused across kbc_index_bm25 calls — that allocation is the hot
- * path of a keystroke search. Consequence: kbc_index_bm25 writes per-index
- * scratch even though it takes a const index, so two concurrent queries must
- * not share one index. kbc_app serializes them; a genuinely concurrent reader
- * set would need a scratch out-param, reported as a contract gap.
+ * Threading contract:
+ *   - BUILD functions (begin_build / add_doc / end_build) are single-threaded.
+ *     An open build is mutated in place; nothing here is safe to share.
+ *   - Every READ function below (doc_count, doc, id_of, avg_doclen, bm25,
+ *     expand_prefix, heap_bytes) takes a const index and is safe to call
+ *     concurrently from any number of threads on ONE index. A sealed index
+ *     is immutable, and the per-query scratch those functions need lives in
+ *     per-thread storage, so no two queries ever touch the same byte.
+ *   - The build->read handoff is a pointer swap done by the caller (kbc_app
+ *     does it under a write lock), not anything inside this file.
  */
 
 #include <stdio.h>
@@ -30,6 +34,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -157,7 +162,6 @@ struct kbc_index {
 
   size_t map_len;
 
-  kbc_acc *acc;
   kbc_scratch *sc;
 };
 
@@ -688,6 +692,56 @@ static kbc_status acc_fit(kbc_acc *a, size_t docs) {
   return KBC_OK;
 }
 
+/* The query scratch is cached in THREAD-LOCAL storage, not on the index. Two
+ * reasons, both load-bearing:
+ *   - correctness: a sealed index is shared by every query thread (kbc_app's
+ *     rwlock admits all of them at once), so a scratch reachable from it would
+ *     be written concurrently. Per-thread scratch shares nothing.
+ *   - cost: the scratch is O(doc_count) doubles and is reused for the life of
+ *     the thread, so a keystroke search still allocates nothing after the first
+ *     query on that thread. Allocating per call would be 3 reallocs + a memset
+ *     of the whole score array on EVERY query — the reuse exists to avoid that.
+ * The destructor is what keeps a long-lived daemon honest: a query thread that
+ * exits hands its scratch back instead of leaking it. */
+static pthread_key_t g_acc_key;
+static pthread_once_t g_acc_once = PTHREAD_ONCE_INIT;
+static bool g_acc_key_ok;
+
+static void acc_dtor(void *p) { acc_free((kbc_acc *)p); }
+
+static void acc_key_init(void) {
+  g_acc_key_ok = pthread_key_create(&g_acc_key, acc_dtor) == 0;
+}
+
+/* Hands back the calling thread's scratch. When there is no thread-local slot
+ * to own it (a failed pthread_key_create) the caller must free what it gets —
+ * *ephemeral says which case this is. */
+static kbc_acc *acc_get(bool *ephemeral) {
+  kbc_acc *a;
+  *ephemeral = false;
+  if (pthread_once(&g_acc_once, acc_key_init) != 0) {
+    *ephemeral = true;
+    return acc_new();
+  }
+  if (!g_acc_key_ok) {
+    *ephemeral = true;
+    return acc_new();
+  }
+  a = (kbc_acc *)pthread_getspecific(g_acc_key);
+  if (!a) {
+    a = acc_new();
+    if (a && pthread_setspecific(g_acc_key, a) != 0) {
+      acc_free(a);
+      a = NULL;
+    }
+  }
+  if (!a) {
+    *ephemeral = true;
+    a = acc_new();
+  }
+  return a;
+}
+
 /* --------------------------------------------------------- little end --- */
 
 static void put_u32(uint8_t *p, uint32_t v) {
@@ -715,18 +769,7 @@ static size_t pad8(size_t n) { return n % 8 == 0 ? 0 : 8 - n % 8; }
 
 /* ------------------------------------------------------------ lifetime --- */
 
-kbc_index *kbc_index_new(void) {
-  kbc_index *ix = (kbc_index *)calloc(1, sizeof(kbc_index));
-  if (!ix) {
-    return NULL;
-  }
-  ix->acc = acc_new();
-  if (!ix->acc) {
-    free(ix);
-    return NULL;
-  }
-  return ix;
-}
+kbc_index *kbc_index_new(void) { return (kbc_index *)calloc(1, sizeof(kbc_index)); }
 
 void kbc_index_free(kbc_index *ix) {
   if (!ix) {
@@ -743,7 +786,6 @@ void kbc_index_free(kbc_index *ix) {
   free(ix->post);
   free(ix->post_term);
   scratch_free(ix);
-  acc_free(ix->acc);
   free(ix);
 }
 
@@ -1168,12 +1210,8 @@ size_t kbc_index_heap_bytes(const kbc_index *ix) {
     n += ix->sc->mcap * (sizeof(uint32_t) + sizeof(uint64_t));
     n += ix->sc->cap * (sizeof(char *) + 4 * sizeof(uint32_t));
   }
-  if (ix->acc) {
-    n += sizeof(kbc_acc);
-    n += ix->acc->doc_cap * (sizeof(double) + 2 * sizeof(uint32_t));
-    n += ix->acc->heap_cap * sizeof(kbc_hit);
-    n += ix->acc->q_cap * (sizeof(uint64_t) + sizeof(char *) + sizeof(uint32_t));
-  }
+  /* Query scratch is per-thread, not reachable from the index, so it is not
+   * counted here (see acc_get). */
   return n; /* the mmap is address space, not heap */
 }
 
@@ -1416,12 +1454,6 @@ kbc_index *kbc_index_open(const char *path, kbc_err *err) {
   }
   ix->map = map;
   ix->map_len = size;
-  ix->acc = acc_new();
-  if (!ix->acc) {
-    (void)kbc_err_set(err, KBC_ERR_NOMEM, "index %s: out of memory", path);
-    kbc_index_free(ix);
-    return NULL;
-  }
   ix->sealed = true;
   ix->doc_count = doc_count;
   ix->doc_cap = doc_cap > doc_count ? doc_cap : doc_count; /* never under-read */
@@ -1629,17 +1661,15 @@ static kbc_hit heap_pop(kbc_hit *h, size_t *n) {
   return top;
 }
 
-kbc_status kbc_index_bm25(const kbc_index *ix, const kbc_tokens *query,
-                          double k1, double b, size_t limit, kbc_hits *out,
-                          kbc_err *err) {
-  kbc_acc *a;
+/* The scoring body, given its scratch. `a` is private to one call on one
+ * thread; nothing here writes to `ix`. */
+static kbc_status bm25_run(const kbc_index *ix, kbc_acc *a,
+                           const kbc_tokens *query, double k1, double b,
+                           size_t limit, kbc_hits *out, kbc_err *err) {
   size_t ndocs, nq, qlen = 0, touched = 0, hn = 0, i;
   double avgdl, N;
   uint32_t gen;
 
-  if (!ix || !out) {
-    return kbc_err_set(err, KBC_ERR_INVALID, "kbc_index_bm25: ix or out is NULL");
-  }
   if (!(k1 >= 0.0) || !(b >= 0.0) || !(b <= 1.0)) {
     return kbc_err_set(err, KBC_ERR_INVALID, "kbc_index_bm25: k1=%g b=%g are out "
                                              "of range",
@@ -1650,11 +1680,6 @@ kbc_status kbc_index_bm25(const kbc_index *ix, const kbc_tokens *query,
   }
   if (limit == 0) {
     return KBC_OK;
-  }
-  a = ix->acc;
-  if (!a) {
-    return kbc_err_set(err, KBC_ERR_INTERNAL,
-                       "kbc_index_bm25: the index has no query scratch");
   }
   if (acc_fit(a, ix->doc_count) != KBC_OK) {
     return kbc_err_set(err, KBC_ERR_NOMEM,
@@ -1786,6 +1811,36 @@ kbc_status kbc_index_bm25(const kbc_index *ix, const kbc_tokens *query,
   return KBC_OK;
 }
 
+/* Okapi BM25 over the postings. Thread-safe: any number of threads may call
+ * this concurrently on one index with no external locking. The index is only
+ * read; all per-query state lives in the calling thread's own scratch (see
+ * acc_get), so concurrent queries cannot observe each other's accumulators,
+ * heaps or dedup sets. kbc_index_free must not race with a call in flight —
+ * that is the caller's to arrange, as it is for any borrowed reference. */
+kbc_status kbc_index_bm25(const kbc_index *ix, const kbc_tokens *query,
+                          double k1, double b, size_t limit, kbc_hits *out,
+                          kbc_err *err) {
+  kbc_acc *a;
+  bool ephemeral;
+  kbc_status st;
+  if (!ix || !out) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "kbc_index_bm25: ix or out is NULL");
+  }
+  a = acc_get(&ephemeral);
+  if (!a) {
+    return kbc_err_set(err, KBC_ERR_NOMEM,
+                       "kbc_index_bm25: no query scratch for this thread");
+  }
+  st = bm25_run(ix, a, query, k1, b, limit, out, err);
+  if (ephemeral) {
+    acc_free(a);
+  }
+  return st;
+}
+
+/* Reads only the immutable term table and the caller's arena/list: no scratch
+ * is cached on the index, so this is safe to call concurrently on one index
+ * exactly as bm25 is. */
 kbc_status kbc_index_expand_prefix(const kbc_index *ix, kbc_arena *a,
                                    const char *prefix, kbc_strlist *out,
                                    kbc_err *err) {

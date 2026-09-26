@@ -6,5 +6,5 @@ C_DEFINES = -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L
 
 C_INCLUDES = -I/home/nik/project/kb-c/include
 
-C_FLAGS = -g -std=c17 -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1 -Wall -Wextra -Wpedantic -Wshadow -Wpointer-arith -Wcast-qual -Wcast-align -Wstrict-prototypes -Wmissing-prototypes -Wwrite-strings -Wvla -Wpointer-to-int-cast -Wformat=2 -Wundef -Werror
+C_FLAGS = -O3 -DNDEBUG -std=c17 -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1 -Wall -Wextra -Wpedantic -Wshadow -Wpointer-arith -Wcast-qual -Wcast-align -Wstrict-prototypes -Wmissing-prototypes -Wwrite-strings -Wvla -Wpointer-to-int-cast -Wformat=2 -Wundef -Werror
 

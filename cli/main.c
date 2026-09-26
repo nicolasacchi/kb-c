@@ -816,19 +816,22 @@ static kbc_status http_do(const char *method, const char *path, const char *body
 }
 
 /* Wraps http_do: a 401 gets the message that names the fix, everything else
- * is returned to the caller with the body and status. */
+ * is returned to the caller with the body and status. `eout` receives the
+ * error, so a caller can tell a connect failure from a status it must
+ * report; pass NULL to keep the error private. */
 static kbc_status http_call(const char *method, const char *path,
                             const char *body, size_t body_len, int *status,
-                            kbc_str *resp) {
-  kbc_err e;
-  kbc_err_reset(&e);
-  kbc_status s = http_do(method, path, body, body_len, status, resp, &e);
+                            kbc_str *resp, kbc_err *eout) {
+  kbc_err local;
+  kbc_err_reset(&local);
+  kbc_err *e = eout != NULL ? eout : &local;
+  kbc_status s = http_do(method, path, body, body_len, status, resp, e);
   if (kbc_failed(s)) {
     return s;
   }
   if (*status == 401) {
     kbc_str_free(resp);
-    return kbc_err_set(&e, KBC_ERR_INVALID,
+    return kbc_err_set(e, KBC_ERR_INVALID,
                        "the daemon wants a token: run `kbc token generate`, "
                        "restart the daemon, then retry");
   }
@@ -1003,6 +1006,12 @@ static kbc_status artifact_json(kbc_str *out, const kbc_artifact *art,
  * index, so a daemon started later sees exactly what a local run wrote. */
 static kbc_app *local_open(kbc_err *err) {
   kbc_err_reset(err);
+  /* Over HTTP the daemon owns the log and the CLI's stderr stays empty; a
+   * local app would otherwise print its own INFO lines into --json's empty
+   * stderr. Errors still print, as they do on every other path. */
+  if (g_json) {
+    kbc_log_set_level(KBC_LOG_ERROR);
+  }
   return kbc_app_open(load_config(), err);
 }
 
@@ -1401,7 +1410,7 @@ static int cmd_search(int argc, char **argv, int start) {
   kbc_str resp;
   kbc_err e;
   kbc_err_reset(&e);
-  kbc_status s = http_call("GET", path.ptr, NULL, 0, &status, &resp);
+  kbc_status s = http_call("GET", path.ptr, NULL, 0, &status, &resp, &e);
   kbc_str_free(&path);
   if (kbc_failed(s)) {
     if (!daemon_unreachable(s, &e)) {
@@ -1469,7 +1478,7 @@ static int cmd_get(int argc, char **argv, int start) {
   kbc_str resp;
   kbc_err e;
   kbc_err_reset(&e);
-  kbc_status s = http_call("GET", path.ptr, NULL, 0, &status, &resp);
+  kbc_status s = http_call("GET", path.ptr, NULL, 0, &status, &resp, &e);
   kbc_str_free(&path);
   if (kbc_failed(s)) {
     if (!daemon_unreachable(s, &e)) {
@@ -1550,7 +1559,7 @@ static int cmd_list(int argc, char **argv, int start) {
   kbc_str resp;
   kbc_err e;
   kbc_err_reset(&e);
-  kbc_status s = http_call("GET", path.ptr, NULL, 0, &status, &resp);
+  kbc_status s = http_call("GET", path.ptr, NULL, 0, &status, &resp, &e);
   kbc_str_free(&path);
   if (kbc_failed(s)) {
     if (!daemon_unreachable(s, &e)) {
@@ -1607,7 +1616,8 @@ static int cmd_reindex(int argc, char **argv, int start) {
   kbc_str resp;
   kbc_err e;
   kbc_err_reset(&e);
-  kbc_status s = http_call("POST", R_REINDEX, body.ptr, body.len, &status, &resp);
+  kbc_status s =
+      http_call("POST", R_REINDEX, body.ptr, body.len, &status, &resp, &e);
   kbc_str_free(&body);
   if (kbc_failed(s)) {
     if (!daemon_unreachable(s, &e)) {
@@ -1660,7 +1670,7 @@ static int cmd_status(int argc, char **argv, int start) {
   kbc_str resp;
   kbc_err e;
   kbc_err_reset(&e);
-  kbc_status s = http_call("GET", R_STATS, NULL, 0, &status, &resp);
+  kbc_status s = http_call("GET", R_STATS, NULL, 0, &status, &resp, &e);
   if (kbc_failed(s)) {
     return call_failed(s, &e, "status");
   }
