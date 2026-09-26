@@ -857,8 +857,7 @@ KBC_TEST(an_unsupported_key_is_rejected_loudly_not_searched_literally) {
   kbc_searcher *s = kbc_searcher_new(ix, resolver, NULL, &err);
   KBC_CHECK_NOT_NULL(s);
 
-  static const char *const keys[] = {"tag:rust",  "cap:table",
-                                     "since:7d",  "index:true",
+  static const char *const keys[] = {"tag:rust",  "cap:table", "index:true",
                                      "scope:kb",  "wibble:1"};
   for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
     kbc_search_result r;
@@ -1344,6 +1343,212 @@ KBC_TEST(cosine_topk_ranks_a_store_past_the_hit_ceiling) {
   free(emb);
 }
 
+/* `since:` is no longer a refused key: the grammar validates the value
+ * (query.rs:276 accepts `Nd`, `Nh` and a raw unix timestamp, and refuses
+ * `since:all` as the absence of a filter), strips the atom from the free
+ * text, and hands the threshold to the caller that owns the mtime. What the
+ * index must NOT do is search for the literal words "since" and "7d". */
+KBC_TEST(since_is_accepted_and_never_searched_literally) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_index *ix = build_gram_index(a, &err);
+  KBC_CHECK_OK(err.status);
+  kbc_searcher *s = kbc_searcher_new(ix, resolver, NULL, &err);
+  KBC_CHECK_NOT_NULL(s);
+
+  kbc_search_result plain;
+  KBC_CHECK_OK(gram_run(s, a, "alpha", &plain, &err));
+  static const char *const accepted[] = {"alpha since:7d", "since:7d alpha",
+                                        "alpha since:12h",
+                                        "alpha since:1700000000",
+                                        "alpha since:\"7d\""};
+  for (size_t i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+    kbc_search_result r;
+    kbc_err_reset(&err);
+    kbc_query q;
+    memset(&q, 0, sizeof(q));
+    q.q = accepted[i];
+    q.mode = KBC_MODE_KEYWORD;
+    q.kind = KBC_KIND__COUNT;
+    KBC_CHECK_MSG(kbc_search_run(s, a, &q, NULL, 0, &r, &err) == KBC_OK,
+                  "since: %s: %s", accepted[i], err.msg);
+    KBC_CHECK_EQ_INT(r.len, plain.len);
+    if (r.len == plain.len && r.len > 0) {
+      /* the same rows in the same order, at the same scores */
+      KBC_CHECK_EQ_DBL(r.rows[0].score, plain.rows[0].score, 0.0);
+    }
+  }
+
+  /* A value the original refuses is still an error here, and NOT since: is
+   * warned and dropped rather than inverted. */
+  static const char *const refused[] = {"since:all", "since:7y", "since:",
+                                        "since:abc"};
+  for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+    kbc_search_result r;
+    kbc_err_reset(&err);
+    const kbc_status st = gram_run(s, a, refused[i], &r, &err);
+    KBC_CHECK_MSG(st != KBC_OK, "since: %s was accepted", refused[i]);
+    KBC_CHECK(err.msg[0] != '\0');
+  }
+  kbc_search_result nn;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(gram_run(s, a, "alpha NOT since:7d", &nn, &err));
+  KBC_CHECK_EQ_INT(nn.len, plain.len);
+
+  kbc_searcher_free(s);
+  kbc_index_free(ix);
+  kbc_arena_free(a);
+}
+
+/* ------------------------------------------------------------ graph boost */
+
+/* fusion.rs:214 apply_graph_boost. A run of the search with the weight at its
+ * default must be indistinguishable from a build that has no graph at all —
+ * that is the property every other ranking test in this file already pins, and
+ * the one that catches a boost leaking into a path it should not. */
+KBC_TEST(graph_boost_at_weight_zero_is_byte_identical_to_no_boost) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_index *ix = build_gram_index(a, &err);
+  KBC_CHECK_OK(err.status);
+  kbc_searcher *s = kbc_searcher_new(ix, resolver, NULL, &err);
+  KBC_CHECK_NOT_NULL(s);
+
+  /* Every document has an in-degree, and the array is a full graph: if the
+   * weight were read before the early return, every score would move. */
+  static const uint32_t ids[] = {0, 1, 2, 3};
+  static const uint32_t deg[] = {9, 4, 1, 16};
+  kbc_query q;
+  memset(&q, 0, sizeof(q));
+  q.q = "alpha";
+  q.mode = KBC_MODE_KEYWORD;
+  q.kind = KBC_KIND__COUNT;
+  q.graph_boost_weight = 0.0;
+  q.in_deg_doc_ids = ids;
+  q.in_deg = deg;
+  q.in_deg_len = 4;
+
+  kbc_search_result r;
+  KBC_CHECK_OK(kbc_search_run(s, a, &q, NULL, 0, &r, &err));
+  KBC_CHECK_EQ_INT(r.len, 3);
+  /* The same three pinned values the title-boost tests assert without any
+   * graph: identical because the boost never ran, not approximately equal. */
+  KBC_CHECK_EQ_DBL(r.rows[0].score, 1.5 / 62.0, 0.0);
+  KBC_CHECK_EQ_DBL(r.rows[1].score, 1.0 / 60.0, 0.0);
+  KBC_CHECK_EQ_DBL(r.rows[2].score, 1.0 / 61.0, 0.0);
+
+  kbc_searcher_free(s);
+  kbc_index_free(ix);
+  kbc_arena_free(a);
+}
+
+/* score += weight * (1/rrf_k) * sqrt(in)/sqrt(in_max), applied after fusion
+ * and before truncation: the well-linked hit that was ranked BELOW the limit
+ * still comes back on top. */
+KBC_TEST(graph_boost_adds_exactly_the_formula_and_can_lift_a_row_past_the_limit) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_index *ix = build_gram_index(a, &err);
+  KBC_CHECK_OK(err.status);
+  kbc_searcher *s = kbc_searcher_new(ix, resolver, NULL, &err);
+  KBC_CHECK_NOT_NULL(s);
+
+  /* Doc 2 ("Alpha notes", title-boosted to 1.5/62) has in-degree 16 = in_max,
+   * so it gains the full weight/rrf_k; doc 1 has 4 and doc 0 has 1. */
+  static const uint32_t ids[] = {0, 1, 2};
+  static const uint32_t deg[] = {1, 4, 16};
+  kbc_query q;
+  memset(&q, 0, sizeof(q));
+  q.q = "alpha";
+  q.mode = KBC_MODE_KEYWORD;
+  q.kind = KBC_KIND__COUNT;
+  q.graph_boost_weight = 1.0;
+  q.in_deg_doc_ids = ids;
+  q.in_deg = deg;
+  q.in_deg_len = 3;
+
+  kbc_search_result r;
+  KBC_CHECK_OK(kbc_search_run(s, a, &q, NULL, 0, &r, &err));
+  KBC_CHECK_EQ_INT(r.len, 3);
+  KBC_CHECK_EQ_INT(r.rows[0].doc_id, 2);
+  KBC_CHECK_EQ_DBL(r.rows[0].score, 1.5 / 62.0 + (1.0 / 60.0) * (4.0 / 4.0),
+                   1e-12);
+  KBC_CHECK_EQ_INT(r.rows[1].doc_id, 1);
+  KBC_CHECK_EQ_DBL(r.rows[1].score, 1.0 / 61.0 + (1.0 / 60.0) * (2.0 / 4.0),
+                   1e-12);
+  KBC_CHECK_EQ_INT(r.rows[2].doc_id, 0);
+  KBC_CHECK_EQ_DBL(r.rows[2].score, 1.0 / 60.0 + (1.0 / 60.0) * (1.0 / 4.0),
+                   1e-12);
+
+  /* The boost runs BEFORE truncation: with limit 1 the boosted doc is still
+   * the one that surfaces. */
+  q.limit = 1;
+  kbc_search_result r1;
+  KBC_CHECK_OK(kbc_search_run(s, a, &q, NULL, 0, &r1, &err));
+  KBC_CHECK_EQ_INT(r1.len, 1);
+  KBC_CHECK_EQ_INT(r1.rows[0].doc_id, 2);
+
+  kbc_searcher_free(s);
+  kbc_index_free(ix);
+  kbc_arena_free(a);
+}
+
+/* A doc the array does not name counts 0, and an all-zero graph is a no-op
+ * rather than a division by zero or a NaN. */
+KBC_TEST(graph_boost_absent_docs_count_zero_and_an_empty_graph_is_a_no_op) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_index *ix = build_gram_index(a, &err);
+  KBC_CHECK_OK(err.status);
+  kbc_searcher *s = kbc_searcher_new(ix, resolver, NULL, &err);
+  KBC_CHECK_NOT_NULL(s);
+
+  kbc_query q;
+  memset(&q, 0, sizeof(q));
+  q.q = "alpha";
+  q.mode = KBC_MODE_KEYWORD;
+  q.kind = KBC_KIND__COUNT;
+  q.graph_boost_weight = 1.0;
+
+  /* doc 3 is the only one named, and it is not even a hit: nothing to boost,
+   * and no crash looking for a hit the array does not have. */
+  static const uint32_t ids[] = {3};
+  static const uint32_t deg[] = {7};
+  q.in_deg_doc_ids = ids;
+  q.in_deg = deg;
+  q.in_deg_len = 1;
+  kbc_search_result r;
+  KBC_CHECK_OK(kbc_search_run(s, a, &q, NULL, 0, &r, &err));
+  KBC_CHECK_EQ_INT(r.len, 3);
+  for (size_t i = 0; i < r.len; i++) {
+    KBC_CHECK(isfinite(r.rows[i].score));
+  }
+  KBC_CHECK_EQ_DBL(r.rows[0].score, 1.5 / 62.0, 0.0);
+  KBC_CHECK_EQ_DBL(r.rows[1].score, 1.0 / 60.0, 0.0);
+  KBC_CHECK_EQ_DBL(r.rows[2].score, 1.0 / 61.0, 0.0);
+
+  /* in_max == 0: sqrt(0) in the denominator is never reached, and every score
+   * is exactly the unboosted one. */
+  static const uint32_t zero_deg[] = {0, 0, 0, 0};
+  q.in_deg = zero_deg;
+  q.in_deg_len = 4;
+  kbc_search_result r0;
+  KBC_CHECK_OK(kbc_search_run(s, a, &q, NULL, 0, &r0, &err));
+  KBC_CHECK_EQ_INT(r0.len, 3);
+  for (size_t i = 0; i < r0.len; i++) {
+    KBC_CHECK(isfinite(r0.rows[i].score));
+    KBC_CHECK_EQ_DBL(r0.rows[i].score, r.rows[i].score, 0.0);
+  }
+
+  kbc_searcher_free(s);
+  kbc_index_free(ix);
+  kbc_arena_free(a);
+}
+
 int main(void) {
   return kbc_test_run("search", (const kbc_test_case[]){
                           {"rrf_score_of_a_doc_first_in_both_lanes_is_two_over_rrf_k",
@@ -1418,6 +1623,14 @@ int main(void) {
                            a_negated_folder_is_rejected_rather_than_ignored},
                           {"a_trailing_star_still_expands_through_the_grammar",
                            a_trailing_star_still_expands_through_the_grammar},
+                          {"since_is_accepted_and_never_searched_literally",
+                           since_is_accepted_and_never_searched_literally},
+                          {"graph_boost_at_weight_zero_is_byte_identical_to_no_boost",
+                           graph_boost_at_weight_zero_is_byte_identical_to_no_boost},
+                          {"graph_boost_adds_exactly_the_formula_and_can_lift_a_row_past_the_limit",
+                           graph_boost_adds_exactly_the_formula_and_can_lift_a_row_past_the_limit},
+                          {"graph_boost_absent_docs_count_zero_and_an_empty_graph_is_a_no_op",
+                           graph_boost_absent_docs_count_zero_and_an_empty_graph_is_a_no_op},
                           {NULL, NULL},
                       });
 }

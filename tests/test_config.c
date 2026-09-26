@@ -1002,6 +1002,134 @@ KBC_TEST(dump_never_contains_the_token_value) {
   kbc_test_rmrf(dir);
 }
 
+/* The graph boost is a ranking weight, so it lives in the config and nowhere
+ * else. 0.0 is the default and means the graph is off; a configured value must
+ * sit in (0, 4], and 0 written in the file is a mistake worth naming rather
+ * than a silent no-op. */
+KBC_TEST(graph_boost_is_off_by_default_and_configured_only_in_range) {
+  char dir[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_config *cfg = NULL;
+
+  kbc_test_tmpdir(dir, sizeof dir);
+  {
+    kbc_config *def = kbc_config_defaults();
+    KBC_CHECK_NOT_NULL(def);
+    KBC_CHECK_EQ_DBL(def->graph_boost, 0.0, 0.0);
+    kbc_config_free(def);
+  }
+
+  write_cfg(dir, "on.toml", "[search]\ngraph_boost = 0.5\n");
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(load_text(&cfg, dir, "on.toml", &err));
+  if (cfg == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+  KBC_CHECK_EQ_DBL(cfg->graph_boost, 0.5, 1e-12);
+  kbc_config_free(cfg);
+  cfg = NULL;
+
+  /* The top of the range is a weight, not an error. */
+  write_cfg(dir, "max.toml", "[search]\ngraph_boost = 4.0\n");
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(load_text(&cfg, dir, "max.toml", &err));
+  if (cfg != NULL) {
+    KBC_CHECK_EQ_DBL(cfg->graph_boost, 4.0, 0.0);
+    kbc_config_free(cfg);
+    cfg = NULL;
+  }
+
+  /* 0 means off, which is already the default: writing it says the operator
+   * thinks they configured something. Out of range either way, and each
+   * message names the key, the line and the value. */
+  expect_reject(dir, "[search]\ngraph_boost = 0\n", "graph_boost", 2);
+  expect_reject(dir, "[search]\ngraph_boost = 0.0\n", "graph_boost", 2);
+  expect_reject(dir, "[search]\ngraph_boost = -1\n", "-1", 2);
+  expect_reject(dir, "[search]\ngraph_boost = 4.01\n", "4.01", 2);
+  expect_reject(dir, "[search]\ngraph_boost = \"loud\"\n",
+                "graph_boost", 2);
+
+  /* A config assembled by hand cannot smuggle a weight past the callers. */
+  {
+    kbc_config *bad = kbc_config_defaults();
+    KBC_CHECK_NOT_NULL(bad);
+    bad->graph_boost = 4.5;
+    kbc_err_reset(&err);
+    KBC_CHECK_ERR(kbc_config_validate(bad, &err), KBC_ERR_INVALID);
+    KBC_CHECK_MSG(strstr(err.msg, "graph_boost") != NULL,
+                  "message %s does not name graph_boost", err.msg);
+    kbc_config_free(bad);
+  }
+
+  kbc_test_rmrf(dir);
+}
+
+/* `kbc config show` has to show the weight, and a dump of the off case must
+ * still load: 0 is the default, so it is not a key the dump writes. */
+KBC_TEST(graph_boost_survives_a_dump_and_load_round_trip) {
+  char dir[KBC_TEST_PATH_MAX];
+  kbc_str out;
+  kbc_err err;
+  kbc_config *cfg = NULL;
+
+  kbc_test_tmpdir(dir, sizeof dir);
+  write_cfg(dir, "on.toml", "[search]\ngraph_boost = 1.25\n");
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(load_text(&cfg, dir, "on.toml", &err));
+  if (cfg == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+
+  kbc_str_init(&out);
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_config_dump(cfg, &out, &err));
+  KBC_CHECK_MSG(strstr(out.ptr, "graph_boost = ") != NULL,
+                "the dump does not show the key: %s", out.ptr);
+  {
+    char dump_path[KBC_TEST_PATH_MAX];
+    kbc_config *back = NULL;
+    join(dump_path, sizeof dump_path, dir, "dump.toml");
+    kbc_test_write_file(dump_path, out.ptr);
+    kbc_err_reset(&err);
+    KBC_CHECK_OK(load_text(&back, dir, "dump.toml", &err));
+    if (back != NULL) {
+      KBC_CHECK_EQ_DBL(back->graph_boost, 1.25, 0.0);
+      kbc_config_free(back);
+    }
+  }
+  kbc_str_free(&out);
+  kbc_config_free(cfg);
+
+  /* The off case: no key in the dump, and the file still loads. */
+  {
+    kbc_config *def = kbc_config_defaults();
+    kbc_config *back = NULL;
+    KBC_CHECK_NOT_NULL(def);
+    kbc_str_init(&out);
+    kbc_err_reset(&err);
+    KBC_CHECK_OK(kbc_config_dump(def, &out, &err));
+    KBC_CHECK_MSG(strstr(out.ptr, "graph_boost") == NULL,
+                  "the dump writes the off weight: %s", out.ptr);
+    {
+      char dump_path[KBC_TEST_PATH_MAX];
+      join(dump_path, sizeof dump_path, dir, "off-dump.toml");
+      kbc_test_write_file(dump_path, out.ptr);
+      kbc_err_reset(&err);
+      KBC_CHECK_OK(load_text(&back, dir, "off-dump.toml", &err));
+    }
+    if (back != NULL) {
+      KBC_CHECK_EQ_DBL(back->graph_boost, 0.0, 0.0);
+      kbc_config_free(back);
+    }
+    kbc_str_free(&out);
+    kbc_config_free(def);
+  }
+  kbc_test_rmrf(dir);
+}
+
+
 /* --------------------------------------------------------- dump round trip -- */
 
 static void same_config(const kbc_config *a, const kbc_config *b) {
@@ -1256,6 +1384,10 @@ int main(void) {
        dump_preserves_a_string_that_looks_like_syntax},
       {"dump_refuses_a_config_with_nothing_to_dump",
        dump_refuses_a_config_with_nothing_to_dump},
+      {"graph_boost_is_off_by_default_and_configured_only_in_range",
+       graph_boost_is_off_by_default_and_configured_only_in_range},
+      {"graph_boost_survives_a_dump_and_load_round_trip",
+       graph_boost_survives_a_dump_and_load_round_trip},
       {"free_tolerates_a_partially_built_config",
        free_tolerates_a_partially_built_config},
       {NULL, NULL},

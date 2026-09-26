@@ -68,6 +68,51 @@ kbc_status kbc_store_get_artifacts_by_path(kbc_store *s, kbc_arena *a,
                                            const char *const *paths, size_t n,
                                            kbc_artifact ***out, kbc_err *err);
 
+/* ------------------------------------------------------------------ edges -- */
+
+/* The corpus link graph. One row per outbound link whose target resolves to an
+ * indexed document; a target that does not resolve is simply not an edge, so
+ * the table is a subset of what the parser found, never a superset.
+ *
+ * In-degree is BACKLINKS ONLY. The Rust daemon deliberately ignores
+ * out-degree when boosting (fusion.rs:214, fed from storage.edge_counts()), and
+ * this table exists to compute that same number.
+ *
+ * CONVERGENCE — read this before trusting an in-degree. Edges are owned by the
+ * SOURCE and are rewritten only when the SOURCE is re-ingested, never when a
+ * target appears. A document ingested after a document that already links to it
+ * therefore stays at in-degree 0 until its sources are re-ingested. This is
+ * neither rare nor self-healing: `kbc daemon` does not reindex at startup, and a
+ * full `kbc reindex` does NOT repair it either, because unchanged documents
+ * contribute no edge writes. In practice the graph is complete only from a
+ * from-scratch index, or after the linking sources are themselves touched.
+ * kbc_config.graph_boost defaults to 0.0 — the graph is OFF — for exactly this
+ * reason. Closing the gap properly needs a pending-links table drained at the
+ * end of each ingest pass; that is PORT_PLAN stage 1, not a subtlety of this
+ * function. */
+kbc_status kbc_store_replace_edges(kbc_store *s, const char *corpus,
+                                   const char *src_path,
+                                   const char *const *dst_paths, size_t n,
+                                   kbc_err *err);
+/* Drops every edge leaving (corpus, src_path). Called when a document's content
+ * changes or it disappears, so a re-link cannot leave a stale edge behind. */
+kbc_status kbc_store_delete_edges(kbc_store *s, const char *corpus,
+                                  const char *src_path, kbc_err *err);
+/* The in-degree (backlink count) of each of `n` NAMED documents, in one
+ * statement, written into the caller's `in_deg` array in the order given. A
+ * document with no backlinks is 0; a document that does not exist is also 0,
+ * so a caller never has to distinguish them. n == 0 is KBC_OK and touches
+ * nothing.
+ *
+ * The caller names documents by PATH because the store is the only layer that
+ * knows paths: an index doc id means nothing here, and the index deliberately
+ * does not carry the graph. This is a single aggregate over the table, not a
+ * lookup per document. */
+kbc_status kbc_store_edge_degrees_for(kbc_store *s, const char *corpus,
+                                      const char *const *paths, size_t n,
+                                      uint32_t *in_deg, kbc_err *err);
+int64_t kbc_store_edge_count(kbc_store *s, const char *corpus, kbc_err *err);
+
 /* ---------------------------------------------------------------- chunks -- */
 
 typedef struct {

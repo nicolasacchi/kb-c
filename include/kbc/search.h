@@ -41,6 +41,24 @@ typedef struct {
   size_t candidate_k;   /* 0 -> 200; per-lane depth before fusion */
   int rrf_k;            /* <= 0 -> 60 */
   double bm25_k1, bm25_b;
+
+  /* In-degree (backlink count) per index doc id, parallel to `in_deg_doc_ids`,
+   * or NULL for no graph boost. KBC_ARENA / BORROWED, supplied by the caller,
+   * which is the only layer that can see the edge table. Applied AFTER fusion
+   * and BEFORE filtering and truncation, exactly as the Rust daemon does:
+   *     score += weight * (1.0 / rrf_k) * sqrt(in) / sqrt(in_max)
+   * sqrt and not ln, deliberately: the Rust daemon chose it so the value is
+   * bit-identical across libm implementations. weight 0.0 disables it, as
+   * apply_graph_boost's own early return does. */
+  double graph_boost_weight;
+  const uint32_t *in_deg_doc_ids; /* parallel to in_deg */
+  const uint32_t *in_deg;
+  size_t in_deg_len;
+
+  /* Drop rows whose artifact is older than this (nanoseconds since the epoch).
+   * 0 disables the filter. Applied by the caller, which is where the store's
+   * mtime lives — the index deliberately does not carry it. */
+  int64_t since_ns;
 } kbc_query;
 
 /* One result row. Strings are ARENA copies taken from the index (and, for
@@ -95,6 +113,17 @@ kbc_status kbc_searcher_set_vecstore(kbc_searcher *s, const kbc_vecstore *vs,
 kbc_status kbc_search_run(kbc_searcher *s, kbc_arena *a, const kbc_query *q,
                           const float *vec, size_t vec_len,
                           kbc_search_result *out, kbc_err *err);
+
+/* Parses a `since:` atom's value into a nanosecond cutoff, using the forms the
+ * Rust overlay accepts: `<n>d` (days), `<n>h` (hours), or a raw unix timestamp
+ * in SECONDS. The unit count is clamped rather than allowed to overflow.
+ *
+ * `value` is BORROWED; `*ns` is 0 when there is no filter. `all` — the Rust
+ * meaning for "drop the atom" — is an ERROR here (KBC_ERR_INVALID), as is an
+ * empty value, an unknown unit, or trailing junk. It is never a silent "no
+ * filter": a `since:` the caller believes it applied must not quietly not
+ * apply. */
+kbc_status kbc_since_value_ns(const char *value, int64_t *ns, kbc_err *err);
 
 /* Cosine top-k over a caller-supplied (doc_id, embedding) table. Exposed so
  * the vector lane is testable without a sidecar.

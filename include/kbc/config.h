@@ -49,6 +49,13 @@ typedef struct kbc_config {
   double bm25_k1; /* 1.2 */
   double bm25_b;  /* 0.75 */
   int rrf_k;      /* 60 */
+  /* Backlink boost weight. 0.0 (the default) means the graph is OFF and
+   * ranking is byte-identical to a build with no edge table at all — an
+   * operator has to ask for the graph, exactly as the Rust daemon's
+   * `[kb.*] graph_boost` does. A configured value is validated to (0, 4];
+   * 0 is the default, so the accepted range for a CONFIGURED value excludes
+   * it. Reached by kbc_query.graph_boost_weight. */
+  double graph_boost;
   size_t chunk_max_bytes; /* 65536 */
   size_t search_max_hits; /* 50 */
   size_t watcher_debounce_ms; /* 250 */

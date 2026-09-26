@@ -792,7 +792,103 @@ static bool parse_expr_or(gram_parser *p, size_t depth, gram_list *out) {
 typedef struct {
   const char *text;   /* arena, space-joined free text; "" when none */
   const char *folder; /* arena, NULL when the query names no folder */
+  /* query.rs:276 parse_since, in nanoseconds. The grammar cannot APPLY it —
+   * the index carries no mtime — so it is reported here for the caller that
+   * does, and the atom never reaches the free text. 0 = no filter. */
+  int64_t since_ns;
 } gram_query;
+
+/* query.rs:276 parse_since. Accepted: `Nd` (days), `Nh` (hours) and a raw
+ * unix timestamp in seconds; `since:all` is the ABSENCE of a filter and is
+ * an error, as it is in the original — the way to write it is to drop the
+ * atom. Returns 0 on a value the original would also refuse. The unit count
+ * is clamped so `since:99999999999d` cannot overflow the arithmetic into a
+ * threshold that silently means the opposite. */
+#define SEARCH_SINCE_MAX_UNITS 1000000000LL
+/* CONTRACT GAP: the value grammar of `since:` is needed by the layer that
+ * APPLIES the filter, not only by the one that validates it, and search.h is
+ * frozen. Declared here for app.c on the same terms as
+ * kbc_searcher_set_vecstore above; the orchestrator should add to search.h:
+ *   kbc_status kbc_since_value_ns(const char *value, int64_t *ns,
+ *                                  kbc_err *err);
+ * 0 in *ns means "no filter". */
+kbc_status kbc_since_value_ns(const char *value, int64_t *ns, kbc_err *err);
+
+kbc_status kbc_since_value_ns(const char *value, int64_t *ns, kbc_err *err) {
+  *ns = 0;
+  if (value[0] == '\0')
+    return kbc_err_set(err, KBC_ERR_INVALID, "search: since: has no value");
+  if (strcmp(value, "all") == 0) {
+    return kbc_err_set(
+        err, KBC_ERR_INVALID,
+        "search: since:all is the absence of a filter — drop the atom");
+  }
+  const size_t len = strlen(value);
+  int64_t units = 0;
+  int64_t mult = 0;
+  bool relative = false;
+  if (value[len - 1] == 'd') {
+    mult = 86400;
+    relative = true;
+  } else if (value[len - 1] == 'h') {
+    mult = 3600;
+    relative = true;
+  }
+  if (relative) {
+    char digits[32];
+    const size_t dlen = len - 1;
+    if (dlen == 0 || dlen >= sizeof(digits))
+      return kbc_err_set(err, KBC_ERR_INVALID,
+                         "search: since %s: not a number of days/hours",
+                         value);
+    for (size_t i = 0; i < dlen; i++) {
+      const char c = value[i];
+      if (c < '0' || c > '9')
+        return kbc_err_set(err, KBC_ERR_INVALID,
+                           "search: since %s: not a number of days/hours",
+                           value);
+      digits[i] = c;
+    }
+    digits[dlen] = '\0';
+    units = strtoll(digits, NULL, 10);
+  } else {
+    char digits[32];
+    if (len >= sizeof(digits))
+      return kbc_err_set(err, KBC_ERR_INVALID,
+                         "search: since: unsupported unit in \"%s\"", value);
+    memcpy(digits, value, len + 1);
+    char *end = NULL;
+    units = strtoll(digits, &end, 10);
+    if (end == digits || *end != '\0')
+      return kbc_err_set(err, KBC_ERR_INVALID,
+                         "search: since: unsupported unit in \"%s\"", value);
+    mult = 1;
+  }
+  /* A raw timestamp IS the threshold; only the relative forms are measured
+   * back from now, and a negative one means a future moment, which no
+   * document can satisfy — 0 there would silently disable the filter, so it
+   * is refused instead. */
+  if (!relative) {
+    if (units <= 0)
+      return kbc_err_set(err, KBC_ERR_INVALID,
+                         "search: since %s: a unix timestamp in seconds must "
+                         "be positive",
+                         value);
+    /* Clamping an ABSOLUTE timestamp would move it into the past and turn a
+     * filter that excludes everything into one that excludes nothing; the
+     * only bound here is the one that keeps the multiply in range. */
+    if (units > INT64_MAX / 1000000000LL)
+      return kbc_err_set(err, KBC_ERR_INVALID,
+                         "search: since %s: timestamp out of range", value);
+    *ns = units * 1000000000LL;
+    return KBC_OK;
+  }
+  if (units > SEARCH_SINCE_MAX_UNITS) units = SEARCH_SINCE_MAX_UNITS;
+  const int64_t now_s = kbc_now_ns() / 1000000000LL;
+  const int64_t delta = units * mult;
+  *ns = (delta >= now_s ? 0 : (now_s - delta) * 1000000000LL);
+  return KBC_OK;
+}
 
 /* CONTRACT GAP: this is the whole of the query grammar as the index can
  * express it, and a test cannot reach it because search.h is frozen. The
@@ -813,6 +909,7 @@ kbc_status kbc_query_grammar(kbc_arena *a, const char *q, gram_query *out,
     return kbc_err_set(err, KBC_ERR_INVALID, "query_grammar: out is NULL");
   out->text = "";
   out->folder = NULL;
+  out->since_ns = 0;
   if (q == NULL)
     return kbc_err_set(err, KBC_ERR_INVALID, "query_grammar: q is NULL");
   const size_t n = strlen(q);
@@ -850,6 +947,7 @@ kbc_status kbc_query_grammar(kbc_arena *a, const char *q, gram_query *out,
   kbc_str text;
   kbc_str_init(&text);
   const char *folder = NULL;
+  int64_t since_ns = 0;
   for (size_t i = 0; i < p.nfacts; i++) {
     const gram_fact *f = &p.facts[i];
     if (f->origin != i) continue; /* a DNF copy of an atom already folded */
@@ -892,19 +990,42 @@ kbc_status kbc_query_grammar(kbc_arena *a, const char *q, gram_query *out,
       }
       continue;
     }
+    if (f->key == GK_SINCE) {
+      if (f->negated) {
+        /* query.rs:381 — there is no upper bound to negate, so the original
+         * warns and drops it. So do we: a filter silently applied backwards
+         * would be worse than one that is visibly absent. */
+        KBC_LOGW("search: NOT since:\"%s\" is unsupported (no upper-bound "
+                 "filter); ignoring",
+                 f->value);
+        continue;
+      }
+      int64_t ns = 0;
+      kbc_status ss = kbc_since_value_ns(f->value, &ns, err);
+      if (ss != KBC_OK) {
+        kbc_str_free(&text);
+        return ss;
+      }
+      /* Validated, then dropped: the index carries no mtime, so applying it
+       * is the caller's job (kbc_query.since_ns). Two `since:` atoms AND
+       * together, so the strictest threshold wins. */
+      if (ns > since_ns) since_ns = ns;
+      continue;
+    }
     if (f->key == GK_OTHER) {
       kbc_str_free(&text);
       return kbc_err_set(err, KBC_ERR_INVALID,
                          "search: unknown query key \"%s\"; valid keys: "
-                         "folder, text",
+                         "folder, since, text",
                          f->name);
     }
     kbc_str_free(&text);
     return kbc_err_set(err, KBC_ERR_UNSUPPORTED,
                        "search: query key \"%s\" is not supported by the "
-                       "kb-c index (valid keys: folder, text)",
+                       "kb-c index (valid keys: folder, since, text)",
                        gram_key_name(f->key));
   }
+  out->since_ns = since_ns;
   out->text = kbc_arena_strndup(a, text.ptr != NULL ? text.ptr : "", text.len);
   if (text.ptr != NULL) kbc_str_free(&text);
   out->folder = folder;
@@ -1004,6 +1125,56 @@ static kbc_status apply_title_boost(kbc_arena *a, const kbc_index *ix,
   }
   kbc_strlist_free(&terms);
   return KBC_OK;
+}
+
+/* fusion.rs:214 apply_graph_boost. In-degree (backlinks) is the endorsement
+ * axis; out-degree is deliberately ignored, so a note that links everything
+ * cannot rank itself up by fan-out. The most-linked document in the corpus
+ * gains `weight / rrf_k` — one extra top-rank RRF arm — and everything else
+ * scales by sqrt(in)/sqrt(in_max).
+ *
+ * `sqrt` and not `ln`, deliberately: IEEE-754 sqrt is correctly rounded and so
+ * bit-identical across libm implementations, while `ln` is not, and a boost
+ * that flipped equal-score ties across glibc/musl would be a determinism bug
+ * wearing a ranking feature's clothes.
+ *
+ * weight 0.0 returns before a single floating-point operation happens, which
+ * is what makes the default off byte-identical to no boost at all. */
+static void apply_graph_boost(fused_row *rows, size_t n, const kbc_query *q,
+                              double rrf_k) {
+  if (q->graph_boost_weight == 0.0 || n == 0 || q->in_deg == NULL ||
+      q->in_deg_len == 0) {
+    return;
+  }
+  /* The corpus-wide max, not the max over this query's candidates: the
+   * normalisation must not change with what a query happened to match. */
+  uint32_t in_max = 0;
+  for (size_t i = 0; i < q->in_deg_len; i++) {
+    if (q->in_deg[i] > in_max) in_max = q->in_deg[i];
+  }
+  if (in_max == 0) return; /* no graph, or every degree is zero: a no-op */
+  const double denom = sqrt((double)in_max);
+  for (size_t r = 0; r < n; r++) {
+    /* A doc the array does not name counts 0 — a lookup, not a skip. */
+    const uint32_t doc = rows[r].doc;
+    uint32_t in = 0;
+    if (q->in_deg_doc_ids != NULL) {
+      size_t lo = 0, hi = q->in_deg_len;
+      while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (q->in_deg_doc_ids[mid] < doc) {
+          lo = mid + 1;
+        } else {
+          hi = mid;
+        }
+      }
+      if (lo < q->in_deg_len && q->in_deg_doc_ids[lo] == doc)
+        in = q->in_deg[lo];
+    }
+    if (in == 0) continue;
+    rows[r].score += q->graph_boost_weight * (1.0 / rrf_k) *
+                     (sqrt((double)in) / denom);
+  }
 }
 
 /* ----------------------------------------------------------- query prep -- */
@@ -1334,6 +1505,12 @@ kbc_status kbc_search_run(kbc_searcher *s, kbc_arena *a, const kbc_query *q,
   st = apply_title_boost(a, s->ix, rows, uniq, gq.text, SEARCH_TITLE_BOOST,
                          err);
   if (st != KBC_OK) return st;
+  /* fusion.rs:214 — the graph boost, on the full candidate pool, after fusion
+   * and after the title boost and before filtering and truncation, so a
+   * well-linked hit just past the limit can still surface. `eq` rather than
+   * `q`: the grammar may have overridden other fields, and the boost reads
+   * the caller's graph either way. */
+  apply_graph_boost(rows, uniq, &eq, rrf_k);
   /* Rust re-sorts stably by score after the boost. kb-c's fused order is
    * already score-desc with a deterministic tie-break, so a plain re-sort by
    * that same comparator IS the stable sort. */

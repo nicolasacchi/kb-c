@@ -69,7 +69,21 @@ static const char *const SCHEMA_V1 =
     "CREATE INDEX IF NOT EXISTS artifacts_kind ON artifacts(kind);"
     "CREATE INDEX IF NOT EXISTS comments_doc ON comments(doc_id);";
 
-#define SCHEMA_VERSION 1
+/* v2 — the corpus link graph. Backlinks only: one row per outbound link
+ * whose target resolves to an indexed document, keyed by the two
+ * corpus-relative paths. Path-keyed rather than artifact-id-keyed because a
+ * document's id is minted from (corpus, path) and a link is a name in a
+ * source file, not a reference to a row: the reindex of a target must not
+ * rewrite every edge pointing at it. */
+static const char *const SCHEMA_V2 =
+    "CREATE TABLE IF NOT EXISTS edges ("
+    " corpus TEXT NOT NULL,"
+    " src_path TEXT NOT NULL,"
+    " dst_path TEXT NOT NULL,"
+    " PRIMARY KEY(corpus, src_path, dst_path));"
+    "CREATE INDEX IF NOT EXISTS edges_dst ON edges(corpus, dst_path);";
+
+#define SCHEMA_VERSION 2
 
 #define ARTIFACT_COLS                                                          \
   "id, corpus, path, title, kind, mtime_ns, size_bytes, content_hash, "     \
@@ -371,7 +385,25 @@ static kbc_status apply_v1(kbc_store *s, kbc_err *err) {
                "INSERT OR IGNORE INTO schema_version(version) VALUES (?1);",
                &ins);
   if (st != KBC_OK) return st;
-  st = bind_i64(err, s, ins, 1, SCHEMA_VERSION);
+  st = bind_i64(err, s, ins, 1, 1); /* step 1, whatever SCHEMA_VERSION is today */
+  if (st == KBC_OK) {
+    int step = sqlite3_step(ins);
+    if (step != SQLITE_DONE)
+      st = sql_fail(err, s, "record schema version", step);
+  }
+  kbc_status fin = finalize(err, s, ins, st);
+  return st != KBC_OK ? st : fin;
+}
+
+static kbc_status apply_v2(kbc_store *s, kbc_err *err) {
+  kbc_status st = exec_plain(err, s, SCHEMA_V2);
+  if (st != KBC_OK) return st;
+  sqlite3_stmt *ins = NULL;
+  st = prepare(err, s,
+               "INSERT OR IGNORE INTO schema_version(version) VALUES (?1);",
+               &ins);
+  if (st != KBC_OK) return st;
+  st = bind_i64(err, s, ins, 1, 2);
   if (st == KBC_OK) {
     int step = sqlite3_step(ins);
     if (step != SQLITE_DONE)
@@ -397,11 +429,15 @@ static kbc_status migrate_locked(kbc_store *s, kbc_err *err) {
     return KBC_OK;
   }
 
-  /* One transaction per migration: schema and its version record land
-   * together, so a crash mid-migration leaves the previous version intact. */
+  /* One transaction for the whole ladder: each step and its version record
+   * land together, so a crash mid-migration leaves the previous version
+   * intact and the next open re-runs the same steps. Every step is written
+   * to be re-runnable (IF NOT EXISTS / OR IGNORE), so a database that
+   * already has step 1 only pays for step 2. */
   st = exec_plain(err, s, "BEGIN IMMEDIATE;");
   if (st != KBC_OK) return st;
-  st = apply_v1(s, err);
+  if (have < 1) st = apply_v1(s, err);
+  if (st == KBC_OK && have < 2) st = apply_v2(s, err);
   if (st == KBC_OK) st = exec_plain(err, s, "COMMIT;");
   if (st != KBC_OK) {
     rollback(s);
@@ -903,6 +939,181 @@ kbc_status kbc_store_total_bytes(kbc_store *s, int64_t *out, kbc_err *err) {
   return rc;
 }
 
+
+/* ------------------------------------------------------------------ edges -- */
+
+kbc_status kbc_store_delete_edges(kbc_store *s, const char *corpus,
+                                   const char *src_path, kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "delete_edges: null store");
+  kbc_status st = require_text(err, "edge corpus", corpus, 255);
+  if (st == KBC_OK)
+    st = require_text(err, "edge src_path", src_path, KBC_MAX_PATH_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *st1 = NULL;
+  st = prepare(err, s,
+               "DELETE FROM edges WHERE corpus = ?1 AND src_path = ?2;",
+               &st1);
+  if (st == KBC_OK) st = bind_text(err, s, st1, 1, corpus);
+  if (st == KBC_OK) st = bind_text(err, s, st1, 2, src_path);
+  if (st == KBC_OK) {
+    int step = sqlite3_step(st1);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "delete edges: step", step);
+  }
+  kbc_status fin = finalize(err, s, st1, st);
+  unlock(s);
+  return st != KBC_OK ? st : fin;
+}
+
+kbc_status kbc_store_replace_edges(kbc_store *s, const char *corpus,
+                                   const char *src_path,
+                                   const char *const *dst_paths, size_t n,
+                                   kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "replace_edges: null store");
+  if (n > 0 && dst_paths == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "replace_edges: null dst_paths");
+  kbc_status st = require_text(err, "edge corpus", corpus, 255);
+  if (st == KBC_OK)
+    st = require_text(err, "edge src_path", src_path, KBC_MAX_PATH_LEN);
+  for (size_t i = 0; st == KBC_OK && i < n; i++) {
+    st = require_text(err, "edge dst_path", dst_paths[i], KBC_MAX_PATH_LEN);
+  }
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  /* REPLACE, in ONE transaction: the delete and every insert commit or roll
+  * back together, so a re-indexed document whose links changed cannot leave
+  * the old edges behind on a failure, and a duplicate target in the batch
+  * collapses on the primary key rather than failing the whole write. */
+  st = exec_plain(err, s, "BEGIN IMMEDIATE;");
+  if (st != KBC_OK) {
+    unlock(s);
+    return st;
+  }
+  sqlite3_stmt *del = NULL;
+  st = prepare(err, s,
+               "DELETE FROM edges WHERE corpus = ?1 AND src_path = ?2;",
+               &del);
+  if (st == KBC_OK) st = bind_text(err, s, del, 1, corpus);
+  if (st == KBC_OK) st = bind_text(err, s, del, 2, src_path);
+  if (st == KBC_OK) {
+    int step = sqlite3_step(del);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "delete edges: step", step);
+  }
+  kbc_status fin = finalize(err, s, del, st);
+  if (st == KBC_OK) st = fin;
+
+  sqlite3_stmt *ins = NULL;
+  if (st == KBC_OK) {
+    st = prepare(err, s,
+                 "INSERT OR IGNORE INTO edges(corpus, src_path, dst_path) "
+                 "VALUES(?1,?2,?3);",
+                 &ins);
+    for (size_t i = 0; st == KBC_OK && i < n; i++) {
+      st = bind_text(err, s, ins, 1, corpus);
+      if (st == KBC_OK) st = bind_text(err, s, ins, 2, src_path);
+      if (st == KBC_OK) st = bind_text(err, s, ins, 3, dst_paths[i]);
+      if (st == KBC_OK) {
+        int step = sqlite3_step(ins);
+        if (step != SQLITE_DONE)
+          st = sql_fail(err, s, "insert edge", step);
+        (void)sqlite3_reset(ins);
+      }
+    }
+    kbc_status fin2 = finalize(err, s, ins, st);
+    if (st == KBC_OK) st = fin2;
+  }
+
+  if (st == KBC_OK) st = exec_plain(err, s, "COMMIT;");
+  if (st != KBC_OK) rollback(s);
+  unlock(s);
+  return st;
+}
+
+kbc_status kbc_store_edge_degrees_for(kbc_store *s, const char *corpus,
+                                      const char *const *paths, size_t n,
+                                      uint32_t *in_deg, kbc_err *err) {
+  if (s == NULL || (n > 0 && (paths == NULL || in_deg == NULL)))
+    return kbc_err_set(err, KBC_ERR_INVALID, "edge_degrees_for: null argument");
+  kbc_status st = require_text(err, "edge corpus", corpus, 255);
+  if (st != KBC_OK) return st;
+  if (n == 0) return KBC_OK;
+  for (size_t i = 0; i < n; i++) {
+    if (paths[i] == NULL)
+      return kbc_err_set(err, KBC_ERR_INVALID, "edge_degrees_for: path %zu is "
+                         "NULL", i);
+    in_deg[i] = 0;
+  }
+
+  /* The documents are named by path because the store cannot know an index
+   * doc id, and they travel as a JSON array rather than as n bound parameters
+   * because n is the size of a corpus, not of a page: a VALUES list would cap
+   * the caller at SQLITE_MAX_VARIABLE_NUMBER rows per query. */
+  kbc_str js;
+  kbc_str_init(&js);
+  st = kbc_str_putc(&js, '[');
+  for (size_t i = 0; st == KBC_OK && i < n; i++) {
+    if (i > 0) st = kbc_str_putc(&js, ',');
+    if (st == KBC_OK)
+      st = kbc_str_append_json_string(&js, paths[i], strlen(paths[i]));
+  }
+  if (st == KBC_OK) st = kbc_str_putc(&js, ']');
+  if (st != KBC_OK) {
+    kbc_str_free(&js);
+    return kbc_err_set(err, st, "edge_degrees_for: %zu paths", n);
+  }
+
+  lock(s);
+  /* ONE statement for the whole batch: a correlated aggregate per requested
+   * path, so a document with no backlinks and a document that does not exist
+   * both come back as 0 and the caller never has to tell them apart. */
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "SELECT (SELECT COUNT(*) FROM edges e"
+               "         WHERE e.corpus = ?1 AND e.dst_path = j.value)"
+               "  FROM json_each(?2) j;",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, corpus);
+  if (st == KBC_OK) {
+    int rc = sqlite3_bind_text(q, 2, js.ptr, (int)js.len, SQLITE_TRANSIENT);
+    if (rc != SQLITE_OK) st = sql_fail(err, s, "bind paths", rc);
+  }
+  size_t i = 0;
+  while (st == KBC_OK) {
+    int step = sqlite3_step(q);
+    if (step == SQLITE_DONE) break;
+    if (step != SQLITE_ROW) {
+      st = sql_fail(err, s, "edge degrees: step", step);
+      break;
+    }
+    /* json_each yields exactly the caller's rows, in array order, duplicates
+     * included, so slot i is the degree of paths[i]. */
+    if (i < n) in_deg[i] = (uint32_t)sqlite3_column_int64(q, 0);
+    i++;
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  unlock(s);
+  kbc_str_free(&js);
+  return st;
+}
+
+int64_t kbc_store_edge_count(kbc_store *s, const char *corpus, kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "edge_count: null store");
+  kbc_status st = require_text(err, "edge corpus", corpus, 255);
+  if (st != KBC_OK) return st;
+  int64_t out = 0;
+  lock(s);
+  st = count_query(err, s,
+                  "SELECT COUNT(*) FROM edges WHERE corpus = ?1;", corpus,
+                  &out);
+  unlock(s);
+  return kbc_failed(st) ? st : out;
+}
 /* --------------------------------------------------------------- chunks -- */
 
 kbc_status kbc_store_replace_chunks(kbc_store *s, const kbc_chunk_in *chunks,

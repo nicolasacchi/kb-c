@@ -110,6 +110,8 @@ typedef struct {
   double bm25_b;
   bool has_rrf_k;
   int64_t rrf_k;
+  bool has_graph_boost;
+  double graph_boost;
   bool has_max_hits;
   int64_t max_hits;
 
@@ -835,6 +837,25 @@ static kbc_status cfg_apply_key(cfg_overlay *ov, cfg_section sec,
       ov->has_rrf_k = true;
       return KBC_OK;
     }
+    if (strcmp(key, "graph_boost") == 0) {
+      st = cfg_need_num(v, key, file, line, err);
+      if (st != KBC_OK) {
+        return st;
+      }
+      /* 0 is not a weight, it is the absence of one: writing it means the
+       * operator believes they are configuring something while the graph
+       * stays off. Name that rather than accept a no-op. */
+      if (!(v->f > 0.0 && v->f <= 4.0)) {
+        return cfg_err_at(file, line, err, KBC_ERR_PARSE,
+                          "key graph_boost must be within (0, 4], found %s "
+                          "(0 means the graph is off, which is the default — "
+                          "omit the key instead)",
+                          v->text);
+      }
+      ov->graph_boost = v->f;
+      ov->has_graph_boost = true;
+      return KBC_OK;
+    }
     if (strcmp(key, "max_hits") == 0) {
       st = cfg_need_int(v, key, file, line, err);
       if (st != KBC_OK) {
@@ -1206,6 +1227,9 @@ static kbc_status cfg_apply(kbc_config *cfg, cfg_overlay *ov, const char *dir,
   if (ov->has_rrf_k) {
     cfg->rrf_k = (int)ov->rrf_k;
   }
+  if (ov->has_graph_boost) {
+    cfg->graph_boost = ov->graph_boost;
+  }
   if (ov->has_max_hits) {
     cfg->search_max_hits = (size_t)ov->max_hits;
   }
@@ -1287,6 +1311,7 @@ kbc_config *kbc_config_defaults(void) {
   c->bm25_k1 = 1.2;
   c->bm25_b = 0.75;
   c->rrf_k = 60;
+  c->graph_boost = 0.0; /* the graph is OFF until an operator asks for it */
   c->chunk_max_bytes = 65536u;
   c->search_max_hits = 50u;
   c->watcher_debounce_ms = 250u;
@@ -1649,6 +1674,14 @@ kbc_status kbc_config_validate(const kbc_config *cfg, kbc_err *err) {
     return kbc_err_set(err, KBC_ERR_INVALID, "bm25_b %g must be within 0..1",
                        cfg->bm25_b);
   }
+  /* The parser refuses these too; the check is here so a caller that built a
+   * config by hand cannot smuggle a weight past every caller downstream. */
+  if (!(cfg->graph_boost >= 0.0 && cfg->graph_boost <= 4.0)) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "graph_boost %g must be 0.0 (the graph off) or within "
+                       "(0, 4]",
+                       cfg->graph_boost);
+  }
   if (cfg->watcher_debounce_ms > (size_t)KBC_CFG_MAX_DEBOUNCE_MS) {
     return kbc_err_set(err, KBC_ERR_INVALID,
                        "watcher debounce_ms %zu is outside 0..%u",
@@ -1837,6 +1870,14 @@ kbc_status kbc_config_dump(const kbc_config *cfg, kbc_str *out, kbc_err *err) {
   st = cfg_kv_fmt(out, "rrf_k = ", "%d", err, cfg->rrf_k);
   if (st != KBC_OK) {
     return st;
+  }
+  /* Dumped only when the graph is on: 0 means off, and a dump that cannot be
+   * loaded back is not a dump. */
+  if (cfg->graph_boost > 0.0) {
+    st = cfg_kv_fmt(out, "graph_boost = ", "%.17g", err, cfg->graph_boost);
+    if (st != KBC_OK) {
+      return st;
+    }
   }
   st = cfg_kv_fmt(out, "max_hits = ", "%zu", err, cfg->search_max_hits);
   if (st != KBC_OK) {

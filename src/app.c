@@ -74,6 +74,28 @@ kbc_status kbc_searcher_set_vecstore(kbc_searcher *s, const kbc_vecstore *vs,
 /* The eight owned char* in kbc_config, counted for the deep copy. */
 #define KBC_APP_CFG_FIELDS 8u
 #define KBC_APP_VEC_FILE "vectors.bin"
+/* search.c's `since:` value grammar, which validates the atom there and is
+ * applied here; see the CONTRACT GAP note there for the header line the
+ * orchestrator should add. */
+kbc_status kbc_since_value_ns(const char *value, int64_t *ns, kbc_err *err);
+/* The link graph's write, and the per-source view it takes. Defined next to
+ * store_forget_path; declared here because reindex_locked is the caller that
+ * owns the whole document set. */
+typedef struct {
+  const char *corpus;
+  const char *src;
+  char **dst; /* owned targets; the array is ours to free */
+  size_t n;
+} app_edge_src;
+
+static void app_edge_srcs_free(app_edge_src *v, size_t n);
+static kbc_status store_write_links(kbc_app *app, app_edge_src *v, size_t nsrc,
+                                    kbc_err *err);
+
+/* Links recorded per document. A document with more outbound links than this
+ * is a generated page, not curation; the cap keeps one file from turning a
+ * reindex into a graph write the size of the corpus. */
+#define APP_MAX_EDGES_PER_DOC 4096u
 
 typedef struct {
   kbc_event_fn fn;
@@ -271,11 +293,19 @@ static char *summary_from_blocks(const kbc_blocks *b) {
 
 /* --------------------------------------------------------------- ingest  */
 
-/* The metadata ingest_file persists. KBC_OWN, freed with stored_free. */
+/* The metadata ingest_file persists. KBC_OWN, freed with ingested_free.
+ *
+ * `link_paths` are the document's outbound link targets, already resolved
+ * against its own directory but NOT yet checked against the store: a target
+ * that has not been ingested yet is not a document, and whether it is one
+ * cannot be known until the whole pass has run. They are therefore carried
+ * out of the parse and written once, after the last document is in. */
 typedef struct {
   char *title;
   int32_t heading_count;
   uint32_t content_hash;
+  char **link_paths; /* KBC_OWN, corpus-relative */
+  size_t n_links;
 } kbc_app_ingested;
 
 static void ingested_free(kbc_app_ingested *g) {
@@ -283,6 +313,10 @@ static void ingested_free(kbc_app_ingested *g) {
   g->title = NULL;
   g->heading_count = 0;
   g->content_hash = 0;
+  for (size_t i = 0; i < g->n_links; i++) free(g->link_paths[i]);
+  free(g->link_paths);
+  g->link_paths = NULL;
+  g->n_links = 0;
 }
 
 static kbc_status read_bounded(const char *path, kbc_str *out, kbc_err *err) {
@@ -404,6 +438,37 @@ static kbc_status ingest_file(kbc_app *app, const char *corpus_name,
   if (kbc_failed(s)) {
     free(summary);
     goto fail;
+  }
+
+  /* The outbound link targets, carried out to be written once the pass has
+   * stored every document — see kbc_app_ingested. */
+  {
+    const kbc_links *links = kbc_parsed_links(p);
+    size_t nl = links->len;
+    if (nl > APP_MAX_EDGES_PER_DOC) {
+      KBC_LOGW("%s/%s: %zu links, only the first %u recorded", corpus_name, rel,
+               nl, (unsigned)APP_MAX_EDGES_PER_DOC);
+      nl = APP_MAX_EDGES_PER_DOC;
+    }
+    if (nl > 0) {
+      out->link_paths = calloc(nl, sizeof(*out->link_paths));
+      if (out->link_paths == NULL) {
+        free(summary);
+        s = kbc_err_set(err, KBC_ERR_NOMEM, "%zu link targets of %s/%s", nl,
+                        corpus_name, rel);
+        goto fail;
+      }
+      for (size_t i = 0; i < nl; i++) {
+        out->link_paths[i] = dup_cstr(links->items[i].target);
+        if (out->link_paths[i] == NULL) {
+          free(summary);
+          s = kbc_err_set(err, KBC_ERR_NOMEM, "link target copy for %s/%s",
+                          corpus_name, rel);
+          goto fail;
+        }
+        out->n_links++;
+      }
+    }
   }
 
   out->title = dup_cstr(art.title ? art.title : "");
@@ -1201,6 +1266,16 @@ static kbc_status reindex_locked(kbc_app *app, kbc_err *err) {
                        (unsigned)UINT32_MAX);
   }
 
+  /* The link graph is written after the loop, not inside it: a link target
+   * that has not been ingested yet is not a document, and a document that
+   * links to a sibling further down the walk must still produce an edge. */
+  app_edge_src *edge_srcs = calloc(m.len > 0 ? m.len : 1, sizeof(*edge_srcs));
+  size_t n_edge_srcs = 0;
+  if (edge_srcs == NULL) {
+    manifest_free(&m);
+    return kbc_err_set(err, KBC_ERR_NOMEM, "%zu link sources", m.len);
+  }
+
   for (size_t i = 0; i < m.len; i++) {
     kbc_app_row *row = &m.items[i];
     if (!row->changed) {
@@ -1211,6 +1286,7 @@ static kbc_status reindex_locked(kbc_app *app, kbc_err *err) {
     if (kbc_failed(s = ingest_file(app, cc->name, cc->path, row->path,
                                    row->mtime_ns, row->size_bytes, &g, err))) {
       if (s != KBC_ERR_NOTFOUND) {
+        app_edge_srcs_free(edge_srcs, n_edge_srcs);
         manifest_free(&m);
         return s;
       }
@@ -1227,7 +1303,30 @@ static kbc_status reindex_locked(kbc_app *app, kbc_err *err) {
       row->title = g.title;
       g.title = NULL;
     }
+    /* EVERY changed document joins the write, links or not: a document that
+     * lost its last link has to reach replace_edges with an empty target list,
+     * which is what deletes the edges it used to have. */
+    edge_srcs[n_edge_srcs].corpus = cc->name;
+    edge_srcs[n_edge_srcs].src = row->path;
+    edge_srcs[n_edge_srcs].dst = g.link_paths;
+    edge_srcs[n_edge_srcs].n = g.n_links;
+    n_edge_srcs++;
+    g.link_paths = NULL;
+    g.n_links = 0;
     ingested_free(&g);
+  }
+
+  if (!kbc_failed(s = store_write_links(app, edge_srcs, n_edge_srcs, err))) {
+    /* nothing */
+  }
+  for (size_t i = 0; i < n_edge_srcs; i++) {
+    for (size_t j = 0; j < edge_srcs[i].n; j++) free(edge_srcs[i].dst[j]);
+    free(edge_srcs[i].dst);
+  }
+  app_edge_srcs_free(edge_srcs, n_edge_srcs);
+  if (kbc_failed(s)) {
+    manifest_free(&m);
+    return s;
   }
 
   /* The walk is the authority on what the corpus contains, so the rows it did
@@ -1329,6 +1428,7 @@ static kbc_status config_clone(kbc_config **dst, const kbc_config *src,
   c->bm25_k1 = src->bm25_k1;
   c->bm25_b = src->bm25_b;
   c->rrf_k = src->rrf_k;
+  c->graph_boost = src->graph_boost;
   c->chunk_max_bytes = src->chunk_max_bytes;
   c->search_max_hits = src->search_max_hits;
   c->watcher_debounce_ms = src->watcher_debounce_ms;
@@ -1593,10 +1693,122 @@ static kbc_status store_forget_path(kbc_app *app, const char *corpus,
   if (kbc_failed(kbc_store_get_artifact_by_path(app->store, qa, corpus, rel_path,
                                                 &prev, &local))) {
     kbc_arena_free(qa);
-    return KBC_OK;
+    /* Not a row, but the edges it left are still ours to drop: a document
+     * that was re-ingested without its store row is not a document. */
+    return kbc_store_delete_edges(app->store, corpus, rel_path, err);
+  }
+  /* The edges leaving a document go with it. Backlinks INTO it are kept: a
+   * document that is unlinked today may be linked again the moment it is
+   * re-ingested, and dropping them would make every other document's
+   * in-degree depend on the order files happened to be scanned in. */
+  s = kbc_store_delete_edges(app->store, corpus, rel_path, err);
+  if (kbc_failed(s)) {
+    kbc_arena_free(qa);
+    return s;
   }
   s = kbc_store_delete_artifact(app->store, prev.id, err);
   kbc_arena_free(qa);
+  return s;
+}
+
+/* The link graph, kept in step with the documents.
+ *
+ * Every re-ingest REPLACES the edges leaving that path, and a removal drops
+ * them, so a file whose links changed cannot leave the previous edges behind.
+ * A target that is not an indexed document is not an edge at all (store.h:
+ * the table is a subset of what the parser found, never a superset), which is
+ * why this runs after the whole pass has stored its documents: whether a
+ * target is a document is not knowable while the pass is still half done, and
+ * an order-dependent graph is a graph that flips on the next reindex.
+ *
+ * The targets of every source are resolved against the store in ONE batch;
+ * each source's own replace is then a single transaction. */
+static void app_edge_srcs_free(app_edge_src *v, size_t n) {
+  free(v);
+  (void)n;
+}
+
+static kbc_status store_write_links(kbc_app *app, app_edge_src *v, size_t nsrc,
+                                    kbc_err *err) {
+  size_t total = 0;
+  for (size_t i = 0; i < nsrc; i++) total += v[i].n;
+  /* total == 0 is NOT a no-op: every source in this batch has lost its last
+   * link, and the write that deletes those edges is exactly the point. Only
+   * the batch RESOLVE needs targets, so that is what is skipped. */
+  if (total == 0) {
+    for (size_t i = 0; i < nsrc; i++) {
+      kbc_status s = kbc_store_replace_edges(app->store, v[i].corpus, v[i].src,
+                                             NULL, 0, err);
+      if (kbc_failed(s)) return s;
+    }
+    KBC_LOGI("graph: %zu documents, 0 of 0 link targets recorded", nsrc);
+    return KBC_OK;
+  }
+
+  kbc_arena *ea = kbc_arena_new(64u * 1024u);
+  if (ea == NULL)
+    return kbc_err_set(err, KBC_ERR_NOMEM, "link arena for %zu targets", total);
+  const char **corpora = kbc_arena_calloc(ea, total, sizeof(*corpora));
+  const char **paths = kbc_arena_calloc(ea, total, sizeof(*paths));
+  if (corpora == NULL || paths == NULL) {
+    kbc_arena_free(ea);
+    return kbc_err_set(err, KBC_ERR_NOMEM, "link batch of %zu targets", total);
+  }
+  size_t at = 0;
+  for (size_t i = 0; i < nsrc; i++) {
+    for (size_t j = 0; j < v[i].n; j++) {
+      corpora[at] = v[i].corpus;
+      paths[at] = v[i].dst[j];
+      at++;
+    }
+  }
+
+  kbc_artifact **arts = NULL;
+  kbc_err local;
+  kbc_err_reset(&local);
+  kbc_status s = kbc_store_get_artifacts_by_path(app->store, ea, corpora, paths,
+                                                 total, &arts, &local);
+  if (kbc_failed(s)) {
+    kbc_arena_free(ea);
+    return kbc_err_set(err, s, "resolve %zu link targets: %s", total,
+                       local.msg[0] ? local.msg : "store failed");
+  }
+
+  const char **kept = calloc(total, sizeof(*kept));
+  if (kept == NULL) {
+    free(arts);
+    kbc_arena_free(ea);
+    return kbc_err_set(err, KBC_ERR_NOMEM, "%zu resolved links", total);
+  }
+  at = 0;
+  size_t recorded = 0;
+  s = KBC_OK;
+  for (size_t i = 0; i < nsrc && s == KBC_OK; i++) {
+    size_t nk = 0;
+    for (size_t j = 0; j < v[i].n; j++) {
+      /* The resolved path is the artifact's own, not the link's spelling:
+       * `../x/y.md` and `x/y.md` are one edge, and the primary key says so. */
+      if (arts[at + j] != NULL) kept[nk++] = arts[at + j]->path;
+    }
+    s = kbc_store_replace_edges(app->store, v[i].corpus, v[i].src, kept, nk,
+                                err);
+    recorded += nk;
+    at += v[i].n;
+  }
+  free(kept);
+  free(arts);
+  kbc_arena_free(ea);
+  if (s == KBC_OK) {
+    /* Three numbers, and they are not the same number: the parser found
+     * `total` link targets, `recorded` of them resolved to an indexed
+     * document, and the graph holds `edges` rows — fewer than `recorded`
+     * because a source linking one document twice has one edge. Only the last
+     * is the table itself. */
+    const int64_t edges = kbc_store_edge_count(app->store, v[0].corpus, NULL);
+    KBC_LOGI("graph: %zu documents, %zu of %zu link targets resolved, %lld "
+             "edges in the graph",
+             nsrc, recorded, total, (long long)edges);
+  }
   return s;
 }
 
@@ -1840,6 +2052,24 @@ static kbc_status reindex_one(kbc_app *app, const char *corpus,
     s = index_touch_one(app, cc, rel_path, true, err);
     goto done;
   }
+  /* The single-document path writes its own edges here: the rest of the
+   * corpus is already in the store, so a target that is a document resolves
+   * now. A target that is not yet indexed records no edge, and the next full
+   * scan — which every watcher event is followed by — records it. */
+  if (g.n_links > 0) {
+    app_edge_src one;
+    one.corpus = corpus;
+    one.src = rel_path;
+    one.dst = g.link_paths;
+    one.n = g.n_links;
+    s = store_write_links(app, &one, 1, err);
+  } else {
+    s = kbc_store_delete_edges(app->store, corpus, rel_path, err);
+  }
+  if (kbc_failed(s)) {
+    ingested_free(&g);
+    return s;
+  }
   ingested_free(&g);
   s = index_touch_one(app, cc, rel_path, false, err);
 
@@ -1879,7 +2109,8 @@ kbc_status kbc_app_reindex_remove(kbc_app *app, const char *corpus,
  * legitimately be one reindex ahead of the store, so a row the batch does not
  * resolve is dropped with a debug line and the search still succeeds. */
 static kbc_status resolve_rows(kbc_app *app, kbc_arena *a,
-                               kbc_search_result *out, kbc_err *err) {
+                               kbc_search_result *out, int64_t since_ns,
+                               kbc_err *err) {
   if (out->len == 0) return KBC_OK;
 
   const char **corpora = kbc_arena_calloc(a, out->len, sizeof(*corpora));
@@ -1913,6 +2144,14 @@ static kbc_status resolve_rows(kbc_app *app, kbc_arena *a,
       KBC_LOGD("search: doc %u not in store, dropping", r->doc_id);
       continue;
     }
+    /* `since:` is a mtime predicate and the mtime lives here, one layer above
+     * the index. It shares the unresolved-row path on purpose: a row that
+     * cannot be resolved is dropped either way, so a since: filter changes
+     * WHICH rows survive, never WHETHER an unresolvable one does. */
+    if (since_ns > 0 && arts[i]->mtime_ns < since_ns) {
+      KBC_LOGD("search: %s older than since:, dropping", arts[i]->path);
+      continue;
+    }
     r->artifact_id = arts[i]->id;
     r->summary = arts[i]->summary;
     if (kept != i) out->rows[kept] = *r;
@@ -1922,6 +2161,184 @@ static kbc_status resolve_rows(kbc_app *app, kbc_arena *a,
   free(arts);
   return KBC_OK;
 }
+
+/* `since:<value>` out of the raw query string, in the same token shape the
+ * grammar reads (query.rs:580): words split on whitespace, '(', ')', and
+ * '"'; a ':' is its own token between a key and its value. The grammar
+ * validates the value and drops the atom; the THRESHOLD is applied here,
+ * because the mtime is the store's and the store is this layer. Two atoms
+ * AND together, so the strictest wins — the same fold search.c does.
+ *
+ * `NOT since:` is skipped, matching the grammar: there is no upper bound to
+ * negate, so the original warns and ignores it, and filtering on an atom the
+ * grammar dropped would be two different queries under one name. */
+typedef struct {
+  const char *p;
+  size_t len;
+  bool quoted;
+  bool colon;
+} app_tok;
+
+/* One token, or false at the end of the string. `quoted` carries the `"…"`
+ * form, whose contents are a value even when they contain a space. */
+static bool app_next_tok(const char *q, size_t len, size_t *i, app_tok *t) {
+  while (*i < len) {
+    const char c = q[*i];
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '(' ||
+        c == ')') {
+      (*i)++;
+      continue;
+    }
+    if (c == ':') {
+      (*i)++;
+      t->p = q + *i - 1;
+      t->len = 1;
+      t->quoted = false;
+      t->colon = true;
+      return true;
+    }
+    if (c == '"') {
+      const size_t s = ++(*i);
+      while (*i < len && q[*i] != '"') (*i)++;
+      t->p = q + s;
+      t->len = *i - s;
+      t->quoted = true;
+      t->colon = false;
+      if (*i < len) (*i)++;
+      return true;
+    }
+    const size_t s = *i;
+    while (*i < len && q[*i] != ' ' && q[*i] != '\t' && q[*i] != '\n' &&
+           q[*i] != '\r' && q[*i] != '(' && q[*i] != ')' && q[*i] != ':') {
+      (*i)++;
+    }
+    t->p = q + s;
+    t->len = *i - s;
+    t->quoted = false;
+    t->colon = false;
+    return true;
+  }
+  return false;
+}
+
+static kbc_status query_since_ns(const char *q, int64_t *ns, kbc_err *err) {
+  *ns = 0;
+  const size_t len = strlen(q);
+  size_t i = 0;
+  /* Four tokens of look-behind: `NOT` `since` `:` `value` is the longest
+   * shape that matters, and the negation is the one thing that must be seen
+   * before the atom is acted on. */
+  app_tok ring[5];
+  memset(ring, 0, sizeof(ring));
+  size_t filled = 0;
+  app_tok t;
+  while (app_next_tok(q, len, &i, &t)) {
+    const size_t slot = filled % 5;
+    /* ring[slot-1] is the most recent previous token, so the pattern reads
+     * backwards: `:` , `since` , whatever came before it. */
+    const app_tok *p1 = &ring[(slot + 2) % 5]; /* the token before `since` */
+    const app_tok *p2 = &ring[(slot + 3) % 5]; /* `since` */
+    const app_tok *p3 = &ring[(slot + 4) % 5]; /* `:` */
+    const bool shape = filled >= 3 && !p1->quoted && !p2->quoted && p2->len == 5 &&
+                       strncasecmp(p2->p, "since", 5) == 0 && p3->colon &&
+                       !t.colon && t.len > 0;
+    const bool negated = shape && !p1->quoted && p1->len > 0 &&
+                         (strncasecmp(p1->p, "not", 3) == 0 ||
+                          strncasecmp(p1->p, "!", 1) == 0);
+    if (shape && !negated) {
+      char value[KBC_MAX_QUERY_LEN + 1];
+      if (t.len >= sizeof(value))
+        return kbc_err_set(err, KBC_ERR_INVALID, "since: value is too long");
+      memcpy(value, t.p, t.len);
+      value[t.len] = '\0';
+      int64_t one = 0;
+      kbc_status st = kbc_since_value_ns(value, &one, err);
+      if (st != KBC_OK) return st;
+      if (one > *ns) *ns = one;
+    }
+    ring[slot] = t;
+    filled++;
+  }
+  return KBC_OK;
+}
+
+/* The corpus link graph, in the searcher's doc-id space.
+ *
+ * The store names documents by PATH and cannot name them by index doc id, so
+ * the walk starts on the index side: the doc table is a flat array, and one
+ * pass over it gives every path this corpus has, in doc-id order. Those paths
+ * go to the store in ONE statement, and the degrees come back parallel to the
+ * array — no positional join against the corpus's artifact order, and no
+ * per-document store lookup. Only documents with a non-zero in-degree are
+ * carried across; the rest cannot change an ordering.
+ *
+ * KBC_OWN out: free with free(). *ids_out / *deg_out are NULL when the corpus
+ * has no linked document, which is the "no graph" case and is not an error. */
+static kbc_status graph_in_degrees(kbc_app *app, const char *corpus,
+                                    uint32_t **ids_out, uint32_t **deg_out,
+                                    size_t *n_out, kbc_err *err) {
+  *ids_out = NULL;
+  *deg_out = NULL;
+  *n_out = 0;
+  const uint32_t n_docs = kbc_index_doc_count(app->index);
+  size_t m = 0;
+  for (uint32_t d = 0; d < n_docs; d++) {
+    const kbc_doc_meta *meta = kbc_index_doc(app->index, d);
+    if (meta != NULL && meta->corpus != NULL && meta->path != NULL &&
+        strcmp(meta->corpus, corpus) == 0)
+      m++;
+  }
+  if (m == 0) return KBC_OK;
+
+  const char **paths = calloc(m, sizeof(*paths));
+  uint32_t *doc_ids = calloc(m, sizeof(*doc_ids));
+  uint32_t *deg = calloc(m, sizeof(*deg));
+  if (paths == NULL || doc_ids == NULL || deg == NULL) {
+    free(paths);
+    free(doc_ids);
+    free(deg);
+    return kbc_err_set(err, KBC_ERR_NOMEM, "edge in-degrees: %zu documents", m);
+  }
+  size_t k = 0;
+  for (uint32_t d = 0; d < n_docs; d++) {
+    const kbc_doc_meta *meta = kbc_index_doc(app->index, d);
+    if (meta != NULL && meta->corpus != NULL && meta->path != NULL &&
+        strcmp(meta->corpus, corpus) == 0) {
+      paths[k] = meta->path;
+      doc_ids[k] = d;
+      k++;
+    }
+  }
+
+  kbc_status s = kbc_store_edge_degrees_for(app->store, corpus, paths, m, deg,
+                                            err);
+  free(paths);
+  if (kbc_failed(s)) {
+    free(doc_ids);
+    free(deg);
+    return s;
+  }
+
+  size_t kept = 0;
+  for (size_t i = 0; i < m; i++) {
+    if (deg[i] == 0) continue;
+    doc_ids[kept] = doc_ids[i];
+    deg[kept] = deg[i];
+    kept++;
+  }
+  /* doc_ids was built by walking the index upward, so it is already ascending
+   * and the searcher's binary search over it is valid as it stands. */
+  if (kept == 0) {
+    free(doc_ids);
+    free(deg);
+    return KBC_OK;
+  }
+  *ids_out = doc_ids;
+  *deg_out = deg;
+  *n_out = kept;
+  return KBC_OK;
+}
+
 
 kbc_status kbc_app_search(kbc_app *app, kbc_arena *a, const kbc_query *q,
                           kbc_search_result *out, kbc_err *err) {
@@ -1939,6 +2356,12 @@ kbc_status kbc_app_search(kbc_app *app, kbc_arena *a, const kbc_query *q,
 
   const int64_t t0 = kbc_now_ns();
 
+  /* `since:` is resolved here, not in the index: the mtime is the store's.
+   * An unparsable value is an error, never a silently ignored filter. */
+  int64_t since_ns = 0;
+  kbc_status pre = query_since_ns(q->q, &since_ns, err);
+  if (kbc_failed(pre)) return pre;
+  if (q->since_ns > since_ns) since_ns = q->since_ns;
   pthread_rwlock_rdlock(&app->lock);
 
   kbc_arena *ea = NULL;
@@ -1979,8 +2402,38 @@ kbc_status kbc_app_search(kbc_app *app, kbc_arena *a, const kbc_query *q,
    * search, and the read lock held here is what keeps it alive. */
   (void)kbc_searcher_set_vecstore(s, app->vec, &local);
 
-  kbc_status rc_st = kbc_search_run(s, a, q, vec, vec_len, out, err);
+  /* The effective query: the caller's, plus the graph the store knows about.
+   * The weight comes from the config, read once per search, and 0.0 means the
+   * graph is off — so nothing is fetched and every score is byte-identical to
+   * a build with no edge table. (0, 4] is enforced by the config layer. */
+  const double weight = app->cfg != NULL ? app->cfg->graph_boost : 0.0;
+  kbc_query eq = *q;
+  uint32_t *deg_ids = NULL;
+  uint32_t *deg_vals = NULL;
+  size_t deg_len = 0;
+  if (weight > 0.0 && q->corpus != NULL) {
+    kbc_err gerr;
+    kbc_err_reset(&gerr);
+    if (kbc_failed(graph_in_degrees(app, q->corpus, &deg_ids, &deg_vals,
+                                    &deg_len, &gerr))) {
+      KBC_LOGW("search: graph boost off for this query: %s", gerr.msg);
+      deg_ids = NULL;
+      deg_vals = NULL;
+      deg_len = 0;
+    } else {
+      eq.graph_boost_weight = weight;
+      eq.in_deg_doc_ids = deg_ids;
+      eq.in_deg = deg_vals;
+      eq.in_deg_len = deg_len;
+      KBC_LOGD("search: graph boost weight %.3f over %zu linked documents",
+               weight, deg_len);
+    }
+  }
+
+  kbc_status rc_st = kbc_search_run(s, a, &eq, vec, vec_len, out, err);
   kbc_searcher_free(s);
+  free(deg_ids);
+  free(deg_vals);
   if (ea) {
     kbc_arena_free(ea);
   }
@@ -1990,7 +2443,7 @@ kbc_status kbc_app_search(kbc_app *app, kbc_arena *a, const kbc_query *q,
     return rc_st;
   }
 
-  kbc_status rs = resolve_rows(app, a, out, err);
+  kbc_status rs = resolve_rows(app, a, out, since_ns, err);
   if (kbc_failed(rs)) {
     return rs;
   }

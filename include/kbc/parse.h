@@ -26,6 +26,31 @@ const kbc_blocks *kbc_parsed_blocks(const kbc_parsed *p);
 const char *kbc_parsed_title(const kbc_parsed *p);
 /* Index of an explicit id="" attribute found in the source, for anchor
  * resolution. Returns false when the id is not present. */
+
+/* Outbound links found in the source, in document order, each already
+ * resolved to a corpus-relative path. KBC_ARENA.
+ *
+ * Markdown `[text](target)` and HTML `<a href="target">` are both read. A
+ * target is resolved against the document's own directory, so `../x/y.md`
+ * becomes `x/y.md`; `..` may not escape the corpus root, and a target that
+ * escapes is DROPPED rather than clamped — a link out of the corpus is not a
+ * link to anything kb-c indexes. Absolute URLs, mailto:, tel: and anchors
+ * (`#section`) are not corpus documents and are not links in this sense.
+ * `rel` (the path kbc_parse was given) is what relative targets resolve
+ * against; the caller decides whether a resolved target exists. */
+typedef struct {
+  const char *target; /* KBC_ARENA, corpus-relative, '/' separated */
+  const char *text;   /* KBC_ARENA, the link's visible text, may be "" */
+  size_t target_len;
+} kbc_link;
+
+typedef struct {
+  kbc_link *items; /* KBC_ARENA */
+  size_t len, cap;
+} kbc_links;
+
+/* May be empty; never NULL. A document with no links yields len == 0. */
+const kbc_links *kbc_parsed_links(const kbc_parsed *p);
 bool kbc_parsed_has_anchor(const kbc_parsed *p, const char *id);
 
 /* ------------------------------------------------------------ tokenizer -- */

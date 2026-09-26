@@ -226,6 +226,7 @@ kbc_status kbc_slugify(kbc_arena *a, const char *text, size_t len,
 
 struct kbc_parsed {
   kbc_blocks blocks;  /* KBC_ARENA */
+  kbc_links links;    /* KBC_ARENA; outbound links, document order */
   char **anchors;     /* KBC_ARENA, NUL-terminated entries */
   size_t anchors_len;
   size_t anchors_cap;
@@ -255,12 +256,23 @@ typedef struct {
   bool in_title; /* inside <title>...</title> */
   bool title_pending; /* whitespace run pending in the title buffer */
   kbc_str title_buf;
-
+  /* The visible text of the <a> currently being read. The link itself is
+   * pushed at the tag, before its text is known, so this buffer is what
+   * fills the link's `text` when </a> closes. */
+  bool in_anchor;
+  bool anchor_pending; /* whitespace run pending in the anchor buffer */
+  kbc_str anchor_buf;
+  const char *rel; /* the document's own corpus-relative path, BORROWED */
+  size_t anchor_link; /* index into out->links, or SIZE_MAX */
 
   const char *title_h1;    /* first h1 block, markdown or HTML */
   const char *title_tag;   /* first <title> element */
   const char *title_prose; /* first non-empty prose block */
 } parser;
+
+const kbc_links *kbc_parsed_links(const kbc_parsed *p) {
+  return p == NULL ? NULL : &p->links;
+}
 
 static kbc_status p_flush(parser *p);
 
@@ -311,6 +323,7 @@ bool kbc_parsed_has_anchor(const kbc_parsed *p, const char *id) {
  * too, so it collapses exactly like a literal space. */
 static kbc_status p_space(parser *p) {
   if (p->cur.len > 0) p->pending = true;
+  if (p->in_anchor && p->anchor_buf.len > 0) p->anchor_pending = true;
   if (p->in_title && p->title_buf.len > 0) p->title_pending = true;
   return KBC_OK;
 }
@@ -335,12 +348,234 @@ static kbc_status p_put(parser *p, const char *d, size_t n) {
     st = kbc_str_append(&p->title_buf, d, n);
     if (kbc_failed(st)) return st;
   }
+  if (p->in_anchor) {
+    if (p->anchor_pending) {
+      p->anchor_pending = false;
+      st = kbc_str_putc(&p->anchor_buf, ' ');
+      if (kbc_failed(st)) return st;
+    }
+    st = kbc_str_append(&p->anchor_buf, d, n);
+    if (kbc_failed(st)) return st;
+  }
   return KBC_OK;
 }
 
 static kbc_status p_put_char(parser *p, unsigned char c) {
   if (is_space(c)) return p_space(p);
   return p_put(p, (const char *)&c, 1);
+}
+
+/* ---------------------------------------------------------------- links --- */
+
+/* A link target is resolved by SEGMENT, never by string surgery on the whole
+ * path: `a/../b` and `a/b/..` are different targets, and collapsing them
+ * textually is how a link ends up pointing somewhere nobody wrote. The
+ * segment stack is bounded by LINK_MAX_SEGS; a target deeper than that is
+ * dropped rather than trusted. */
+#define LINK_MAX_SEGS 64
+
+/* Appends `seg` as one '/'-separated segment, recording where it starts. */
+static kbc_status link_push_seg(kbc_str *out, size_t *stack, size_t *depth,
+                                const char *seg, size_t len) {
+  if (len == 0) return KBC_OK;
+  if (*depth >= LINK_MAX_SEGS) return KBC_ERR_INVALID;
+  stack[*depth] = out->len;
+  (*depth)++;
+  kbc_status st = kbc_str_putc(out, '/');
+  if (kbc_failed(st)) return st;
+  return kbc_str_append(out, seg, len);
+}
+
+/* Consumes one '/'-separated run of `s`, interpreting "." as nothing and
+ * ".." as one step up. False means the target tried to escape the corpus
+ * root, which is a DROP, not a clamp: a link out of the corpus is not a link
+ * to anything kb-c indexes. */
+static bool link_walk(const char *s, size_t len, kbc_str *out, size_t *stack,
+                      size_t *depth) {
+  size_t i = 0;
+  while (i < len) {
+    while (i < len && (s[i] == '/' || s[i] == '\\')) i++;
+    const size_t start = i;
+    while (i < len && s[i] != '/' && s[i] != '\\') i++;
+    const size_t slen = i - start;
+    if (slen == 0) continue;
+    if (slen == 1 && s[start] == '.') continue;
+    if (slen == 2 && s[start] == '.' && s[start + 1] == '.') {
+      if (*depth == 0) return false;
+      (*depth)--;
+      out->len = stack[*depth];
+      continue;
+    }
+    if (kbc_failed(link_push_seg(out, stack, depth, s + start, slen)))
+      return false;
+  }
+  return true;
+}
+
+/* Resolves a raw href/markdown target to a corpus-relative path in `out`.
+ * False = not a corpus document, and the link is dropped.
+ *
+ * Dropped: the empty target, an anchor (`#section`), anything with a scheme
+ * (`http://`, `mailto:`, `tel:`, `data:` — a ':' in the first segment is the
+ * test, so a Windows drive letter is dropped with them) and anything with a
+ * query string, since no indexed path carries one. A leading '/' is corpus
+ * root-relative, not filesystem-absolute (links.rs:187 normalize_target
+ * strips it), and '\\' is folded to '/', as that function does. */
+static bool link_resolve(const char *rel, const char *t, size_t tlen,
+                         kbc_str *out) {
+  while (tlen > 0 && is_space((unsigned char)t[0])) {
+    t++;
+    tlen--;
+  }
+  while (tlen > 0 && is_space((unsigned char)t[tlen - 1])) tlen--;
+  if (tlen == 0 || t[0] == '#') return false;
+  for (size_t i = 0; i < tlen; i++) {
+    if (t[i] == '#') {
+      tlen = i;
+      break;
+    }
+    if (t[i] == ':' || t[i] == '?') return false;
+  }
+  if (tlen == 0) return false;
+
+  size_t stack[LINK_MAX_SEGS];
+  size_t depth = 0;
+  size_t i = 0;
+  if (t[0] == '/') {
+    while (i < tlen && t[i] == '/') i++;
+  } else {
+    const char *slash = rel != NULL ? strrchr(rel, '/') : NULL;
+    if (slash != NULL) {
+      size_t dlen = (size_t)(slash - rel);
+      if (!link_walk(rel, dlen, out, stack, &depth)) return false;
+    }
+  }
+  if (!link_walk(t + i, tlen - i, out, stack, &depth)) return false;
+  /* Segments are joined with a leading '/', which is the shape the walk
+   * needs; a corpus-relative path is not. */
+  if (out->len > 0 && out->ptr[0] == '/') {
+    memmove(out->ptr, out->ptr + 1, out->len - 1);
+    out->len--;
+    out->ptr[out->len] = '\0';
+  }
+  return out->len > 0;
+}
+
+/* Pushes one resolved link. The text is stored verbatim; the caller has
+ * already decoded it if it wants the decoded form. Returns SIZE_MAX when the
+ * target was not a corpus document, so the caller can leave an unopened
+ * </a> harmless. */
+static kbc_status push_link(parser *p, const char *t, size_t tlen,
+                            const char *text, size_t text_len, size_t *idx) {
+  *idx = SIZE_MAX;
+  kbc_str resolved;
+  kbc_str_init(&resolved);
+  if (!link_resolve(p->rel, t, tlen, &resolved)) {
+    kbc_str_free(&resolved);
+    return KBC_OK;
+  }
+  kbc_status st = arena_grow((void ***)&p->out->links.items,
+                             &p->out->links.cap, p->out->links.len + 1,
+                             sizeof(kbc_link), p->a);
+  if (kbc_failed(st)) {
+    kbc_str_free(&resolved);
+    return st;
+  }
+  kbc_link *l = &p->out->links.items[p->out->links.len];
+  l->target = kbc_arena_strndup(p->a, resolved.ptr, resolved.len);
+  l->target_len = resolved.len;
+  l->text = kbc_arena_strndup(p->a, text != NULL ? text : "", text_len);
+  kbc_str_free(&resolved);
+  if (l->target == NULL || l->text == NULL) return KBC_ERR_NOMEM;
+  *idx = p->out->links.len++;
+  return KBC_OK;
+}
+
+/* `[text](target)`, `[text](<target>)` and `[text](target "title")`. Returns
+ * the byte just past the closing ')', or 0 when this is not a link — a bare
+ * '[', a reference link, or a '[' whose ']' never arrives on this line. An
+ * image (`![alt](src)`) is NOT a link: the caller still consumes the text, so
+ * the block's prose is byte-identical either way, and `*image` says so. */
+static size_t md_link(const char *s, size_t n, size_t i, bool *image,
+                      size_t *text_off, size_t *text_len, size_t *tgt_off,
+                      size_t *tgt_len) {
+  size_t j = i + 1;
+  while (j < n && s[j] != ']' && s[j] != '[' && s[j] != '\n') j++;
+  if (j >= n || s[j] != ']' || j + 1 >= n || s[j + 1] != '(') return 0;
+  *image = i > 0 && s[i - 1] == '!';
+  *text_off = i + 1;
+  *text_len = j - (i + 1);
+
+  size_t t = j + 2;
+  int depth = 1;
+  char quote = '\0';
+  while (t < n) {
+    const char c = s[t];
+    if (quote != '\0') {
+      if (c == quote) quote = '\0';
+    } else if (c == '"' || c == '\'') {
+      quote = c;
+    } else if (c == '(') {
+      depth++;
+    } else if (c == ')') {
+      if (--depth == 0) break;
+    } else if (c == '\n') {
+      return 0; /* a link does not run across a line: not this grammar */
+    }
+    t++;
+  }
+  if (t >= n || depth != 0) return 0;
+
+  size_t ts = j + 2, te = t;
+  while (ts < te && is_space((unsigned char)s[ts])) ts++;
+  while (te > ts && is_space((unsigned char)s[te - 1])) te--;
+  if (ts < te && s[ts] == '<') {
+    size_t gt = ts + 1;
+    while (gt < te && s[gt] != '>') gt++;
+    if (gt < te) {
+      ts++;
+      te = gt;
+    }
+  }
+  else {
+    /* an optional title follows the target: `[a](b "t")` -> `b` */
+    size_t k = ts;
+    while (k < te && !is_space((unsigned char)s[k])) k++;
+    if (k > ts && s[k - 1] == '\\') k--; /* an escaped space stays in it */
+    te = k;
+  }
+  *tgt_off = ts;
+  *tgt_len = te - ts;
+  return t + 1;
+}
+
+/* Feeds a byte range through exactly the path the main loop takes for one
+ * byte, so a link's visible text lands in the block prose the way it would
+ * have without the link syntax around it. */
+static kbc_status feed_inline(parser *p, const char *s, size_t from, size_t to) {
+  size_t pos = from;
+  while (pos < to) {
+    p->src_off = pos;
+    if (s[pos] == '&') {
+      kbc_str dec;
+      kbc_str_init(&dec);
+      size_t used = 0;
+      kbc_status st = decode_entity(&dec, s, to, pos, &used);
+      if (!kbc_failed(st)) {
+        for (size_t x = 0; x < dec.len && !kbc_failed(st); x++) {
+          st = p_put_char(p, (unsigned char)dec.ptr[x]);
+        }
+      }
+      kbc_str_free(&dec);
+      if (kbc_failed(st)) return st;
+      pos += used;
+      continue;
+    }
+    kbc_status st = p_put_char(p, (unsigned char)s[pos]);
+    if (kbc_failed(st)) return st;
+    pos++;
+  }
+  return KBC_OK;
 }
 
 
@@ -516,6 +751,8 @@ static kbc_status p_tag(parser *p, const char *s, size_t n, size_t *pos) {
   for (size_t k = 0; k < namelen; k++) name[k] = lower(s[ns + k]);
   name[namelen] = '\0';
 
+  const char *href = NULL;
+  size_t href_len = 0;
   bool self_closing = false;
   while (i < n && s[i] != '>') {
     if (is_space((unsigned char)s[i]) || s[i] == '/') {
@@ -572,12 +809,50 @@ static kbc_status p_tag(parser *p, const char *s, size_t n, size_t *pos) {
       kbc_str_free(&id);
       if (kbc_failed(st)) return st;
     }
+    if (alen == 4 && lower(s[as]) == 'h' && lower(s[as + 1]) == 'r' &&
+        lower(s[as + 2]) == 'e' && lower(s[as + 3]) == 'f' && val != NULL) {
+      href = val;
+      href_len = vlen;
+    }
   }
   *pos = (i < n) ? i + 1 : n;
 
   bool is_title = name_eq(name, namelen, "title");
   int level = 0;
   bool block = block_tag(name, namelen, &level);
+
+  if (name_eq(name, namelen, "a")) {
+    /* <a> is inline: it must not flush the block, and its href is one of the
+     * two link forms parse.h names. The text is not known until </a>, so the
+     * link goes in now and is completed there. */
+    if (closing) {
+      if (p->in_anchor) {
+        if (p->anchor_link != SIZE_MAX) {
+          p->out->links.items[p->anchor_link].text = kbc_arena_strndup(
+              p->a, p->anchor_buf.ptr != NULL ? p->anchor_buf.ptr : "",
+              p->anchor_buf.len);
+          if (p->out->links.items[p->anchor_link].text == NULL) {
+            p->in_anchor = false;
+            p->anchor_link = SIZE_MAX;
+            return KBC_ERR_NOMEM;
+          }
+        }
+        p->in_anchor = false;
+        p->anchor_pending = false;
+        p->anchor_link = SIZE_MAX;
+        kbc_str_clear(&p->anchor_buf);
+      }
+      return KBC_OK;
+    }
+    size_t idx = SIZE_MAX;
+    kbc_status ls = push_link(p, href, href_len, "", 0, &idx);
+    if (kbc_failed(ls)) return ls;
+    p->in_anchor = true;
+    p->anchor_pending = false;
+    p->anchor_link = idx;
+    kbc_str_clear(&p->anchor_buf);
+    return KBC_OK;
+  }
 
   if (!closing && (name_eq(name, namelen, "script") ||
                    name_eq(name, namelen, "style")) &&
@@ -889,6 +1164,9 @@ kbc_parsed *kbc_parse(kbc_arena *a, const char *text, size_t len,
   }
   kbc_str_init(&p.cur);
   kbc_str_init(&p.title_buf);
+  kbc_str_init(&p.anchor_buf);
+  p.rel = rel_path;
+  p.anchor_link = SIZE_MAX;
   bool html = looks_like_html(text, len);
   (void)html; /* the scanner is shape-driven; sniffing only documents intent */
 
@@ -907,6 +1185,27 @@ kbc_parsed *kbc_parse(kbc_arena *a, const char *text, size_t len,
     }
     p.src_off = pos;
     unsigned char c = (unsigned char)text[pos];
+    if (c == '[') {
+      /* A markdown link, read inline. The visible text is fed through the
+       * ordinary append path and the whole construct is consumed, so the
+       * block's prose is byte-identical to the same document without link
+       * syntax — only the links vector learns about it. */
+      bool image = false;
+      size_t toff = 0, tlen2 = 0, goff = 0, glen = 0;
+      const size_t end =
+          md_link(text, len, pos, &image, &toff, &tlen2, &goff, &glen);
+      if (end > 0) {
+        if (!image) {
+          size_t idx = SIZE_MAX;
+          st = push_link(&p, text + goff, glen, text + toff, tlen2, &idx);
+          if (kbc_failed(st)) goto fail;
+        }
+        st = feed_inline(&p, text, toff, toff + tlen2);
+        if (kbc_failed(st)) goto fail;
+        pos = end;
+        continue;
+      }
+    }
     if (c == '<') {
       size_t before = pos;
       st = p_tag(&p, text, len, &pos);
@@ -955,11 +1254,13 @@ kbc_parsed *kbc_parse(kbc_arena *a, const char *text, size_t len,
   p.out->title = kbc_arena_strdup(a, title ? title : "");
   kbc_str_free(&p.cur);
   kbc_str_free(&p.title_buf);
+  kbc_str_free(&p.anchor_buf);
   return p.out;
 
 fail:
   kbc_str_free(&p.cur);
   kbc_str_free(&p.title_buf);
+  kbc_str_free(&p.anchor_buf);
   if (st == KBC_ERR_NOMEM) {
     kbc_err_set(err, KBC_ERR_NOMEM, "parse: out of memory");
   } else {

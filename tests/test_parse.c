@@ -820,6 +820,159 @@ KBC_TEST(slugify_all_punctuation_is_empty) {
 
 /* ---------------------------------------------------------------- main --- */
 
+
+/* ----------------------------------------------------------------- links -- */
+
+/* Links are read out of the SAME single pass that reads the prose, so every
+ * case here also pins the invariant that matters most: extracting a link must
+ * not change a single byte of the block text. */
+static kbc_parsed *parse_links(kbc_arena *a, const char *rel, const char *text) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_parsed *p = kbc_parse(a, text, strlen(text), rel, &err);
+  KBC_CHECK_MSG(p != NULL, "parse returned NULL: %s", err.msg);
+  return p;
+}
+
+KBC_TEST(links_markdown_and_html_in_document_order) {
+  kbc_arena *a = kbc_arena_new(4096);
+  const kbc_parsed *p = parse_links(a, "notes/doc.md",
+                                   "See [alpha](a.md) and <a href=\"b.md\">beta</a>.\n");
+  const kbc_links *ls = kbc_parsed_links(p);
+  KBC_CHECK_EQ_INT(ls->len, 2);
+  KBC_CHECK_EQ_STR(ls->items[0].target, "notes/a.md");
+  KBC_CHECK_EQ_STR(ls->items[0].text, "alpha");
+  KBC_CHECK_EQ_STR(ls->items[1].target, "notes/b.md");
+  KBC_CHECK_EQ_STR(ls->items[1].text, "beta");
+  kbc_arena_free(a);
+}
+
+KBC_TEST(links_resolve_relative_to_the_documents_own_directory) {
+  kbc_arena *a = kbc_arena_new(4096);
+  const kbc_parsed *p = parse_links(a, "ops/deep/note.md",
+                                   "[a](./x.md) [b](../x/y.md) "
+                                   "[c](../../z.md) [d](/root.md) "
+                                   "[e](sub/)\n");
+  const kbc_links *ls = kbc_parsed_links(p);
+  KBC_CHECK_EQ_INT(ls->len, 5);
+  KBC_CHECK_EQ_STR(ls->items[0].target, "ops/deep/x.md");
+  KBC_CHECK_EQ_STR(ls->items[1].target, "ops/x/y.md");
+  KBC_CHECK_EQ_STR(ls->items[2].target, "z.md");
+  KBC_CHECK_EQ_STR(ls->items[3].target, "root.md");
+  KBC_CHECK_EQ_STR(ls->items[4].target, "ops/deep/sub");
+  kbc_arena_free(a);
+}
+
+KBC_TEST(links_that_escape_the_corpus_root_are_dropped_not_clamped) {
+  kbc_arena *a = kbc_arena_new(4096);
+  const kbc_parsed *p =
+      parse_links(a, "note.md", "[a](../../outside.md) [b](../up.md)\n");
+  const kbc_links *ls = kbc_parsed_links(p);
+  /* `../up.md` from a document at the root escapes; so does `../../`. A
+   * clamped result would invent an edge to a document nobody linked. */
+  KBC_CHECK_EQ_INT(ls->len, 0);
+  kbc_arena_free(a);
+}
+
+KBC_TEST(links_non_corpus_targets_are_not_links) {
+  kbc_arena *a = kbc_arena_new(4096);
+  const kbc_parsed *p = parse_links(
+      a, "note.md",
+      "[a](https://example.com/x) [b](mailto:me@example.com) "
+      "[c](tel:+15550100) [d](#section) [e](data:text/plain,hi) [f]()\n");
+  const kbc_links *ls = kbc_parsed_links(p);
+  KBC_CHECK_EQ_INT(ls->len, 0);
+  kbc_arena_free(a);
+}
+
+KBC_TEST(links_a_fragment_is_stripped_and_a_query_is_not_a_path) {
+  kbc_arena *a = kbc_arena_new(4096);
+  const kbc_parsed *p = parse_links(a, "n/x.md", "[a](y.md#part) [b](y.md?q=1)\n");
+  const kbc_links *ls = kbc_parsed_links(p);
+  KBC_CHECK_EQ_INT(ls->len, 1);
+  KBC_CHECK_EQ_STR(ls->items[0].target, "n/y.md");
+  kbc_arena_free(a);
+}
+
+KBC_TEST(links_duplicates_are_preserved_and_a_bare_bracket_is_not_a_link) {
+  kbc_arena *a = kbc_arena_new(4096);
+  const kbc_parsed *p =
+      parse_links(a, "n/x.md", "[a](t.md) [b](t.md) [a](t.md) [c][ref] [ ]\n");
+  const kbc_links *ls = kbc_parsed_links(p);
+  KBC_CHECK_EQ_INT(ls->len, 3);
+  for (size_t i = 0; i < ls->len; i++) {
+    KBC_CHECK_EQ_STR(ls->items[i].target, "n/t.md");
+  }
+  kbc_arena_free(a);
+}
+
+KBC_TEST(links_a_link_with_no_text_is_still_a_link) {
+  kbc_arena *a = kbc_arena_new(4096);
+  const kbc_parsed *p = parse_links(a, "n/x.md", "[](t.md) <a href=\"u.md\"></a>\n");
+  const kbc_links *ls = kbc_parsed_links(p);
+  KBC_CHECK_EQ_INT(ls->len, 2);
+  KBC_CHECK_EQ_STR(ls->items[0].target, "n/t.md");
+  KBC_CHECK_EQ_STR(ls->items[0].text, "");
+  KBC_CHECK_EQ_STR(ls->items[1].target, "n/u.md");
+  KBC_CHECK_EQ_STR(ls->items[1].text, "");
+  kbc_arena_free(a);
+}
+
+KBC_TEST(links_a_document_with_no_links_yields_an_empty_list) {
+  kbc_arena *a = kbc_arena_new(4096);
+  const kbc_parsed *p = parse_links(a, "n.md", "# Title\n\nJust prose.\n");
+  const kbc_links *ls = kbc_parsed_links(p);
+  /* never NULL, and no allocation either: a caller may read ->len blind. */
+  KBC_CHECK_NOT_NULL(ls);
+  KBC_CHECK_EQ_INT(ls->len, 0);
+  kbc_parsed *bad = parse_links(a, "n.md", "");
+  KBC_CHECK_NOT_NULL(kbc_parsed_links(bad));
+  kbc_arena_free(a);
+}
+
+KBC_TEST(links_do_not_change_the_block_text) {
+  kbc_arena *a = kbc_arena_new(4096);
+  const kbc_parsed *linked =
+      parse_links(a, "n.md", "Go to [alpha](a.md) now.\n");
+  const kbc_parsed *plain = parse_links(a, "n.md", "Go to alpha now.\n");
+  const kbc_blocks *lb = kbc_parsed_blocks(linked);
+  const kbc_blocks *pb = kbc_parsed_blocks(plain);
+  KBC_CHECK_EQ_INT(lb->len, pb->len);
+  KBC_CHECK_EQ_INT(lb->len, 1);
+  KBC_CHECK_EQ_STR(lb->items[0].text, pb->items[0].text);
+  kbc_arena_free(a);
+}
+
+KBC_TEST(links_an_image_is_not_a_link) {
+  kbc_arena *a = kbc_arena_new(4096);
+  const kbc_parsed *p = parse_links(a, "n/x.md", "![alt](pic.png) [real](r.md)\n");
+  const kbc_links *ls = kbc_parsed_links(p);
+  KBC_CHECK_EQ_INT(ls->len, 1);
+  KBC_CHECK_EQ_STR(ls->items[0].target, "n/r.md");
+  kbc_arena_free(a);
+}
+
+KBC_TEST(links_inside_a_fenced_code_block_are_not_links) {
+  kbc_arena *a = kbc_arena_new(4096);
+  const kbc_parsed *p = parse_links(a, "n/x.md",
+                                   "```\n[a](t.md)\n```\n[b](u.md)\n");
+  const kbc_links *ls = kbc_parsed_links(p);
+  KBC_CHECK_EQ_INT(ls->len, 1);
+  KBC_CHECK_EQ_STR(ls->items[0].target, "n/u.md");
+  kbc_arena_free(a);
+}
+
+KBC_TEST(links_a_pointy_bracket_target_and_a_title_are_read) {
+  kbc_arena *a = kbc_arena_new(4096);
+  const kbc_parsed *p =
+      parse_links(a, "n/x.md", "[a](<weird name.md> \"the title\") [b](t.md \"ti\")\n");
+  const kbc_links *ls = kbc_parsed_links(p);
+  KBC_CHECK_EQ_INT(ls->len, 2);
+  KBC_CHECK_EQ_STR(ls->items[0].target, "n/weird name.md");
+  KBC_CHECK_EQ_STR(ls->items[1].target, "n/t.md");
+  kbc_arena_free(a);
+}
+
 static const kbc_test_case cases[] = {
     {"md_atx_headings", md_atx_headings},
     {"md_atx_heading_trims_closing_hashes", md_atx_heading_trims_closing_hashes},
@@ -871,6 +1024,26 @@ static const kbc_test_case cases[] = {
     {"slugify_trims_and_collapses_separators",
      slugify_trims_and_collapses_separators},
     {"slugify_all_punctuation_is_empty", slugify_all_punctuation_is_empty},
+    {"links_markdown_and_html_in_document_order",
+     links_markdown_and_html_in_document_order},
+    {"links_resolve_relative_to_the_documents_own_directory",
+     links_resolve_relative_to_the_documents_own_directory},
+    {"links_that_escape_the_corpus_root_are_dropped_not_clamped",
+     links_that_escape_the_corpus_root_are_dropped_not_clamped},
+    {"links_non_corpus_targets_are_not_links", links_non_corpus_targets_are_not_links},
+    {"links_a_fragment_is_stripped_and_a_query_is_not_a_path",
+     links_a_fragment_is_stripped_and_a_query_is_not_a_path},
+    {"links_duplicates_are_preserved_and_a_bare_bracket_is_not_a_link",
+     links_duplicates_are_preserved_and_a_bare_bracket_is_not_a_link},
+    {"links_a_link_with_no_text_is_still_a_link", links_a_link_with_no_text_is_still_a_link},
+    {"links_a_document_with_no_links_yields_an_empty_list",
+     links_a_document_with_no_links_yields_an_empty_list},
+    {"links_do_not_change_the_block_text", links_do_not_change_the_block_text},
+    {"links_an_image_is_not_a_link", links_an_image_is_not_a_link},
+    {"links_inside_a_fenced_code_block_are_not_links",
+     links_inside_a_fenced_code_block_are_not_links},
+    {"links_a_pointy_bracket_target_and_a_title_are_read",
+     links_a_pointy_bracket_target_and_a_title_are_read},
     {NULL, NULL},
 };
 

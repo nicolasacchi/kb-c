@@ -133,6 +133,22 @@ static void fx_teardown(fixture *f) {
   kbc_test_rmrf(f->root);
 }
 
+/* The app keeps a private copy of the config from the moment it opens, so
+ * changing a config value means closing and reopening — the same thing an
+ * operator does after editing kb.toml. Reindexes, so the corpus on disk is
+ * the corpus the ranking sees. */
+static void reopen_with_graph_boost(fixture *f, double weight) {
+  kbc_err err;
+  kbc_app_close(f->app);
+  f->app = NULL;
+  f->cfg->graph_boost = weight;
+  kbc_err_reset(&err);
+  f->app = kbc_app_open(f->cfg, &err);
+  if (f->app == NULL) fprintf(stderr, "  app_open: %s\n", err.msg);
+  KBC_CHECK_NOT_NULL(f->app);
+  if (f->app != NULL) KBC_CHECK_OK(kbc_app_reindex(f->app, &err));
+}
+
 /* The scalars of a search, copied out of the arena the result was built in:
  * the result struct points into that arena, so it cannot outlive it. */
 typedef struct {
@@ -1134,6 +1150,206 @@ KBC_TEST(hybrid_search_degrades_to_keyword_without_an_embedder) {
   fx_teardown(&f);
 }
 
+
+/* ----------------------------------------------------------------- since -- */
+
+/* `since:` is a predicate on the store's mtime, so it is applied where the
+ * mtime is: on the resolved rows, alongside the drop-on-unresolved. A filter
+ * that excludes everything must return nothing — a filter that returned
+ * everything would be indistinguishable from an ignored one. */
+static size_t search_len(kbc_app *app, const char *q, const char *corpus,
+                         kbc_status *st_out, kbc_err *err) {
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) return 0;
+  kbc_query query;
+  memset(&query, 0, sizeof query);
+  query.q = q;
+  query.corpus = corpus;
+  query.kind = KBC_KIND__COUNT;
+  query.mode = KBC_MODE_KEYWORD;
+  query.limit = 10;
+  kbc_search_result res;
+  memset(&res, 0, sizeof res);
+  kbc_err_reset(err);
+  const kbc_status s = kbc_app_search(app, a, &query, &res, err);
+  if (st_out != NULL) *st_out = s;
+  const size_t n = res.len;
+  kbc_arena_free(a);
+  return n;
+}
+
+KBC_TEST(since_filters_on_the_store_mtime_and_an_impossible_since_returns_nothing) {
+  fixture f;
+  fx_setup(&f, false);
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  /* "verdigris" is in c.md alone, so the row count is exactly this document's
+   * fate and nothing else. */
+  kbc_status st = KBC_OK;
+  KBC_CHECK_EQ_INT(search_len(f.app, "verdigris", CORPUS_A, &st, &err), 1);
+  KBC_CHECK_OK(st);
+
+  /* A window that contains the document keeps it… */
+  KBC_CHECK_EQ_INT(search_len(f.app, "verdigris since:7d", CORPUS_A, &st, &err), 1);
+  KBC_CHECK_OK(st);
+  /* …and one that starts after the corpus was written does not. A raw unix
+   * timestamp is the other accepted form (query.rs:276). */
+  KBC_CHECK_EQ_INT(search_len(f.app, "verdigris since:4102444800", CORPUS_A,
+                              &st, &err),
+                   0);
+  KBC_CHECK_OK(st);
+  /* since:all is the absence of a filter and the original refuses it. */
+  (void)search_len(f.app, "verdigris since:all", CORPUS_A, &st, &err);
+  KBC_CHECK(st != KBC_OK);
+  KBC_CHECK(err.msg[0] != '\0');
+  /* An unparsable unit is an error too, never a silently dropped filter. */
+  (void)search_len(f.app, "verdigris since:7y", CORPUS_A, &st, &err);
+  KBC_CHECK(st != KBC_OK);
+  KBC_CHECK(err.msg[0] != '\0');
+  /* …and the filter is not what dropped those rows: an errored query returns
+   * no rows, which is the same shape as a working filter and must not be
+   * mistaken for one. */
+
+  fx_teardown(&f);
+}
+
+/* The link graph is written from the corpus's own links, and only for targets
+ * that resolve: a document that links out records an edge, a document that is
+ * linked to has an in-degree, and a link to a file that does not exist is not
+ * an edge at all. */
+KBC_TEST(reindex_records_only_edges_whose_target_is_an_indexed_document) {
+  fixture f;
+  fx_setup(&f, false);
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, "links.md");
+  kbc_test_write_file(p,
+                      "# Links\n\n"
+                      "See [alpha](a.md) and [ghost](nope.md) and "
+                      "[outside](../../etc/passwd) and [web](https://x.test/).\n");
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  kbc_store *store = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(store);
+  int64_t edges = kbc_store_edge_count(store, CORPUS_A, &err);
+  /* exactly the one link that resolves */
+  KBC_CHECK_EQ_INT(edges, 1);
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(store, CORPUS_B, &err), 0);
+
+  /* The degree is asked for by PATH: the store cannot name a document by its
+   * index doc id, so a.md is named the way the parser named it. */
+  static const char *const want[] = {"a.md", "links.md"};
+  uint32_t deg[2] = {9, 9};
+  KBC_CHECK_OK(kbc_store_edge_degrees_for(store, CORPUS_A, want, 2, deg, &err));
+  KBC_CHECK_EQ_INT(deg[0], 1); /* linked from links.md */
+  KBC_CHECK_EQ_INT(deg[1], 0); /* links out, is linked to by nobody */
+
+  /* Editing the document so the link disappears must not leave the edge
+   * behind: replace, never append. */
+  kbc_test_write_file(p, "# Links\n\nNo links any more.\n");
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(store, CORPUS_A, &err), 0);
+
+  kbc_store_close(store);
+  fx_teardown(&f);
+}
+
+/* The graph boost is opt-in and its weight comes from the config. The hub is
+ * deliberately a poor text match — long, with the query term once — so the
+ * only thing that can promote it is in-degree: the ordering is then a real
+ * reordering, not a coincidence. */
+static void order_of_hits(kbc_app *app, const char *q, const char *corpus,
+                          char *out, size_t cap) {
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  size_t off = 0;
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) return;
+  kbc_query query;
+  memset(&query, 0, sizeof query);
+  query.q = q;
+  query.corpus = corpus;
+  query.kind = KBC_KIND__COUNT;
+  query.mode = KBC_MODE_HYBRID;
+  query.limit = 10;
+  query.bm25_k1 = 1.2;
+  query.bm25_b = 0.75;
+  kbc_search_result res;
+  memset(&res, 0, sizeof res);
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_search(app, a, &query, &res, &err));
+  out[0] = '\0';
+  for (size_t i = 0; i < res.len; i++) {
+    const char *p = res.rows[i].path;
+    int n = snprintf(out + off, cap - off, "%s%s", i == 0 ? "" : ",",
+                     p != NULL ? p : "?");
+    if (n < 0 || (size_t)n >= cap - off) {
+      KBC_CHECK_MSG(false, "ordering does not fit in %zu bytes", cap);
+      break;
+    }
+    off += (size_t)n;
+  }
+  kbc_arena_free(a);
+}
+
+KBC_TEST(the_graph_boost_is_off_by_default_and_reorders_when_configured) {
+  fixture f;
+  fx_setup(&f, false);
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, "hub.md");
+  kbc_test_write_file(p,
+                      "# Hub\n\n"
+                      "Alabaster brimstone cinnabar dolomite eflin fudge "
+                      "gamboge halite icicle jasper krypton lilac mullet "
+                      "nimbus onyx peridot quartz rhodonite siderite topaz "
+                      "uranium verdigris wurtzite xenon yttrium zoisite "
+                      "amber beryl cordierite dravite euclase forsterite "
+                      "grossular hackmanite iolite kaersutite leucite "
+                      "mellite nepheline olivine pectolite rutile "
+                      "spodumene tundrite vesuvianite wiluite.\n");
+  /* Three documents linking to hub.md, so its in-degree is 3. */
+  for (int i = 0; i < 3; i++) {
+    char name[64];
+    snprintf(name, sizeof name, "linker%d.md", i);
+    char body[256];
+    snprintf(body, sizeof body,
+             "# Linker\n\nSee [hub](hub.md) and the verdigris ledger.\n");
+    join(p, sizeof p, f.corpus_a, name);
+    kbc_test_write_file(p, body);
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  /* No key in the config: the graph is not even fetched, so the ordering is
+   * the one the text alone produces, and the hub is not first. */
+  char off[KBC_TEST_PATH_MAX * 2];
+  order_of_hits(f.app, "verdigris", CORPUS_A, off, sizeof off);
+  KBC_CHECK_MSG(strncmp(off, "hub.md", 6) != 0,
+                "with the graph off the hub wins on text: %s", off);
+
+  /* The same corpus, the same query, one config key added: the most-linked
+   * document takes the top rank. The app takes its own copy of the config at
+   * open, so this is a reopen — which is what an operator editing kb.toml
+   * does. */
+  reopen_with_graph_boost(&f, 2.0);
+  char on[KBC_TEST_PATH_MAX * 2];
+  order_of_hits(f.app, "verdigris", CORPUS_A, on, sizeof on);
+  KBC_CHECK_EQ_STR(on, "hub.md,linker2.md,linker1.md,linker0.md,c.md");
+
+  /* The key removed: the off ranking returns, byte for byte. */
+  reopen_with_graph_boost(&f, 0.0);
+  char again[KBC_TEST_PATH_MAX * 2];
+  order_of_hits(f.app, "verdigris", CORPUS_A, again, sizeof again);
+  KBC_CHECK_EQ_STR(again, off);
+
+  fx_teardown(&f);
+}
+
 int main(void) {
   static const kbc_test_case cases[] = {
       {"ingest_indexes_every_document", ingest_indexes_every_document},
@@ -1163,6 +1379,12 @@ int main(void) {
        a_corrupt_index_is_refused_not_ignored},
       {"hybrid_search_degrades_to_keyword_without_an_embedder",
        hybrid_search_degrades_to_keyword_without_an_embedder},
+      {"since_filters_on_the_store_mtime_and_an_impossible_since_returns_nothing",
+       since_filters_on_the_store_mtime_and_an_impossible_since_returns_nothing},
+      {"reindex_records_only_edges_whose_target_is_an_indexed_document",
+       reindex_records_only_edges_whose_target_is_an_indexed_document},
+      {"the_graph_boost_is_off_by_default_and_reorders_when_configured",
+       the_graph_boost_is_off_by_default_and_reorders_when_configured},
       {NULL, NULL},
   };
   return kbc_test_run("app", cases);

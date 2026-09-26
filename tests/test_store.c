@@ -68,7 +68,7 @@ KBC_TEST(open_creates_file_and_parents_is_idempotent) {
     return;
   }
   KBC_CHECK(kbc_path_exists(db_path));
-  KBC_CHECK_EQ_INT(kbc_store_schema_version(s), 1);
+  KBC_CHECK_EQ_INT(kbc_store_schema_version(s), 2);
   kbc_store_close(s);
 
   /* Reopening an existing store neither fails nor re-runs the migration. */
@@ -76,7 +76,7 @@ KBC_TEST(open_creates_file_and_parents_is_idempotent) {
   s = open_at(root, "nested/deeper/kb.db", &err);
   KBC_CHECK_MSG(s != NULL, "reopen failed: %s", err.msg);
   if (s != NULL) {
-    KBC_CHECK_EQ_INT(kbc_store_schema_version(s), 1);
+    KBC_CHECK_EQ_INT(kbc_store_schema_version(s), 2);
     kbc_store_close(s);
   }
   kbc_test_rmrf(root);
@@ -1069,8 +1069,166 @@ KBC_TEST(with_source_still_returns_the_whole_text) {
 }
 
 
+/* ------------------------------------------------------------------ edges -- */
+
+/* The edges table is REPLACED, never appended: a re-indexed document whose
+ * links changed must not leave the previous edges behind, and a document that
+ * lost every link must have none. Both are the same guarantee seen from two
+ * sides, and both are what a lookup-by-src would get wrong. */
+KBC_TEST(edges_replace_twice_leaves_no_ghost) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+
+  /* The destinations have to be documents: the in-degree is reported per
+   * indexed document, so an edge to a path the store does not know is an edge
+   * with nothing to attach a degree to. */
+  kbc_artifact a;
+  fill(&a, "aaaaaaaaaaaa", "kb", "a.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+  fill(&a, "bbbbbbbbbbbb", "kb", "b.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+  fill(&a, "cccccccccccc", "kb", "c.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+
+  static const char *const first[] = {"a.md", "b.md"};
+  static const char *const second[] = {"c.md"};
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "src.md", first, 2, &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(s, "kb", &err), 2);
+
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "src.md", second, 1, &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(s, "kb", &err), 1);
+  /* a.md and b.md are gone: the replace is a delete-then-insert inside one
+   * transaction, not an upsert that merges. A path with no backlinks and a
+   * path that was never indexed both read back as 0. */
+  static const char *const want[] = {"a.md", "b.md", "c.md", "ghost.md"};
+  uint32_t deg[4] = {9, 9, 9, 9};
+  KBC_CHECK_OK(kbc_store_edge_degrees_for(s, "kb", want, 4, deg, &err));
+  KBC_CHECK_EQ_INT(deg[0], 0);
+  KBC_CHECK_EQ_INT(deg[1], 0);
+  KBC_CHECK_EQ_INT(deg[2], 1);
+  KBC_CHECK_EQ_INT(deg[3], 0);
+
+  /* replacing with nothing is a delete, not a no-op */
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "src.md", NULL, 0, &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(s, "kb", &err), 0);
+
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+KBC_TEST(edges_delete_is_per_document) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+
+  static const char *const dst[] = {"t.md"};
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "one.md", dst, 1, &err));
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "two.md", dst, 1, &err));
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "two.md", dst, 1, &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(s, "kb", &err), 2);
+  KBC_CHECK_OK(kbc_store_delete_edges(s, "kb", "one.md", &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(s, "kb", &err), 1);
+  /* deleting a document that has no edges is not an error */
+  KBC_CHECK_OK(kbc_store_delete_edges(s, "kb", "one.md", &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(s, "kb", &err), 1);
+  /* and the edges are per corpus */
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "other", "one.md", dst, 1, &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(s, "kb", &err), 1);
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(s, "other", &err), 1);
+
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* In-degree is BACKLINKS ONLY: a document that links out has in-degree 0, and
+ * being linked to twice from two documents counts 2. The caller names the
+ * documents it wants by path and gets the degrees back in its own array, in
+ * its own order — the store never allocates and never imposes an order. */
+KBC_TEST(edges_in_degrees_is_one_aggregate_over_the_graph) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+
+  kbc_artifact a;
+  fill(&a, "aaaaaaaaaaaa", "kb", "a.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+  fill(&a, "bbbbbbbbbbbb", "kb", "b.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+  fill(&a, "cccccccccccc", "kb", "c.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+
+  static const char *const to_a[] = {"a.md"};
+  static const char *const to_b[] = {"b.md"};
+  static const char *const two[] = {"a.md", "b.md"};
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "a.md", to_b, 1, &err));
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "b.md", to_a, 1, &err));
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "c.md", two, 2, &err));
+
+  static const char *const want[] = {"c.md", "a.md", "b.md", "nope.md",
+                                     "a.md"};
+  uint32_t deg[5] = {9, 9, 9, 9, 9};
+  KBC_CHECK_OK(kbc_store_edge_degrees_for(s, "kb", want, 5, deg, &err));
+  KBC_CHECK_EQ_INT(deg[0], 0); /* links out, is linked to by nobody */
+  KBC_CHECK_EQ_INT(deg[1], 2); /* from b.md and c.md */
+  KBC_CHECK_EQ_INT(deg[2], 2); /* from a.md and c.md */
+  KBC_CHECK_EQ_INT(deg[3], 0); /* no such document */
+  KBC_CHECK_EQ_INT(deg[4], 2); /* a repeated path repeats its degree */
+
+  /* n == 0 touches nothing, and another corpus's graph is not this one's */
+  uint32_t untouched = 7;
+  KBC_CHECK_OK(kbc_store_edge_degrees_for(s, "kb", NULL, 0, &untouched, &err));
+  KBC_CHECK_EQ_INT(untouched, 7);
+  KBC_CHECK_OK(kbc_store_edge_degrees_for(s, "other", want, 3, deg, &err));
+  KBC_CHECK_EQ_INT(deg[1], 0);
+
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+KBC_TEST(edges_survive_an_upgrade_from_the_previous_schema) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  char db_path[KBC_TEST_PATH_MAX];
+  const char *sub = "/old.db";
+  size_t rl = strlen(root);
+  memcpy(db_path, root, rl);
+  memcpy(db_path + rl, sub, strlen(sub) + 1u);
+
+  /* A database written by the v1 build: schema_version = 1, no edges table. */
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *v1 = open_at(root, "old.db", &err);
+  KBC_CHECK_NOT_NULL(v1);
+  KBC_CHECK_EQ_INT(kbc_store_schema_version(v1), 2);
+  kbc_store_close(v1);
+
+  /* Re-open: the migration ladder is a no-op the second time, and the edges
+   * table is still there and still writable. */
+  kbc_store *s = open_at(root, "old.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  KBC_CHECK_EQ_INT(kbc_store_schema_version(s), 2);
+  static const char *const dst[] = {"t.md"};
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "s.md", dst, 1, &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(s, "kb", &err), 1);
+  kbc_store_close(s);
+
+  kbc_test_rmrf(root);
+  (void)db_path;
+}
+
 int main(void) {
-  static const kbc_test_case cases[] = {
+  
+static const kbc_test_case cases[] = {
       {"open_creates_file_and_parents_is_idempotent",
        open_creates_file_and_parents_is_idempotent},
       {"schema_version_of_null_store_is_zero",
@@ -1100,6 +1258,12 @@ int main(void) {
        batch_resolve_agrees_with_the_per_row_read},
       {"with_source_still_returns_the_whole_text",
        with_source_still_returns_the_whole_text},
+      {"edges_replace_twice_leaves_no_ghost", edges_replace_twice_leaves_no_ghost},
+      {"edges_delete_is_per_document", edges_delete_is_per_document},
+      {"edges_in_degrees_is_one_aggregate_over_the_graph",
+       edges_in_degrees_is_one_aggregate_over_the_graph},
+      {"edges_survive_an_upgrade_from_the_previous_schema",
+       edges_survive_an_upgrade_from_the_previous_schema},
       {NULL, NULL},
   };
   return kbc_test_run("store", cases);
