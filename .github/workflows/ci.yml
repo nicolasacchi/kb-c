@@ -61,9 +61,12 @@ jobs:
             printf '# Note %s\n\nkb-c indexes markdown and serves it over http. token%s filler text.\n' \
               "$i" "$i" > "bench/data/corpus/note-$i.md"
           done
-          printf 'data_dir = "./db"\nport = 4317\n\n[[corpus]]\nname = "bench"\npath = "./corpus"\n' \
+          # Keys must live under a table header — the parser rejects a bare
+          # top-level key rather than half-applying it.
+          printf '[daemon]\ndata_dir = "./db"\nport = 4317\n\n[[corpus]]\nname = "bench"\npath = "./corpus"\n' \
             > bench/data/kb.toml
       - name: Reindex the generated corpus
-        run: ./build/kbc reindex --config bench/data/kb.toml
+        # Global flags precede the verb — `kbc reindex --config X` is rejected.
+        run: ./build/kbc --config bench/data/kb.toml reindex
       - name: Bench
-        run: ./build/kbc bench --config bench/data/kb.toml
+        run: ./build/kbc --config bench/data/kb.toml bench
