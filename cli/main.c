@@ -1295,8 +1295,22 @@ static void parse_verb(const flag_def *defs, int argc, char **argv, int start,
       }
       continue;
     }
+    /* Global flags: accepted before or after the verb, in any position among
+     * the verb's own flags. Repeated, the last one wins. */
     if (strcmp(s, "--json") == 0) {
-      g_json = true; /* --json is global: accepted before or after the verb */
+      g_json = true;
+      continue;
+    }
+    if (strcmp(s, "--daemon") == 0 || strcmp(s, "--config") == 0) {
+      if (k + 1 >= argc) {
+        die_user("%s needs an argument", s);
+      }
+      const char *value = argv[++k];
+      if (s[2] == 'd') {
+        g_daemon_flag = value;
+      } else {
+        g_config_flag = value;
+      }
       continue;
     }
     if (s[1] != '-') {
@@ -2369,6 +2383,10 @@ static void usage(FILE *out) {
   fprintf(out,
           "usage: kbc [--json] [--daemon URL] [--config PATH] <verb> [args]\n"
           "\n"
+          "The global flags above may also be given after the verb, among its\n"
+          "own flags: `kbc reindex --kb notes` and `kbc reindex --config\n"
+          "kb.toml` both work. A global repeated in one command line takes\n"
+          "its last value.\n"
           "verbs:\n"
           "  daemon [--bind ADDR] [--port N] [--foreground]\n"
           "  add <dir> --kb NAME\n"
