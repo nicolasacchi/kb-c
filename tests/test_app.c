@@ -269,6 +269,78 @@ KBC_TEST(search_returns_the_document_the_query_names) {
   fx_teardown(&f);
 }
 
+/* A search resolves every hit it returns to a stored document, and the
+ * resolver reads the row WITHOUT its `source` column — a batch lookup, one
+ * locked round trip, the same rows the per-row function would return. So the
+ * ids, titles and summaries a client sees must be exactly the store's, or the
+ * API changes shape with nothing to notice. */
+KBC_TEST(search_rows_carry_the_stored_ids_titles_and_summaries) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  kbc_store *st = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_MSG(st != NULL, "store_open: %s", err.msg);
+  if (st == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  /* The three terms name the three documents, so this is a real batch and
+   * not the single-hit case that hides a mis-indexed resolve. */
+  kbc_query q;
+  memset(&q, 0, sizeof q);
+  q.q = "quixotic verdigris accruals";
+  q.kind = KBC_KIND__COUNT;
+  q.mode = KBC_MODE_KEYWORD;
+  q.limit = 10;
+  kbc_search_result res;
+  memset(&res, 0, sizeof res);
+  KBC_CHECK_OK(kbc_app_search(f.app, a, &q, &res, &err));
+  KBC_CHECK_EQ_INT(res.len, 3);
+
+  for (size_t i = 0; i < res.len; i++) {
+    const kbc_result_row *row = &res.rows[i];
+    KBC_CHECK_MSG(row->artifact_id != NULL, "row %zu resolved no id", i);
+    KBC_CHECK_MSG(kbc_id_is_valid(row->artifact_id),
+                  "row %zu carries an invalid id \"%s\"", i,
+                  row->artifact_id ? row->artifact_id : "");
+    if (row->artifact_id == NULL) continue;
+
+    kbc_arena *one = kbc_arena_new(0);
+    kbc_artifact want;
+    KBC_CHECK_OK(
+        kbc_store_get_artifact(st, one, row->artifact_id, true, &want, &err));
+    KBC_CHECK_MSG(strcmp(row->title, want.title) == 0,
+                  "row %zu title \"%s\" != stored \"%s\"", i, row->title,
+                  want.title);
+    KBC_CHECK_MSG(want.summary != NULL && row->summary != NULL &&
+                      strcmp(row->summary, want.summary) == 0,
+                  "row %zu summary \"%s\" != stored \"%s\"", i,
+                  row->summary ? row->summary : "(null)",
+                  want.summary ? want.summary : "(null)");
+    KBC_CHECK_MSG(strcmp(row->path, want.path) == 0,
+                  "row %zu path \"%s\" != stored \"%s\"", i, row->path,
+                  want.path);
+    /* The document is really there, source and all: the resolve reads less of
+     * the row, not a different row. */
+    KBC_CHECK_MSG(want.source != NULL && strstr(want.source, "The") != NULL,
+                  "row %zu resolved a document with no stored source", i);
+    kbc_arena_free(one);
+  }
+  kbc_arena_free(a);
+  kbc_store_close(st);
+  fx_teardown(&f);
+}
+
 KBC_TEST(unchanged_files_are_skipped_by_mtime_and_size) {
   fixture f;
   fx_setup(&f, false);
@@ -883,6 +955,8 @@ int main(void) {
       {"ingest_indexes_every_document", ingest_indexes_every_document},
       {"search_returns_the_document_the_query_names",
        search_returns_the_document_the_query_names},
+      {"search_rows_carry_the_stored_ids_titles_and_summaries",
+       search_rows_carry_the_stored_ids_titles_and_summaries},
       {"unchanged_files_are_skipped_by_mtime_and_size",
        unchanged_files_are_skipped_by_mtime_and_size},
       {"rewriting_a_file_indexes_the_new_words",

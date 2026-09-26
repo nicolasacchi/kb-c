@@ -97,34 +97,77 @@ total it is ~17x. The total includes a resident ONNX model kb-c does not load.
 ## Concurrency
 
 `bench/bench-kbc.sh`, kb-c only — the Rust daemon's concurrency was **not**
-measured, so there is no comparison to draw. 8 clients, REPS=30, after the
-per-hit resolve fix:
+measured, so there is no comparison to draw. 8 clients, REPS=30, the
+`limit=10` the script uses by default. Before and after the resolve fix, run
+back to back on the same corpus on 2026-09-26:
 
-| clients | rps | p50 | p99 |
-|---|---|---|---|
-| 1 | 1,385 | 0.82 ms | 1.49 ms |
-| 2 | 2,286 | 0.92 ms | 2.27 ms |
-| 4 | 2,648 | 1.62 ms | 7.67 ms |
-| 8 | 2,336 | 2.43 ms | 7.20 ms |
+| clients | rps before | rps after | p50 before | p50 after | p99 before | p99 after |
+|---|---|---|---|---|---|---|
+| 1 | 1,372 | 2,452 | 0.68 ms | 0.38 ms | 1.48 ms | 0.62 ms |
+| 2 | 2,497 | 4,525 | 0.74 ms | 0.41 ms | 1.55 ms | 0.90 ms |
+| 4 | 2,325 | 5,762 | 1.21 ms | 0.61 ms | 3.57 ms | 1.75 ms |
+| 8 | 2,533 | 5,682 | 3.02 ms | 1.17 ms | 5.64 ms | 3.99 ms |
 
-Throughput does not scale past ~4 clients. That was diagnosed rather than
-guessed, and the first diagnosis was only half right:
+The "before" column reproduces the earlier per-hit-resolve-fix run
+(1,385 / 2,286 / 2,648 / 2,336 rps) to within host noise, and it shows the same
+thing: **throughput did not scale past ~4 clients.** After the fix it still
+flattens — 4 and 8 clients are within 2% of each other — but at 2.3x the
+throughput, and the ceiling has moved off the per-hit resolve (see below).
+Throughput was diagnosed rather than guessed, and the first diagnosis was only
+half right:
 
 - **Ruled out by measurement:** the client (4 processes x 8 threads reach the
   same rps at 12% CPU each), the epoll worker count (2/4/8/16 workers plateau
   identically), CPU (~1.2 of 8 cores busy at the plateau), fd/connection limits
   (16 connections, 0 errors), and the scoring path itself — queries returning no
   hits reach **20.7k rps** at 8 clients.
-- **Fixed:** the per-hit store resolve took the store's single mutex once per
+- **Fixed (1):** the per-hit store resolve took the store's single mutex once per
   returned hit. Resolving a query's hits in one `kbc_store_get_artifacts_by_path`
   call took it once per query. Interleaved A/B at 8 clients: **1,832 → 2,336 rps
   median (+27%)**, p50 −20%, p99 halved. The `limit=1` vs `limit=50` spread —
   which isolates the per-hit cost — went from **10.0x to 6.0x**, and the
   marginal cost per hit fell from 33.1 µs to 18.5 µs.
-- **Still the limit:** the residual ~18 µs is the **row read, not the lock**.
-  `artifacts.source` averages 12.5 KB, so each resolve walks a multi-page
-  overflow record. Fixing it needs a schema change (a slim covering table
-  without `source`, or a search projection off the wide row). Not done.
+- **Fixed (2):** that residual was the **row read, not the lock** — the
+  diagnosis was right, the prescription was not. `artifacts.source` averages
+  12.5 KB of a ~12.8 KB record, so every resolve decoded an overflow record to
+  get two small columns out of it. The resolve's statement simply stopped
+  selecting `source` (no schema change, no migration: nothing on the search
+  path reads it, and `kbc_store_get_artifact(..., with_source=true)` is a
+  different call that still returns the full text). Interleaved A/B, 8 clients,
+  five paired runs, REPS=30, `limit=50`:
+
+  | | rps | p50 | p99 |
+  |---|---|---|---|
+  | before | 872 (median of 872/911/864/886/854) | 7.4 ms | 14.4–19.5 ms |
+  | after | **2,967** (3102/3071/2687/2748/2967) | **2.0 ms** | 4.6–6.5 ms |
+
+  **+240%**, and the same `limit=1` run — which resolves one hit and so is the
+  control — did not move at all (5,643 → 5,671 rps median), which is what makes
+  the limit=50 figure attributable to the per-hit read rather than to noise or
+  to the daemon getting faster in general. The `limit=1` vs `limit=50` spread
+  fell from **6.5x to 1.9x**.
+- **What did NOT help, and why.** Both structural alternatives were built and
+  measured before the one-line change was chosen, on the benchmark database:
+  - a covering index on `(corpus, path)` including id/title/summary is
+    **not used by the planner** — `EXPLAIN QUERY PLAN` still reports
+    `SEARCH artifacts USING INDEX sqlite_autoindex_artifacts_2`, because the
+    existing `UNIQUE(corpus, path)` is a smaller candidate and equally exact.
+    Adding it changed nothing (3.6–4.2 µs per lookup either way);
+  - moving `source` into its own `artifact_sources(doc_id, source)` table —
+    i.e. making the hot row physically small — was built and timed too, and it
+    measured **the same as simply not selecting the column** (min 3.57 µs,
+    p50 4.31 µs against 3.50–3.64 / 4.11–4.51). Omitting the column already
+    stops the overflow walk; physically removing the bytes buys nothing on top
+    of that. So no migration was added, which is also why an existing database
+    needs none: `CREATE TABLE` and the statement text are the only changes.
+- The single-process microbenchmark is committed as `bench/resolve-mb.c`
+  (`cc -O2 -o /tmp/resolve-mb bench/resolve-mb.c -lsqlite3`) so the per-lookup
+  cost can be compared directly instead of inferred from the daemon. On the
+  1,114-document benchmark database, 21 interleaved trials: at 50 pairs
+  **5.75 µs wide vs 3.59 µs slim** (min), 6.59 vs 4.15 (p50); at 10 pairs
+  4.96 vs 3.53 and 5.58 vs 4.24. This host is shared, so the trial spread is
+  wide and the min/median are both reported; the end-to-end A/B above is the
+  number to quote.
 - The literal prescription to build the batch as one
   `(?1 AND ?2) OR (?3 AND ?4) ...` statement was **slower**, because
   `sqlite3_prepare_v2` re-parses and re-plans the n-term OR on every query

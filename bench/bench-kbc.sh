@@ -29,6 +29,8 @@
 # Usage: bench-kbc.sh [CORPUS_DIR] [PORT]
 # Env:   QUERY_FILE, REPS (default 20), LEVELS (default "1 2 4 8"),
 #        WORKERS (daemon http workers, default 4 = the config default),
+#        LIMIT (hits per query, default 10 — set LIMIT=1 and LIMIT=50 to
+#        isolate the marginal per-hit cost),
 #        KBC_BIN, SANDBOX, PORT, KB_NAME
 # Output: progress log on stderr; machine-readable key=value on stdout;
 #         raw per-sample TSVs under $SANDBOX/samples.
@@ -53,11 +55,31 @@
 # (+27%), p50 -20%, p99 halved. The limit=1 vs limit=50 spread — the cleanest
 # evidence, since it isolates the per-hit cost — went 10.0x -> 6.0x.
 #
-# STILL THE LIMIT (not fixed): the marginal cost per returned hit is ~18 us, and
-# it is the row read, not the lock. artifacts.source averages 12.5 KB, so every
-# resolve walks a multi-page overflow record. Fixing it needs a schema change —
-# a slim covering table without `source`, or a search projection that does not
-# read the wide row. Until then, expect throughput to keep tracking 1/hits.
+# FIXED AGAIN (2026-09-26): the remaining marginal cost per hit was the row
+# read, and the resolve's own statement was the whole of it. artifacts.source
+# averages 12.5 KB of a ~12.8 KB record, so every step in the batch decode
+# walked an overflow chain to produce columns the search path then discarded.
+# The batch (and the watcher's by-path read) now SELECT the ten small columns
+# and never name `source`; nothing on the search path reads it, and
+# kbc_store_get_artifact(..., with_source=true) — a different call, the one
+# `kb get --source` and the artifact route use — still returns the full text,
+# so no schema change and no migration was needed.
+#
+# Interleaved A/B, 8 clients, REPS=30, five paired runs. limit=50:
+# 872 -> 2,967 rps median (+240%), p50 7.4 -> 2.0 ms, p99 14.4-19.5 -> 4.6-6.5 ms.
+# limit=1 — the control, one hit, so no per-hit read to remove — did not move
+# (5,643 -> 5,671 rps), which is what makes the limit=50 figure attributable to
+# the resolve rather than to host noise. The limit=1 vs limit=50 spread fell
+# from 6.5x to 1.9x. At the default limit=10: 1,372/2,497/2,325/2,533 rps at
+# 1/2/4/8 clients before, 2,452/4,525/5,762/5,682 after; p50 at 8 clients
+# 3.02 -> 1.17 ms.
+#
+# NOT WORTH THE MIGRATION, both built and measured before the one-line change
+# was chosen: a covering index on (corpus, path) is not used by the planner at
+# all (the existing UNIQUE(corpus, path) is chosen instead, and the cost is the
+# same), and moving `source` into its own artifact_sources table measures the
+# same as simply not selecting the column. bench/resolve-mb.c is the
+# single-process version of this measurement, for the per-lookup figure.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -71,7 +93,7 @@ LEVELS="${LEVELS:-1 2 4 8}"
 WORKERS="${WORKERS:-4}"
 QUERY_FILE="${QUERY_FILE:-$ROOT/bench/queries.txt}"
 MODE="keyword"
-LIMIT=10
+LIMIT="${LIMIT:-10}"
 URL="http://127.0.0.1:${PORT}"
 CFG="$SANDBOX/daemon.toml"
 LOG="$SANDBOX/daemon.log"

@@ -853,6 +853,222 @@ KBC_TEST(open_rejects_an_unusable_db_path) {
   kbc_test_rmrf(root);
 }
 
+/* ------------------------------------------------- batch resolve -------- */
+
+/* 20 KB of source: comfortably past SQLite's page, so it lands in the
+ * overflow chain of the record. A read that comes back byte for byte is the
+ * evidence that the resolve path stays off it without truncating anything. */
+static char *big_source(size_t n) {
+  char *p = malloc(n + 1u);
+  if (p == NULL) return NULL;
+  for (size_t i = 0; i < n; i++) p[i] = (char)('a' + (int)(i % 26u));
+  p[n] = '\0';
+  return p;
+}
+
+/* The batch exists so a search resolves its top-k in one locked round trip,
+ * and it reads the row WITHOUT `source` — that column is ~12.5 KB of a ~12.8
+ * KB record and nothing on the search path wants it. The batch must therefore
+ * return exactly what the per-row read returns, field for field, or the
+ * search response changes shape without anybody noticing. */
+KBC_TEST(batch_resolve_agrees_with_the_per_row_read) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_MSG(s != NULL, "open: %s", err.msg);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+
+  size_t src_len = 20000u;
+  char *src = big_source(src_len);
+  KBC_CHECK_NOT_NULL(src);
+  if (src == NULL) {
+    kbc_store_close(s);
+    kbc_test_rmrf(root);
+    return;
+  }
+
+  kbc_artifact a;
+  fill(&a, "111111111111", "kb", "one.md", KBC_KIND_NOTE);
+  a.title = "One";
+  a.summary = "summary of one";
+  a.source = src;
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+  fill(&a, "222222222222", "kb", "two.md", KBC_KIND_SESSION);
+  a.title = "Two";
+  a.summary = "summary of two";
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+  /* Same path in another corpus: a resolve must stay corpus-scoped. */
+  fill(&a, "333333333333", "notes", "one.md", KBC_KIND_NOTE);
+  a.title = "One (notes)";
+  a.summary = "summary of one, in notes";
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+
+  const char *corpora[] = {"kb", "notes", "kb", "kb", "kb", "nosuch", "kb"};
+  const char *paths[] = {"one.md", "one.md", "two.md", "missing.md", "one.md",
+                         "one.md", "one.md"};
+  const size_t n = sizeof paths / sizeof paths[0];
+
+  kbc_arena *ar = kbc_arena_new(0);
+  kbc_artifact **slots = NULL;
+  KBC_CHECK_OK(
+      kbc_store_get_artifacts_by_path(s, ar, corpora, paths, n, &slots, &err));
+  KBC_CHECK_NOT_NULL(slots);
+  KBC_CHECK_MSG(slots != NULL, "batch: %s", err.msg);
+  if (slots != NULL) {
+    for (size_t i = 0; i < n; i++) {
+      const bool should_hit = (i != 3u && i != 5u);
+      if (!should_hit) {
+        KBC_CHECK_MSG(slots[i] == NULL, "slot %zu: expected no row", i);
+        continue;
+      }
+      KBC_CHECK_MSG(slots[i] != NULL, "slot %zu: expected a row", i);
+      if (slots[i] == NULL) continue;
+
+      kbc_arena *one = kbc_arena_new(0);
+      kbc_artifact want;
+      KBC_CHECK_OK(kbc_store_get_artifact_by_path(s, one, corpora[i], paths[i],
+                                                  &want, &err));
+      const kbc_artifact *got = slots[i];
+      KBC_CHECK_MSG(strcmp(got->id, want.id) == 0, "slot %zu id: %s vs %s", i,
+                    got->id, want.id);
+      KBC_CHECK_MSG(strcmp(got->corpus, want.corpus) == 0, "slot %zu corpus", i);
+      KBC_CHECK_MSG(strcmp(got->path, want.path) == 0, "slot %zu path", i);
+      KBC_CHECK_MSG(strcmp(got->title, want.title) == 0, "slot %zu title: %s",
+                    i, got->title);
+      KBC_CHECK_MSG(strcmp(got->summary, want.summary) == 0,
+                    "slot %zu summary: %s", i, got->summary);
+      KBC_CHECK_EQ_INT(got->kind, want.kind);
+      KBC_CHECK_EQ_INT(got->mtime_ns, want.mtime_ns);
+      KBC_CHECK_EQ_INT(got->size_bytes, want.size_bytes);
+      KBC_CHECK_EQ_INT(got->content_hash, want.content_hash);
+      KBC_CHECK_EQ_INT(got->heading_count, want.heading_count);
+      KBC_CHECK_NULL(got->source);
+      kbc_arena_free(one);
+    }
+    /* The duplicate pair is one row fetched once, and both slots name it. */
+    KBC_CHECK_NOT_NULL(slots[0]);
+    KBC_CHECK_NOT_NULL(slots[4]);
+    KBC_CHECK_NOT_NULL(slots[6]);
+    if (slots[0] != NULL && slots[4] != NULL) {
+      KBC_CHECK_MSG(strcmp(slots[0]->id, slots[4]->id) == 0,
+                    "duplicate pair resolved differently");
+    }
+    free(slots);
+  }
+  kbc_arena_free(ar);
+
+  /* An unlookupable pair in the middle of the batch. It resolves to no row
+   * AND it must not shift which document the pairs after it look up: the
+   * de-duplication used to index the caller's arrays by a compacted counter,
+   * so a skipped pair made every later pair compare against — and read — the
+   * wrong slots. Slot 1 below is the pair that exposed it. */
+  const char *shift_corpora[] = {"kb", "", "kb", "kb", NULL};
+  const char *shift_paths[] = {"two.md", "ignored.md", "one.md", "two.md", "x"};
+  kbc_arena *sa = kbc_arena_new(0);
+  kbc_artifact **sslots = NULL;
+  KBC_CHECK_OK(kbc_store_get_artifacts_by_path(s, sa, shift_corpora,
+                                               shift_paths, 5, &sslots, &err));
+  KBC_CHECK_NOT_NULL(sslots);
+  if (sslots != NULL) {
+    KBC_CHECK_MSG(sslots[0] != NULL, "slot 0 (kb/two.md) went missing");
+    KBC_CHECK_MSG(sslots[1] == NULL, "slot 1 (empty corpus) resolved");
+    KBC_CHECK_MSG(sslots[2] != NULL, "slot 2 (kb/one.md) went missing");
+    KBC_CHECK_MSG(sslots[3] != NULL, "slot 3 (duplicate of slot 0) went missing");
+    KBC_CHECK_MSG(sslots[4] == NULL, "slot 4 (NULL corpus) resolved");
+    if (sslots[0] != NULL)
+      KBC_CHECK_MSG(strcmp(sslots[0]->id, "222222222222") == 0,
+                    "slot 0 resolved %s, expected 222222222222", sslots[0]->id);
+    if (sslots[2] != NULL)
+      KBC_CHECK_MSG(strcmp(sslots[2]->id, "111111111111") == 0,
+                    "slot 2 resolved %s, expected 111111111111", sslots[2]->id);
+    if (sslots[0] != NULL && sslots[3] != NULL)
+      KBC_CHECK_MSG(strcmp(sslots[0]->id, sslots[3]->id) == 0,
+                    "the duplicate pair resolved to a different document");
+    free(sslots);
+  }
+  kbc_arena_free(sa);
+
+  /* n == 0 is a successful no-op, not an error and not an empty array. */
+  kbc_arena *empty = kbc_arena_new(0);
+  kbc_artifact **none = (kbc_artifact **)(void *)ar;
+  KBC_CHECK_OK(kbc_store_get_artifacts_by_path(s, empty, corpora, paths, 0,
+                                               &none, &err));
+  KBC_CHECK_NULL(none);
+  kbc_arena_free(empty);
+
+  kbc_store_close(s);
+  free(src);
+  kbc_test_rmrf(root);
+}
+
+/* The wide read is a different call from the resolve and must stay byte for
+ * byte exact: `kb get <id> --source` and the artifact route depend on it. */
+KBC_TEST(with_source_still_returns_the_whole_text) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_MSG(s != NULL, "open: %s", err.msg);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+
+  size_t src_len = 20000u;
+  char *src = big_source(src_len);
+  KBC_CHECK_NOT_NULL(src);
+  if (src == NULL) {
+    kbc_store_close(s);
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_artifact a;
+  fill(&a, "444444444444", "kb", "wide.md", KBC_KIND_ARTIFACT);
+  a.source = src;
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+
+  /* The batch resolve ran against the same store first: reading the row
+   * without `source` must not have damaged the wide read that follows. */
+  const char *corpora[] = {"kb"};
+  const char *paths[] = {"wide.md"};
+  kbc_arena *ar = kbc_arena_new(0);
+  kbc_artifact **slots = NULL;
+  KBC_CHECK_OK(
+      kbc_store_get_artifacts_by_path(s, ar, corpora, paths, 1, &slots, &err));
+  KBC_CHECK_NOT_NULL(slots);
+  if (slots != NULL) {
+    KBC_CHECK_NULL(slots[0]->source);
+    free(slots);
+  }
+  kbc_arena_free(ar);
+
+  kbc_arena *wide = kbc_arena_new(0);
+  kbc_artifact got;
+  KBC_CHECK_OK(kbc_store_get_artifact(s, wide, "444444444444", true, &got, &err));
+  KBC_CHECK_NOT_NULL(got.source);
+  if (got.source != NULL) {
+    KBC_CHECK_MSG(strlen(got.source) == src_len, "source length %zu != %zu",
+                  strlen(got.source), src_len);
+    KBC_CHECK_MSG(strcmp(got.source, src) == 0, "source came back changed");
+  }
+  /* with_source=false on the same row: the ten small columns, no source. */
+  kbc_arena_free(wide);
+  wide = kbc_arena_new(0);
+  KBC_CHECK_OK(kbc_store_get_artifact(s, wide, "444444444444", false, &got, &err));
+  KBC_CHECK_NULL(got.source);
+  KBC_CHECK_EQ_STR(got.summary, "First paragraph of the document.");
+  kbc_arena_free(wide);
+
+  kbc_store_close(s);
+  free(src);
+  kbc_test_rmrf(root);
+}
+
+
 int main(void) {
   static const kbc_test_case cases[] = {
       {"open_creates_file_and_parents_is_idempotent",
@@ -880,6 +1096,10 @@ int main(void) {
       {"null_and_empty_arguments_are_invalid",
        null_and_empty_arguments_are_invalid},
       {"open_rejects_an_unusable_db_path", open_rejects_an_unusable_db_path},
+      {"batch_resolve_agrees_with_the_per_row_read",
+       batch_resolve_agrees_with_the_per_row_read},
+      {"with_source_still_returns_the_whole_text",
+       with_source_still_returns_the_whole_text},
       {NULL, NULL},
   };
   return kbc_test_run("store", cases);

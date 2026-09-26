@@ -86,13 +86,33 @@ enum {
   COL_HASH,
   COL_HEADINGS,
   COL_SUMMARY,
-  COL_SOURCE
+  COL_SOURCE,
+  COL_COUNT
 };
+
+/* Two shapes of the same row, in the same column order, so one reader
+ * (read_artifact) decodes both.
+ *
+ * `source` averages 12.5 KB against a few hundred bytes for everything else,
+ * so a row that carries it is a multi-page record with an overflow chain, and
+ * sqlite3_column_text() on it walks that chain — even when the C code goes on
+ * to discard the value. Omitting the column from the SELECT is what stops the
+ * walk: nothing asks for the overflow pages, and nothing faults them in. The
+ * resolve path (a search's top-k, and the watcher's by-path lookup) only ever
+ * wants the ten small columns, so it uses SLIM. Only the by-id read that
+ * actually returns source to a caller — `kb get <id> --source`, the artifact
+ * route — pays for the wide row. */
+#define ARTIFACT_SLIM_COLS                                                      \
+  "id, corpus, path, title, kind, mtime_ns, size_bytes, content_hash, "         \
+  "heading_count, summary"
 
 #define ARTIFACT_SELECT_BY_ID                                                  \
   "SELECT " ARTIFACT_COLS " FROM artifacts WHERE id = ?1;"
-#define ARTIFACT_SELECT_BY_PATH                                                \
-  "SELECT " ARTIFACT_COLS " FROM artifacts WHERE corpus = ?1 AND path = ?2;"
+#define ARTIFACT_SELECT_BY_ID_SLIM                                             \
+  "SELECT " ARTIFACT_SLIM_COLS " FROM artifacts WHERE id = ?1;"
+#define ARTIFACT_SELECT_BY_PATH_SLIM                                           \
+  "SELECT " ARTIFACT_SLIM_COLS                                                 \
+  " FROM artifacts WHERE corpus = ?1 AND path = ?2;"
 
 static kbc_status migrate_locked(kbc_store *s, kbc_err *err);
 static kbc_status require_text(kbc_err *err, const char *what, const char *v,
@@ -200,7 +220,12 @@ static void read_artifact(kbc_arena *a, sqlite3_stmt *st, bool with_source,
   out->content_hash = (uint32_t)sqlite3_column_int64(st, COL_HASH);
   out->heading_count = (int32_t)sqlite3_column_int(st, COL_HEADINGS);
   out->summary = col_str(a, st, COL_SUMMARY);
-  out->source = with_source ? col_str(a, st, COL_SOURCE) : NULL;
+  /* The slim statements do not have a `source` column at all. The column
+   * count is what says which shape this row is, so the reader is the same
+   * function either way. */
+  out->source = (with_source && sqlite3_column_count(st) == COL_COUNT)
+                    ? col_str(a, st, COL_SOURCE)
+                    : NULL;
 }
 
 /* ---------------------------------------------------------- validation --- */
@@ -521,9 +546,13 @@ kbc_status kbc_store_get_artifact(kbc_store *s, kbc_arena *a, const char *id,
   kbc_status st = require_text(err, "artifact id", id, KBC_MAX_ID_LEN);
   if (st != KBC_OK) return st;
 
+  /* The wide statement is only for a caller that keeps `source`; without it
+   * nothing ever asks sqlite for the overflow chain. */
   lock(s);
-  st = get_artifact_locked(s, a, ARTIFACT_SELECT_BY_ID, id, NULL, with_source,
-                           out, err);
+  st = get_artifact_locked(s, a,
+                           with_source ? ARTIFACT_SELECT_BY_ID
+                                       : ARTIFACT_SELECT_BY_ID_SLIM,
+                           id, NULL, with_source, out, err);
   unlock(s);
   return st;
 }
@@ -540,8 +569,8 @@ kbc_status kbc_store_get_artifact_by_path(kbc_store *s, kbc_arena *a,
   if (st != KBC_OK) return st;
 
   lock(s);
-  st = get_artifact_locked(s, a, ARTIFACT_SELECT_BY_PATH, corpus, path, false,
-                           out, err);
+  st = get_artifact_locked(s, a, ARTIFACT_SELECT_BY_PATH_SLIM, corpus, path,
+                           false, out, err);
   unlock(s);
   return st;
 }
@@ -564,14 +593,25 @@ kbc_status kbc_store_get_artifacts_by_path(kbc_store *s, kbc_arena *a,
   kbc_artifact **slots = calloc(n, sizeof(*slots));
   kbc_artifact *arts = kbc_arena_calloc(a, n, sizeof(*arts));
   size_t *owner = malloc(n * sizeof(*owner)); /* slot -> distinct pair */
-  if (slots == NULL || arts == NULL || owner == NULL) {
+  const size_t np = n > (size_t)KBC_MAX_HITS ? (size_t)KBC_MAX_HITS : n;
+  /* The distinct pairs, compacted. They need their own arrays because a
+   * distinct pair's index is NOT its input slot: a pair that cannot be looked
+   * up is skipped, and every later pair shifts down. Reading the input arrays
+   * at a distinct index therefore looks up the wrong document as soon as one
+   * pair is unlookupable. */
+  const char **dc = malloc(np * sizeof(*dc));
+  const char **dp = malloc(np * sizeof(*dp));
+  if (slots == NULL || arts == NULL || owner == NULL || dc == NULL ||
+      dp == NULL) {
     free(slots);
     free(owner);
+    free(dc);
+    free(dp);
     return kbc_err_set(err, KBC_ERR_NOMEM, "get_artifacts_by_path: %zu pairs",
                        n);
   }
   *out = slots;
-  const size_t np = n > (size_t)KBC_MAX_HITS ? (size_t)KBC_MAX_HITS : n;
+
 
   /* A pair that cannot be looked up (NULL, empty, over the cap) resolves to
    * no row. It is a slot the caller must be able to see the absence of, not a
@@ -583,19 +623,25 @@ kbc_status kbc_store_get_artifacts_by_path(kbc_store *s, kbc_arena *a,
         kbc_failed(require_text(NULL, "path", paths[i], KBC_MAX_PATH_LEN))) {
       continue;
     }
-    for (size_t j = 0; j < distinct; j++) {
-      if (strcmp(corpora[j], corpora[i]) == 0 &&
-          strcmp(paths[j], paths[i]) == 0) {
+    size_t seen = distinct;
+    for (size_t j = 0; j < seen; j++) {
+      if (strcmp(dc[j], corpora[i]) == 0 && strcmp(dp[j], paths[i]) == 0) {
         owner[i] = j;
-        goto next;
+        break;
       }
     }
-    owner[i] = distinct++;
-  next:;
+    if (owner[i] == SIZE_MAX) {
+      dc[distinct] = corpora[i];
+      dp[distinct] = paths[i];
+      owner[i] = distinct++;
+    }
   }
+  for (size_t i = np; i < n; i++) owner[i] = SIZE_MAX;
   if (distinct == 0) {
     free(slots);
     free(owner);
+    free(dc);
+    free(dp);
     *out = NULL;
     return kbc_err_set(err, KBC_ERR_INVALID,
                        "get_artifacts_by_path: no lookupable pair in %zu", n);
@@ -611,13 +657,21 @@ kbc_status kbc_store_get_artifacts_by_path(kbc_store *s, kbc_arena *a,
    * query (193 us for 10 pairs here, against 168 us for the same ten lookups
    * through one reset-and-rebind statement). So the pairs go in as bound
    * parameters to a single prepared statement, reset between pairs, which
-   * keeps the index seek per pair and pays the prepare once. */
+   * keeps the index seek per pair and pays the prepare once.
+   *
+   * The statement is the SLIM one. `source` is 12.5 KB of a ~12.8 KB row, so
+   * selecting it makes every one of these steps decode a record whose tail
+   * lives on overflow pages — a walk the resolver never wanted, since a search
+   * hit reports an id and a summary and nothing else. Measured on the
+   * 1,114-document benchmark database with bench/resolve-mb.c, 50 pairs, 15
+   * interleaved trials: 5.5-6.6 us per lookup wide against 3.5-4.1 us slim.
+   */
   lock(s);
   sqlite3_stmt *sel = NULL;
-  kbc_status st = prepare(err, s, ARTIFACT_SELECT_BY_PATH, &sel);
+  kbc_status st = prepare(err, s, ARTIFACT_SELECT_BY_PATH_SLIM, &sel);
   for (size_t k = 0; st == KBC_OK && k < distinct; k++) {
-    st = bind_text(err, s, sel, 1, corpora[k]);
-    if (st == KBC_OK) st = bind_text(err, s, sel, 2, paths[k]);
+    st = bind_text(err, s, sel, 1, dc[k]);
+    if (st == KBC_OK) st = bind_text(err, s, sel, 2, dp[k]);
     if (st != KBC_OK) break;
     /* (corpus, path) is UNIQUE, so this step yields at most one row. */
     int step = sqlite3_step(sel);
@@ -634,6 +688,8 @@ kbc_status kbc_store_get_artifacts_by_path(kbc_store *s, kbc_arena *a,
   if (kbc_failed(st)) {
     free(slots);
     free(owner);
+    free(dc);
+    free(dp);
     *out = NULL;
     return st;
   }
@@ -646,6 +702,8 @@ kbc_status kbc_store_get_artifacts_by_path(kbc_store *s, kbc_arena *a,
                    : NULL;
   }
   free(owner);
+  free(dc);
+  free(dp);
   return KBC_OK;
 }
 
