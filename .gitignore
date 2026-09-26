@@ -1,0 +1,22 @@
+# build
+/build/
+/cmake-build-*/
+compile_commands.json
+*.o
+*.a
+*.so
+/kbc
+/kbc-embedder
+
+# test + bench artifacts
+/tests/*.db
+/tests/*.db-*
+*.tmp.*
+/bench/data/
+
+# editors
+.cache/
+.vscode/
+.idea/
+*.swp
+.DS_Store
