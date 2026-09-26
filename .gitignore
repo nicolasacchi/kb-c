@@ -25,3 +25,9 @@ compile_commands.json
 /build-asan/
 /build-tsan/
 /build-*/
+
+# runtime state a local run leaves in the repo root
+/data/
+*.db
+*.db-wal
+*.db-shm
