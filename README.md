@@ -1,10 +1,11 @@
 # kb-c
 
 kb-c is a C17 rewrite of the [kb](https://github.com/nicolasacchi/kb) daemon — the
-self-hosted system of record for everything an AI agent writes. It targets lower
-query latency and a much smaller dependency surface: the query path is a
-memory-mapped inverted index, so it touches no database and copies no bytes it
-does not need.
+self-hosted system of record for everything an AI agent writes. Its query path
+is a memory-mapped inverted index, so a search touches no database and copies
+no bytes it does not need, and it links four libraries instead of a runtime
+stack. Whether that is faster in practice is **unmeasured**: see
+[Performance](#performance).
 
 The relationship to the Rust original: same product, same corpus model, new
 engine. A kb-c daemon and the Rust daemon use different default ports (4317 vs
@@ -17,18 +18,36 @@ same corpus.
 
 Works today:
 
-- `kbc` builds from source with CMake and passes its ctest suite.
-- Config loading (a strict `kb.toml` subset), the SQLite store and its
-  migrations, the block/anchor parser, the tokenizer, the mmap'd inverted index
-  with BM25, RRF fusion over the keyword and vector lanes, the inotify watcher,
-  and the subprocess embedder seam are specified in the frozen headers under
-  `include/kbc/`. Which of them are wired end to end changes week to week —
-  read the source, not this list, if you need today's truth.
+- `kbc` builds from source with CMake and passes its ctest suite: 11 suites,
+  215 cases, green in the Release and `-DKBC_SANITIZE=ON` lanes.
+- Config loading (a strict `kb.toml` subset), the SQLite store and its single
+  migration, the Markdown/HTML block parser with stable anchors, the tokenizer
+  and its stopword list, the mmap'd inverted index with BM25, RRF fusion over
+  the keyword and vector lanes, the mmap'd vector store, the inotify watcher
+  with debounce, the subprocess embedder client, the epoll + `SO_REUSEPORT`
+  HTTP daemon with bearer auth and an SSE stream, and a CLI with eleven verbs
+  — all specified in the frozen headers under `include/kbc/` and all wired end
+  to end.
+- The daemon serves a route banner on `/` and seven JSON routes: `/api/health`,
+  `/api/stats`, `/api/search`, `/api/artifacts`, `/api/artifacts/{id}`,
+  `POST /api/reindex` and `/api/events`. `reindex`, `search`, `get` and `list`
+  work with or without a running daemon.
+- A vector lane works when `kb-embedder` is configured and healthy. Without
+  one, `hybrid` degrades to keyword and `semantic` returns nothing, and the
+  response says `degraded: true`.
 
 Not done:
 
-- No published performance numbers. The head-to-head harness is `kbc bench`;
-  its results have not been written up.
+- No query grammar. A query is tokenized and every token is a term; `AND`,
+  `OR`, `NOT`, `key:value` and `since:` are not parsed yet (`PORT_PLAN.md`
+  stage 2).
+- No incremental index update: one changed file triggers a full corpus
+  rebuild, because the frozen index has no add-to-open operation.
+- No `problem+json` errors, no CORS, no rate limiting, no `/api/identity`,
+  no `/api/kbs`.
+- No published performance numbers, here or anywhere in this repository. The
+  harness is `kbc bench --queries N --repeat N --corpus DIR`; see
+  [Performance](#performance).
 - No web UI. The Rust repo's two React/Vite SPAs, the Claude Code plugins and
   the Playwright e2e suite are out of scope for the C port.
 - Large parts of the Rust surface are deliberately not ported. `INVENTORY.md`
@@ -64,25 +83,35 @@ EOF
 Write `kb.toml` next to the corpus:
 
 ```toml
+[daemon]
+bind = "127.0.0.1"
+port = 4317          # 4000 belongs to the Rust daemon; the two can coexist
 data_dir = "./data"
-port = 4317
 
 [[corpus]]
 name = "docs"
 path = "./corpus"
 ```
 
-Index it, then search it:
+`examples/kb.toml` is the annotated version. Keys live under a table header —
+a bare `data_dir` on line 1 is a parse error, as is an unknown key.
+
+Index it, then search it. Global flags come **before** the verb, so this is
+`kbc --config kb.toml reindex`, not `kbc reindex --config kb.toml`:
 
 ```bash
-./build/kbc reindex --config kb.toml
-./build/kbc search "inverted index" --config kb.toml
+./build/kbc --config kb.toml reindex
+./build/kbc --config kb.toml search "inverted index"
 ```
+
+Both work with or without a running daemon: with no daemon answering they say
+so on stderr (`reindex: no daemon at http://127.0.0.1:4317; running locally`)
+and do the work in-process. `kbc status` has no such fallback and exits 2.
 
 Run the daemon and talk to it over HTTP:
 
 ```bash
-./build/kbc daemon --config kb.toml &
+./build/kbc --config kb.toml daemon &
 curl -s localhost:4317/api/health
 curl -s 'localhost:4317/api/search?q=inverted+index&limit=5'
 ```
@@ -116,7 +145,8 @@ is required on every `/api` route except `/api/health`.
         [ HTTP daemon: epoll + SO_REUSEPORT ]  ---->  /api/*  and  SSE
                   ^
                   |
-        [ kbc CLI: reindex | search | daemon | status | bench | config ]
+        [ kbc CLI: daemon | add | search | get | list | reindex | status
+                    | bench | config show | token generate | version ]
 ```
 
 Request-scoped memory lives in an arena and dies with the request. The store,
@@ -150,10 +180,17 @@ JSON protocol, the same seam the Rust build uses.
 
 ## Performance
 
-There are no published latency numbers for kb-c yet, so this section makes no
-claims. The head-to-head harness is `kbc bench`; the numbers belong in
-`BENCHMARKS.md`, which does not exist yet. When it does, it will state the
-corpus, the machine, the query set and the Rust build it was compared against.
+There are no published latency numbers for kb-c, so this section makes no
+claims and neither does the rest of the documentation. What exists is the set
+of mechanisms a number would come from — an mmap'd postings walk, a bounded
+top-k heap instead of a full sort, no SQLite on the read path, and per-request
+arenas — described in `PORT_PLAN.md` §4 with the measurement each one still
+needs.
+
+The head-to-head harness is `kbc bench --queries N --repeat N --corpus DIR`.
+Its results belong in `BENCHMARKS.md`, and that file is written from measured
+numbers only — corpus, machine, query set and the Rust build it was compared
+against. Until it exists, this repository makes no performance claim.
 
 ## Layout
 

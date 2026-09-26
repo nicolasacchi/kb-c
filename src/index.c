@@ -68,6 +68,11 @@ typedef struct {
   uint32_t term_len;
   uint32_t post_off;
   uint32_t post_len;
+  /* Stable term identity, assigned once at creation. The SLOT INDEX is not
+   * stable: term_grow rehashes and moves every live term, so nothing that has
+   * to survive a grow may name a slot. Build-time only, never written to the
+   * file. */
+  uint32_t id;
 } kbc_term_slot;
 
 typedef struct {
@@ -146,14 +151,20 @@ struct kbc_index {
 
   kbc_posting *post;
   size_t post_len, post_cap;
-  /* Build-time only: the term slot index each appended posting belongs to.
-   * The commit loop appends one posting per DISTINCT TERM per document, so
-   * the global array is interleaved and post_off/post_len (a count, not a
-   * span) cannot describe a term's postings. This sidecar carries the missing
-   * term identity through the build so end_build can materialize one
-   * contiguous run per term. It is freed by end_build and never saved. */
+  /* Build-time only: the STABLE TERM ID (kbc_term_slot.id) of the term each
+   * appended posting belongs to. The commit loop appends one posting per
+   * DISTINCT TERM per document, so the global array is interleaved and
+   * post_off/post_len (a count, not a span) cannot describe a term's postings.
+   * This sidecar carries the missing term identity through the build so
+   * end_build can materialize one contiguous run per term. It is keyed on the
+   * id, never on the slot index: term_grow moves every live term, so a stale
+   * slot index names a different term after a rehash and scatters that term's
+   * postings under a stranger. Freed by end_build, never saved. */
   uint32_t *post_term;
   size_t post_term_cap;
+  /* One past the highest term id handed out this build. Ids are never reused
+   * or renumbered, so an id names the same term for the whole build. */
+  uint32_t next_term_id;
 
   bool sealed;
 
@@ -427,6 +438,7 @@ static const kbc_term_slot *term_find(const kbc_index *ix, uint64_t h,
 static void term_remove_at(kbc_index *ix, size_t idx) {
   ix->terms[idx].term_off = SLOT_TOMB;
   ix->terms[idx].term_len = 0;
+  ix->terms[idx].id = UINT32_MAX; /* the id is dead: end_build must not group by it */
   ix->terms[idx].post_off = 0;
   ix->terms[idx].post_len = 0;
   if (ix->term_live > 0) {
@@ -805,6 +817,7 @@ kbc_status kbc_index_begin_build(kbc_index *ix, kbc_err *err) {
   free(ix->post_term);
   ix->post_term = NULL;
   ix->post_term_cap = 0;
+  ix->next_term_id = 0;
   ix->sealed = false;
   scratch_free(ix); /* a stale scratch carries stale term offsets */
   return KBC_OK;
@@ -985,6 +998,15 @@ kbc_status kbc_index_add_doc(kbc_index *ix, uint32_t doc_id, const char *corpus,
   ix->docs[ix->doc_count].kind = (uint8_t)kind;
   ix->docs[ix->doc_count].token_count = (uint32_t)t->len;
 
+  /* The commit loop below hands out term ids; check the space once, up front,
+   * so exhausting it cannot leave a half-claimed slot behind. */
+  if (n > 0 && ix->next_term_id == UINT32_MAX) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "kbc_index_add_doc(doc %u): the term id space is "
+                       "exhausted (over %u terms)",
+                       doc_id, UINT32_MAX);
+  }
+
   /* Commit. Invariant: doc_id is strictly increasing across calls, so each
    * posting list stays ascending by doc_id. */
   post_before = ix->post_len;
@@ -1004,6 +1026,7 @@ kbc_status kbc_index_add_doc(kbc_index *ix, uint32_t doc_id, const char *corpus,
       sl->term_len = sc->tl[i];
       sl->post_off = (uint32_t)ix->post_len;
       sl->post_len = 0;
+      sl->id = ix->next_term_id++;
       ix->term_live++;
       if (sc->ci_len < sc->ci_cap) {
         sc->ci[sc->ci_len++] = (uint32_t)ti;
@@ -1035,7 +1058,7 @@ kbc_status kbc_index_add_doc(kbc_index *ix, uint32_t doc_id, const char *corpus,
     }
     ix->post[ix->post_len].doc = doc_id;
     ix->post[ix->post_len].tf = sc->tf[i];
-    ix->post_term[ix->post_len] = (uint32_t)ti;
+    ix->post_term[ix->post_len] = sl->id;
     ix->post_len++;
     sl->post_len++;
   }
@@ -1056,16 +1079,22 @@ kbc_status kbc_index_end_build(kbc_index *ix, kbc_err *err) {
    * TSLOT/POST records, kbc_index_bm25 — assumes they are, and post_len is a
    * COUNT, not a span, so the slots alone cannot say which postings are whose.
    * The build-time sidecar ix->post_term does. Materialize the runs here, once:
-   * a stable counting sort keyed on the term slot, in slot order. Stability
-   * keeps doc_id ascending inside every run (documents are appended in
-   * ascending doc_id order), so nothing is compared or reordered. O(postings),
-   * no extra hashing. Failure-atomic: both scratch buffers are obtained and
-   * filled before anything is swapped, so a NOMEM leaves the index exactly as
-   * it was. */
+   * a stable counting sort keyed on the term's STABLE ID (kbc_term_slot.id),
+   * with the runs laid out in slot order. Stability keeps doc_id ascending
+   * inside every run (documents are appended in ascending doc_id order), so
+   * nothing is compared or reordered. O(postings), no extra hashing.
+   * Failure-atomic: every scratch buffer is obtained and filled before
+   * anything is swapped, so a NOMEM leaves the index exactly as it was.
+   *
+   * The key MUST be the id, never the slot index: term_grow rehashes and
+   * moves every live term, so a posting's build-time slot index names a
+   * different term after the first grow (only a corpus past the initial table
+   * size ever grows, which is why small tests never saw it). Ids are handed
+   * out once, at creation, and term_grow does not renumber them. */
   {
-    size_t total = 0, run = 0, k;
+    size_t total = 0, run = 0, k, nids = ix->next_term_id;
     kbc_posting *np;
-    uint32_t *cursor;
+    uint32_t *cursor, *slot_of = NULL;
 
     for (i = 0; i < ix->term_cap; i++) {
       const kbc_term_slot *s = &ix->terms[i];
@@ -1085,13 +1114,23 @@ kbc_status kbc_index_end_build(kbc_index *ix, kbc_err *err) {
     np = (kbc_posting *)malloc(total * sizeof(*np));
     cursor = ix->term_cap ? (uint32_t *)malloc(ix->term_cap * sizeof(*cursor))
                           : NULL;
-    if (!np || (ix->term_cap && !cursor)) {
+    if (nids > 0) {
+      slot_of = (uint32_t *)malloc(nids * sizeof(*slot_of));
+      if (slot_of) {
+        for (k = 0; k < nids; k++) {
+          slot_of[k] = UINT32_MAX;
+        }
+      }
+    }
+    if (!np || (ix->term_cap && !cursor) || (nids > 0 && !slot_of)) {
       free(np);
       free(cursor);
+      free(slot_of);
       return kbc_err_set(err, KBC_ERR_NOMEM,
                          "kbc_index_end_build: cannot allocate the packed "
-                         "postings array (%zu postings over %zu term slots)",
-                         total, (size_t)ix->term_cap);
+                         "postings array (%zu postings over %zu term slots, "
+                         "%zu term ids)",
+                         total, (size_t)ix->term_cap, nids);
     }
     for (i = 0; i < ix->term_cap; i++) {
       kbc_term_slot *s = &ix->terms[i];
@@ -1100,26 +1139,30 @@ kbc_status kbc_index_end_build(kbc_index *ix, kbc_err *err) {
       }
       s->post_off = (uint32_t)run;
       cursor[i] = (uint32_t)run;
+      if (s->id < nids && slot_of[s->id] == UINT32_MAX) {
+        slot_of[s->id] = (uint32_t)i;
+      }
       run += s->post_len;
     }
     for (k = 0; k < ix->post_len; k++) {
-      uint32_t ti = ix->post_term[k];
-      kbc_term_slot *s;
+      uint32_t id = ix->post_term[k];
+      uint32_t ti;
       /* A term retired mid-build (only the add_doc overflow rollback does that,
        * and it truncates ix->post_len with it) leaves no run; the postings it
        * owned are dead weight and are dropped here. The bound check is the
-       * belt to that braces: a sidecar entry can never name a slot past the
-       * table, and never reads out of it if one ever did. */
-      if (ti >= ix->term_cap) {
+       * belt to that braces: a sidecar id can never be out of the id space,
+       * and the UINT32_MAX lookup can never read out of the slot table. */
+      if (id >= nids) {
         continue;
       }
-      s = &ix->terms[ti];
-      if (s->term_off == SLOT_EMPTY || s->term_off == SLOT_TOMB) {
+      ti = slot_of[id];
+      if (ti == UINT32_MAX) {
         continue;
       }
       np[cursor[ti]++] = ix->post[k];
     }
     free(cursor);
+    free(slot_of);
     free(ix->post);
     free(ix->post_term);
     ix->post = np;
@@ -1535,6 +1578,7 @@ kbc_index *kbc_index_open(const char *path, kbc_err *err) {
       ix->terms[i].term_len = get_u32(rec + 12);
       ix->terms[i].post_off = get_u32(rec + 16);
       ix->terms[i].post_len = get_u32(rec + 20);
+      ix->terms[i].id = UINT32_MAX; /* a loaded index is never rebuilt in place */
       if (ix->terms[i].term_off == SLOT_EMPTY) {
         continue;
       }

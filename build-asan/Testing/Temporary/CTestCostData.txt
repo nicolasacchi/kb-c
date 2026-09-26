@@ -1,12 +1,12 @@
-test_app 1 0.0808802
-test_config 1 0.0191868
-test_embed 1 10.1477
-test_httpd 1 0.0743583
-test_index 1 0.0405678
-test_json 1 0.0127289
-test_mem 1 0.0122853
-test_parse 1 3.29739
-test_search 1 0.0179104
-test_store 1 0.0409569
-test_watcher 1 14.0283
+test_app 1 0.182655
+test_config 1 0.0179725
+test_embed 1 10.1207
+test_httpd 1 0.09622
+test_index 1 1.36412
+test_json 1 0.0148879
+test_mem 1 0.0146296
+test_parse 1 3.55102
+test_search 1 0.0190103
+test_store 1 0.613298
+test_watcher 1 14.0171
 ---

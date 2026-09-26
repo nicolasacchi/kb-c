@@ -1,28 +1,28 @@
-Start testing: Sep 26 17:30 CEST
+Start testing: Sep 26 18:35 CEST
 ----------------------------------------------------------
 1/11 Testing: test_app
 1/11 Test: test_app
 Command: "/home/nik/project/kb-c/build-asan/test_app"
 Directory: /home/nik/project/kb-c/build-asan
-"test_app" start time: Sep 26 17:30 CEST
+"test_app" start time: Sep 26 18:35 CEST
 Output:
 ----------------------------------------------------------
-2026-09-26T15:30:23.635Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 2804 us
-2026-09-26T15:30:23.641Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 2107 us
-2026-09-26T15:30:23.646Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1882 us
-2026-09-26T15:30:23.648Z info reindex: 3 docs, 13 terms (0 changed, 3 unchanged, 0 skipped, 0 removed, 0 embedded) in 1204 us
-2026-09-26T15:30:23.650Z info reindex: 3 docs, 13 terms (0 changed, 3 unchanged, 0 skipped, 0 removed, 0 embedded) in 1004 us
-2026-09-26T15:30:23.654Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1673 us
-2026-09-26T15:30:23.655Z info reindex: 3 docs, 13 terms (1 changed, 2 unchanged, 0 skipped, 0 removed, 0 embedded) in 1423 us
-2026-09-26T15:30:23.659Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1340 us
-2026-09-26T15:30:23.661Z info reindex: 2 docs, 9 terms (0 changed, 2 unchanged, 0 skipped, 0 removed, 0 embedded) in 924 us
-2026-09-26T15:30:23.665Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1323 us
-2026-09-26T15:30:23.669Z info reindex: 4 docs, 16 terms (4 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1842 us
-2026-09-26T15:30:23.672Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1166 us
-2026-09-26T15:30:23.676Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1658 us
-2026-09-26T15:30:23.679Z info reindex: 3 docs, 13 terms (1 changed, 2 unchanged, 0 skipped, 0 removed, 0 embedded) in 1561 us
-2026-09-26T15:30:23.684Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1133 us
-2026-09-26T15:30:23.687Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1146 us
+2026-09-26T16:35:50.145Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1515 us
+2026-09-26T16:35:50.150Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1285 us
+2026-09-26T16:35:50.153Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1418 us
+2026-09-26T16:35:50.155Z info reindex: 3 docs, 13 terms (0 changed, 3 unchanged, 0 skipped, 0 removed, 0 embedded) in 1274 us
+2026-09-26T16:35:50.156Z info reindex: 3 docs, 13 terms (0 changed, 3 unchanged, 0 skipped, 0 removed, 0 embedded) in 754 us
+2026-09-26T16:35:50.159Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1245 us
+2026-09-26T16:35:50.160Z info reindex: 3 docs, 13 terms (1 changed, 2 unchanged, 0 skipped, 0 removed, 0 embedded) in 934 us
+2026-09-26T16:35:50.164Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1205 us
+2026-09-26T16:35:50.165Z info reindex: 2 docs, 9 terms (0 changed, 2 unchanged, 0 skipped, 0 removed, 0 embedded) in 614 us
+2026-09-26T16:35:50.168Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1164 us
+2026-09-26T16:35:50.172Z info reindex: 4 docs, 16 terms (4 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 2493 us
+2026-09-26T16:35:50.177Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1351 us
+2026-09-26T16:35:50.180Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1264 us
+2026-09-26T16:35:50.182Z info reindex: 3 docs, 13 terms (1 changed, 2 unchanged, 0 skipped, 0 removed, 0 embedded) in 1157 us
+2026-09-26T16:35:50.187Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1753 us
+2026-09-26T16:35:50.192Z info reindex: 3 docs, 13 terms (3 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1828 us
 == app ==
   ingest_indexes_every_document                ok
   search_returns_the_document_the_query_names  ok
@@ -37,10 +37,10 @@ Output:
   hybrid_search_degrades_to_keyword_without_an_embedder ok
 app: 0 check failure(s)
 <end of output>
-Test time =   0.08 sec
+Test time =   0.18 sec
 ----------------------------------------------------------
 Test Passed.
-"test_app" end time: Sep 26 17:30 CEST
+"test_app" end time: Sep 26 18:35 CEST
 "test_app" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -48,7 +48,7 @@ Test Passed.
 2/11 Test: test_config
 Command: "/home/nik/project/kb-c/build-asan/test_config"
 Directory: /home/nik/project/kb-c/build-asan
-"test_config" start time: Sep 26 17:30 CEST
+"test_config" start time: Sep 26 18:35 CEST
 Output:
 ----------------------------------------------------------
 == config ==
@@ -74,7 +74,7 @@ config: 0 check failure(s)
 Test time =   0.02 sec
 ----------------------------------------------------------
 Test Passed.
-"test_config" end time: Sep 26 17:30 CEST
+"test_config" end time: Sep 26 18:35 CEST
 "test_config" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -82,7 +82,7 @@ Test Passed.
 3/11 Test: test_embed
 Command: "/home/nik/project/kb-c/build-asan/test_embed"
 Directory: /home/nik/project/kb-c/build-asan
-"test_embed" start time: Sep 26 17:30 CEST
+"test_embed" start time: Sep 26 18:35 CEST
 Output:
 ----------------------------------------------------------
 == embed ==
@@ -100,10 +100,10 @@ Output:
   embedder_start_rejects_bad_argv              ok
 embed: 0 check failure(s)
 <end of output>
-Test time =  10.15 sec
+Test time =  10.12 sec
 ----------------------------------------------------------
 Test Passed.
-"test_embed" end time: Sep 26 17:30 CEST
+"test_embed" end time: Sep 26 18:36 CEST
 "test_embed" time elapsed: 00:00:10
 ----------------------------------------------------------
 
@@ -111,25 +111,25 @@ Test Passed.
 4/11 Test: test_httpd
 Command: "/home/nik/project/kb-c/build-asan/test_httpd"
 Directory: /home/nik/project/kb-c/build-asan
-"test_httpd" start time: Sep 26 17:30 CEST
+"test_httpd" start time: Sep 26 18:36 CEST
 Output:
 ----------------------------------------------------------
-2026-09-26T15:30:33.883Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1763 us
-2026-09-26T15:30:33.884Z info reindex: 2 docs, 4 terms (0 changed, 2 unchanged, 0 skipped, 0 removed, 0 embedded) in 750 us
-2026-09-26T15:30:33.887Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 912 us
-2026-09-26T15:30:33.891Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1130 us
-2026-09-26T15:30:33.894Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1134 us
-2026-09-26T15:30:33.895Z info reindex: 2 docs, 4 terms (0 changed, 2 unchanged, 0 skipped, 0 removed, 0 embedded) in 531 us
-2026-09-26T15:30:33.897Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1068 us
-2026-09-26T15:30:33.901Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1470 us
-2026-09-26T15:30:33.904Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 929 us
-2026-09-26T15:30:33.908Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1168 us
-2026-09-26T15:30:33.911Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 864 us
-2026-09-26T15:30:33.914Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1160 us
-2026-09-26T15:30:33.917Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 900 us
-2026-09-26T15:30:33.917Z info httpd listening on 127.0.0.1:38823 with 1 workers
-2026-09-26T15:30:33.926Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1170 us
-2026-09-26T15:30:33.926Z info httpd listening on 127.0.0.1:33539 with 1 workers
+2026-09-26T16:36:00.360Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1501 us
+2026-09-26T16:36:00.361Z info reindex: 2 docs, 4 terms (0 changed, 2 unchanged, 0 skipped, 0 removed, 0 embedded) in 876 us
+2026-09-26T16:36:00.365Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1125 us
+2026-09-26T16:36:00.368Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1151 us
+2026-09-26T16:36:00.372Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1331 us
+2026-09-26T16:36:00.373Z info reindex: 2 docs, 4 terms (0 changed, 2 unchanged, 0 skipped, 0 removed, 0 embedded) in 621 us
+2026-09-26T16:36:00.376Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1206 us
+2026-09-26T16:36:00.379Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1056 us
+2026-09-26T16:36:00.382Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1246 us
+2026-09-26T16:36:00.386Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1091 us
+2026-09-26T16:36:00.391Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1035 us
+2026-09-26T16:36:00.393Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 965 us
+2026-09-26T16:36:00.397Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1476 us
+2026-09-26T16:36:00.397Z info httpd listening on 127.0.0.1:42515 with 1 workers
+2026-09-26T16:36:00.426Z info reindex: 2 docs, 4 terms (2 changed, 0 unchanged, 0 skipped, 0 removed, 0 embedded) in 1302 us
+2026-09-26T16:36:00.426Z info httpd listening on 127.0.0.1:35325 with 1 workers
 == httpd ==
   routing_status_codes                         ok
   artifact_by_id_found_and_missing             ok
@@ -145,10 +145,10 @@ Output:
   response_headers_are_set                     ok
 httpd: 0 check failure(s)
 <end of output>
-Test time =   0.07 sec
+Test time =   0.10 sec
 ----------------------------------------------------------
 Test Passed.
-"test_httpd" end time: Sep 26 17:30 CEST
+"test_httpd" end time: Sep 26 18:36 CEST
 "test_httpd" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -156,10 +156,11 @@ Test Passed.
 5/11 Test: test_index
 Command: "/home/nik/project/kb-c/build-asan/test_index"
 Directory: /home/nik/project/kb-c/build-asan
-"test_index" start time: Sep 26 17:30 CEST
+"test_index" start time: Sep 26 18:36 CEST
 Output:
 ----------------------------------------------------------
 == index ==
+  end_build_survives_a_term_table_rehash       ok
   bm25_score_matches_hand_computation          ok
   bm25_returns_exactly_the_matching_docs       ok
   bm25_idf_falls_as_df_rises                   ok
@@ -183,18 +184,18 @@ Output:
   expand_prefix_matches_sorted                 ok
 index: 0 check failure(s)
 <end of output>
-Test time =   0.04 sec
+Test time =   1.36 sec
 ----------------------------------------------------------
 Test Passed.
-"test_index" end time: Sep 26 17:30 CEST
-"test_index" time elapsed: 00:00:00
+"test_index" end time: Sep 26 18:36 CEST
+"test_index" time elapsed: 00:00:01
 ----------------------------------------------------------
 
 6/11 Testing: test_json
 6/11 Test: test_json
 Command: "/home/nik/project/kb-c/build-asan/test_json"
 Directory: /home/nik/project/kb-c/build-asan
-"test_json" start time: Sep 26 17:30 CEST
+"test_json" start time: Sep 26 18:36 CEST
 Output:
 ----------------------------------------------------------
 == json ==
@@ -223,7 +224,7 @@ json: 0 check failure(s)
 Test time =   0.01 sec
 ----------------------------------------------------------
 Test Passed.
-"test_json" end time: Sep 26 17:30 CEST
+"test_json" end time: Sep 26 18:36 CEST
 "test_json" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -231,7 +232,7 @@ Test Passed.
 7/11 Test: test_mem
 Command: "/home/nik/project/kb-c/build-asan/test_mem"
 Directory: /home/nik/project/kb-c/build-asan
-"test_mem" start time: Sep 26 17:30 CEST
+"test_mem" start time: Sep 26 18:36 CEST
 Output:
 ----------------------------------------------------------
 == mem ==
@@ -279,7 +280,7 @@ mem: 0 check failure(s)
 Test time =   0.01 sec
 ----------------------------------------------------------
 Test Passed.
-"test_mem" end time: Sep 26 17:30 CEST
+"test_mem" end time: Sep 26 18:36 CEST
 "test_mem" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -287,7 +288,7 @@ Test Passed.
 8/11 Test: test_parse
 Command: "/home/nik/project/kb-c/build-asan/test_parse"
 Directory: /home/nik/project/kb-c/build-asan
-"test_parse" start time: Sep 26 17:30 CEST
+"test_parse" start time: Sep 26 18:36 CEST
 Output:
 ----------------------------------------------------------
 == parse ==
@@ -335,10 +336,10 @@ Output:
   slugify_all_punctuation_is_empty             ok
 parse: 0 check failure(s)
 <end of output>
-Test time =   3.30 sec
+Test time =   3.55 sec
 ----------------------------------------------------------
 Test Passed.
-"test_parse" end time: Sep 26 17:30 CEST
+"test_parse" end time: Sep 26 18:36 CEST
 "test_parse" time elapsed: 00:00:03
 ----------------------------------------------------------
 
@@ -346,7 +347,7 @@ Test Passed.
 9/11 Test: test_search
 Command: "/home/nik/project/kb-c/build-asan/test_search"
 Directory: /home/nik/project/kb-c/build-asan
-"test_search" start time: Sep 26 17:30 CEST
+"test_search" start time: Sep 26 18:36 CEST
 Output:
 ----------------------------------------------------------
 == search ==
@@ -374,7 +375,7 @@ search: 0 check failure(s)
 Test time =   0.02 sec
 ----------------------------------------------------------
 Test Passed.
-"test_search" end time: Sep 26 17:30 CEST
+"test_search" end time: Sep 26 18:36 CEST
 "test_search" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -382,7 +383,7 @@ Test Passed.
 10/11 Test: test_store
 Command: "/home/nik/project/kb-c/build-asan/test_store"
 Directory: /home/nik/project/kb-c/build-asan
-"test_store" start time: Sep 26 17:30 CEST
+"test_store" start time: Sep 26 18:36 CEST
 Output:
 ----------------------------------------------------------
 == store ==
@@ -402,10 +403,10 @@ Output:
   open_rejects_an_unusable_db_path             ok
 store: 0 check failure(s)
 <end of output>
-Test time =   0.04 sec
+Test time =   0.61 sec
 ----------------------------------------------------------
 Test Passed.
-"test_store" end time: Sep 26 17:30 CEST
+"test_store" end time: Sep 26 18:36 CEST
 "test_store" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -413,7 +414,7 @@ Test Passed.
 11/11 Test: test_watcher
 Command: "/home/nik/project/kb-c/build-asan/test_watcher"
 Directory: /home/nik/project/kb-c/build-asan
-"test_watcher" start time: Sep 26 17:30 CEST
+"test_watcher" start time: Sep 26 18:36 CEST
 Output:
 ----------------------------------------------------------
 == watcher ==
@@ -427,11 +428,11 @@ Output:
   start_rejects_null_arguments                 ok
 watcher: 0 check failure(s)
 <end of output>
-Test time =  14.03 sec
+Test time =  14.02 sec
 ----------------------------------------------------------
 Test Passed.
-"test_watcher" end time: Sep 26 17:30 CEST
+"test_watcher" end time: Sep 26 18:36 CEST
 "test_watcher" time elapsed: 00:00:14
 ----------------------------------------------------------
 
-End testing: Sep 26 17:30 CEST
+End testing: Sep 26 18:36 CEST

@@ -817,10 +817,138 @@ KBC_TEST(expand_prefix_matches_sorted) {
   kbc_index_free(ix);
 }
 
+/* The term hash table rehashes past its initial capacity, which MOVES every
+ * live term to a new slot. Anything the build carries across a grow must be
+ * keyed on something that travels with the term (its stable id), not on the
+ * slot index: keying on the slot scatters a term's postings under whichever
+ * term inherited the old index, and end_build's ascending-order invariant is
+ * what catches it. A small fixture never rehashes, so this one is sized to
+ * force several grows, and every expectation comes from a reference model
+ * built in the test rather than from the index under test. */
+#define GROW_DOCS 1500u
+
+/* Doc d: unique term "u<d>", "shared" when d % 5 == 0, "mid" when d % 7 == 0.
+ * The modulus is chosen so every query below matches fewer than 512 documents: the
+ * hits container refuses to grow past KBC_MAX_HITS, and a truncated result set
+ * would mask the document-set check below.
+ * The model mirrors exactly that, so a posting grouped under the wrong term
+ * shows up as a wrong document set or a wrong score. */
+static size_t grow_model_tf(uint32_t d, const char *term) {
+  if (strcmp(term, "shared") == 0) {
+    return (d % 5u == 0u) ? 1u : 0u;
+  }
+  if (strcmp(term, "mid") == 0) {
+    return (d % 7u == 0u) ? 1u : 0u;
+  }
+  if (strncmp(term, "u", 1) == 0) {
+    char mine[24];
+    (void)snprintf(mine, sizeof mine, "u%u", d);
+    return strcmp(mine, term) == 0 ? 1u : 0u;
+  }
+  return 0u;
+}
+
+static double grow_model_score(uint32_t d, const char *const *terms, size_t nq,
+                               double avgdl, uint32_t ndocs, double k1,
+                               double b) {
+  double s = 0.0, dl;
+  size_t i;
+  dl = 1.0 + (double)grow_model_tf(d, "shared") + (double)grow_model_tf(d, "mid");
+  for (i = 0; i < nq; i++) {
+    uint32_t j;
+    size_t df = 0;
+    double tf, idf;
+    for (j = 0; j < ndocs; j++) {
+      df += grow_model_tf(j, terms[i]);
+    }
+    tf = (double)grow_model_tf(d, terms[i]);
+    if (df == 0 || tf == 0.0) {
+      continue;
+    }
+    idf = log(1.0 + ((double)ndocs - (double)df + 0.5) / ((double)df + 0.5));
+    s += idf * (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * (dl / avgdl)));
+  }
+  return s;
+}
+
+KBC_TEST(end_build_survives_a_term_table_rehash) {
+  kbc_index *ix = kbc_index_new();
+  kbc_arena *a = kbc_arena_new(1u << 20);
+  kbc_err err;
+  char body[128];
+  double avgdl;
+  uint32_t d;
+  size_t i;
+  static const char *const kShared[1] = {"shared"};
+  static const char *const kMid[1] = {"mid"};
+  static const char *const kUniq[1] = {"u7"};
+  static const char *const kBoth[2] = {"shared", "mid"};
+  static const struct {
+    const char *text; /* what the query is asked, spaces and all */
+    const char *const *q;
+    size_t nq;
+  } queries[] = {{"shared", kShared, 1},
+                 {"mid", kMid, 1},
+                 {"u7", kUniq, 1},
+                 {"shared mid", kBoth, 2}};
+  memset(&err, 0, sizeof err);
+  KBC_CHECK_OK(kbc_index_begin_build(ix, &err));
+  for (d = 0; d < GROW_DOCS; d++) {
+    char uniq[24];
+    (void)snprintf(uniq, sizeof uniq, "u%u", d);
+    (void)snprintf(body, sizeof body, "%s%s%s", uniq,
+                   (d % 5u == 0u) ? " shared" : "", (d % 7u == 0u) ? " mid" : "");
+    KBC_CHECK_OK(add(ix, a, d, "kb", "grow.md", "g", body, &err));
+    if (kbc_failed(err.status)) {
+      break;
+    }
+  }
+  /* The fixture only means anything if it really did force the term table
+   * past its initial capacity: the unique term is the rehash driver. */
+  KBC_CHECK(kbc_index_term_count(ix) >= GROW_DOCS);
+  KBC_CHECK_OK(kbc_index_end_build(ix, &err));
+  KBC_CHECK_EQ_INT(kbc_index_doc_count(ix), (int)GROW_DOCS);
+  avgdl = kbc_index_avg_doclen(ix);
+  KBC_CHECK(avgdl > 0.0);
+
+  for (i = 0; i < sizeof queries / sizeof queries[0]; i++) {
+    kbc_status st;
+    kbc_hits h = query(ix, a, queries[i].text, 512u, &st);
+    size_t expect_n = 0;
+    KBC_CHECK_OK(st);
+    /* Exactly the documents that contain the query terms — a term whose run
+     * absorbed a stranger's postings shows up here — and the same scores a
+     * single-threaded reference computes. */
+    for (d = 0; d < GROW_DOCS; d++) {
+      double want = grow_model_score(d, queries[i].q, queries[i].nq, avgdl,
+                                     GROW_DOCS, 1.2, 0.75);
+      size_t k;
+      bool got = false;
+      if (want > 0.0) {
+        expect_n++;
+      }
+      for (k = 0; k < h.len; k++) {
+        if (h.items[k].doc == d) {
+          got = true;
+          KBC_CHECK_EQ_DBL(h.items[k].score, want, 1e-9);
+          break;
+        }
+      }
+      KBC_CHECK_EQ_INT(got, want > 0.0);
+    }
+    KBC_CHECK_EQ_INT((int)h.len, (int)expect_n);
+    kbc_hits_free(&h);
+  }
+  kbc_arena_free(a);
+  kbc_index_free(ix);
+}
+
 /* ------------------------------------------------------------- main ------ */
 
 int main(void) {
   static const kbc_test_case cases[] = {
+      {"end_build_survives_a_term_table_rehash",
+       end_build_survives_a_term_table_rehash},
       {"bm25_score_matches_hand_computation", bm25_score_matches_hand_computation},
       {"bm25_returns_exactly_the_matching_docs",
        bm25_returns_exactly_the_matching_docs},
