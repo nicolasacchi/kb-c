@@ -943,12 +943,656 @@ KBC_TEST(end_build_survives_a_term_table_rehash) {
   kbc_index_free(ix);
 }
 
+/* ------------------------------------------------- incremental updates --
+ * The incremental entry points, declared in include/kbc/index.h. */
+
+/* A corpus as a test can state it: an ordered list of (path, body), with a
+ * NULL body meaning "not in the index". The index under test is mutated one
+ * document at a time; the model is the same corpus, and a full rebuild of the
+ * model is the reference every expectation is compared against. */
+typedef struct {
+  const char *path;
+  const char *body;
+} inc_doc;
+
+static const char *const kIncQueries[] = {
+    "alpha",  "beta",      "gamma",  "delta",  "epsilon", "alpha beta",
+    "zeta",   "theta",     "iota",   "alpha gamma", "kappa", "mu nu xi"};
+
+/* Counts the observable truth about a corpus: distinct terms, (document,
+ * distinct term) pairs, and tokens. Derived through the real tokenizer, so a
+ * fixture change moves the expectation with it instead of pinning a number. */
+typedef struct {
+  uint32_t terms;
+  uint64_t postings;
+  uint64_t tokens;
+  uint32_t docs;
+} inc_stats;
+
+static void inc_stats_of(const inc_doc *m, size_t n, inc_stats *out) {
+  kbc_arena *a = kbc_arena_new(1u << 16);
+  kbc_token *seen = (kbc_token *)malloc(((size_t)1u << 17) * sizeof(kbc_token));
+  kbc_err err;
+  size_t i, j, nseen = 0;
+  memset(&err, 0, sizeof err);
+  memset(out, 0, sizeof *out);
+  for (i = 0; i < n; i++) {
+    kbc_tokens t;
+    uint32_t distinct = 0;
+    size_t start;
+    if (m[i].body == NULL) {
+      continue;
+    }
+    tokens_zero(&t);
+    (void)kbc_tokenize(a, m[i].body, strlen(m[i].body), &t, &err);
+    out->docs++;
+    out->tokens += t.len;
+    /* `start` is where this document's own terms begin in `seen`: the dedup
+     * that counts POSTINGS is per document, and the one that counts TERMS is
+     * over the whole corpus. Conflating them undercounts both. */
+    start = nseen;
+    for (j = 0; j < t.len; j++) {
+      size_t k;
+      bool known_here = false;
+      bool known_at_all = false;
+      for (k = 0; k < nseen; k++) {
+        if (seen[k].len == t.items[j].len &&
+            memcmp(seen[k].text, t.items[j].text, t.items[j].len) == 0) {
+          known_at_all = true;
+          if (k >= start) {
+            known_here = true;
+          }
+          break;
+        }
+      }
+      if (known_here) {
+        continue; /* this document already counts this term */
+      }
+      distinct++;
+      if (!known_at_all && nseen < (((size_t)1u << 17) - 1)) {
+        seen[nseen++] = t.items[j];
+      }
+    }
+    out->postings += distinct;
+  }
+  out->terms = (uint32_t)nseen;
+  free(seen);
+  kbc_arena_free(a);
+}
+
+/* A full rebuild of the model: what kbc_index_end_build produces when the
+ * whole corpus arrives in one pass, which is the only thing an incremental
+ * index has to agree with. */
+static kbc_index *inc_reference(const inc_doc *m, size_t n) {
+  kbc_index *ix = kbc_index_new();
+  kbc_arena *a = kbc_arena_new(1u << 16);
+  kbc_err err;
+  uint32_t id = 0;
+  size_t i;
+  memset(&err, 0, sizeof err);
+  (void)kbc_index_begin_build(ix, &err);
+  for (i = 0; i < n; i++) {
+    if (m[i].body == NULL) {
+      continue;
+    }
+    (void)add(ix, a, id, "kb", m[i].path, m[i].path, m[i].body, &err);
+    id++;
+  }
+  (void)kbc_index_end_build(ix, &err);
+  kbc_arena_free(a);
+  return ix;
+}
+
+/* Byte-for-byte score comparison, per document, against a full rebuild. The
+ * two indexes reach the same doubles by the same arithmetic over the same
+ * tf / token_count / df / N / avgdl, so anything less than exact equality is a
+ * real difference and not a tolerance question. Documents are matched by doc
+ * id because a removal COMPACTS: the model order is the doc id order. */
+static void inc_compare(kbc_index *ix, kbc_index *ref, size_t nq,
+                        const char *what) {
+  kbc_arena *a = kbc_arena_new(1u << 16);
+  size_t q;
+  for (q = 0; q < nq; q++) {
+    kbc_status sa, sb;
+    size_t i;
+    kbc_hits ha = query(ix, a, kIncQueries[q], KBC_MAX_HITS, &sa);
+    kbc_hits hb = query(ref, a, kIncQueries[q], KBC_MAX_HITS, &sb);
+    KBC_CHECK_MSG(sa == KBC_OK && sb == KBC_OK, "%s: query \"%s\" failed", what,
+                  kIncQueries[q]);
+    KBC_CHECK_MSG(ha.len == hb.len,
+                  "%s: query \"%s\" returned %zu hits, a rebuild of the same "
+                  "corpus returns %zu",
+                  what, kIncQueries[q], ha.len, hb.len);
+    for (i = 0; i < ha.len && i < hb.len; i++) {
+      KBC_CHECK_MSG(ha.items[i].doc == hb.items[i].doc,
+                    "%s: query \"%s\" hit %zu is doc %u, the rebuild says %u",
+                    what, kIncQueries[q], i, ha.items[i].doc, hb.items[i].doc);
+      KBC_CHECK_MSG(ha.items[i].score == hb.items[i].score,
+                    "%s: query \"%s\" doc %u scored %.17g, the rebuild says "
+                    "%.17g",
+                    what, kIncQueries[q], ha.items[i].doc, ha.items[i].score,
+                    hb.items[i].score);
+    }
+    kbc_hits_free(&ha);
+    kbc_hits_free(&hb);
+  }
+  kbc_arena_free(a);
+}
+
+/* Every observable property an incrementally mutated index has to have after
+ * each mutation: the counters, the doc id order, and the scores. */
+static void inc_check(kbc_index *ix, const inc_doc *m, size_t n,
+                      const char *what) {
+  inc_stats st;
+  kbc_index *ref = inc_reference(m, n);
+  size_t i, nq = sizeof kIncQueries / sizeof kIncQueries[0];
+  uint32_t id = 0;
+
+  inc_stats_of(m, n, &st);
+  KBC_CHECK_MSG(kbc_index_doc_count(ix) == st.docs,
+                "%s: doc_count %u, the corpus holds %u", what,
+                kbc_index_doc_count(ix), st.docs);
+  KBC_CHECK_MSG(kbc_index_term_count(ix) == st.terms,
+                "%s: term_count %u, the corpus has %u distinct terms", what,
+                kbc_index_term_count(ix), st.terms);
+  /* The ghost-posting detector: a document whose terms shrank, or a removal
+   * that missed a term, leaves a posting behind and moves this count. */
+  KBC_CHECK_MSG(kbc_index_posting_count(ix) == st.postings,
+                "%s: posting_count %llu, the corpus has %llu (document, term) "
+                "pairs",
+                what, (unsigned long long)kbc_index_posting_count(ix),
+                (unsigned long long)st.postings);
+  KBC_CHECK_MSG(kbc_index_avg_doclen(ix) ==
+                    (st.docs ? (double)st.tokens / (double)st.docs : 0.0),
+                "%s: avg_doclen %.17g, the corpus is %llu tokens over %u "
+                "documents",
+                what, kbc_index_avg_doclen(ix),
+                (unsigned long long)st.tokens, st.docs);
+  for (i = 0; i < n; i++) {
+    const kbc_doc_meta *d;
+    if (m[i].body == NULL) {
+      continue;
+    }
+    /* A removed document's postings are gone AND its id is out of range: a
+     * hole left behind would divide avg_doclen by the wrong count. */
+    KBC_CHECK_MSG(kbc_index_id_of(ix, "kb", m[i].path) == id,
+                  "%s: %s has doc id %u, the corpus order says %u", what,
+                  m[i].path, kbc_index_id_of(ix, "kb", m[i].path), id);
+    d = kbc_index_doc(ix, id);
+    KBC_CHECK_NOT_NULL(d);
+    if (d != NULL) {
+      KBC_CHECK_MSG(strcmp(d->path, m[i].path) == 0,
+                    "%s: doc %u is %s, the corpus order says %s", what, id,
+                    d->path, m[i].path);
+      KBC_CHECK_MSG(d->token_count > 0 || strlen(m[i].body) == 0,
+                    "%s: doc %u (%s) has token_count %u", what, id, d->path,
+                    d->token_count);
+    }
+    id++;
+  }
+  inc_compare(ix, ref, nq, what);
+  kbc_index_free(ref);
+}
+
+/* The same, but through the file: an incrementally mutated index has to save,
+ * reopen, and answer identically from the reopened copy. This is also the
+ * only path that exercises an mmap'd index being mutated, which is what a
+ * restarted daemon does. */
+static void inc_check_roundtrip(kbc_index *ix, const inc_doc *m, size_t n,
+                                const char *dir, const char *what) {
+  char path[KBC_TEST_PATH_MAX + 32];
+  kbc_err err;
+  int k = snprintf(path, sizeof path, "%s/inc.idx", dir);
+  memset(&err, 0, sizeof err);
+  KBC_CHECK(k > 0 && (size_t)k < sizeof path);
+  inc_check(ix, m, n, what);
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_index_save(ix, path, &err));
+  kbc_err_reset(&err);
+  kbc_index *reopened = kbc_index_open(path, &err);
+  KBC_CHECK_MSG(reopened != NULL, "%s: reopen failed: %s", what, err.msg);
+  if (reopened != NULL) {
+    inc_check(reopened, m, n, what);
+    kbc_index_free(reopened);
+  }
+}
+
+/* Takes one document out of the model, the way a removal takes it out of the
+ * index. */
+static void inc_retire(inc_doc *m, size_t n, const char *path) {
+  size_t i;
+  for (i = 0; i < n; i++) {
+    if (strcmp(m[i].path, path) == 0) {
+      m[i].body = NULL;
+      return;
+    }
+  }
+  KBC_CHECK_MSG(false, "no document %s in the model", path);
+}
+
+/* Replaces or appends one document in `ix` through the incremental API, and
+ * updates the model to match. */
+static void inc_apply(kbc_index *ix, inc_doc *m, size_t *n, const char *path,
+                      const char *body, kbc_arena *a, kbc_err *err) {
+  kbc_tokens t;
+  size_t i;
+  uint32_t id = kbc_index_id_of(ix, "kb", path);
+  if (id == UINT32_MAX) {
+    /* Not in the index: it is a new document, and the model grows at the end
+     * because that is where a rebuild puts it. A path the model still carries
+     * from an earlier life (remove, then re-add) moves to the end with it —
+     * the index appends, so the model has to as well. */
+    for (i = 0; i < *n; i++) {
+      if (strcmp(m[i].path, path) == 0) {
+        if (i + 1 < *n) {
+          memmove(&m[i], &m[i + 1], (*n - i - 1) * sizeof m[0]);
+        }
+        (*n)--;
+        break;
+      }
+    }
+    m[*n].path = path;
+    m[*n].body = body;
+    (*n)++;
+  } else {
+    for (i = 0; i < *n; i++) {
+      if (strcmp(m[i].path, path) == 0) {
+        m[i].body = body;
+        break;
+      }
+    }
+  }
+  tokens_zero(&t);
+  KBC_CHECK_OK(tok(a, body, &t, err));
+  KBC_CHECK_OK(kbc_index_update_doc(ix, id, "kb", path, path, KBC_KIND_ARTIFACT,
+                                    &t, err));
+}
+
+/* The sequence the watcher produces over a session, each step checked against
+ * a full rebuild of the corpus as it stands at that moment: an edit that adds
+ * and drops terms, a brand new document, an edit that leaves a document with
+ * almost nothing, a removal in the middle, a removal followed by a re-add, and
+ * a document emptied of tokens. The scores must not merely be close to a
+ * rebuild's — they must be the same doubles, which is the only way a document
+ * that lost a term is distinguishable from one that kept a ghost of it. */
+KBC_TEST(incremental_mutations_match_a_full_rebuild) {
+  char dir[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(dir, sizeof dir);
+  kbc_index *ix = kbc_index_new();
+  kbc_arena *a = kbc_arena_new(1u << 18);
+  kbc_err err;
+  inc_doc m[16];
+  size_t n = 0;
+  memset(&err, 0, sizeof err);
+  memset(m, 0, sizeof m);
+
+  m[n++] = (inc_doc){"a.md", "alpha alpha beta one two"};
+  m[n++] = (inc_doc){"b.md", "beta gamma gamma three"};
+  m[n++] = (inc_doc){"c.md", "gamma delta four five"};
+  m[n++] = (inc_doc){"d.md", "delta epsilon six seven"};
+  m[n++] = (inc_doc){"e.md", "epsilon zeta eight nine"};
+  m[n++] = (inc_doc){"f.md", "theta iota kappa ten"};
+
+  KBC_CHECK_OK(kbc_index_begin_build(ix, &err));
+  {
+    uint32_t id = 0;
+    for (size_t i = 0; i < n; i++) {
+      KBC_CHECK_OK(add(ix, a, id, "kb", m[i].path, m[i].path, m[i].body, &err));
+      id++;
+    }
+  }
+  KBC_CHECK_OK(kbc_index_end_build(ix, &err));
+  inc_check(ix, m, n, "fresh build");
+
+  /* An edit: keeps one term, drops two, gains one. */
+  inc_apply(ix, m, &n, "a.md", "alpha zeta two", a, &err);
+  inc_check_roundtrip(ix, m, n, dir, "edit a.md");
+
+  /* A document the index has never seen. */
+  inc_apply(ix, m, &n, "g.md", "mu nu xi kappa", a, &err);
+  inc_check_roundtrip(ix, m, n, dir, "add g.md");
+
+  /* An edit that leaves almost nothing: every term this document used to have
+   * except one has to leave with it. */
+  inc_apply(ix, m, &n, "b.md", "beta", a, &err);
+  inc_check_roundtrip(ix, m, n, dir, "shrink b.md");
+
+  /* A removal in the middle of the corpus: the documents after it move down,
+   * and everything that moves must still score what it scored. */
+  {
+    uint32_t id = kbc_index_id_of(ix, "kb", "c.md");
+    KBC_CHECK(id != UINT32_MAX);
+    inc_retire(m, n, "c.md");
+    KBC_CHECK_OK(kbc_index_remove_doc(ix, id, &err));
+  }
+  inc_check_roundtrip(ix, m, n, dir, "remove c.md");
+
+  /* Remove then re-add: the re-added document is a new document at the end,
+   * which is exactly what a rebuild of that corpus would produce. */
+  {
+    uint32_t id = kbc_index_id_of(ix, "kb", "d.md");
+    KBC_CHECK(id != UINT32_MAX);
+    inc_retire(m, n, "d.md");
+    KBC_CHECK_OK(kbc_index_remove_doc(ix, id, &err));
+  }
+  inc_check_roundtrip(ix, m, n, dir, "remove d.md");
+  inc_apply(ix, m, &n, "d.md", "delta delta zeta eleven", a, &err);
+  inc_check_roundtrip(ix, m, n, dir, "re-add d.md");
+
+  /* A document with no tokens at all: recorded, addressable, matching
+   * nothing — and contributing no posting. */
+  inc_apply(ix, m, &n, "e.md", "", a, &err);
+  inc_check_roundtrip(ix, m, n, dir, "empty e.md");
+
+  /* Removing the LAST document renumbers nothing, so the vectors in the rest
+   * of the corpus keep their doc ids. */
+  {
+    uint32_t id = kbc_index_id_of(ix, "kb", "d.md");
+    KBC_CHECK(id != UINT32_MAX);
+    KBC_CHECK_EQ_INT(id, kbc_index_doc_count(ix) - 1);
+    inc_retire(m, n, "d.md");
+    KBC_CHECK_OK(kbc_index_remove_doc(ix, id, &err));
+  }
+  inc_check_roundtrip(ix, m, n, dir, "remove the last document");
+
+  /* And back again, so the corpus is not left in a state only removals
+   * produce. */
+  inc_apply(ix, m, &n, "d.md", "alpha beta", a, &err);
+  inc_check_roundtrip(ix, m, n, dir, "re-add d.md again");
+
+  kbc_arena_free(a);
+  kbc_index_free(ix);
+  kbc_test_rmrf(dir);
+}
+
+/* The counter case, separately: doc_count / term_count / avg_doclen after
+ * every single mutation, on a corpus where each document contributes a term
+ * nobody else has, so a term left behind by a removal is visible in
+ * term_count and not only in the scores. */
+KBC_TEST(incremental_counters_track_reality) {
+  kbc_index *ix = kbc_index_new();
+  kbc_arena *a = kbc_arena_new(1u << 16);
+  kbc_err err;
+  memset(&err, 0, sizeof err);
+  KBC_CHECK_OK(kbc_index_begin_build(ix, &err));
+  for (uint32_t d = 0; d < 5u; d++) {
+    char body[64], path[16];
+    (void)snprintf(body, sizeof body, "only%u common", d);
+    (void)snprintf(path, sizeof path, "p%u.md", d);
+    KBC_CHECK_OK(add(ix, a, d, "kb", path, path, body, &err));
+  }
+  KBC_CHECK_OK(kbc_index_end_build(ix, &err));
+  KBC_CHECK_EQ_INT(kbc_index_doc_count(ix), 5);
+  KBC_CHECK_EQ_INT(kbc_index_term_count(ix), 6); /* five unique + "common" */
+  KBC_CHECK_EQ_INT(kbc_index_posting_count(ix), 10);
+
+  /* A replace that drops the document's unique term entirely: the term goes
+   * with it, because a rebuild of this corpus would never have made it. */
+  {
+    kbc_tokens t;
+    tokens_zero(&t);
+    KBC_CHECK_OK(tok(a, "common common common", &t, &err));
+    KBC_CHECK_OK(kbc_index_update_doc(ix, 2, "kb", "p2.md", "p2",
+                                      KBC_KIND_ARTIFACT, &t, &err));
+  }
+  KBC_CHECK_EQ_INT(kbc_index_doc_count(ix), 5);
+  KBC_CHECK_EQ_INT(kbc_index_term_count(ix), 5);
+  KBC_CHECK_EQ_INT(kbc_index_posting_count(ix), 9);
+  /* Ten tokens over five documents, less the two the replaced document had,
+   * plus the three it has now. */
+  KBC_CHECK_EQ_DBL(kbc_index_avg_doclen(ix), 11.0 / 5.0, 0.0);
+
+  /* A removal takes one document, one posting per term it had, and the
+   * documents below it move down by one. The document that moved is still
+   * findable, under its new id: a stale id that resolved to the wrong document
+   * would be worse than no lookup at all. */
+  KBC_CHECK_OK(kbc_index_remove_doc(ix, 0, &err));
+  KBC_CHECK_EQ_INT(kbc_index_doc_count(ix), 4);
+  KBC_CHECK_EQ_INT(kbc_index_term_count(ix), 4);
+  KBC_CHECK_EQ_INT(kbc_index_posting_count(ix), 7);
+  KBC_CHECK_EQ_DBL(kbc_index_avg_doclen(ix), 9.0 / 4.0, 0.0);
+  KBC_CHECK_EQ_INT(kbc_index_id_of(ix, "kb", "p0.md"), UINT32_MAX);
+  KBC_CHECK_EQ_INT(kbc_index_id_of(ix, "kb", "p1.md"), 0);
+  KBC_CHECK_EQ_INT(kbc_index_id_of(ix, "kb", "p2.md"), 1);
+
+  /* An append restores the count, and the term it brings is new. */
+  {
+    kbc_tokens t;
+    tokens_zero(&t);
+    KBC_CHECK_OK(tok(a, "only0 common", &t, &err));
+    KBC_CHECK_OK(kbc_index_update_doc(ix, UINT32_MAX, "kb", "q.md", "q",
+                                      KBC_KIND_ARTIFACT, &t, &err));
+  }
+  KBC_CHECK_EQ_INT(kbc_index_doc_count(ix), 5);
+  KBC_CHECK_EQ_INT(kbc_index_term_count(ix), 5);
+  KBC_CHECK_EQ_INT(kbc_index_posting_count(ix), 9);
+
+  /* Refusals. An index mid-build is not a live index, a doc id that belongs to
+   * another document is a caller bug, and neither may half-apply. */
+  {
+    kbc_tokens t;
+    tokens_zero(&t);
+    KBC_CHECK_OK(tok(a, "zzz", &t, &err));
+    kbc_index *fresh = kbc_index_new();
+    kbc_err_reset(&err);
+    KBC_CHECK_OK(kbc_index_begin_build(fresh, &err));
+    KBC_CHECK_ERR(kbc_index_update_doc(fresh, UINT32_MAX, "kb", "a.md", "a",
+                                       KBC_KIND_ARTIFACT, &t, &err),
+                  KBC_ERR_INVALID);
+    KBC_CHECK_ERR_MSG(err);
+    KBC_CHECK_EQ_INT(kbc_index_doc_count(fresh), 0);
+    kbc_index_free(fresh);
+    kbc_err_reset(&err);
+    KBC_CHECK_ERR(kbc_index_update_doc(ix, 3, "kb", "not-this-one.md", "p",
+                                       KBC_KIND_ARTIFACT, &t, &err),
+                  KBC_ERR_INVALID);
+    KBC_CHECK_ERR_MSG(err);
+    KBC_CHECK_EQ_INT(kbc_index_doc_count(ix), 5);
+    kbc_err_reset(&err);
+    KBC_CHECK_ERR(kbc_index_remove_doc(ix, 99, &err), KBC_ERR_INVALID);
+    KBC_CHECK_ERR_MSG(err);
+    KBC_CHECK_EQ_INT(kbc_index_doc_count(ix), 5);
+    /* kbc_index_add_doc still refuses a live index: the build path has not
+     * quietly become a second way to write one. */
+    kbc_err_reset(&err);
+    KBC_CHECK_ERR(add(ix, a, 5, "kb", "r.md", "r", "common", &err),
+                  KBC_ERR_INVALID);
+  }
+
+  kbc_arena_free(a);
+  kbc_index_free(ix);
+}
+
+/* A live index that came from disk — which is what a restarted daemon holds —
+ * points its strings into the mapping, and a save writes the heap arenas. The
+ * first mutation has to reconcile the two without a rebuild, and the file it
+ * writes has to be one kbc_index_open accepts. */
+KBC_TEST(an_index_loaded_from_disk_can_be_updated_in_place) {
+  char dir[KBC_TEST_PATH_MAX];
+  char path[KBC_TEST_PATH_MAX + 32];
+  kbc_test_tmpdir(dir, sizeof dir);
+  (void)snprintf(path, sizeof path, "%s/loaded.idx", dir);
+  kbc_index *ix = kbc_index_new();
+  kbc_arena *a = kbc_arena_new(1u << 16);
+  kbc_err err;
+  inc_doc m[8];
+  size_t n = 0;
+  memset(&err, 0, sizeof err);
+  memset(m, 0, sizeof m);
+  m[n++] = (inc_doc){"a.md", "alpha beta gamma"};
+  m[n++] = (inc_doc){"b.md", "beta delta epsilon"};
+
+  KBC_CHECK_OK(kbc_index_begin_build(ix, &err));
+  for (uint32_t d = 0; d < n; d++) {
+    KBC_CHECK_OK(add(ix, a, d, "kb", m[d].path, m[d].path, m[d].body, &err));
+  }
+  KBC_CHECK_OK(kbc_index_end_build(ix, &err));
+  KBC_CHECK_OK(kbc_index_save(ix, path, &err));
+  kbc_index_free(ix);
+
+  kbc_err_reset(&err);
+  ix = kbc_index_open(path, &err);
+  KBC_CHECK_MSG(ix != NULL, "open: %s", err.msg);
+  if (ix == NULL) {
+    kbc_arena_free(a);
+    kbc_test_rmrf(dir);
+    return;
+ }
+  inc_check(ix, m, n, "loaded index");
+
+  /* Edit, add and remove, all on the mapped copy, then save it again. */
+  {
+    kbc_tokens t;
+    tokens_zero(&t);
+    KBC_CHECK_OK(tok(a, "alpha zeta", &t, &err));
+    KBC_CHECK_OK(kbc_index_update_doc(ix, kbc_index_id_of(ix, "kb", "a.md"),
+                                      "kb", "a.md", "a.md", KBC_KIND_ARTIFACT,
+                                      &t, &err));
+    m[0].body = "alpha zeta";
+  }
+  inc_check(ix, m, n, "loaded index, edited");
+
+  {
+    kbc_tokens t;
+    tokens_zero(&t);
+    KBC_CHECK_OK(tok(a, "theta iota", &t, &err));
+    KBC_CHECK_OK(kbc_index_update_doc(ix, UINT32_MAX, "kb", "c.md", "c.md",
+                                      KBC_KIND_ARTIFACT, &t, &err));
+    m[n++] = (inc_doc){"c.md", "theta iota"};
+  }
+  inc_check(ix, m, n, "loaded index, appended");
+
+  {
+    uint32_t id = kbc_index_id_of(ix, "kb", "b.md");
+    KBC_CHECK(id != UINT32_MAX);
+    KBC_CHECK_OK(kbc_index_remove_doc(ix, id, &err));
+    m[1].body = NULL;
+  }
+  inc_check(ix, m, n, "loaded index, removed");
+
+  /* The whole point: the file this daemon is about to serve is one a fresh
+   * open accepts, and the reopened copy scores the same. */
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_index_save(ix, path, &err));
+  kbc_err_reset(&err);
+  kbc_index *re = kbc_index_open(path, &err);
+  KBC_CHECK_MSG(re != NULL, "reopen after incremental mutation: %s", err.msg);
+  if (re != NULL) {
+    inc_check(re, m, n, "reopened after incremental mutation");
+    kbc_index_free(re);
+  }
+
+  kbc_index_free(ix);
+  kbc_arena_free(a);
+  kbc_test_rmrf(dir);
+}
+
+/* The rehash case that already bit the build, driven through the incremental
+ * path instead: enough distinct terms to force the term table to grow while
+ * an update is in flight, and a term that only the mutated document has. A
+ * grow MOVES every live term, so anything the update carries across it must be
+ * keyed on the term and not on where the term happened to sit — which is the
+ * bug the reference model below is built to catch. */
+KBC_TEST(incremental_update_survives_a_term_table_rehash) {
+  kbc_index *ix = kbc_index_new();
+  kbc_index *ref = kbc_index_new();
+  kbc_arena *a = kbc_arena_new(1u << 20);
+  kbc_err err;
+  char body[128];
+  double avgdl;
+  uint32_t d;
+  size_t i;
+  memset(&err, 0, sizeof err);
+  KBC_CHECK_OK(kbc_index_begin_build(ix, &err));
+  for (d = 0; d < GROW_DOCS; d++) {
+    char uniq[24];
+    (void)snprintf(uniq, sizeof uniq, "u%u", d);
+    (void)snprintf(body, sizeof body, "%s%s%s", uniq,
+                   (d % 5u == 0u) ? " shared" : "", (d % 7u == 0u) ? " mid" : "");
+    KBC_CHECK_OK(add(ix, a, d, "kb", "grow.md", "g", body, &err));
+  }
+  KBC_CHECK_OK(kbc_index_end_build(ix, &err));
+  /* The fixture is only meaningful if it really did force a grow. */
+  KBC_CHECK(kbc_index_term_count(ix) >= GROW_DOCS);
+
+  /* Replace one document with a body that introduces terms the table has
+   * never seen: the update grows the table mid-flight. The reference is the
+   * same corpus built whole, which is the only way the two doc ids can line
+   * up. */
+  {
+    kbc_tokens t;
+    tokens_zero(&t);
+    KBC_CHECK_OK(tok(a, "brandnew shared shared freshword", &t, &err));
+    KBC_CHECK_OK(kbc_index_update_doc(ix, 3, "kb", "grow.md", "g",
+                                      KBC_KIND_ARTIFACT, &t, &err));
+  }
+  kbc_index_free(ref);
+  ref = kbc_index_new();
+  KBC_CHECK_OK(kbc_index_begin_build(ref, &err));
+  for (d = 0; d < GROW_DOCS; d++) {
+    if (d == 3) {
+      KBC_CHECK_OK(add(ref, a, d, "kb", "grow.md", "g",
+                       "brandnew shared shared freshword", &err));
+      continue;
+    }
+    char uniq[24];
+    (void)snprintf(uniq, sizeof uniq, "u%u", d);
+    (void)snprintf(body, sizeof body, "%s%s%s", uniq,
+                   (d % 5u == 0u) ? " shared" : "", (d % 7u == 0u) ? " mid" : "");
+    KBC_CHECK_OK(add(ref, a, d, "kb", "grow.md", "g", body, &err));
+  }
+  KBC_CHECK_OK(kbc_index_end_build(ref, &err));
+
+  KBC_CHECK_EQ_INT(kbc_index_doc_count(ix), kbc_index_doc_count(ref));
+  KBC_CHECK_EQ_INT(kbc_index_term_count(ix), kbc_index_term_count(ref));
+  KBC_CHECK_EQ_INT(kbc_index_posting_count(ix), kbc_index_posting_count(ref));
+  avgdl = kbc_index_avg_doclen(ix);
+  KBC_CHECK(avgdl > 0.0);
+  for (i = 0; i < 2; i++) {
+    kbc_status sa, sb;
+    kbc_hits ha = query(ix, a, i == 0 ? "shared" : "brandnew", GROW_DOCS, &sa);
+    kbc_hits hb =
+        query(ref, a, i == 0 ? "shared" : "brandnew", GROW_DOCS, &sb);
+    size_t k;
+    KBC_CHECK_OK(sa);
+    KBC_CHECK_OK(sb);
+    KBC_CHECK_EQ_INT((int)ha.len, (int)hb.len);
+    for (k = 0; k < ha.len && k < hb.len; k++) {
+      KBC_CHECK_MSG(ha.items[k].doc == hb.items[k].doc,
+                    "query %zu hit %zu: doc %u vs %u", i, k, ha.items[k].doc,
+                    hb.items[k].doc);
+      KBC_CHECK_MSG(ha.items[k].score == hb.items[k].score,
+                    "query %zu doc %u: %.17g vs %.17g", i, ha.items[k].doc,
+                    ha.items[k].score, hb.items[k].score);
+      /* And against the hand-written model, which knows nothing about how the
+       * index is laid out. The two new terms exist only in document 3. */
+      if (i == 1) {
+        KBC_CHECK_EQ_INT(ha.items[k].doc == 3, 1);
+      }
+    }
+    kbc_hits_free(&ha);
+    kbc_hits_free(&hb);
+  }
+
+  kbc_index_free(ref);
+  kbc_arena_free(a);
+  kbc_index_free(ix);
+}
+
 /* ------------------------------------------------------------- main ------ */
 
 int main(void) {
   static const kbc_test_case cases[] = {
       {"end_build_survives_a_term_table_rehash",
        end_build_survives_a_term_table_rehash},
+      {"incremental_mutations_match_a_full_rebuild",
+       incremental_mutations_match_a_full_rebuild},
+      {"incremental_counters_track_reality",
+       incremental_counters_track_reality},
+      {"an_index_loaded_from_disk_can_be_updated_in_place",
+       an_index_loaded_from_disk_can_be_updated_in_place},
+      {"incremental_update_survives_a_term_table_rehash",
+       incremental_update_survives_a_term_table_rehash},
       {"bm25_score_matches_hand_computation", bm25_score_matches_hand_computation},
       {"bm25_returns_exactly_the_matching_docs",
        bm25_returns_exactly_the_matching_docs},

@@ -31,17 +31,32 @@ SAMPLES="$SANDBOX/samples"
 
 log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 
-# ---- fixed query set (terms sampled from the staged corpus) ---------------
-QUERIES=(
-  "daemon"
-  "artifact provenance"
-  "markdown tokenizer"
-  "lancedb embedding"
-  "benchmark milestone"
-  "watcher reconcile"
-  "throttle telemetry"
-  "onboarding backpressure"
-)
+# ---- query set -----------------------------------------------------------
+# QUERY_FILE drives both engines from ONE list, so the head-to-head is a real
+# A/B. Without it the two sides would each use their own queries and the
+# comparison would be weaker than it looks. One query per line; blank lines and
+# lines starting with # are ignored.
+if [ -n "${QUERY_FILE:-}" ]; then
+  [ -r "$QUERY_FILE" ] || { log "QUERY_FILE not readable: $QUERY_FILE"; exit 2; }
+  QUERIES=()
+  while IFS= read -r qline; do
+    case "$qline" in ''|\#*) continue ;; esac
+    QUERIES+=("$qline")
+  done < "$QUERY_FILE"
+  [ ${#QUERIES[@]} -gt 0 ] || { log "QUERY_FILE held no queries: $QUERY_FILE"; exit 2; }
+  log "query set: QUERY_FILE=$QUERY_FILE (${#QUERIES[@]} queries)"
+else
+  QUERIES=(
+    "daemon"
+    "artifact provenance"
+    "markdown tokenizer"
+    "lancedb embedding"
+    "benchmark milestone"
+    "watcher reconcile"
+    "throttle telemetry"
+    "onboarding backpressure"
+  )
+fi
 NQUERIES=${#QUERIES[@]}
 
 DAEMON_PID=""

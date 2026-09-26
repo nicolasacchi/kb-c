@@ -52,6 +52,21 @@ kbc_status kbc_store_count_artifacts(kbc_store *s, const char *corpus,
                                      int64_t *out, kbc_err *err);
 kbc_status kbc_store_list_corpora(kbc_store *s, kbc_strlist *out, kbc_err *err);
 kbc_status kbc_store_total_bytes(kbc_store *s, int64_t *out, kbc_err *err);
+/* Resolves `n` (corpus, path) pairs in ONE round trip, writing the result to
+ * `*out`: a KBC_OWN array of EXACTLY n slots, parallel to the input. Each
+ * non-NULL slot points at a KBC_ARENA kbc_artifact in `a`; a NULL slot means
+ * that pair has no row. The caller free()s the array itself; the artifacts
+ * belong to the arena.
+ *
+ * The parallel shape is deliberate: a search resolving its top-k hits must be
+ * able to ask for all of them at once instead of taking the store's lock once
+ * per hit, and it must still be able to tell WHICH hit did not resolve. Pairs
+ * are de-duplicated internally, so a result set naming the same document twice
+ * fetches it once. n == 0 is KBC_OK with *out set to NULL. */
+kbc_status kbc_store_get_artifacts_by_path(kbc_store *s, kbc_arena *a,
+                                           const char *const *corpora,
+                                           const char *const *paths, size_t n,
+                                           kbc_artifact ***out, kbc_err *err);
 
 /* ---------------------------------------------------------------- chunks -- */
 

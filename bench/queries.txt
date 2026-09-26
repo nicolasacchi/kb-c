@@ -1,0 +1,21 @@
+# The one query set both engines are measured on.
+#
+# Loaded by bench/bench-rust.sh via QUERY_FILE, and by bench/bench-kbc.sh.
+# Changing this file changes both sides' numbers, so it only changes when both
+# engines are re-measured.
+#
+# Every term here is drawn from documents that exist in the staged corpus
+# (bench/data/corpus, generated from the kb checkout's own Markdown and HTML),
+# so both engines have something real to match against. Mix of one-word and
+# multi-word queries, and a mix of head terms and rarer terms, because a query
+# set of only rare terms flatters IDF behaviour and one of only common terms
+# flatters posting-list length.
+
+inverted index
+tokenizer embeddings
+rust port performance
+sqlite migrations
+http daemon epoll
+watcher debounce inotify
+sanitizer memory safety
+vector search fusion

@@ -377,6 +377,145 @@ KBC_TEST(rewriting_a_file_indexes_the_new_words) {
   fx_teardown(&f);
 }
 
+/* Every row a search returns, by path, so a test can ask what ONE document
+ * scores — not just which document came first. */
+typedef struct {
+  char path[64];
+  double score;
+} score_row;
+
+static size_t scores_by_path(kbc_app *app, const char *q, score_row *out,
+                             size_t cap) {
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) return 0;
+  kbc_query query;
+  memset(&query, 0, sizeof query);
+  query.q = q;
+  query.kind = KBC_KIND__COUNT;
+  query.mode = KBC_MODE_KEYWORD;
+  query.limit = 20;
+  query.bm25_k1 = 1.2;
+  query.bm25_b = 0.75;
+  kbc_search_result res;
+  memset(&res, 0, sizeof res);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_status s = kbc_app_search(app, a, &query, &res, &err);
+  KBC_CHECK_OK(s);
+  size_t n = 0;
+  for (size_t i = 0; s == KBC_OK && i < res.len && i < cap; i++) {
+    snprintf(out[n].path, sizeof out[n].path, "%s",
+             res.rows[i].path ? res.rows[i].path : "");
+    out[n].score = res.rows[i].keyword_score;
+    n++;
+  }
+  kbc_arena_free(a);
+  return n;
+}
+
+/* The product guarantee the watcher depends on: saving ONE file updates that
+ * file and leaves every other document's postings, and therefore its score,
+ * exactly as they were. A full rebuild satisfies this too, so the assertion
+ * that matters is the one that would catch a rebuild that quietly did NOT
+ * cover the corpus — and the ones that would catch an incremental update that
+ * moved a neighbour's postings. Run twice: over an index this process built,
+ * and over one it opened from disk, which is the state a restarted daemon is
+ * in when the first file is saved.
+ *
+ * The corpus here carries a term ("quorum") that all three untouched documents
+ * share, so a query for it scores every one of them, and the scores can be
+ * compared before and after. */
+KBC_TEST(reindexing_one_file_leaves_the_other_documents_alone) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, "q1.md");
+  kbc_test_write_file(p, "# Quorum One\n\nThe quorum sits.\n");
+  join(p, sizeof p, f.corpus_a, "q2.md");
+  kbc_test_write_file(p, "# Quorum Two\n\nThe quorum stands.\n");
+  join(p, sizeof p, f.corpus_a, "q3.md");
+  kbc_test_write_file(p, "# Quorum Three\n\nThe quorum waits.\n");
+  join(p, sizeof p, f.corpus_a, "t.md");
+  kbc_test_write_file(p, "# Touched\n\nThe quorum doc mentions beforeword.\n");
+
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  score_row before[8], after[8];
+  size_t nb = scores_by_path(f.app, "quorum", before, 8);
+  KBC_CHECK_EQ_INT(nb, 4);
+  KBC_CHECK_EQ_INT(scores_by_path(f.app, "beforeword", after, 8), 1);
+  KBC_CHECK_EQ_STR(after[0].path, "t.md");
+
+  /* The watcher's path: one file changed, nothing else. */
+  join(p, sizeof p, f.corpus_a, "t.md");
+  kbc_test_write_file(p, "# Touched\n\nThe quorum doc mentions afterword now.\n");
+  KBC_CHECK_OK(kbc_app_reindex_file(f.app, CORPUS_A, "t.md", &err));
+
+  size_t na = scores_by_path(f.app, "quorum", after, 8);
+  KBC_CHECK_EQ_INT(na, nb);
+  for (size_t i = 0; i < na && i < nb; i++) {
+    KBC_CHECK_MSG(strcmp(after[i].path, before[i].path) == 0,
+                  "row %zu is %s, it was %s", i, after[i].path, before[i].path);
+    /* Exactly equal, not close: a neighbour's posting that moved would change
+     * its tf or its length norm, and either shows up here. */
+    KBC_CHECK_MSG(after[i].score == before[i].score,
+                  "%s scored %.17g after touching t.md, it scored %.17g before",
+                  after[i].path, after[i].score, before[i].score);
+  }
+  /* And the touched document is the only one whose keywords changed. */
+  KBC_CHECK_EQ_INT(scores_by_path(f.app, "beforeword", after, 8), 0);
+  KBC_CHECK_EQ_INT(scores_by_path(f.app, "afterword", after, 8), 1);
+  KBC_CHECK_EQ_STR(after[0].path, "t.md");
+  kbc_app_stats st;
+  KBC_CHECK_OK(kbc_app_stats_get(f.app, &st, &err));
+  KBC_CHECK_EQ_INT(st.index_docs, 7);
+  KBC_CHECK_EQ_INT(store_count(f.cfg), 7);
+
+  /* Now the same thing over an index this process did not build: reopen, and
+   * the live index is whatever kbc_index_open produced. */
+  kbc_app_close(f.app);
+  f.app = NULL;
+  f.app = kbc_app_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(f.app);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  nb = scores_by_path(f.app, "quorum", before, 8);
+  KBC_CHECK_EQ_INT(nb, 4);
+  /* The replacement body has the same TOKEN COUNT as the one it replaces, and
+   * that is load-bearing: BM25's length norm divides by the corpus average, so
+   * an edit that changes a document's token count moves every other document's
+   * score too, correctly. Holding the count still is what isolates "the other
+   * documents' postings did not move" from "the average moved". ("now" is a
+   * stopword, so it contributes nothing either way.) */
+  join(p, sizeof p, f.corpus_a, "t.md");
+  kbc_test_write_file(p, "# Touched\n\nThe quorum doc mentions thirdword now.\n");
+  KBC_CHECK_OK(kbc_app_reindex_file(f.app, CORPUS_A, "t.md", &err));
+  na = scores_by_path(f.app, "quorum", after, 8);
+  KBC_CHECK_EQ_INT(na, nb);
+  for (size_t i = 0; i < na && i < nb; i++) {
+    KBC_CHECK_MSG(strcmp(after[i].path, before[i].path) == 0,
+                  "after restart, row %zu is %s, it was %s", i, after[i].path,
+                  before[i].path);
+    KBC_CHECK_MSG(after[i].score == before[i].score,
+                  "after restart, %s scored %.17g, it scored %.17g before the "
+ "file was touched",
+                  after[i].path, after[i].score, before[i].score);
+  }
+  KBC_CHECK_EQ_INT(scores_by_path(f.app, "afterword", after, 8), 0);
+  KBC_CHECK_EQ_INT(scores_by_path(f.app, "thirdword", after, 8), 1);
+
+  fx_teardown(&f);
+}
+
 KBC_TEST(deleting_a_file_removes_it_from_index_and_store) {
   fixture f;
   fx_setup(&f, false);
@@ -718,8 +857,12 @@ KBC_TEST(hybrid_search_degrades_to_keyword_without_an_embedder) {
       KBC_CHECK_MSG(kbc_app_search(f.app, a, &q, &r, &le) == KBC_OK,
                     "mode %s failed: %s", kbc_search_mode_str((kbc_search_mode)mode),
                     le.msg);
-      KBC_CHECK_MSG(r.degraded, "mode %s did not report degradation",
-                    kbc_search_mode_str((kbc_search_mode)mode));
+      /* Degraded means a lane the CALLER asked for could not run. A keyword
+       * query never asked for the vector lane, so losing it costs it
+       * nothing and must not show up in /api/stats as a degraded search. */
+      KBC_CHECK_MSG(r.degraded == ((kbc_search_mode)mode != KBC_MODE_KEYWORD),
+                    "mode %s reported degraded=%d",
+                    kbc_search_mode_str((kbc_search_mode)mode), r.degraded);
       if ((kbc_search_mode)mode == KBC_MODE_SEMANTIC) {
         /* No embedder means no vector lane, and a semantic search that invents
          * results would be worse than an empty answer. */
@@ -744,6 +887,8 @@ int main(void) {
        unchanged_files_are_skipped_by_mtime_and_size},
       {"rewriting_a_file_indexes_the_new_words",
        rewriting_a_file_indexes_the_new_words},
+      {"reindexing_one_file_leaves_the_other_documents_alone",
+       reindexing_one_file_leaves_the_other_documents_alone},
       {"deleting_a_file_removes_it_from_index_and_store",
        deleting_a_file_removes_it_from_index_and_store},
       {"get_artifact_round_trips_and_rejects_unknown_ids",

@@ -1195,6 +1195,791 @@ kbc_status kbc_index_end_build(kbc_index *ix, kbc_err *err) {
   return KBC_OK;
 }
 
+/* --------------------------------------------------------- incremental --
+ * A live index is mutated in place, one document at a time, by the two entry
+ * points at the end of this section. Everything here exists to keep the one
+ * layout claim end_build made — every term owns one contiguous, doc_id
+ * ascending run of the global postings array — true AFTER a mutation, so the
+ * query path, the on-disk format and kbc_index_open are all unchanged by
+ * incremental work. The read path gains nothing and loses nothing: a query
+ * still scans one array with no indirection.
+ *
+ * The rewrite is a single O(postings) pass rather than one memmove per
+ * touched term. In one global array an insertion into the middle of a term's
+ * run shifts every LATER term's offset, so the per-term operations are not
+ * independent; doing them one at a time is O(touched_terms * postings). Doing
+ * them together — lay the runs out, merge each run's old postings with that
+ * run's new ones — is O(postings) once, and the pass is a sequential read
+ * plus a sequential write over memory the daemon is going to touch anyway.
+ */
+
+/* One posting an update asks for. The SLOT, not the term id: every term is
+ * resolved before the rewrite starts and nothing rehashes the table after
+ * that, so a slot index names one term for the whole call. An id would not:
+ * an index loaded from disk carries none until it is rebuilt in place. */
+typedef struct {
+  size_t slot;
+  uint32_t doc;
+  uint32_t tf;
+} kbc_add;
+
+/* The update's add list keyed on slot, so the rewrite can ask "does this term
+ * get a posting?" in O(1) per posting instead of scanning the list per
+ * posting. Open addressed, SLOT_EMPTY when free. */
+typedef struct {
+  uint32_t *slot;
+  uint32_t *val; /* index into the caller's adds[] */
+  size_t cap;
+} kbc_addmap;
+
+static void addmap_free(kbc_addmap *m) {
+  free(m->slot);
+  free(m->val);
+  m->slot = NULL;
+  m->val = NULL;
+  m->cap = 0;
+}
+
+static kbc_status addmap_build(kbc_addmap *m, const kbc_add *adds, size_t n) {
+  size_t i;
+  memset(m, 0, sizeof *m);
+  m->cap = round_up_pow2(n * 2 + 8);
+  if (m->cap == 0) {
+    return KBC_ERR_NOMEM;
+  }
+  m->slot = (uint32_t *)malloc(m->cap * sizeof(uint32_t));
+  m->val = (uint32_t *)malloc(m->cap * sizeof(uint32_t));
+  if (!m->slot || !m->val) {
+    addmap_free(m);
+    return KBC_ERR_NOMEM;
+  }
+  for (i = 0; i < m->cap; i++) {
+    m->slot[i] = SLOT_EMPTY;
+  }
+  for (i = 0; i < n; i++) {
+    size_t j = adds[i].slot & (m->cap - 1);
+    while (m->slot[j] != SLOT_EMPTY) {
+      j = (j + 1) & (m->cap - 1);
+    }
+    m->slot[j] = (uint32_t)adds[i].slot;
+    m->val[j] = (uint32_t)i;
+  }
+  return KBC_OK;
+}
+
+/* The index of this slot's add, if it has one. A term can carry at most one:
+ * the update resolves the document's DISTINCT terms, so a repeated term is
+ * already folded into one tf. */
+static bool addmap_get(const kbc_addmap *m, size_t slot, size_t *out) {
+  size_t j;
+  if (m->cap == 0) {
+    return false;
+  }
+  j = slot & (m->cap - 1);
+  while (m->slot[j] != SLOT_EMPTY) {
+    if (m->slot[j] == (uint32_t)slot) {
+      *out = m->val[j];
+      return true;
+    }
+    j = (j + 1) & (m->cap - 1);
+  }
+  return false;
+}
+
+/* Whether this term's run contains `doc`. This is the reverse direction — the
+ * terms a document contributed to — answered by a binary search per term
+ * rather than a doc -> terms side index. The run is ascending by
+ * construction, so a removal costs O(terms * log df) and the index carries no
+ * per-document reverse structure that the read path would have to keep alive.
+ */
+static bool run_has_doc(const kbc_index *ix, const kbc_term_slot *s,
+                        uint32_t doc) {
+  size_t lo = 0, hi = s->post_len;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    uint32_t d = ix->post[s->post_off + mid].doc;
+    if (d == doc) {
+      return true;
+    }
+    if (d < doc) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return false;
+}
+
+/* The one mutation primitive. Rewrites ix->post so that afterwards:
+ *   - every live term owns one contiguous, doc_id-ascending run;
+ *   - no posting names `drop` (when has_drop);
+ *   - every doc id >= `shift` has moved down by one (when has_shift), which is
+ *     the compaction that keeps doc ids dense after a removal;
+ *   - each entry of `adds` is present exactly once, at its ascending position.
+ * An update passes drop = the document it is replacing, so the terms the
+ * document no longer has lose their posting here — the ghost-posting case —
+ * and the terms it still has get the new tf in the same pass.
+ *
+ * Failure-atomic: the new array is allocated and filled completely before the
+ * swap, so a NOMEM (or the invariant check below) leaves every term slot, the
+ * doc table and the totals exactly as they were.
+ */
+static kbc_status postings_rewrite(kbc_index *ix, bool has_drop, uint32_t drop,
+                                   bool has_shift, uint32_t shift,
+                                   const kbc_add *adds, size_t nadds,
+                                   const char *who, kbc_err *err) {
+  kbc_addmap m;
+  kbc_posting *np = NULL;
+  uint32_t *nl = NULL, *noff = NULL, *cur = NULL;
+  size_t i, run = 0, total = 0;
+  kbc_status st = KBC_OK;
+
+  if (nadds > 0 && ix->term_cap == 0) {
+    return kbc_err_set(err, KBC_ERR_INTERNAL,
+                       "%s: %zu postings to add but the term table is empty",
+                       who, nadds);
+  }
+  if (addmap_build(&m, adds, nadds) != KBC_OK) {
+    return kbc_err_set(err, KBC_ERR_NOMEM, "%s: add map for %zu terms", who,
+                       nadds);
+  }
+  if (ix->term_cap > 0) {
+    nl = (uint32_t *)malloc(ix->term_cap * sizeof(uint32_t));
+    noff = (uint32_t *)malloc(ix->term_cap * sizeof(uint32_t));
+    cur = (uint32_t *)malloc(ix->term_cap * sizeof(uint32_t));
+  }
+  if ((ix->term_cap > 0 && (!nl || !noff || !cur))) {
+    st = KBC_ERR_NOMEM;
+    goto done;
+  }
+
+  /* Pass 1: every term's new run length, so the runs can be laid out. */
+  for (i = 0; i < ix->term_cap; i++) {
+    const kbc_term_slot *s = &ix->terms[i];
+    uint32_t len = 0;
+    size_t k;
+    if (s->term_off == SLOT_EMPTY || s->term_off == SLOT_TOMB) {
+      continue;
+    }
+    len = s->post_len;
+    if (has_drop && run_has_doc(ix, s, drop)) {
+      len--;
+    }
+    if (addmap_get(&m, i, &k)) {
+      len++;
+    }
+    nl[i] = len;
+    total += len;
+  }
+  if (total > (size_t)UINT32_MAX) {
+    st = kbc_err_set(err, KBC_ERR_INVALID,
+                     "%s: the index would hold %zu postings, the format cannot "
+                     "hold more",
+                     who, total);
+    goto done;
+  }
+  if (total > 0) {
+    np = (kbc_posting *)malloc(total * sizeof(*np));
+    if (!np) {
+      st = kbc_err_set(err, KBC_ERR_NOMEM, "%s: %zu postings", who, total);
+      goto done;
+    }
+  }
+  for (i = 0; i < ix->term_cap; i++) {
+    if (ix->terms[i].term_off == SLOT_EMPTY || ix->terms[i].term_off == SLOT_TOMB) {
+      continue;
+    }
+    noff[i] = (uint32_t)run;
+    cur[i] = (uint32_t)run;
+    run += nl[i];
+  }
+
+  /* Pass 2: merge, in slot order, so the runs stay contiguous. The slot's old
+   * post_off/post_len are still intact here — the new ones are only committed
+   * after the whole array is written. */
+  for (i = 0; i < ix->term_cap; i++) {
+    const kbc_term_slot *s = &ix->terms[i];
+    size_t k, kk = 0;
+    bool pending;
+    if (s->term_off == SLOT_EMPTY || s->term_off == SLOT_TOMB) {
+      continue;
+    }
+    pending = addmap_get(&m, i, &kk);
+    for (k = 0; k < s->post_len; k++) {
+      kbc_posting p = ix->post[s->post_off + k];
+      uint32_t d;
+      if (has_drop && p.doc == drop) {
+        if (pending) {
+          np[cur[i]].doc = adds[kk].doc;
+          np[cur[i]].tf = adds[kk].tf;
+          cur[i]++;
+          pending = false;
+        }
+        continue; /* this document's previous posting for this term */
+      }
+      d = (has_shift && p.doc >= shift) ? p.doc - 1 : p.doc;
+      if (pending && adds[kk].doc <= d) {
+        np[cur[i]].doc = adds[kk].doc;
+        np[cur[i]].tf = adds[kk].tf;
+        cur[i]++;
+        pending = false;
+      }
+      if (d >= ix->doc_count) {
+        continue; /* defensive: no posting may name a document that is gone */
+      }
+      np[cur[i]].doc = d;
+      np[cur[i]].tf = p.tf;
+      cur[i]++;
+    }
+    if (pending) {
+      np[cur[i]].doc = adds[kk].doc;
+      np[cur[i]].tf = adds[kk].tf;
+      cur[i]++;
+    }
+    /* The length pass and the merge must agree, or the runs would overlap. */
+    if (cur[i] != noff[i] + nl[i]) {
+      st = kbc_err_set(err, KBC_ERR_INTERNAL,
+                       "%s: term slot %zu wrote %u postings, planned %u", who, i,
+                       cur[i] - noff[i], nl[i]);
+      goto done;
+    }
+  }
+
+  /* The invariant the format and the query scan both depend on, re-established
+   * rather than assumed: one ascending run per term. A violation here means a
+   * mutation left a posting behind or inserted one twice, and publishing that
+   * would silently mis-score the whole corpus — so it is an error, not a
+   * warning. */
+  for (i = 0; i < ix->term_cap; i++) {
+    const kbc_term_slot *s = &ix->terms[i];
+    size_t j;
+    if (s->term_off == SLOT_EMPTY || s->term_off == SLOT_TOMB) {
+      continue;
+    }
+    for (j = 1; j < nl[i]; j++) {
+      if (np[noff[i] + j - 1].doc >= np[noff[i] + j].doc) {
+        const char *t = term_ptr(ix, s->term_off);
+        st = kbc_err_set(err, KBC_ERR_INTERNAL,
+                         "%s: postings for \"%.*s\" are not doc_id-ascending at "
+                         "%zu",
+                         who, (int)s->term_len, t ? t : "", j);
+        goto done;
+      }
+    }
+  }
+
+  /* Commit. */
+  for (i = 0; i < ix->term_cap; i++) {
+    kbc_term_slot *s = &ix->terms[i];
+    if (s->term_off == SLOT_EMPTY || s->term_off == SLOT_TOMB) {
+      continue;
+    }
+    s->post_off = noff[i];
+    s->post_len = nl[i];
+  }
+  free(ix->post);
+  ix->post = np;
+  ix->post_len = total;
+  ix->post_cap = total;
+  np = NULL;
+
+done:
+  free(np);
+  free(nl);
+  free(noff);
+  free(cur);
+  addmap_free(&m);
+  return st;
+}
+
+/* A term whose last posting went away is not a term: a full rebuild of the
+ * same corpus would never have created it, so leaving it would make
+ * kbc_index_term_count (and every prefix expansion) disagree with a rebuild. */
+static void prune_empty_terms(kbc_index *ix) {
+  size_t i;
+  for (i = 0; i < ix->term_cap; i++) {
+    const kbc_term_slot *s = &ix->terms[i];
+    if (s->term_off == SLOT_EMPTY || s->term_off == SLOT_TOMB) {
+      continue;
+    }
+    if (s->post_len == 0) {
+      term_remove_at(ix, i);
+    }
+  }
+}
+
+/* An index opened from disk points its TERM strings into the mapping, and
+ * kbc_index_save writes the heap arenas. A mutation is the first thing that
+ * needs to append a term to that arena, so the first one copies it onto the
+ * heap. The copy is a memcpy of one contiguous region, not a rebuild: the
+ * bytes a later save writes are byte-identical to the bytes that were read.
+ * (The doc arena never needs this — every mutation rebuilds it whole, see
+ * doctab_build.) */
+static kbc_status materialize_term_arena(kbc_index *ix) {
+  uint32_t off;
+  size_t declared;
+  if (ix->tar_base == NULL) {
+    return KBC_OK;
+  }
+  /* tar.total is the LENGTH THE FILE DECLARED, and the heap arena behind it is
+   * still empty: the copy is what fills it, so the counter has to start at
+   * zero or every byte is counted twice and the next save writes a shorter
+   * file than its own header describes. */
+  declared = ix->tar.total;
+  ix->tar.total = 0;
+  if (sar_put(&ix->tar, ix->tar_base, declared, &off) != KBC_OK) {
+    ix->tar.total = declared; /* nothing was allocated: unchanged */
+    return KBC_ERR_NOMEM;
+  }
+  ix->tar_base = NULL;
+  return KBC_OK;
+}
+
+/* The document table a mutation is about to install, and the string arena that
+ * goes with it. Built whole, off to the side, and only swapped in once every
+ * fallible step has succeeded.
+ *
+ * The rebuild is not tidiness. The on-disk doc table carries string LENGTHS
+ * only, and the loader rebuilds every pointer by walking the doc arena in
+ * doc-id order, so the arena has to BE in doc-id order with nothing dead
+ * between one document's three strings and the next. A replace that appended
+ * its new strings would leave them after the documents that follow it, and
+ * the file would decode into the wrong documents. Relaying the arena is a
+ * memcpy of the live strings — the same order of cost as the postings rewrite
+ * that has already run by the time this is called. */
+typedef struct {
+  kbc_doc_meta *docs;
+  uint32_t count;
+  kbc_arena_str dar;
+  kbc_doc_slot *dhash;
+  size_t dhash_cap;
+} kbc_doctab;
+
+static void doctab_free(kbc_doctab *dt) {
+  free(dt->docs);
+  free(dt->dhash);
+  sar_free(&dt->dar);
+  dt->docs = NULL;
+  dt->dhash = NULL;
+  dt->count = 0;
+}
+
+/* Copies one string into the flat block and hands back where it landed. The
+ * arena is exactly sized, so there is no block to roll over to. */
+static const char *doctab_put(kbc_arena_str *ar, const char *s) {
+  kbc_arena_block *b = &ar->blocks[0];
+  size_t n = strlen(s) + 1;
+  char *p = b->p + b->used;
+  memcpy(p, s, n);
+  b->used += n;
+  ar->total += n;
+  return p;
+}
+
+/* Which document of the CURRENT table supplies output row `i`: itself, unless
+ * the row is the caller's new document, or the removal has already shifted the
+ * ones above the hole down by one. NULL means "the caller's values". */
+static const kbc_doc_meta *doctab_source(const kbc_index *ix, bool remove,
+                                         uint32_t slot, size_t i) {
+  if (remove) {
+    return &ix->docs[i < slot ? i : i + 1]; /* the hole closes up */
+  }
+  if (slot == UINT32_MAX) {
+    /* An append: the table is unchanged and the new document is the row after
+     * the last one. */
+    return (i < ix->doc_count) ? &ix->docs[i] : NULL;
+  }
+  if (i < (size_t)slot) {
+    return &ix->docs[i];
+  }
+  if (i == (size_t)slot) {
+    return NULL; /* the caller's document */
+  }
+  return &ix->docs[i]; /* a replace moves nothing */
+}
+
+/* The prospective table. `remove` drops slot `slot` and slides everything above
+ * it down one; otherwise `slot` is the document the caller's corpus / path /
+ * title / kind / token_count replace (UINT32_MAX to append one). Either way the
+ * result is a whole table, a whole arena and a whole doc hash that agree with
+ * each other, built off to the side. */
+static kbc_status doctab_build(kbc_doctab *out, const kbc_index *ix,
+                               bool remove, uint32_t slot, const char *corpus,
+                               const char *path, const char *title,
+                               kbc_kind kind, uint32_t token_count,
+                               const char *who, kbc_err *err) {
+  /* A removal loses one, an append gains one, and a replace changes neither:
+   * the document is being rewritten where it stands. */
+  uint32_t n = remove ? ix->doc_count - 1u
+                      : ix->doc_count + ((slot == UINT32_MAX) ? 1u : 0u);
+  size_t i, total = 0;
+  kbc_doc_meta *nd;
+  memset(out, 0, sizeof *out);
+  for (i = 0; i < n; i++) {
+    const kbc_doc_meta *d = doctab_source(ix, remove, slot, i);
+    const char *c = d ? d->corpus : corpus;
+    const char *p = d ? d->path : path;
+    const char *t = d ? (d->title ? d->title : "") : (title ? title : "");
+    size_t need = strlen(c) + strlen(p) + strlen(t) + 3;
+    if (total > SIZE_MAX - need) {
+      return kbc_err_set(err, KBC_ERR_NOMEM, "%s: doc strings overflow", who);
+    }
+    total += need;
+  }
+  nd = (kbc_doc_meta *)malloc((n ? n : 1) * sizeof(*nd));
+  out->dar.blocks = (kbc_arena_block *)malloc(sizeof(kbc_arena_block));
+  out->dar.cap_blocks = 1;
+  out->dar.blocks[0].p = (char *)malloc(total ? total : 1);
+  if (!nd || !out->dar.blocks || !out->dar.blocks[0].p) {
+    free(nd);
+    free(out->dar.blocks);
+    out->dar.blocks = NULL;
+    out->dar.cap_blocks = 0;
+    return kbc_err_set(err, KBC_ERR_NOMEM, "%s: doc table of %u documents "
+                       "(%zu bytes of strings)",
+                       who, n, total);
+  }
+  out->dar.blocks[0].size = total ? total : 1;
+  out->dar.blocks[0].used = 0;
+  out->dar.blocks[0].base = 0;
+  out->dar.nblocks = 1;
+  for (i = 0; i < n; i++) {
+    const kbc_doc_meta *d = doctab_source(ix, remove, slot, i);
+    nd[i].corpus = doctab_put(&out->dar, d ? d->corpus : corpus);
+    nd[i].path = doctab_put(&out->dar, d ? d->path : path);
+    nd[i].title = doctab_put(&out->dar, d ? (d->title ? d->title : "")
+                                           : (title ? title : ""));
+    nd[i].kind = (uint8_t)(d ? d->kind : kind);
+    nd[i].token_count = (d ? d->token_count : token_count);
+  }
+  out->docs = nd;
+  out->count = n;
+  /* The doc hash is rebuilt with the table rather than patched. A removal
+   * renumbers the documents above it and a dhash slot names a doc id, so a
+   * slot left pointing at the old id would resolve — after the renumbering —
+   * to a DIFFERENT document, and a slot pointing past the end is a file
+   * kbc_index_open refuses outright. Rebuilding is O(documents) off to the
+   * side, and it is also what keeps dead slots from accumulating over the life
+   * of a daemon that churns through a corpus. */
+  out->dhash_cap = round_up_pow2((size_t)n * 2 + 16);
+  if (out->dhash_cap < 256) {
+    out->dhash_cap = 256;
+  }
+  if (out->dhash_cap == 0) {
+    doctab_free(out);
+    return kbc_err_set(err, KBC_ERR_NOMEM, "%s: doc hash capacity overflow",
+                       who);
+  }
+  out->dhash = (kbc_doc_slot *)malloc(out->dhash_cap * sizeof(*out->dhash));
+  if (!out->dhash) {
+    doctab_free(out);
+    return kbc_err_set(err, KBC_ERR_NOMEM, "%s: doc hash of %zu slots", who,
+                       out->dhash_cap);
+  }
+  for (i = 0; i < out->dhash_cap; i++) {
+    out->dhash[i].doc = SLOT_EMPTY;
+  }
+  for (i = 0; i < n; i++) {
+    uint64_t h = hash_corpus_path(nd[i].corpus, nd[i].path);
+    size_t j = (size_t)(h & (uint64_t)(out->dhash_cap - 1));
+    while (out->dhash[j].doc != SLOT_EMPTY) {
+      j = (j + 1) & (out->dhash_cap - 1);
+    }
+    out->dhash[j].hash = h;
+    out->dhash[j].doc = (uint32_t)i;
+  }
+  return KBC_OK;
+}
+
+/* Every check kbc_index_add_doc makes about its arguments, because an update
+ * writes the same fields into the same structures. */
+static kbc_status update_validate(const kbc_index *ix, uint32_t doc_id,
+                                 const char *corpus, const char *path,
+                                 kbc_kind kind, const kbc_tokens *toks,
+                                 kbc_err *err) {
+  static const kbc_tokens empty = {NULL, 0, 0};
+  const kbc_tokens *t = toks ? toks : &empty;
+  if (!ix) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "kbc_index_update_doc: ix is NULL");
+  }
+  if (!corpus || !path) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "kbc_index_update_doc(doc %u): corpus or path is NULL",
+                       doc_id);
+  }
+  if (!ix->sealed) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "kbc_index_update_doc(doc %u): the index is not sealed, "
+                       "finish the build first",
+                       doc_id);
+  }
+  if (doc_id != UINT32_MAX) {
+    const kbc_doc_meta *d;
+    if (doc_id >= ix->doc_count) {
+      return kbc_err_set(err, KBC_ERR_INVALID,
+                         "kbc_index_update_doc(doc %u): the index holds %u "
+                         "documents",
+                         doc_id, ix->doc_count);
+    }
+    d = &ix->docs[doc_id];
+    if (strcmp(d->corpus, corpus) != 0 || strcmp(d->path, path) != 0) {
+      return kbc_err_set(err, KBC_ERR_INVALID,
+                         "kbc_index_update_doc(doc %u): that id is %s/%s, not "
+                         "%s/%s",
+                         doc_id, d->corpus, d->path, corpus, path);
+    }
+  }
+  if ((uint32_t)kind >= (uint32_t)KBC_KIND__COUNT) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "kbc_index_update_doc(doc %u): kind %d is not a kbc_kind",
+                       doc_id, (int)kind);
+  }
+  if (strlen(corpus) > KBC_MAX_CORPORA || strlen(path) > KBC_MAX_PATH_LEN) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "kbc_index_update_doc(doc %u): corpus/path too long "
+                       "(%zu/%zu bytes)",
+                       doc_id, strlen(corpus), strlen(path));
+  }
+  if (t->len > KBC_MAX_TOKENS_PER_DOC) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "kbc_index_update_doc(doc %u): %zu tokens exceeds the %u "
+                       "limit",
+                       doc_id, t->len, KBC_MAX_TOKENS_PER_DOC);
+  }
+  if (t->len > 0 && !t->items) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "kbc_index_update_doc(doc %u): %zu tokens but no items",
+                       doc_id, t->len);
+  }
+  return KBC_OK;
+}
+
+/* Interns one term, or finds it. Returns the slot, and reports through
+ * `created` whether this call is what put it in the table — a caller that then
+ * fails has to take it back out, exactly as kbc_index_add_doc's commit loop
+ * does. */
+static kbc_status term_intern(kbc_index *ix, const char *t, size_t n,
+                              uint64_t h, uint32_t *off_out, size_t *slot_out,
+                              bool *created) {
+  size_t ti = term_find_idx(ix, h, t, n);
+  if (ti == SIZE_MAX) {
+    if (ix->next_term_id == UINT32_MAX) {
+      return KBC_ERR_INVALID;
+    }
+    if (sar_put(&ix->tar, t, n, off_out) != KBC_OK) {
+      return KBC_ERR_NOMEM;
+    }
+    ti = (size_t)(h & (uint64_t)(ix->term_cap - 1));
+    while (ix->terms[ti].term_off != SLOT_EMPTY) {
+      ti = (ti + 1) & (ix->term_cap - 1);
+    }
+    ix->terms[ti].hash = h;
+    ix->terms[ti].term_off = *off_out;
+    ix->terms[ti].term_len = (uint32_t)n;
+    ix->terms[ti].post_off = 0;
+    ix->terms[ti].post_len = 0;
+    ix->terms[ti].id = ix->next_term_id++;
+    ix->term_live++;
+    *created = true;
+  }
+  *slot_out = ti;
+  return KBC_OK;
+}
+
+/* Adds or replaces one document in a LIVE index, without rebuilding anything
+ * else. `doc_id` is the document being replaced — kbc_index_id_of(ix, corpus,
+ * path) — or UINT32_MAX to append a document that is not in the index yet.
+ * Every other document's postings, doc id and token count are left exactly as
+ * they were; this document's own postings are replaced wholesale, so terms it
+ * no longer has do not survive it.
+ *
+ * Not const and not thread-safe, like every build function in this file: the
+ * caller must hold whatever lock its readers take (kbc_app holds the write
+ * lock, so no query is in flight). On failure NOTHING is applied — the
+ * postings array, the term table, the doc table, doc_count and the token
+ * totals are all as they were — except the string arenas, which may have
+ * grown by the bytes a rejected document would have used. */
+kbc_status kbc_index_update_doc(kbc_index *ix, uint32_t doc_id,
+                                const char *corpus, const char *path,
+                                const char *title, kbc_kind kind,
+                                const kbc_tokens *toks, kbc_err *err) {
+  static const kbc_tokens empty = {NULL, 0, 0};
+  const kbc_tokens *t = toks ? toks : &empty;
+  kbc_scratch *sc;
+  kbc_add *adds = NULL;
+  uint32_t *created = NULL;
+  kbc_doctab dt;
+  size_t n = 0, i, ncreated = 0;
+  uint32_t new_id;
+  bool is_new = (doc_id == UINT32_MAX);
+  kbc_status st;
+
+  memset(&dt, 0, sizeof dt);
+  st = update_validate(ix, doc_id, corpus, path, kind, toks, err);
+  if (kbc_failed(st)) {
+    return st;
+  }
+  new_id = is_new ? ix->doc_count : doc_id;
+  if (materialize_term_arena(ix) != KBC_OK) {
+    return kbc_err_set(err, KBC_ERR_NOMEM,
+                       "kbc_index_update_doc(%s/%s): term arena alloc failed",
+                       corpus, path);
+  }
+  if (scratch_ensure(ix, t->len) != KBC_OK) {
+    return kbc_err_set(err, KBC_ERR_NOMEM,
+                       "kbc_index_update_doc(%s/%s): scratch alloc failed",
+                       corpus, path);
+  }
+  sc = ix->sc;
+  if (scratch_count(sc, t, err) != KBC_OK) {
+    return err ? err->status : KBC_ERR_INVALID;
+  }
+  n = sc->len;
+
+  /* Everything the commit needs is obtained before any of it is written. */
+  if (n > 0) {
+    size_t need = ((ix->term_live + ix->term_tombs + n) * 1000) / LOAD_PERMILLE +
+                  2;
+    if (ix->term_cap == 0 || need > ix->term_cap) {
+      if (term_grow(ix, need) != KBC_OK) {
+        return kbc_err_set(err, KBC_ERR_NOMEM,
+                           "kbc_index_update_doc(%s/%s): term table alloc "
+                           "failed",
+                           corpus, path);
+      }
+    }
+    adds = (kbc_add *)malloc(n * sizeof(*adds));
+    created = (uint32_t *)malloc(n * sizeof(*created));
+    if (!adds || !created) {
+      free(adds);
+      free(created);
+      return kbc_err_set(err, KBC_ERR_NOMEM,
+                         "kbc_index_update_doc(%s/%s): alloc failed for %zu "
+                         "terms",
+                         corpus, path, n);
+    }
+  }
+  st = doctab_build(&dt, ix, false, is_new ? UINT32_MAX : new_id, corpus, path,
+                    title, kind, (uint32_t)t->len, "kbc_index_update_doc", err);
+  if (kbc_failed(st)) {
+    free(adds);
+    free(created);
+    return st;
+  }
+
+  /* Intern. Nothing is committed yet, so a term this call creates is simply
+   * taken back out if a later step fails. */
+  for (i = 0; i < n; i++) {
+    uint64_t th = fnv1a64(sc->ts[i], sc->tl[i]);
+    size_t slot = 0;
+    uint32_t off = 0;
+    bool made = false;
+    st = term_intern(ix, sc->ts[i], sc->tl[i], th, &off, &slot, &made);
+    if (kbc_failed(st)) {
+      goto unwind;
+    }
+    if (made) {
+      created[ncreated++] = (uint32_t)slot;
+    }
+    adds[i].slot = slot;
+    adds[i].doc = new_id;
+    adds[i].tf = sc->tf[i];
+  }
+
+  st = postings_rewrite(ix, !is_new, new_id, false, 0, adds, n,
+                        "kbc_index_update_doc", err);
+  if (kbc_failed(st)) {
+    goto unwind;
+  }
+
+  /* Commit. Past this line nothing can fail: the postings are already in, and
+   * the table, the arena and the doc hash are three allocations made above. */
+  if (!is_new) {
+    /* A replace does not move doc ids, so a vecstore row and a store hit keyed
+     * on one stay valid. */
+    ix->total_tokens -= ix->docs[new_id].token_count;
+  }
+  free(ix->docs);
+  ix->docs = dt.docs;
+  ix->doc_cap = dt.count;
+  ix->doc_count = dt.count;
+  sar_free(&ix->dar);
+  ix->dar = dt.dar;
+  free(ix->dhash);
+  ix->dhash = dt.dhash;
+  ix->dhash_cap = dt.dhash_cap;
+  ix->total_tokens += (uint64_t)t->len;
+  prune_empty_terms(ix);
+  scratch_free(ix); /* the term offsets it holds are stale after a rehash */
+  free(adds);
+  free(created);
+  return KBC_OK;
+
+unwind:
+  for (i = 0; i < ncreated; i++) {
+    term_remove_at(ix, created[i]);
+  }
+  doctab_free(&dt);
+  free(adds);
+  free(created);
+  return st;
+}
+
+/* Removes one document from a LIVE index: its postings leave every term it
+ * contributed to, the doc ids above it move down so they stay dense, and the
+ * token total follows. Threading and failure are as for kbc_index_update_doc.
+ *
+ * A removed document is COMPACTED out rather than left as a hole, because
+ * kbc_index_avg_doclen divides by doc_count and a hole would move every score
+ * in the corpus. The consequence is visible and deliberate: the documents after
+ * the removed one get new doc ids, so a caller holding an id across a removal
+ * must look the document up again by (corpus, path) — which is what
+ * kbc_index_id_of is for. */
+kbc_status kbc_index_remove_doc(kbc_index *ix, uint32_t doc_id, kbc_err *err) {
+  kbc_doctab dt;
+  kbc_status st;
+  if (!ix) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "kbc_index_remove_doc: ix is NULL");
+  }
+  if (!ix->sealed) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "kbc_index_remove_doc(doc %u): the index is not sealed",
+                       doc_id);
+  }
+  if (doc_id >= ix->doc_count) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "kbc_index_remove_doc(doc %u): the index holds %u "
+                       "documents",
+                       doc_id, ix->doc_count);
+  }
+  memset(&dt, 0, sizeof dt);
+  /* The table without this document: every later document moves down one, and
+   * the hash is rebuilt to match. */
+  st = doctab_build(&dt, ix, true, doc_id, NULL, NULL, NULL, KBC_KIND_ARTIFACT,
+                    0, "kbc_index_remove_doc", err);
+  if (kbc_failed(st)) {
+    return st;
+  }
+  st = postings_rewrite(ix, true, doc_id, true, doc_id + 1, NULL, 0,
+                        "kbc_index_remove_doc", err);
+  if (kbc_failed(st)) {
+    doctab_free(&dt);
+    return st;
+  }
+  /* Commit: infallible from here. */
+  ix->total_tokens -= ix->docs[doc_id].token_count;
+  free(ix->docs);
+  ix->docs = dt.docs;
+  ix->doc_cap = dt.count;
+  ix->doc_count = dt.count;
+  sar_free(&ix->dar);
+  ix->dar = dt.dar;
+  free(ix->dhash);
+  ix->dhash = dt.dhash;
+  ix->dhash_cap = dt.dhash_cap;
+  prune_empty_terms(ix);
+  return KBC_OK;
+}
 /* ----------------------------------------------------------- inspecting -- */
 
 uint32_t kbc_index_doc_count(const kbc_index *ix) {

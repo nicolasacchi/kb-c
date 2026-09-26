@@ -120,12 +120,6 @@ struct kbc_app {
   _Atomic int64_t st_bytes;
 };
 
-/* ctx for the search resolver. `ix` is BORROWED and is alive for as long as
- * the caller's read lock is held. */
-typedef struct {
-  kbc_app *app;
-  const kbc_index *ix;
-} kbc_app_resolve_ctx;
 
 /* ------------------------------------------------------------------ util */
 
@@ -626,6 +620,33 @@ static float *embed_one(kbc_app *app, kbc_arena *a, const char *text,
   return *dim_out ? out : NULL;
 }
 
+/* The text a document is indexed by: the title twice (the BM25 length-norm
+ * convention, and the caller's decision per index.h), then the extracted
+ * prose. Raw markup would only contribute terms nobody searches for. Shared by
+ * the full build and the one-document update — two copies of this rule would
+ * be two chances for the keyword lane to disagree with itself. */
+static kbc_status searchable_text(const kbc_blocks *blocks, const char *title,
+                                  kbc_str *out, kbc_err *err) {
+  size_t b;
+  for (b = 0; b < blocks->len + 2u; b++) {
+    if (b < 2u) {
+      if (kbc_failed(kbc_str_puts(out, title)) ||
+          kbc_failed(kbc_str_putc(out, ' '))) {
+        return kbc_err_set(err, KBC_ERR_NOMEM, "searchable text for \"%s\"",
+                           title);
+      }
+      continue;
+    }
+    if (kbc_failed(kbc_str_putc(out, ' ')) ||
+        kbc_failed(kbc_str_append(out, blocks->items[b - 2u].text,
+                                  blocks->items[b - 2u].text_len))) {
+      return kbc_err_set(err, KBC_ERR_NOMEM, "searchable text for \"%s\"",
+                         title);
+    }
+  }
+  return KBC_OK;
+}
+
 /* ------------------------------------------------------------- the build */
 
 /* Pass two: turn the manifest into a sealed index, embedding as it goes.
@@ -771,20 +792,9 @@ static kbc_status build_index(kbc_app *app, kbc_app_manifest *m,
      * would only contribute terms nobody searches for. */
     kbc_str text;
     kbc_str_init(&text);
-    const kbc_blocks *blocks = kbc_parsed_blocks(p);
-    for (size_t b = 0; b < blocks->len + 2u; b++) {
-      if (b < 2u) {
-        if (kbc_failed(kbc_str_puts(&text, row->title)) ||
-            kbc_failed(kbc_str_putc(&text, ' '))) {
-          goto text_fail;
-        }
-        continue;
-      }
-      if (kbc_failed(kbc_str_putc(&text, ' ')) ||
-          kbc_failed(kbc_str_append(&text, blocks->items[b - 2u].text,
-                                    blocks->items[b - 2u].text_len))) {
-        goto text_fail;
-      }
+    s = searchable_text(kbc_parsed_blocks(p), row->title, &text, err);
+    if (kbc_failed(s)) {
+      goto text_fail;
     }
 
     kbc_tokens toks;
@@ -840,7 +850,7 @@ static kbc_status build_index(kbc_app *app, kbc_app_manifest *m,
     continue;
 
   text_fail:
-    s = kbc_err_set(err, KBC_ERR_NOMEM, "searchable text for %s", row->path);
+    /* searchable_text already named the document; keep its message. */
     kbc_str_free(&text);
     kbc_str_free(&raw);
     kbc_arena_free(fa);
@@ -1476,13 +1486,199 @@ kbc_status kbc_app_reindex(kbc_app *app, kbc_err *err) {
   return KBC_OK;
 }
 
-/* Bring one path up to date. The index is immutable once built (index.h: "a
- * running daemon never mutates a live index"), and index.h offers no
- * add-to-open operation, so a single-file update has no correct form cheaper
- * than a full rebuild. The rebuild is also the only form that cannot leave the
- * index a reindex behind, which is the invariant app.h exists to protect. */
+/* Drops the store row for one path. A path that is not there is not a failure:
+ * the caller is bringing the index in line with the filesystem, and the
+ * filesystem has already said the document does not exist. */
+static kbc_status store_forget_path(kbc_app *app, const char *corpus,
+                                    const char *rel_path, kbc_err *err) {
+  kbc_arena *qa = kbc_arena_new(4096u);
+  if (qa == NULL) {
+    return kbc_err_set(err, KBC_ERR_NOMEM, "arena for %s/%s", corpus, rel_path);
+  }
+  kbc_artifact prev;
+  memset(&prev, 0, sizeof prev);
+  kbc_status s = KBC_OK;
+  kbc_err local;
+  kbc_err_reset(&local);
+  if (kbc_failed(kbc_store_get_artifact_by_path(app->store, qa, corpus, rel_path,
+                                                &prev, &local))) {
+    kbc_arena_free(qa);
+    return KBC_OK;
+  }
+  s = kbc_store_delete_artifact(app->store, prev.id, err);
+  kbc_arena_free(qa);
+  return s;
+}
+
+/* One document, in place: read it, tokenize it, rewrite only its postings.
+ *
+ * The mutation runs under the write lock — a reader must never see a
+ * half-rewritten postings array — and the result is saved and promoted before
+ * the lock is released, so a crash mid-update leaves the previous generation
+ * on disk and the daemon comes back up on it. The store row is committed
+ * before any of this (reindex_one), so app.h's invariant holds throughout: the
+ * index never references a document the store has not committed.
+ *
+ * `vanished` means the file is not on disk, which is a removal rather than an
+ * update. */
+static kbc_status index_touch_one(kbc_app *app, const kbc_corpus_cfg *cc,
+                                  const char *rel_path, bool vanished,
+                                  kbc_err *err) {
+  const int64_t t0 = kbc_now_ns();
+  kbc_arena *fa = kbc_arena_new(64u * 1024u);
+  if (fa == NULL) {
+    return kbc_err_set(err, KBC_ERR_NOMEM, "arena for %s/%s", cc->name,
+                       rel_path);
+  }
+  kbc_str full, text, raw;
+  kbc_str_init(&full);
+  kbc_str_init(&text);
+  kbc_str_init(&raw);
+  kbc_tokens toks;
+  memset(&toks, 0, sizeof toks);
+  const char *title = "";
+  float *v = NULL;
+  size_t dim = 0;
+  kbc_status s;
+  uint32_t doc_id, target = UINT32_MAX, docs_before = 0;
+  bool dropped_vec = false;
+
+  s = kbc_str_printf(&full, "%s/%s", cc->path, rel_path);
+  if (kbc_failed(s)) {
+    s = kbc_err_set(err, KBC_ERR_NOMEM, "path buffer for %s/%s", cc->name,
+                    rel_path);
+    goto out;
+  }
+  if (!vanished) {
+    s = read_bounded(full.ptr, &raw, err);
+    if (kbc_failed(s)) {
+      goto out;
+    }
+    kbc_parsed *p = kbc_parse(fa, raw.ptr, raw.len, rel_path, err);
+    if (p == NULL) {
+      s = kbc_err_set(err, KBC_ERR_PARSE, "parse %s: malformed document",
+                      full.ptr);
+      goto out;
+    }
+    const char *parsed_title = kbc_parsed_title(p);
+    if (parsed_title != NULL) {
+      title = parsed_title;
+    }
+    s = searchable_text(kbc_parsed_blocks(p), title, &text, err);
+    if (kbc_failed(s)) {
+      goto out;
+    }
+    s = kbc_tokenize(fa, text.ptr, text.len, &toks, err);
+    if (kbc_failed(s)) {
+      goto out;
+    }
+    /* Embedded before the write lock, because the embedder is a subprocess
+     * round trip and the lock is the one thing searches queue behind. */
+    v = embed_one(app, fa, text.ptr, &dim);
+  }
+
+  pthread_rwlock_wrlock(&app->lock);
+  doc_id = kbc_index_id_of(app->index, cc->name, rel_path);
+  docs_before = kbc_index_doc_count(app->index);
+  if (vanished) {
+    if (doc_id != UINT32_MAX) {
+      s = kbc_index_remove_doc(app->index, doc_id, err);
+      if (kbc_failed(s)) {
+        pthread_rwlock_unlock(&app->lock);
+        goto out;
+      }
+      /* A removal renumbers every document above it, so the vector rows keyed
+       * on those ids now describe the wrong documents. The store has no
+       * per-row delete, and a vector lane that returns another document's
+       * neighbours is worse than no vector lane: drop it, loudly, and let the
+       * next full reindex rebuild it. Removing the LAST document renumbers
+       * nothing, so that case keeps its lane. */
+      if (app->vec != NULL && doc_id + 1u < docs_before) {
+        kbc_vecstore_free(app->vec);
+        app->vec = NULL;
+        dropped_vec = true;
+      }
+    }
+  } else {
+    target = (doc_id == UINT32_MAX) ? docs_before : doc_id;
+    s = kbc_index_update_doc(app->index, doc_id, cc->name, rel_path, title,
+                             KBC_KIND_ARTIFACT, &toks, err);
+    if (kbc_failed(s)) {
+      pthread_rwlock_unlock(&app->lock);
+      goto out;
+    }
+    /* A replace keeps every doc id, and an append uses one past the old end,
+     * so `target` is the row this text belongs to. */
+    if (v != NULL && app->vec != NULL) {
+      if (dim != kbc_vecstore_dim(app->vec)) {
+        KBC_LOGW("embedder returned dim %zu, store is %zu; vector lane off", dim,
+                 kbc_vecstore_dim(app->vec));
+      } else {
+        kbc_err local;
+        kbc_err_reset(&local);
+        if (kbc_failed(kbc_vecstore_set(app->vec, target, v, &local))) {
+          KBC_LOGW("vector row %u for %s: %s, dropping the vector lane", target,
+                   rel_path, local.msg);
+          kbc_vecstore_free(app->vec);
+          app->vec = NULL;
+          dropped_vec = true;
+        }
+      }
+    }
+  }
+
+  kbc_str build_path;
+  kbc_str_init(&build_path);
+  s = kbc_str_printf(&build_path, "%s.build", app->cfg->index_path);
+  if (!kbc_failed(s)) {
+    s = kbc_index_save(app->index, build_path.ptr, err);
+  }
+  if (!kbc_failed(s)) {
+    s = promote_file(app->cfg->index_path, err);
+  }
+  kbc_str_free(&build_path);
+  if (kbc_failed(s)) {
+    pthread_rwlock_unlock(&app->lock);
+    goto out;
+  }
+  const int64_t docs = (int64_t)kbc_index_doc_count(app->index);
+  atomic_store_explicit(&app->st_indexed, docs, memory_order_relaxed);
+  atomic_store_explicit(&app->st_docs, docs, memory_order_relaxed);
+  atomic_store_explicit(&app->st_terms, (int64_t)kbc_index_term_count(app->index),
+                        memory_order_relaxed);
+  atomic_store_explicit(&app->st_last_ns, kbc_now_ns(), memory_order_relaxed);
+  atomic_store_explicit(&app->st_last_docs, docs, memory_order_relaxed);
+  /* st_runs counts FULL scans, and this is not one; last_reindex_* is "when the
+ * index last changed", which this is. */
+  atomic_store_explicit(&app->st_last_us, (kbc_now_ns() - t0) / 1000,
+                        memory_order_relaxed);
+  pthread_rwlock_unlock(&app->lock);
+
+  kbc_str payload;
+  kbc_str_init(&payload);
+  if (!kbc_failed(kbc_str_printf(&payload, "{\"docs\":%" PRId64 "}", docs))) {
+    kbc_app_publish(app, "index.updated", payload.ptr);
+  }
+  kbc_str_free(&payload);
+  KBC_LOGI("reindex: %s/%s %s, %" PRId64 " docs in %" PRId64 " us%s", cc->name,
+           rel_path, vanished ? "removed" : "updated", docs,
+           (kbc_now_ns() - t0) / 1000,
+           dropped_vec ? ", vector lane off" : "");
+
+out:
+  kbc_str_free(&text);
+  kbc_str_free(&raw);
+  kbc_str_free(&full);
+  kbc_arena_free(fa);
+  return s;
+}
+
+/* Bring one path up to date, without touching any other. The filesystem is the
+ * authority, exactly as it is for a full scan: a delete event for a file that
+ * is still there re-ingests it rather than dropping it, and a save event for a
+ * file that has since been deleted drops it. */
 static kbc_status reindex_one(kbc_app *app, const char *corpus,
-                              const char *rel_path, bool removed, kbc_err *err) {
+                              const char *rel_path, kbc_err *err) {
   if (!app) {
     return kbc_err_set(err, KBC_ERR_INVALID, "reindex: app is NULL");
   }
@@ -1505,70 +1701,130 @@ static kbc_status reindex_one(kbc_app *app, const char *corpus,
     return kbc_err_set(err, KBC_ERR_NOTFOUND, "corpus %s is not configured",
                        corpus);
   }
-
-  if (removed) {
-    kbc_arena *qa = kbc_arena_new(4096u);
-    if (!qa) {
-      return kbc_err_set(err, KBC_ERR_NOMEM, "arena for %s/%s", corpus,
-                         rel_path);
-    }
-    kbc_artifact prev;
-    memset(&prev, 0, sizeof(prev));
-    kbc_status q =
-        kbc_store_get_artifact_by_path(app->store, qa, corpus, rel_path, &prev,
-                                       err);
-    if (!kbc_failed(q)) {
-      kbc_status d = kbc_store_delete_artifact(app->store, prev.id, err);
-      if (kbc_failed(d)) {
-        kbc_arena_free(qa);
-        return d;
-      }
-    } else {
-      /* Already gone: the rebuild below drops the doc either way, so this is
-       * not a failure the caller needs to see. */
-      kbc_err_reset(err);
-    }
-    kbc_arena_free(qa);
+  /* No index to update in place (first start, before any reindex): a full scan
+   * is not a fallback here, it is the only thing that can work. */
+  if (app->index == NULL) {
+    return kbc_app_reindex(app, err);
   }
 
-  return kbc_app_reindex(app, err);
-}
+  /* The filesystem is the authority. A path that is not there is a removal:
+   * the store row goes first, so the index is never the side that still knows
+   * about a document the store has dropped. */
+  struct stat sb;
+  kbc_str full;
+  kbc_str_init(&full);
+  kbc_status s = kbc_str_printf(&full, "%s/%s", cc->path, rel_path);
+  bool vanished = kbc_failed(s) || stat(full.ptr, &sb) != 0;
+
+  if (vanished) {
+    kbc_str_free(&full);
+    if (!kbc_failed(store_forget_path(app, corpus, rel_path, err))) {
+      s = index_touch_one(app, cc, rel_path, true, err);
+    }
+    goto done;
+  }
+
+  kbc_app_ingested g;
+  s = ingest_file(app, cc->name, cc->path, rel_path,
+                  (int64_t)sb.st_mtim.tv_sec * 1000000000LL +
+                      (int64_t)sb.st_mtim.tv_nsec,
+                  (int64_t)sb.st_size, &g, err);
+  kbc_str_free(&full);
+  if (kbc_failed(s)) {
+    if (s != KBC_ERR_NOTFOUND) {
+      return s;
+    }
+    /* Vanished between the stat and the read. */
+    KBC_LOGW("%s/%s vanished mid-reindex, dropping it from the index", corpus,
+             rel_path);
+    kbc_err_reset(err);
+    s = store_forget_path(app, corpus, rel_path, err);
+    if (kbc_failed(s)) {
+      return s;
+    }
+    s = index_touch_one(app, cc, rel_path, true, err);
+    goto done;
+  }
+  ingested_free(&g);
+  s = index_touch_one(app, cc, rel_path, false, err);
+
+done:
+  if (kbc_failed(s)) {
+    /* The store row is committed and the index is not, so this file's
+     * keywords are stale until something else reindexes it. A watcher does
+     * not re-fire for a file it has already reported, so a full scan now is
+     * what keeps the invariant app.h exists for — the rare path, and the only
+     * one that cannot leave the daemon a reindex behind. */
+    KBC_LOGW("reindex %s/%s: %s; falling back to a full scan", corpus, rel_path,
+             err->msg);
+    kbc_err_reset(err);
+    return kbc_app_reindex(app, err);
+   }
+  return KBC_OK;
+ }
 
 kbc_status kbc_app_reindex_file(kbc_app *app, const char *corpus,
                                 const char *rel_path, kbc_err *err) {
-  return reindex_one(app, corpus, rel_path, false, err);
+  return reindex_one(app, corpus, rel_path, err);
 }
 
 kbc_status kbc_app_reindex_remove(kbc_app *app, const char *corpus,
                                   const char *rel_path, kbc_err *err) {
-  return reindex_one(app, corpus, rel_path, true, err);
+  return reindex_one(app, corpus, rel_path, err);
 }
 
-/* ---------------------------------------------------------------- search */
 
-static kbc_status resolve_locked(void *ctx, kbc_arena *a, uint32_t doc_id,
-                                 const char **artifact_id,
-                                 const char **summary) {
-  kbc_app_resolve_ctx *rc = (kbc_app_resolve_ctx *)ctx;
-  const kbc_doc_meta *meta = kbc_index_doc(rc->ix, doc_id);
-  if (!meta) {
-    return kbc_err_set(NULL, KBC_ERR_NOTFOUND, "doc %u is out of range", doc_id);
+/* ---------------------------------------------------------------- search */
+/* Resolves every surviving row in ONE store round trip.
+ *
+ * The searcher asked the store once per row, and the store guards one
+ * connection with one mutex: a query returning k hits took that mutex k
+ * times, and the convoy behind it — not the scoring, which is thread-local by
+ * design — is what capped query throughput under concurrency. The index may
+ * legitimately be one reindex ahead of the store, so a row the batch does not
+ * resolve is dropped with a debug line and the search still succeeds. */
+static kbc_status resolve_rows(kbc_app *app, kbc_arena *a,
+                               kbc_search_result *out, kbc_err *err) {
+  if (out->len == 0) return KBC_OK;
+
+  const char **corpora = kbc_arena_calloc(a, out->len, sizeof(*corpora));
+  const char **paths = kbc_arena_calloc(a, out->len, sizeof(*paths));
+  if (corpora == NULL || paths == NULL)
+    return kbc_err_set(err, KBC_ERR_NOMEM, "search: %zu hit pairs", out->len);
+  for (size_t i = 0; i < out->len; i++) {
+    /* A row with no corpus or no path cannot name a store row. The empty
+     * string is the batch's own "unlookupable" marker: that slot comes back
+     * NULL, exactly as a row with no store record does. */
+    corpora[i] = out->rows[i].corpus != NULL ? out->rows[i].corpus : "";
+    paths[i] = out->rows[i].path != NULL ? out->rows[i].path : "";
   }
-  kbc_artifact art;
-  memset(&art, 0, sizeof(art));
+
+  kbc_artifact **arts = NULL;
   kbc_err local;
   kbc_err_reset(&local);
-  kbc_status s = kbc_store_get_artifact_by_path(rc->app->store, a, meta->corpus,
-                                                meta->path, &art, &local);
+  kbc_status s =
+      kbc_store_get_artifacts_by_path(app->store, a, corpora, paths, out->len,
+                                      &arts, &local);
   if (kbc_failed(s)) {
-    /* search.h: KBC_ERR_NOTFOUND drops the row. The index may legitimately be
-     * one reindex ahead of the store, and failing the whole search over it
-     * would be worse than returning one fewer hit. */
-    return kbc_err_set(NULL, KBC_ERR_NOTFOUND, "%s/%s is not in the store",
-                       meta->corpus, meta->path);
+    free(arts);
+    return kbc_err_set(err, s, "resolve %zu search hits: %s", out->len,
+                       local.msg[0] ? local.msg : "store failed");
   }
-  *artifact_id = art.id;
-  *summary = art.summary;
+
+  size_t kept = 0;
+  for (size_t i = 0; i < out->len; i++) {
+    kbc_result_row *r = &out->rows[i];
+    if (arts[i] == NULL) {
+      KBC_LOGD("search: doc %u not in store, dropping", r->doc_id);
+      continue;
+    }
+    r->artifact_id = arts[i]->id;
+    r->summary = arts[i]->summary;
+    if (kept != i) out->rows[kept] = *r;
+    kept++;
+  }
+  out->len = kept;
+  free(arts);
   return KBC_OK;
 }
 
@@ -1603,13 +1859,14 @@ kbc_status kbc_app_search(kbc_app *app, kbc_arena *a, const kbc_query *q,
     }
   }
 
-  kbc_app_resolve_ctx rc;
-  rc.app = app;
-  rc.ix = app->index;
+  /* The searcher is handed no resolver: the rows come back with their corpus
+   * and path already copied into the caller's arena, which is everything the
+   * batch needs. Resolving here, after the index lock is released, is what
+   * lets one query take the store's lock once. */
 
   kbc_err local;
   kbc_err_reset(&local);
-  kbc_searcher *s = kbc_searcher_new(app->index, resolve_locked, &rc, &local);
+  kbc_searcher *s = kbc_searcher_new(app->index, NULL, NULL, &local);
   if (!s) {
     if (ea) {
       kbc_arena_free(ea);
@@ -1631,10 +1888,16 @@ kbc_status kbc_app_search(kbc_app *app, kbc_arena *a, const kbc_query *q,
     return rc_st;
   }
 
+  kbc_status rs = resolve_rows(app, a, out, err);
+  if (kbc_failed(rs)) {
+    return rs;
+  }
+
   out->took_us = (kbc_now_ns() - t0) / 1000;
-  if (!vec) {
-    out->degraded = true;
-    out->vector_ran = false;
+  /* The searcher knows what was asked for and what ran; degraded means a lane
+   * the caller wanted could not run, which is not the same as "this build has
+   * no embedder". A mode=keyword query never wanted the vector lane. */
+  if (out->degraded) {
     atomic_fetch_add_explicit(&app->st_degraded, 1, memory_order_relaxed);
   }
   atomic_fetch_add_explicit(&app->st_searches, 1, memory_order_relaxed);
