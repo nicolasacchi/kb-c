@@ -12,6 +12,9 @@ Reproduce with:
 QUERY_FILE=bench/queries.txt ./bench/bench-rust.sh       # the Rust baseline
 ./bench/bench-kbc.sh                                    # kb-c, single + concurrent
 ./build/kbc --config <cfg> bench                        # kb-c, in-process
+./bench/bench-rust-concurrency.sh bench/data/corpus/web-code  # matched-corpus A/B
+./bench/bench-scale.sh 1000 && ./bench/bench-scale.sh 5000     # the scale ladder
+./bench/bench-vector.sh                                         # the real sidecar
 ```
 
 The raw Rust measurements are in [`RUST-BASELINE.md`](RUST-BASELINE.md); the
@@ -71,12 +74,26 @@ retrieval *quality* (Recall@k, MRR, nDCG) and reports no timings.
 | | Rust `kb` | kb-c |
 |---|---|---|
 | full corpus, from empty | 252–262 s (1,594 docs) | 1.79 s / 1.83 s (1,114 docs) |
-| **one file changed** | full rebuild, same cost | **10.3 ms** (was 1,334.9 ms) |
+| **one file changed** | full rebuild, same cost | **9–14 ms** at 1,114 documents |
 | largest single file (2.4 MB) | — | 75.6 ms |
 
 The single-file row is the one that matters for a daemon: a file save used to
-re-parse and re-index the whole corpus, and now costs what the file costs.
-**~130x**, and the cost is proportional to the file rather than the corpus.
+re-parse and re-index the whole corpus, and now costs what the file costs, and
+the cost is proportional to the file rather than the corpus. The 9–14 ms figure
+is the end-to-end proof — an in-place update to a live index, with the store
+row committed first, that survives a restart of the daemon and reads back
+identical.
+
+**An earlier number for this row was 10.3 ms, and a later measurement of the
+same thing was 355 ms at 1,000 documents. The 355 ms is not a regression.** It
+was taken while the watcher-path defect was live: the watcher published an
+absolute path, `app.c` read it as corpus-relative, the file could not be
+resolved, and a save was therefore recorded as a *removal* and swept the
+document out of the index — a different code path from the incremental one,
+measured under a different corpus size. Both defects are fixed and each has an
+end-to-end proof; the incremental number to quote is 9–14 ms. The earlier
+10.3 ms is not repeated in the table because it predates the fix and would
+imply a clean measurement it never was.
 
 The full-corpus gap is also partly "kb-c does less per document" — no links,
 wikilinks, attachments, capability flags, frontmatter or provenance edges, and
@@ -94,12 +111,64 @@ no embedding model at ingest. Read it as a bound, not as "C is 140x faster".
 Against the daemon process alone (133,884 kB) the ratio is ~7x; against the
 total it is ~17x. The total includes a resident ONNX model kb-c does not load.
 
-## Concurrency
+### With a real embedder and a resident model
 
-`bench/bench-kbc.sh`, kb-c only — the Rust daemon's concurrency was **not**
-measured, so there is no comparison to draw. 8 clients, REPS=30, the
-`limit=10` the script uses by default. Before and after the resolve fix, run
-back to back on the same corpus on 2026-09-26:
+The table above is keyword-only. With the production
+`/home/nik/.local/bin/kb-embedder` running `bge-small-en-v1.5` and the model
+resident, the same 1,114-document corpus:
+
+| | |
+|---|---|
+| ingest, with embeddings | **178 s** (1.79 s without — the model does that work) |
+| documents embedded | 1,114 of 1,114, dim 384 |
+| RSS, model resident | **299,948 kB** total: 22,844 kB daemon + 277,104 kB sidecar |
+| the Rust baseline, same shape | 321,580 kB total |
+
+So with the same model doing the same embedding work, kb-c holds ~7% *less*
+resident memory than the Rust daemon. The daemon's own footprint barely moves
+(18,816 kB → 22,844 kB) because the vector matrix is `mmap`ed, not copied.
+
+## Concurrency, Rust vs kb-c — MATCHED corpora
+
+`bench/bench-rust-concurrency.sh` against `bench/bench-kbc.sh`, both engines on
+the **same 360-document corpus** (`bench/data/corpus/web-code`, 360 documents
+indexed by each), the same query file, `REPS=30`, `mode=keyword`, 1/2/4/8
+clients, 2026-09-26. The corpora are matched here, which the latency table
+above is not.
+
+| clients | Rust rps | kb-c rps | Rust p50 | kb-c p50 |
+|---|---|---|---|---|
+| 1 | 11.5 | 2,484 | 47.5 ms | 0.354 ms |
+| 2 | 23.7 | 3,806 | 77.5 ms | 0.450 ms |
+| 4 | 25.3 | 4,160 | 150.9 ms | 0.773 ms |
+| 8 | 31.9 | 4,615 | 260.5 ms | 1.394 ms |
+
+**Caveats, stated here rather than in a footnote.** 360 documents is a small
+corpus, chosen because Rust ingest on this contended host ran at 1.2–2.5 docs/s
+and a larger one did not fit in a reasonable run; it is matched, not
+representative. kb-c's 4- and 8-client rows are **client-limited** — the Python
+client burns 1.10 cores against the daemon's 0.91, so kb-c's throughput and
+latency at those levels are a floor, not a ceiling. Both engines were driven
+from the same file, so the query sets are identical.
+
+The rps and p50 columns are throughput-shaped and therefore hostage to who is
+the bottleneck. The number that is not is **CPU per query**:
+
+| | Rust `kb` | kb-c | ratio |
+|---|---|---|---|
+| CPU per query | ~35 ms, flat at 1/2/4/8 clients | ~0.21 ms, flat | **~170x** |
+| cores busy at the plateau | never more than 1.09 of 8 | — | — |
+
+~170x of CPU per query is the comparison to quote. It is flat on both sides,
+so it is a property of the work, not of the client count. Rust scales to 2.06x
+at two clients and then flattens; kb-c is still climbing at 8 but the client,
+not the daemon, is what stops it.
+
+## Concurrency — the two resolve fixes (kb-c only)
+
+`bench/bench-kbc.sh`, 8 clients, REPS=30, the `limit=10` the script uses by
+default. Before and after the resolve fix, run back to back on the same corpus
+on 2026-09-26:
 
 | clients | rps before | rps after | p50 before | p50 after | p99 before | p99 after |
 |---|---|---|---|---|---|---|
@@ -175,17 +244,88 @@ half right:
   first implementation measured *worse than baseline* and was thrown away; what
   shipped is the reset-and-rebind form.
 
-## What was not measured
+## The vector lane
 
-- **The vector lane.** kb-c's embedder seam is implemented and tested against a
-  fake sidecar, but no real `kb-embedder` was ever run against kb-c. The Rust
-  hybrid row (p50 42.116 ms with a real `bge-small-en-v1.5`) therefore has no
-  counterpart here.
-- **The Rust daemon under concurrency.** kb-c's scaling curve stands alone.
-- **A larger corpus.** 1,114 documents exercises the index but does not
-  characterise it at 100k+, where the mmap'd postings start paging.
+Verified against the **production** `/home/nik/.local/bin/kb-embedder` running
+`bge-small-en-v1.5` — not a fake sidecar.
+
+| | |
+|---|---|
+| ingest with embeddings, 1,114 docs | **178 s** (1.79 s without) |
+| documents embedded | 1,114 / 1,114, dim 384 |
+| RSS with the model resident | 299,948 kB (daemon 22,844 + sidecar 277,104) |
+| Rust baseline, same shape | 321,580 kB |
+
+After a streaming top-k fix, `mode=semantic` and `mode=hybrid` both work at
+1,112 documents with `degraded:false` and real vector scores. A semantic
+query's **peak arena is 71,406 bytes whether the store holds 1,114 rows or
+20,000** — the vector scan is a single sequential pass, so the per-request
+allocation does not track the corpus. That is the number that says the
+brute-force scan is not the thing that will not scale; the 20,000-row cliff
+where IVF-PQ would start to pay for itself is still ahead, and unmeasured.
+
+**The wire protocol, corrected.** An earlier draft of `include/kbc/embed.h`
+documented a protocol the real sidecar does not speak, in every respect. What
+it actually is: there is **no health op**; readiness is an **unsolicited**
+`{"kind":"ready",...}` line that must be absorbed wherever it arrives, including
+mid-reply; **`req_id` is mandatory** and must be echoed, and a reply carrying
+someone else's `req_id` is a protocol error; replies are `kind=embed_ok` and
+`kind=error`, not what the draft said. And the sidecar reads stdin as UTF-8
+and **exits** on a non-UTF-8 line, so no byte >= 0x80 may reach the wire — text
+is escaped locally to `\u00XX` rather than passed through raw. A corpus with
+8-bit bytes otherwise kills the sidecar mid-ingest and silently ends the vector
+lane.
+
+## The scale ladder
+
+`bench/bench-scale.sh` is a byte-reproducible generator (`--seed 20260926`): the
+same seed gives the same bytes. It is **proven to generate 100,000 documents /
+199.4 MB**; the ingest was actually run at 1,000 and 5,000.
+
+| | 1,000 docs | 5,000 docs |
+|---|---|---|
+| corpus | 2.0 MB | 10.1 MB |
+| index on disk | 1.5 MB | 6.5 MB |
+| ingest | 6.6 s | 61.7 s |
+| RSS at rest | 9 MB | 16 MB |
+| p50 | 0.483 ms | 0.594 ms |
+| p99 | 3.37 ms | 3.42 ms |
+| cold p50 | 0.62 ms | 0.44 ms |
+
+The index/corpus ratio **falls** from 0.75 to 0.64 as the corpus grows — more
+term sharing, not more index. And evicting the index from the page cache costs
+nothing measurable at these sizes.
+
+**The knee was not located.** Ingest cost per document rises steeply from 1,000
+to 5,000 (6.6 ms → 12.3 ms per document) and that trend was not followed far
+enough to say where it turns over. Two points are a line, not a curve. The
+100,000-document corpus exists and is byte-reproducible, but no number in this
+document comes from ingesting it.
+
+## What was still not measured
+
+- **Rust at scale.** The Rust daemon was never run at the 5,000-document scale
+  ladder, so the ladder is kb-c alone.
+- **A 100,000-document ingest.** The generator is proven; the ingest is not.
+- **The 20,000-row cliff** where brute-force cosine stops beating IVF-PQ.
 - **Cold page cache** for query latency; all query figures are warm.
 - **kb-c startup, cold** (no index on disk).
+
+## Two defects these measurements found
+
+Both were found by running the thing, not by reading it, and both are fixed
+with end-to-end proofs.
+
+1. **The incremental path wrote an index its own loader rejected.** Two whole
+   sections were declared in the header and never written, because an opened
+   index keeps its arenas in the `mmap` while `save` wrote the empty heap
+   copies. `save` now has a self-check that refuses to write a file its own
+   loader would reject.
+2. **A file save in a running daemon deleted the document.** The watcher
+   published an absolute path, `app.c` treated it as corpus-relative, the file
+   could not be resolved, and the event was recorded as a *removal* — sweeping
+   the document out of the index on every save. This is what the 355 ms
+   "one file changed" number above was actually measuring.
 
 ## Why the query path is faster, and what is unproven
 
@@ -201,6 +341,8 @@ half right:
    65 ThreadSanitizer races before the fix, 0 after, no added allocation.
 6. **Incremental reindex** — a file save costs that file, not the corpus.
 
-Unproven: that any of this holds at a scale beyond what was measured, that it
-holds for the vector lane, or that it holds under concurrent load. Those need
-their own measurements.
+Concurrent load and the vector lane are now measured above, and neither is
+where this breaks. What is still unproven is **scale**: the ladder stops at
+5,000 documents and locates no knee, so nothing here is a claim about 100k+.
+Also unproven: the 20,000-row point where brute-force cosine stops being the
+right answer, and any Rust comparison above that 360-document matched corpus.

@@ -2,6 +2,14 @@
 #
 # Every key below is optional; this file only overrides defaults, and an
 # unknown key is a parse error rather than a silently ignored line.
+#
+# Path rules: every relative path in this file is relative to THIS FILE's
+# directory, never to the directory you happen to run kbc from — the same rule
+# corpus paths use. data_dir is the anchor: the database, the index and the
+# token file default to <data_dir>/kb.db, <data_dir>/index and
+# <data_dir>/token, so setting data_dir alone relocates the daemon's state as
+# one unit. Set db_path / index_path / token_file only to move one of them
+# elsewhere: each key you set wins, the rest still follow data_dir.
 
 [daemon]
 bind = "127.0.0.1"   # a non-loopback bind without a token is refused

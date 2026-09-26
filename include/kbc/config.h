@@ -27,12 +27,17 @@ typedef struct {
 typedef struct kbc_config {
   /* Every char* and the corpora array are KBC_OWN; free with kbc_config_free. */
   char *config_path;  /* absolute path of the file loaded, or NULL */
+  /* data_dir/db_path/index_path/token_path are RESOLVED: an absolute value
+   * stands, a relative one hangs off the config file's directory — never off
+   * the process cwd. db_path, index_path and token_path are derived from
+   * data_dir as <data_dir>/kb.db, /index and /token unless the file pinned
+   * them, so `kbc token generate` and the daemon always name one file. */
   char *data_dir;     /* where db + index + token live */
-  char *db_path;
-  char *index_path;
+  char *db_path;      /* default "data/kb.db" */
+  char *index_path;   /* default "data/index" */
   char *bind_addr;    /* default "127.0.0.1" */
   int port;           /* default 4317 — 4000 is the Rust daemon's, never clash */
-  char *token_path;
+  char *token_path;   /* default "data/token"; read by kbc_config_load_token */
   char *token;        /* NULL when the daemon runs without a token */
   char *embedder_cmd; /* argv[0] of the sidecar; NULL disables the vector lane */
 
@@ -73,6 +78,22 @@ bool kbc_config_bind_is_safe(const kbc_config *cfg, char *why, size_t why_cap);
 
 const kbc_corpus_cfg *kbc_config_corpus(const kbc_config *cfg,
                                         const char *name);
+
+/* Resolves the bearer token into cfg->token: the literal value already in the
+ * config if it carries one, else the first line of cfg->token_path. A missing
+ * or unreadable token file is KBC_ERR_IO with the path named — deliberately
+ * NOT "no token", because a configured token file that cannot be read would
+ * otherwise leave the daemon running unauthenticated on a public bind.
+ * No token_file configured at all is KBC_OK with cfg->token left NULL, which is
+ * the loopback-with-no-auth case.
+ *
+ * Call this once, before kbc_config_validate and before kbc_httpd_start, so
+ * the bind guard and the request auth gate see the SAME token. Idempotent.
+ *
+ * There is deliberately no kb.toml key for a literal token: a secret belongs in
+ * a 0600 file, not in a config file that gets copied around and printed by
+ * `kbc config show`. Set cfg->token programmatically if you need to. */
+kbc_status kbc_config_load_token(kbc_config *cfg, kbc_err *err);
 
 void kbc_config_free(kbc_config *cfg);
 

@@ -58,6 +58,13 @@
 #include "kbc/types.h"
 
 /* The event bus is a fixed table, not a queue: the SSE writer has its own. */
+
+/* search.h gives the searcher no way to learn the document embeddings, so
+ * search.c exports this setter and records the header gap there. Declared
+ * here because search.h is frozen; when the header grows it, this
+ * declaration goes away with it. */
+kbc_status kbc_searcher_set_vecstore(kbc_searcher *s, const kbc_vecstore *vs,
+                                     kbc_err *err);
 #define KBC_APP_MAX_SUBS 64u
 /* Recursion cap for the corpus walk; symlinked directories make this a
  * correctness concern, not merely a stack one. */
@@ -620,6 +627,75 @@ static float *embed_one(kbc_app *app, kbc_arena *a, const char *text,
   return *dim_out ? out : NULL;
 }
 
+/* Splits the configured `[embedder] command` into an argv. The sidecar is not
+ * a bare binary — `kb-embedder --model NAME --cache DIR` is the only way to
+ * say which model to load — so the config value is a command LINE, not a
+ * path. Splitting happens here rather than in config.c so the frozen
+ * `char *embedder_cmd` contract keeps its meaning ("the command to run") while
+ * what is exec'd stays honest about the arguments.
+ *
+ * Whitespace separates; '...' and "..." group; a backslash escapes the next
+ * character inside quotes. No expansion of any kind: nothing here reaches a
+ * shell, the argv is exec'd directly. `buf` is a mutable copy the caller owns
+ * and frees — the words point into it, and kbc_embedder_start copies them
+ * before returning, so the config value itself is never modified (it is
+ * written back verbatim when the config is saved). */
+static kbc_status split_command(char *buf, const char **argv, size_t max,
+                                 kbc_err *err) {
+  size_t n = 0;
+  char *p = buf;
+  while (*p != '\0') {
+    while (*p == ' ' || *p == '\t' || *p == '\n') {
+      p++;
+    }
+    if (*p == '\0') {
+      break;
+    }
+    if (n + 1 >= max) {
+      return kbc_err_set(err, KBC_ERR_INVALID,
+                         "embedder command has more than %zu words", max - 1);
+    }
+    argv[n++] = p;
+    char quote = '\0';
+    while (*p != '\0') {
+      if (quote != '\0') {
+        if (*p == quote) {
+          quote = '\0';
+          p++;
+          continue;
+        }
+        if (*p == '\\' && p[1] != '\0' && quote == '"') {
+          p++;
+        }
+        p++;
+        continue;
+      }
+      if (*p == '\'' || *p == '"') {
+        quote = *p++;
+        continue;
+      }
+      if (*p == ' ' || *p == '\t' || *p == '\n') {
+        break;
+      }
+      p++;
+    }
+    if (quote != '\0') {
+      return kbc_err_set(err, KBC_ERR_INVALID,
+                         "embedder command has an unterminated %c quote",
+                         quote);
+    }
+    if (*p != '\0') {
+      *p++ = '\0';
+    }
+  }
+  argv[n] = NULL;
+  if (n == 0) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "embedder command holds no executable");
+  }
+  return KBC_OK;
+}
+
 /* The text a document is indexed by: the title twice (the BM25 length-norm
  * convention, and the caller's decision per index.h), then the extracted
  * prose. Raw markup would only contribute terms nobody searches for. Shared by
@@ -669,19 +745,14 @@ static kbc_status build_index(kbc_app *app, kbc_app_manifest *m,
     return s;
   }
 
+  /* The sidecar reports its dimension only once it has answered something,
+   * and nothing has asked it anything yet at open time, so the store is
+   * created on the first successful embed in the loop below rather than here.
+   * `vec_tried` makes that a one-shot: a store that cannot be created is not
+   * retried per document, and a healthy sidecar that never answers never
+   * allocates one. */
   kbc_vecstore *vec = NULL;
-  size_t vdim = 0;
-  if (app->embed && kbc_embedder_healthy(app->embed)) {
-    vdim = kbc_embedder_dim(app->embed);
-    if (vdim > 0 && m->len > 0) {
-      kbc_err local;
-      kbc_err_reset(&local);
-      vec = kbc_vecstore_new(vdim, (uint32_t)m->len, &local);
-      if (!vec) {
-        KBC_LOGW("vector store: %s, keyword lane only", local.msg);
-      }
-    }
-  }
+  bool vec_tried = false;
 
   int64_t n_embedded = 0;
   for (size_t i = 0; i < m->len; i++) {
@@ -818,10 +889,21 @@ static kbc_status build_index(kbc_app *app, kbc_app_manifest *m,
       goto fail;
     }
 
-    if (vec) {
-      size_t dim = 0;
-      float *v = embed_one(app, fa, text.ptr, &dim);
-      if (v && dim == kbc_vecstore_dim(vec)) {
+    /* Embedded before the store decision: at this point nobody may know the
+     * dimension yet, and a store sized for the wrong one is worse than none. */
+    size_t dim = 0;
+    float *v = embed_one(app, fa, text.ptr, &dim);
+    if (v != NULL && vec == NULL && !vec_tried && dim > 0 && m->len > 0) {
+      vec_tried = true;
+      kbc_err local;
+      kbc_err_reset(&local);
+      vec = kbc_vecstore_new(dim, (uint32_t)m->len, &local);
+      if (!vec) {
+        KBC_LOGW("vector store: %s, keyword lane only", local.msg);
+      }
+    }
+    if (v && vec) {
+      if (dim == kbc_vecstore_dim(vec)) {
         kbc_err local;
         kbc_err_reset(&local);
         if (kbc_failed(kbc_vecstore_set(vec, (uint32_t)i, v, &local))) {
@@ -832,7 +914,7 @@ static kbc_status build_index(kbc_app *app, kbc_app_manifest *m,
         } else {
           n_embedded++;
         }
-      } else if (v) {
+      } else {
         /* Dimension drift between the sidecar and the store means the two
          * halves of the lane no longer agree; the keyword lane is still
          * correct, so degrade rather than publish mismatched rows. */
@@ -1408,10 +1490,18 @@ kbc_app *kbc_app_open(const kbc_config *cfg, kbc_err *err) {
   }
 
   if (app->cfg->embedder_cmd && app->cfg->embedder_cmd[0] != '\0') {
-    const char *argv[2];
-    argv[0] = app->cfg->embedder_cmd;
-    argv[1] = NULL;
-    app->embed = kbc_embedder_start(argv, err);
+    const size_t clen = strlen(app->cfg->embedder_cmd);
+    char *cbuf = malloc(clen + 1);
+    if (cbuf == NULL) {
+      (void)kbc_err_set(err, KBC_ERR_NOMEM, "embedder command buffer");
+      goto fail;
+    }
+    memcpy(cbuf, app->cfg->embedder_cmd, clen + 1);
+    const char *argv[64];
+    kbc_status cst =
+        split_command(cbuf, argv, sizeof argv / sizeof argv[0], err);
+    app->embed = kbc_failed(cst) ? NULL : kbc_embedder_start(argv, err);
+    free(cbuf);
     if (!app->embed) {
       goto fail;
     }
@@ -1520,7 +1610,12 @@ static kbc_status store_forget_path(kbc_app *app, const char *corpus,
  * index never references a document the store has not committed.
  *
  * `vanished` means the file is not on disk, which is a removal rather than an
- * update. */
+ * update.
+ *
+ * `rel_path` is CORPUS-RELATIVE — the same shape the watcher publishes and the
+ * store and index are keyed on. The corpus root is joined once, into `full`,
+ * and never prepended to the key.
+ */
 static kbc_status index_touch_one(kbc_app *app, const kbc_corpus_cfg *cc,
                                   const char *rel_path, bool vanished,
                                   kbc_err *err) {
@@ -1877,6 +1972,13 @@ kbc_status kbc_app_search(kbc_app *app, kbc_arena *a, const kbc_query *q,
                        local.msg[0] ? local.msg : "failed");
   }
 
+  /* The searcher scores the vector lane against the document embeddings, and
+   * search.h has no way to learn them; search.c exports this setter and
+   * documents the gap. Without this call the lane never runs and every
+   * semantic query degrades to an empty result. app->vec is BORROWED for the
+   * search, and the read lock held here is what keeps it alive. */
+  (void)kbc_searcher_set_vecstore(s, app->vec, &local);
+
   kbc_status rc_st = kbc_search_run(s, a, q, vec, vec_len, out, err);
   kbc_searcher_free(s);
   if (ea) {
@@ -1992,6 +2094,11 @@ static void watcher_cb(void *user, const char *type, const char *json_payload) {
     kbc_arena_free(a);
     return;
   }
+  /* The event contract: `corpus` names the corpus, `path` is CORPUS-RELATIVE.
+   * Everything below — the store, the index and the touch/remove path — is
+   * keyed on exactly that, so the root is joined here and nowhere else. An
+   * absolute path in the event would key every lookup on a path that does not
+   * exist, and an edit would read as a removal. */
   const char *corpus = kbc_json_str(j, "corpus", "");
   const char *path = kbc_json_str(j, "path", "");
   if (corpus[0] == '\0' || path[0] == '\0') {

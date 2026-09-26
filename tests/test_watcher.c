@@ -239,17 +239,20 @@ static void fx_teardown(fixture *f) {
 KBC_TEST(create_publishes_file_changed) {
   fixture f;
   fx_setup(&f, NULL, 250);
+  /* The payload's `path` is corpus-relative, so the assertions below name the
+   * file, not the absolute path they wrote it to. */
+  const char *rel = "created.md";
   char path[KBC_TEST_PATH_MAX];
-  path_join(path, sizeof path, f.root, "created.md");
+  path_join(path, sizeof path, f.root, rel);
   kbc_test_write_file(path, "hello\n");
 
-  const char *arg = path;
+  const char *arg = rel;
   int n = wait_count(&f.s, pred_any_for, arg, WAIT_MS);
   KBC_CHECK_MSG(n == 1, "expected exactly 1 event for the new file, got %d", n);
 
-  int changed = count_type_path(&f.s, "file.changed", path);
+  int changed = count_type_path(&f.s, "file.changed", rel);
   KBC_CHECK_MSG(changed == 1, "expected 1 file.changed, got %d", changed);
-  KBC_CHECK_EQ_INT(count_type_path(&f.s, "file.removed", path), 0);
+  KBC_CHECK_EQ_INT(count_type_path(&f.s, "file.removed", rel), 0);
 
   /* The action lives in the payload, not only in the event type. */
   bool saw_changed_action = false;
@@ -266,25 +269,25 @@ KBC_TEST(create_publishes_file_changed) {
 KBC_TEST(write_then_rename_yields_one_event) {
   fixture f;
   fx_setup(&f, NULL, 250);
+  const char *rel = "target.md";
   char path[KBC_TEST_PATH_MAX], tmp[KBC_TEST_PATH_MAX];
-  path_join(path, sizeof path, f.root, "target.md");
+  path_join(path, sizeof path, f.root, rel);
   path_join(tmp, sizeof tmp, f.root, ".stage.md");
   kbc_test_write_file(path, "v1\n");
-  wait_count(&f.s, pred_any_for, path, WAIT_MS);
-  const int pre = count_path(&f.s, path); /* the creation event is not part of it */
+  wait_count(&f.s, pred_any_for, rel, WAIT_MS);
+  const int pre = count_path(&f.s, rel); /* the creation event is not part of it */
   const size_t before = sink_n(&f.s);
 
   /* The atomic-save shape: write a sibling, then rename it over the target. */
   kbc_test_write_file(tmp, "v2\n");
   KBC_CHECK_MSG(rename(tmp, path) == 0, "rename over the target failed");
 
-  const char *arg = path;
-  (void)wait_count(&f.s, pred_any_for, arg, WAIT_MS);
+  (void)wait_count(&f.s, pred_any_for, rel, WAIT_MS);
   nap_ms(SETTLE_MS);
-  KBC_CHECK_MSG(count_path(&f.s, path) - pre == 1,
+  KBC_CHECK_MSG(count_path(&f.s, rel) - pre == 1,
                 "write-then-rename produced %d event(s) for the target, want 1",
-                count_path(&f.s, path) - pre);
-  KBC_CHECK_EQ_INT(count_type_path(&f.s, "file.removed", path), 0);
+                count_path(&f.s, rel) - pre);
+  KBC_CHECK_EQ_INT(count_type_path(&f.s, "file.removed", rel), 0);
   /* Nothing else may fire either: the staging file is a dotfile, so the
    * rename contributes exactly one event, for the target. */
   KBC_CHECK_MSG(sink_n(&f.s) - before == 1,
@@ -297,8 +300,9 @@ KBC_TEST(write_then_rename_yields_one_event) {
 KBC_TEST(rapid_writes_to_one_path_coalesce) {
   fixture f;
   fx_setup(&f, NULL, 400);
+  const char *rel = "hot.md";
   char path[KBC_TEST_PATH_MAX];
-  path_join(path, sizeof path, f.root, "hot.md");
+  path_join(path, sizeof path, f.root, rel);
 
   /* Six writes well inside the 400ms window, and the file is created by the
    * first of them — creation and every write must collapse into one event. */
@@ -307,9 +311,9 @@ KBC_TEST(rapid_writes_to_one_path_coalesce) {
     nap_ms(5);
   }
   nap_ms(WAIT_MS);
-  KBC_CHECK_MSG(count_path(&f.s, path) == 1,
+  KBC_CHECK_MSG(count_path(&f.s, rel) == 1,
                 "6 rapid writes produced %d event(s), want 1 (debounce)",
-                count_path(&f.s, path));
+                count_path(&f.s, rel));
 
   fx_teardown(&f);
 }
@@ -323,8 +327,8 @@ KBC_TEST(writes_to_different_paths_do_not_coalesce) {
   kbc_test_write_file(a, "1");
   kbc_test_write_file(b, "2");
   nap_ms(WAIT_MS);
-  KBC_CHECK_EQ_INT(count_path(&f.s, a), 1);
-  KBC_CHECK_EQ_INT(count_path(&f.s, b), 1);
+  KBC_CHECK_EQ_INT(count_path(&f.s, "one.md"), 1);
+  KBC_CHECK_EQ_INT(count_path(&f.s, "two.md"), 1);
   KBC_CHECK_MSG(sink_n(&f.s) == 2, "expected 2 events total, got %zu",
                 sink_n(&f.s));
 
@@ -334,14 +338,15 @@ KBC_TEST(writes_to_different_paths_do_not_coalesce) {
 KBC_TEST(delete_publishes_file_removed) {
   fixture f;
   fx_setup(&f, NULL, 250);
+  const char *rel = "doomed.md";
   char path[KBC_TEST_PATH_MAX];
-  path_join(path, sizeof path, f.root, "doomed.md");
+  path_join(path, sizeof path, f.root, rel);
   kbc_test_write_file(path, "bye\n");
-  (void)wait_count(&f.s, pred_any_for, path, WAIT_MS);
+  (void)wait_count(&f.s, pred_any_for, rel, WAIT_MS);
 
   KBC_CHECK_MSG(unlink(path) == 0, "unlink failed");
 
-  const char *pair[2] = {"file.removed", path};
+  const char *pair[2] = {"file.removed", rel};
   int n = wait_count(&f.s, pred_type_path, pair, WAIT_MS);
   KBC_CHECK_MSG(n == 1, "expected exactly 1 file.removed, got %d", n);
 
@@ -351,6 +356,32 @@ KBC_TEST(delete_publishes_file_removed) {
                     "file.removed payload lacked action=removed");
     }
   }
+
+  fx_teardown(&f);
+}
+
+/* The published `path` is CORPUS-RELATIVE — the index, the store and
+ * kbc_app's touch path are all keyed on that, and a consumer that saw the
+ * root repeated here would key every lookup on a path that does not exist. */
+KBC_TEST(payload_path_is_corpus_relative) {
+  fixture f;
+  fx_setup(&f, NULL, 250);
+  char dir[KBC_TEST_PATH_MAX], path[KBC_TEST_PATH_MAX];
+  path_join(dir, sizeof dir, f.root, "sub");
+  kbc_test_mkdir_p(dir);
+  /* The watch on a brand-new subdirectory is added from the create event, so
+   * a file written before that lands would be missed entirely. */
+  nap_ms(SETTLE_MS);
+  path_join(path, sizeof path, dir, "deep.md");
+  kbc_test_write_file(path, "x");
+
+  const char *rel = "sub/deep.md";
+  int n = wait_count(&f.s, pred_any_for, rel, WAIT_MS);
+  KBC_CHECK_MSG(n == 1, "expected 1 event for the nested file, got %d", n);
+  KBC_CHECK_MSG(count_path(&f.s, path) == 0,
+                "the payload carried the absolute path %s, not %s", path, rel);
+  KBC_CHECK_MSG(payload_has(f.s.evs[0].json, "corpus", "c1"),
+                "the payload did not name the corpus it belongs to");
 
   fx_teardown(&f);
 }
@@ -369,12 +400,12 @@ KBC_TEST(ignored_and_dotfile_names_publish_nothing) {
   kbc_test_write_file(control, "x");
 
   /* The control must arrive; otherwise "no event" below would prove nothing. */
-  (void)wait_count(&f.s, pred_any_for, control, WAIT_MS);
-  KBC_CHECK_MSG(count_path(&f.s, control) == 1,
+  (void)wait_count(&f.s, pred_any_for, "kept.md", WAIT_MS);
+  KBC_CHECK_MSG(count_path(&f.s, "kept.md") == 1,
                 "the non-ignored control file did not publish, test is vacuous");
   nap_ms(SETTLE_MS);
-  KBC_CHECK_EQ_INT(count_path(&f.s, ignored), 0);
-  KBC_CHECK_EQ_INT(count_path(&f.s, dot), 0);
+  KBC_CHECK_EQ_INT(count_path(&f.s, "scratch.tmp.md"), 0);
+  KBC_CHECK_EQ_INT(count_path(&f.s, ".hidden.md"), 0);
 
   fx_teardown(&f);
 }
@@ -432,6 +463,7 @@ int main(void) {
       {"writes_to_different_paths_do_not_coalesce",
        writes_to_different_paths_do_not_coalesce},
       {"delete_publishes_file_removed", delete_publishes_file_removed},
+      {"payload_path_is_corpus_relative", payload_path_is_corpus_relative},
       {"ignored_and_dotfile_names_publish_nothing",
        ignored_and_dotfile_names_publish_nothing},
       {"stop_is_prompt_and_null_safe", stop_is_prompt_and_null_safe},

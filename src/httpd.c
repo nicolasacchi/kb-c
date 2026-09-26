@@ -14,6 +14,7 @@
  * body byte is read.
  */
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -29,6 +30,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -48,6 +50,20 @@
 #define KBC_WORKER_MAX 64u
 #define KBC_REQ_BUF_MAX                                                       \
   (KBC_HTTP_MAX_REQUEST_LINE + KBC_HTTP_MAX_HEADER_BYTES + KBC_MAX_SNIFF_BYTES)
+
+/* Per-connection request cap. The daemon is loopback-by-default and refuses a
+ * routable bind with no token, so there is no untrusted-caller path to rate
+ * limit against; what this protects is the worker, not the corpus. One client
+ * that pipelines a million requests must not be able to keep a worker busy
+ * past the point where other clients are served. A fixed window is enough for
+ * that, and a token bucket would only be a more expensive lie. */
+#define KBC_RATE_LIMIT_DEFAULT 120u /* requests per connection per second */
+#define KBC_RATE_WINDOW_NS (1000000000ll)
+/* A preflight is a browser's question, not work: it is counted separately so
+ * that a page opening twenty connections does not spend the budget it has for
+ * the data it actually asked for. */
+#define KBC_CORS_MAX_ORIGINS 32u
+#define KBC_PEER_ADDR_MAX 64u
 
 /* ------------------------------------------------------------------ util -- */
 
@@ -70,10 +86,14 @@ static int hex_val(unsigned char c) {
   return -1;
 }
 
+/* RFC 7807 `title`: the reason phrase for the status, so a client that drops
+ * the body still has something to show. 429 is here because the per-connection
+ * request cap answers with it. */
 static const char *status_text(int status) {
   switch (status) {
   case 200: return "OK";
   case 202: return "Accepted";
+  case 204: return "No Content";
   case 400: return "Bad Request";
   case 401: return "Unauthorized";
   case 403: return "Forbidden";
@@ -81,9 +101,29 @@ static const char *status_text(int status) {
   case 405: return "Method Not Allowed";
   case 413: return "Payload Too Large";
   case 414: return "URI Too Long";
+  case 429: return "Too Many Requests";
   case 500: return "Internal Server Error";
   case 503: return "Service Unavailable";
   default: return "Error";
+  }
+}
+
+/* RFC 7807 `type`, a stable URN per status. A client dispatches on this, never
+ * on the human `title`; the mapping is deliberately one slug per status so a
+ * new call site cannot invent a new type by accident. */
+static const char *problem_type(int status) {
+  switch (status) {
+  case 400: return "urn:kb:errors:bad-request";
+  case 401: return "urn:kb:errors:unauthorized";
+  case 403: return "urn:kb:errors:forbidden";
+  case 404: return "urn:kb:errors:not-found";
+  case 405: return "urn:kb:errors:method-not-allowed";
+  case 413: return "urn:kb:errors:payload-too-large";
+  case 414: return "urn:kb:errors:uri-too-long";
+  case 429: return "urn:kb:errors:too-many-requests";
+  case 500: return "urn:kb:errors:internal";
+  case 503: return "urn:kb:errors:unavailable";
+  default: return "urn:kb:errors:error";
   }
 }
 
@@ -118,6 +158,18 @@ typedef struct conn {
   size_t body_want;  /* Content-Length, 0 when absent */
   size_t body_off;   /* offset of the body start */
   size_t consumed;   /* header_end + body_want */
+
+  char peer[KBC_PEER_ADDR_MAX]; /* the accept() address, "?" when unknown */
+
+  /* Per-connection request cap: a fixed window owned by this connection alone,
+   * so it needs no lock and no other connection can be starved by it. */
+  size_t rl_count;
+  int64_t rl_win_ns;
+  /* Headers the write path adds to the next response: the matched CORS origin
+   * (BORROWED from the httpd allowlist, NULL when none matched) and a one-shot
+   * extra header line (Retry-After on a 429). */
+  const char *cors_origin;
+  const char *extra_hdr;
 
   /* SSE state. `closed` and the conn list are guarded by h->conns_mu; the
    * frame queue is guarded by `mu`. Lock order: conns_mu, then mu. */
@@ -173,6 +225,13 @@ struct kbc_httpd {
   sse_hist ring[KBC_SSE_RING_CAP];
   size_t ring_next; /* next slot to write; == the oldest when full */
   uint64_t next_id;
+
+  /* Exact-match CORS origin allowlist, read once at start from the environment
+   * because kbc_config has no field for it (see the note above KBC_ROUTES).
+   * Empty means same-origin only, which is both the default and the safe one:
+   * kb-c serves no web UI, so there is no legitimate cross-origin caller. */
+  kbc_strlist cors;
+  size_t rate_limit; /* requests per connection per second, 0 disables */
 };
 
 /* -------------------------------------------------------- response bits -- */
@@ -180,6 +239,8 @@ struct kbc_httpd {
 static const char *const CT_JSON = "application/json; charset=utf-8";
 static const char *const CT_TEXT = "text/plain; charset=utf-8";
 static const char *const CT_SSE = "text/event-stream; charset=utf-8";
+static const char *const CT_PROBLEM =
+    "application/problem+json; charset=utf-8";
 
 void kbc_response_init(kbc_response *r) {
   if (!r) return;
@@ -206,22 +267,31 @@ kbc_status kbc_response_json(kbc_response *r, int status, const char *json) {
   return kbc_str_puts(&r->body, json ? json : "");
 }
 
+/* RFC 7807. The shape is the contract: type (stable URN), title (the reason
+ * phrase for the status), status (echoed so a client that lost the status line
+ * can still read it), detail (why, in the daemon's own words) and code (the
+ * kbc_status name, which is what the CLI matches on). A bare {"ok":false} told
+ * a client nothing it could branch on; this is what anything built against the
+ * kb API expects to parse. */
 kbc_status kbc_response_error_json(kbc_response *r, int status, kbc_status code,
                                    const char *msg) {
   if (!r) return kbc_err_set(NULL, KBC_ERR_INVALID, "kbc_response_error_json: r");
   kbc_response_free(r);
   r->status = status;
-  r->content_type = CT_JSON;
+  r->content_type = CT_PROBLEM;
   kbc_str s;
   kbc_str_init(&s);
-  kbc_status st = kbc_str_puts(&s, "{\"error\":{\"status\":");
+  kbc_status st = kbc_str_printf(&s, "{\"type\":\"%s\",\"title\":\"%s\","
+                                    "\"status\":%d,\"code\":\"%s\",\"detail\":",
+                                 problem_type(status), status_text(status),
+                                 status, kbc_status_str(code));
   if (kbc_failed(st)) goto done;
-  st = kbc_str_printf(&s, "%d,\"code\":\"%s\",\"message\":", status,
-                      kbc_status_str(code));
+  st = kbc_str_append_json_string(&s, msg != NULL && msg[0] != '\0'
+                                            ? msg
+                                            : status_text(status),
+                                  msg != NULL ? strlen(msg) : 0u);
   if (kbc_failed(st)) goto done;
-  st = kbc_str_append_json_string(&s, msg ? msg : "", msg ? strlen(msg) : 0);
-  if (kbc_failed(st)) goto done;
-  st = kbc_str_puts(&s, "}}");
+  st = kbc_str_putc(&s, '}');
   if (kbc_failed(st)) goto done;
   st = kbc_str_append(&r->body, s.ptr, s.len);
 done:
@@ -912,6 +982,188 @@ static kbc_status route_reindex(kbc_app *app, kbc_str *out, kbc_err *err) {
                         (long long)took_us);
 }
 
+/* ------------------------------------------------- identity (attribution) --
+ *
+ * This port has ONE trust tier, by design. It binds loopback unless a token is
+ * configured, and a token names the single operator of this daemon — there is
+ * no user registry, no roles, no ACLs and no per-user tokens, because there is
+ * nothing here they would gate. So identity is ATTRIBUTION (who the daemon
+ * thinks is on the other end of this request), never AUTHORIZATION: the same
+ * identity gets the same routes whatever it is, and knowing it grants nothing.
+ * The response says so in the body, so a client cannot mistake the answer for
+ * a capability it may spend. */
+typedef enum {
+  TIER_OPEN = 0,     /* no token configured: admission needed nothing */
+  TIER_LOOPBACK,     /* admitted because the peer is on the loopback */
+  TIER_TOKEN,        /* admitted by presenting the configured token */
+} auth_tier;
+
+/* Fails closed: an absent, empty or unparsable address is NOT loopback, and
+ * no proxy header is consulted (P7 — a spoofed X-Forwarded-For must never
+ * buy loopback). */
+static bool addr_is_loopback(const char *addr) {
+  if (addr == NULL || addr[0] == '\0' || addr[0] == '?') return false;
+  if (strcmp(addr, "::1") == 0) return true;
+  struct in_addr v4;
+  memset(&v4, 0, sizeof v4);
+  if (inet_pton(AF_INET, addr, &v4) == 1) {
+    return (ntohl(v4.s_addr) >> 24) == 127u;
+  }
+  return false;
+}
+
+static const char *tier_source(auth_tier t) {
+  switch (t) {
+  case TIER_TOKEN: return "token";
+  case TIER_LOOPBACK: return "loopback";
+  default: return "unresolved";
+  }
+}
+
+static const char *tier_identity(auth_tier t) {
+  switch (t) {
+  case TIER_TOKEN: return "operator";
+  case TIER_LOOPBACK: return "local";
+  default: return "unattributed";
+  }
+}
+
+/* A corpus name arrives from the query string and is only ever COMPARED, never
+ * used to build a path; the shape checks below exist so that a traversal or an
+ * over-long value is refused outright instead of quietly matching nothing. */
+static kbc_status corpus_filter(kbc_arena *a, const char *query,
+                                const kbc_config *cfg, const char **out,
+                                kbc_err *err) {
+  *out = NULL;
+  if (!query_has(query, "kb")) return KBC_OK;
+  kbc_status st = query_get(a, query, "kb", out, err);
+  if (kbc_failed(st)) return st;
+  if (*out == NULL || (*out)[0] == '\0') {
+    return kbc_err_set(err, KBC_ERR_INVALID, "kb must name a configured corpus");
+  }
+  size_t n = strlen(*out);
+  if (n > 256u) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "kb is %zu bytes, max 256", n);
+  }
+  for (size_t i = 0; i < n; i++) {
+    unsigned char ch = (unsigned char)(*out)[i];
+    if (ch < 0x20u || ch == 0x7fu || ch == '/' || ch == '\\') {
+      return kbc_err_set(err, KBC_ERR_INVALID,
+                         "kb contains a character no corpus name may hold");
+    }
+  }
+  if (strstr(*out, "..") != NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "kb must not contain \"..\"");
+  }
+  if (kbc_config_corpus(cfg, *out) == NULL) {
+    return kbc_err_set(err, KBC_ERR_NOTFOUND,
+                       "no corpus named \"%s\" is configured", *out);
+  }
+  return KBC_OK;
+}
+
+/* GET /api/kbs — the corpora this daemon was configured with, one row each.
+ * `docs` is the number of artifact rows stored for that corpus, counted through
+ * the public listing API, which clamps at KBC_MAX_HITS; a corpus at the clamp
+ * says so in `docs_truncated` rather than reporting a fake total. */
+static kbc_status route_kbs(kbc_app *app, kbc_arena *a, const char *query,
+                            const kbc_config *cfg, kbc_str *out,
+                            kbc_err *err) {
+  const char *only = NULL;
+  kbc_status st = corpus_filter(a, query, cfg, &only, err);
+  if (kbc_failed(st)) return st;
+
+  kbc_app_stats stats;
+  memset(&stats, 0, sizeof stats);
+  st = kbc_app_stats_get(app, &stats, err);
+  if (kbc_failed(st)) return st;
+
+  size_t n = cfg != NULL ? cfg->ncorpora : 0u;
+  st = kbc_str_puts(out, "{\"kbs\":[");
+  if (kbc_failed(st)) return st;
+  size_t emitted = 0;
+  for (size_t i = 0; i < n; i++) {
+    const kbc_corpus_cfg *c = &cfg->corpora[i];
+    if (only != NULL && strcmp(only, c->name) != 0) continue;
+    if (emitted > 0) {
+      st = kbc_str_putc(out, ',');
+      if (kbc_failed(st)) return st;
+    }
+    kbc_artifact *rows = NULL;
+    size_t nrows = 0;
+    kbc_err local;
+    kbc_err_reset(&local);
+    st = kbc_app_list_artifacts(app, a, c->name, KBC_KIND__COUNT, KBC_MAX_HITS,
+                                0, &rows, &nrows, &local);
+    if (kbc_failed(st)) return st;
+    struct stat sb;
+    bool root_exists = stat(c->path, &sb) == 0 && S_ISDIR(sb.st_mode);
+    st = kbc_str_puts(out, "{\"name\":");
+    if (kbc_failed(st)) return st;
+    st = kbc_str_append_json_string(out, c->name, strlen(c->name));
+    if (kbc_failed(st)) return st;
+    st = kbc_str_puts(out, ",\"path\":");
+    if (kbc_failed(st)) return st;
+    st = kbc_str_append_json_string(out, c->path, strlen(c->path));
+    if (kbc_failed(st)) return st;
+    st = kbc_str_printf(out,
+                        ",\"configured\":true,\"root_exists\":%s,"
+                        "\"docs\":%zu,\"docs_truncated\":%s}",
+                        root_exists ? "true" : "false", nrows,
+                        nrows >= KBC_MAX_HITS ? "true" : "false");
+    if (kbc_failed(st)) return st;
+    emitted++;
+  }
+  return kbc_str_printf(out,
+                        "],\"count\":%zu,\"index_terms\":%lld,"
+                        "\"index_docs\":%lld}",
+                        emitted, (long long)stats.index_terms,
+                        (long long)stats.index_docs);
+}
+
+/* GET /api/identity — who the daemon resolved this request to, and the fact
+ * that resolving it changed nothing about what the caller may do. */
+static kbc_status route_identity(const char *query, const kbc_request *req,
+                                 auth_tier tier, kbc_str *out, kbc_err *err) {
+  /* Identity is resolved, never requested. A client that tries to name itself
+   * is refused rather than believed: a route that accepted ?as=admin would be
+   * an authz system with one hardcoded role, which is worse than none. */
+  if (query_has(query, "as") || query_has(query, "identity") ||
+      query_has(query, "user")) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "identity is resolved by the daemon; a caller cannot "
+                       "claim one");
+  }
+  const char *client = req->client_addr != NULL ? req->client_addr : "?";
+  kbc_status st = kbc_str_puts(out, "{\"identity\":");
+  if (kbc_failed(st)) return st;
+  st = kbc_str_append_json_string(out, tier_identity(tier),
+                                  strlen(tier_identity(tier)));
+  if (kbc_failed(st)) return st;
+  st = kbc_str_puts(out, ",\"source\":");
+  if (kbc_failed(st)) return st;
+  st = kbc_str_append_json_string(out, tier_source(tier),
+                                  strlen(tier_source(tier)));
+  if (kbc_failed(st)) return st;
+  st = kbc_str_puts(out, ",\"client_addr\":");
+  if (kbc_failed(st)) return st;
+  st = kbc_str_append_json_string(out, client, strlen(client));
+  if (kbc_failed(st)) return st;
+  st = kbc_str_puts(out,
+                    ",\"loopback\":");
+  if (kbc_failed(st)) return st;
+  st = kbc_str_puts(out, addr_is_loopback(client) ? "true" : "false");
+  if (kbc_failed(st)) return st;
+  /* Everything a client would want to know about what this answer does NOT
+   * confer, stated once, in the body. */
+  return kbc_str_puts(
+      out,
+      ",\"trust_tiers\":1,\"authorization\":false,\"roles\":[],"
+      "\"note\":\"single-operator loopback daemon: identity is attribution, "
+      "not authorization; there are no roles, ACLs or per-user tokens\"}");
+}
+
 static kbc_status route_banner(kbc_str *out) {
   return kbc_str_printf(
       out,
@@ -919,19 +1171,28 @@ static kbc_status route_banner(kbc_str *out) {
       "This port serves a JSON API only; there is no reader UI here.\n"
       "Routes:\n"
       "  GET  /api/health\n"
+      "  GET  /api/identity\n"
+      "  GET  /api/kbs?kb=<corpus>\n"
       "  GET  /api/search?q=<terms>&kb=<corpus>&kind=&mode=&limit=&offset=\n"
       "  GET  /api/artifacts?kb=<corpus>&kind=&limit=&offset=\n"
       "  GET  /api/artifacts/{id}?source=1\n"
       "  POST /api/reindex\n"
       "  GET  /api/events\n"
-      "  GET  /api/stats\n",
+      "  GET  /api/stats\n"
+      "Errors are RFC 7807 application/problem+json.\n"
+      "One trust tier: identity is attribution, not authorization.\n"
+      "CORS is same-origin only unless KBC_CORS_ORIGINS names origins;\n"
+      "KBC_RATE_LIMIT_RPS caps requests per connection per second.\n",
       KBC_VERSION);
 }
 
 /* No token configured -> open. Otherwise a well-formed Bearer token must match
- * in constant time: a missing or malformed header is 401, a wrong one 403. */
+ * in constant time: a missing or malformed header is 401, a wrong one 403.
+ * `*tier` reports WHICH of the single admission paths let this request
+ * through, which is what /api/identity reports back. */
 static kbc_status check_auth(const kbc_config *cfg, const kbc_request *req,
-                             kbc_response *out) {
+                             kbc_response *out, auth_tier *tier) {
+  *tier = addr_is_loopback(req->client_addr) ? TIER_LOOPBACK : TIER_OPEN;
   if (cfg == NULL || cfg->token == NULL || cfg->token[0] == '\0') return KBC_OK;
   const char *auth = req->auth != NULL ? req->auth : "";
   static const char kPrefix[] = "Bearer ";
@@ -958,6 +1219,7 @@ static kbc_status check_auth(const kbc_config *cfg, const kbc_request *req,
                                   "invalid bearer token");
     return KBC_ERR_INVALID;
   }
+  *tier = TIER_TOKEN;
   return KBC_OK;
 }
 
@@ -987,7 +1249,33 @@ static kbc_status dispatch(kbc_app *app, const kbc_config *cfg,
     return route_health(app, &out->body, uptime_s);
   }
 
-  if (kbc_failed(check_auth(cfg, req, out))) return KBC_OK;
+  auth_tier tier = TIER_OPEN;
+  if (kbc_failed(check_auth(cfg, req, out, &tier))) return KBC_OK;
+
+  if (strcmp(p, "/api/identity") == 0) {
+    if (!is_get) return method_not_allowed(out, m, p);
+    /* No arena: this route decodes nothing and allocates nothing a request
+     * outlives. */
+    kbc_status st = route_identity(req->query, req, tier, &out->body, err);
+    if (kbc_failed(st)) {
+      return resp_error(out, 400, st, "%s", err_msg(err, st));
+    }
+    return KBC_OK;
+  }
+  if (strcmp(p, "/api/kbs") == 0) {
+    if (!is_get) return method_not_allowed(out, m, p);
+    kbc_arena *a = kbc_arena_new(16384);
+    if (a == NULL) return resp_error(out, 500, KBC_ERR_NOMEM, "no arena");
+    kbc_status st = route_kbs(app, a, req->query, cfg, &out->body, err);
+    kbc_arena_free(a);
+    if (st == KBC_ERR_NOTFOUND) {
+      return resp_error(out, 404, st, "%s", err_msg(err, st));
+    }
+    if (kbc_failed(st)) {
+      return resp_error(out, 400, st, "%s", err_msg(err, st));
+    }
+    return KBC_OK;
+  }
 
   if (strcmp(p, "/api/stats") == 0) {
     if (!is_get) return method_not_allowed(out, m, p);
@@ -1303,13 +1591,43 @@ static kbc_status queue_headers(conn *c, int status, const char *ct,
   kbc_status st = kbc_str_printf(&c->out, "HTTP/1.1 %d %s\r\n", status,
                                  status_text(status));
   if (kbc_failed(st)) return st;
-  st = kbc_str_printf(&c->out, "Content-Type: %s\r\n", ct);
-  if (kbc_failed(st)) return st;
+  /* A 204 carries no body, so it declares no content type and no length: a
+   * Content-Type on an empty response describes nothing. */
+  if (status != 204) {
+    st = kbc_str_printf(&c->out, "Content-Type: %s\r\n", ct);
+    if (kbc_failed(st)) return st;
+  }
   /* An SSE response has no Content-Length: the body never ends, and claiming a
    * length would tell the client to wait for bytes that are not coming. */
-  if (!sse) {
+  if (!sse && status != 204) {
     st = kbc_str_printf(&c->out, "Content-Length: %zu\r\n", body_len);
     if (kbc_failed(st)) return st;
+  }
+  /* `Vary: Origin` goes on EVERY response, allowed origin or not: a shared
+   * cache must not hand an allowed-origin answer to a browser that sent a
+   * different one, and that is only true if every answer varies. */
+  st = kbc_str_puts(&c->out, "Vary: Origin\r\n");
+  if (kbc_failed(st)) return st;
+  /* Reflected only for an origin that matched the configured allowlist. There
+   * is deliberately no `Access-Control-Allow-Origin: *` fallback: a daemon
+   * holding an entire corpus has no reason to make itself readable by any page
+   * the operator happens to have open. */
+  if (c->cors_origin != NULL) {
+    st = kbc_str_printf(
+        &c->out,
+        "Access-Control-Allow-Origin: %s\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Authorization, Content-Type, "
+        "Last-Event-ID\r\n"
+        "Access-Control-Expose-Headers: Retry-After\r\n"
+        "Access-Control-Max-Age: 600\r\n",
+        c->cors_origin);
+    if (kbc_failed(st)) return st;
+  }
+  if (c->extra_hdr != NULL) {
+    st = kbc_str_printf(&c->out, "%s\r\n", c->extra_hdr);
+    if (kbc_failed(st)) return st;
+    c->extra_hdr = NULL; /* one-shot: the next response has its own headers */
   }
   st = kbc_str_puts(&c->out, "X-Content-Type-Options: nosniff\r\n");
   if (kbc_failed(st)) return st;
@@ -1439,14 +1757,88 @@ static void sse_attach(conn *c, const char *last_event_id) {
   }
 }
 
+/* Exact match against the configured allowlist. An origin is never pattern
+ * matched and never wildcarded: a subdomain rule would be a rule somebody has
+ * to reason about before trusting it with a whole corpus. */
+static const char *cors_match(const kbc_httpd *h, const char *origin) {
+  if (origin == NULL || origin[0] == '\0') return NULL;
+  return kbc_strlist_contains(&h->cors, origin) ? origin : NULL;
+}
+
+/* A preflight is a browser asking "may I?" before it sends anything. It
+ * carries no credentials, so it is answered without the token gate and it
+ * never reaches a handler — but it is still not free to ask about an origin the
+ * daemon does not serve. */
+static void serve_preflight(conn *c, const http_req *r) {
+  const char *origin = hdr_find(r, "Origin");
+  kbc_response resp;
+  kbc_response_init(&resp);
+  if (origin == NULL || origin[0] == '\0') {
+    c->cors_origin = NULL;
+    (void)resp_error(&resp, 404, KBC_ERR_NOTFOUND,
+                     "OPTIONS %s without an Origin is not a preflight", r->path);
+  } else {
+    const char *ok = cors_match(c->h, origin);
+    c->cors_origin = ok;
+    if (ok == NULL) {
+      (void)resp_error(&resp, 403, KBC_ERR_INVALID,
+                       "origin %s is not in KBC_CORS_ORIGINS", origin);
+    } else {
+      resp.status = 204;
+    }
+  }
+  conn_queue_response(c, resp.status, resp.content_type, resp.body.ptr,
+                      resp.body.len, false, false);
+  kbc_response_free(&resp);
+}
+
 static void serve_request(conn *c, const http_req *r) {
+  const char *origin = hdr_find(r, "Origin");
+  c->cors_origin = cors_match(c->h, origin);
+  c->extra_hdr = NULL;
+  if (strcmp(r->method, "OPTIONS") == 0 && strncmp(r->path, "/api/", 5) == 0) {
+    serve_preflight(c, r);
+    return;
+  }
+
+  /* Per-connection fixed window. What this protects is the worker: one client
+   * that pipelines faster than the daemon can answer must not be able to keep
+   * that worker's loop busy enough to delay every other connection it holds.
+   * It is NOT a defence against an attacker — there is no untrusted-caller
+   * path to defend against (loopback-only bind, no routable bind without a
+   * token) — and it is deliberately per connection, not global, so one noisy
+   * client cannot spend another client's budget. */
+  size_t cap = c->h->rate_limit;
+  if (cap > 0) {
+    int64_t now = kbc_now_ns();
+    if (c->rl_win_ns == 0 || now - c->rl_win_ns >= KBC_RATE_WINDOW_NS) {
+      c->rl_win_ns = now;
+      c->rl_count = 0;
+    }
+    if (c->rl_count >= cap) {
+      kbc_response resp;
+      kbc_response_init(&resp);
+      (void)resp_error(&resp, 429, KBC_ERR_INVALID,
+                       "more than %zu requests in one second on this "
+                       "connection; raise KBC_RATE_LIMIT_RPS to lift this",
+                       cap);
+      c->extra_hdr = "Retry-After: 1";
+      conn_queue_response(c, resp.status, resp.content_type, resp.body.ptr,
+                          resp.body.len, true, false);
+      kbc_response_free(&resp);
+      c->close_after = true;
+      return;
+    }
+    c->rl_count++;
+  }
+
   kbc_request req;
   memset(&req, 0, sizeof req);
   req.method = r->method;
   req.path = r->path;
   req.query = r->query;
   req.auth = r->auth != NULL ? r->auth : "";
-  req.client_addr = "peer";
+  req.client_addr = c->peer;
   req.body = c->in.ptr + c->body_off;
   req.body_len = c->body_want;
 
@@ -1642,7 +2034,13 @@ static void worker_service_sse(kbc_worker *w) {
 static void worker_accept(kbc_worker *w) {
   kbc_httpd *h = w->h;
   for (;;) {
-    int fd = accept(w->lfd, NULL, NULL);
+    /* The peer address is read here, at accept, because that is the only point
+     * where it is the kernel's answer and not a claim by the client. It is what
+     * /api/identity and the loopback admission tier are decided from. */
+    struct sockaddr_storage ss;
+    socklen_t slen = sizeof ss;
+    memset(&ss, 0, sizeof ss);
+    int fd = accept(w->lfd, (struct sockaddr *)&ss, &slen);
     if (fd < 0) {
       if (errno == EINTR) continue;
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -1665,15 +2063,25 @@ static void worker_accept(kbc_worker *w) {
     int one = 1;
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     if (atomic_load(&h->conns) >= (int)KBC_HTTP_MAX_CONNECTIONS) {
-      static const char kBusy[] =
-          "HTTP/1.1 503 Service Unavailable\r\n"
-          "Content-Type: application/json; charset=utf-8\r\n"
-          "Content-Length: 80\r\n"
-          "X-Content-Type-Options: nosniff\r\n"
-          "Connection: close\r\n\r\n"
-          "{\"error\":{\"status\":503,\"code\":\"conflict\",\"message\":\"too "
-          "many connections\"}}\n";
-      ssize_t ignored = send(fd, kBusy, sizeof kBusy - 1, MSG_NOSIGNAL);
+      /* Refused before any conn exists, so the body is written by hand — and
+       * it is the same problem+json every other error is, with a
+       * Content-Length computed rather than counted by hand. */
+      static const char kBusyBody[] =
+          "{\"type\":\"urn:kb:errors:unavailable\",\"title\":\"Service "
+          "Unavailable\",\"status\":503,\"code\":\"conflict\",\"detail\":\"too "
+          "many connections\"}";
+      char busy[512];
+      int bn = snprintf(busy, sizeof busy,
+                        "HTTP/1.1 503 Service Unavailable\r\n"
+                        "Content-Type: application/problem+json; "
+                        "charset=utf-8\r\n"
+                        "Content-Length: %zu\r\n"
+                        "Vary: Origin\r\n"
+                        "X-Content-Type-Options: nosniff\r\n"
+                        "Connection: close\r\n\r\n%s",
+                        sizeof kBusyBody - 1, kBusyBody);
+      ssize_t ignored =
+          bn > 0 ? send(fd, busy, (size_t)bn, MSG_NOSIGNAL) : (ssize_t)-1;
       (void)ignored;
       close(fd);
       continue;
@@ -1688,6 +2096,24 @@ static void worker_accept(kbc_worker *w) {
     c->tag = CONN_TAG_FD;
     c->fd = fd;
     c->event_fd = -1;
+    /* "?" is not an address: addr_is_loopback() fails closed on it, so a
+     * connection whose peer the kernel did not name is never admitted as
+     * loopback. */
+    snprintf(c->peer, sizeof c->peer, "%s", "?");
+    if (ss.ss_family == AF_INET) {
+      char ip[INET_ADDRSTRLEN];
+      const struct sockaddr_in *v4 = (const struct sockaddr_in *)(const void *)&ss;
+      if (inet_ntop(AF_INET, &v4->sin_addr, ip, sizeof ip) != NULL) {
+        snprintf(c->peer, sizeof c->peer, "%s", ip);
+      }
+    } else if (ss.ss_family == AF_INET6) {
+      char ip[INET6_ADDRSTRLEN];
+      const struct sockaddr_in6 *v6 =
+          (const struct sockaddr_in6 *)(const void *)&ss;
+      if (inet_ntop(AF_INET6, &v6->sin6_addr, ip, sizeof ip) != NULL) {
+        snprintf(c->peer, sizeof c->peer, "%s", ip);
+      }
+    }
     kbc_str_init(&c->in);
     kbc_str_init(&c->out);
     pthread_mutex_init(&c->mu, NULL);
@@ -1860,6 +2286,65 @@ kbc_httpd *kbc_httpd_start(kbc_app *app, const kbc_config *cfg, kbc_err *err) {
   h->threads = calloc(want, sizeof *h->threads);
   h->wake_rd = -1;
   h->wake_wr = -1;
+
+  /* The two knobs that have no home in kbc_config. They are read ONCE here,
+   * into httpd-owned memory, and never again: a worker must not call getenv
+   * on the request path, and a per-connection cap has to have one threshold
+   * for the life of the daemon. The config fields they should become are in
+   * the port report; until the header owns them, the environment is the
+   * honest place for them. */
+  kbc_strlist_init(&h->cors);
+  h->rate_limit = KBC_RATE_LIMIT_DEFAULT;
+  const char *origins = getenv("KBC_CORS_ORIGINS");
+  if (origins != NULL) {
+    /* Comma-separated, exact origins. Whitespace around a value is trimmed,
+     * an empty element is skipped: a trailing comma is a typo, not an origin. */
+    const char *p = origins;
+    while (*p != '\0' && h->cors.len < KBC_CORS_MAX_ORIGINS) {
+      const char *comma = strchr(p, ',');
+      size_t n = comma != NULL ? (size_t)(comma - p) : strlen(p);
+      while (n > 0 && (*p == ' ' || *p == '\t')) {
+        p++;
+        n--;
+      }
+      while (n > 0 && (p[n - 1] == ' ' || p[n - 1] == '\t')) n--;
+      if (n > 0) {
+        char *one = malloc(n + 1);
+        if (one == NULL) {
+          (void)kbc_err_set(err, KBC_ERR_NOMEM, "KBC_CORS_ORIGINS: alloc");
+          kbc_httpd_stop(h);
+          return NULL;
+        }
+        memcpy(one, p, n);
+        one[n] = '\0';
+        /* push copies, so `one` is ours to release either way — the list holds
+         * its own copy and nothing else points at this buffer. */
+        kbc_status ps = kbc_strlist_push(&h->cors, one);
+        KBC_LOGI("httpd: allowing CORS origin %s", one);
+        free(one);
+        if (kbc_failed(ps)) {
+          (void)kbc_err_set(err, KBC_ERR_NOMEM, "KBC_CORS_ORIGINS: list");
+          kbc_httpd_stop(h);
+          return NULL;
+        }
+      }
+      if (comma == NULL) break;
+      p = comma + 1;
+    }
+  }
+  const char *rps = getenv("KBC_RATE_LIMIT_RPS");
+  if (rps != NULL && rps[0] != '\0') {
+    char *end = NULL;
+    errno = 0;
+    unsigned long v = strtoul(rps, &end, 10);
+    if (end == rps || *end != '\0' || errno != 0) {
+      (void)kbc_err_set(err, KBC_ERR_INVALID,
+                         "KBC_RATE_LIMIT_RPS: \"%s\" is not a number", rps);
+      kbc_httpd_stop(h);
+      return NULL;
+    }
+    h->rate_limit = v;
+  }
   if (h->bind_addr == NULL || h->listen_fd == NULL || h->w == NULL ||
       h->threads == NULL) {
     (void)kbc_err_set(err, KBC_ERR_NOMEM, "kbc_httpd_start: worker arrays");
@@ -1988,6 +2473,7 @@ void kbc_httpd_stop(kbc_httpd *h) {
     free(h->ring[i].type);
     free(h->ring[i].json);
   }
+  kbc_strlist_free(&h->cors);
   free(h->bind_addr);
   free(h->listen_fd);
   free(h->w);
@@ -1999,11 +2485,19 @@ void kbc_httpd_stop(kbc_httpd *h) {
 
 int kbc_httpd_port(const kbc_httpd *h) { return h != NULL ? h->port : 0; }
 
+/* CORS and the per-connection request cap have no field in kbc_config, so they
+ * are read once at start from KBC_CORS_ORIGINS and KBC_RATE_LIMIT_RPS; see
+ * kbc_httpd_start. Defaults: no cross-origin caller at all, and a cap of
+ * KBC_RATE_LIMIT_DEFAULT requests per connection per second. */
 /* ------------------------------------------------------ (5) route export -- */
 
 const kbc_route KBC_ROUTES[] = {
     {"GET", "/api/health", "liveness, version, uptime, indexed doc count",
      false},
+    {"GET", "/api/identity",
+     "resolved identity and its source; attribution, not authorization", true},
+    {"GET", "/api/kbs", "configured corpora with doc counts, ?kb= filters one",
+     true},
     {"GET", "/api/stats", "daemon counters as JSON", true},
     {"GET", "/api/search", "search, ?q=&kb=&kind=&mode=&limit=&offset=", true},
     {"GET", "/api/artifacts", "list artifacts, ?kb=&kind=&limit=&offset=",

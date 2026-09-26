@@ -1084,12 +1084,34 @@ static kbc_status cfg_put(char **slot, char *value, const char *what,
   *slot = value;
   return KBC_OK;
 }
+/* A path as the config file's author wrote it, made absolute against the
+ * config file's own directory: the corpus rule, applied to data_dir,
+ * db_path, index_path and token_file too. Nothing a config names is relative
+ * to whatever directory the operator happened to be standing in. */
+static char *cfg_resolve(const char *dir, const char *p) {
+  if (p[0] == '/') {
+    return cfg_strdup(p);
+  }
+  return cfg_join(dir, p);
+}
+
+/* Move an overlay path into its config slot, resolved against `dir`. The
+ * overlay's own copy dies here: cfg_put takes ownership of the resolved
+ * string, and nulling the overlay slot without freeing it would leak the
+ * original. */
+static kbc_status cfg_take_path(char **slot, char *owned, const char *dir,
+                                const char *what, kbc_err *err) {
+  char *p = cfg_resolve(dir, owned);
+  free(owned);
+  return cfg_put(slot, p, what, err);
+}
 
 /* The one place the overlay lands. `dir` is the config file's directory,
- * against which relative corpus paths resolve. */
+ * against which every relative path in the file resolves. */
 static kbc_status cfg_apply(kbc_config *cfg, cfg_overlay *ov, const char *dir,
                             const char *abs_path, kbc_err *err) {
   kbc_status st;
+  bool data_dir_given = false;
 
   if (ov->bind_addr != NULL) {
     st = cfg_put(&cfg->bind_addr, ov->bind_addr, "bind", err);
@@ -1099,40 +1121,59 @@ static kbc_status cfg_apply(kbc_config *cfg, cfg_overlay *ov, const char *dir,
     ov->bind_addr = NULL;
   }
   if (ov->data_dir != NULL) {
-    st = cfg_put(&cfg->data_dir, ov->data_dir, "data_dir", err);
+    st = cfg_take_path(&cfg->data_dir, ov->data_dir, dir, "data_dir", err);
     if (st != KBC_OK) {
       return st;
     }
     ov->data_dir = NULL;
-    /* db/index follow data_dir unless the file pinned them explicitly, so a
-     * config that only sets data_dir still points at one directory. */
-    if (ov->db_path == NULL && ov->index_path == NULL) {
-      cfg_put(&cfg->db_path, cfg_join(cfg->data_dir, "kb.db"), "db_path", err);
-      cfg_put(&cfg->index_path, cfg_join(cfg->data_dir, "index"), "index_path",
-              err);
-    }
+    data_dir_given = true;
   }
+  /* db, index and token follow data_dir by name unless the file pinned them,
+   * so a config that only sets data_dir points every path it owns at one
+   * directory. Deriving each independently (rather than all-or-nothing) is
+   * what makes "data_dir + one explicit path" coherent too. */
   if (ov->db_path != NULL) {
-    st = cfg_put(&cfg->db_path, ov->db_path, "db_path", err);
+    st = cfg_take_path(&cfg->db_path, ov->db_path, dir, "db_path", err);
     if (st != KBC_OK) {
       return st;
     }
     ov->db_path = NULL;
+  } else if (data_dir_given) {
+    st = cfg_put(&cfg->db_path, cfg_join(cfg->data_dir, "kb.db"), "db_path",
+                 err);
+    if (st != KBC_OK) {
+      return st;
+    }
   }
   if (ov->index_path != NULL) {
-    st = cfg_put(&cfg->index_path, ov->index_path, "index_path", err);
+    st = cfg_take_path(&cfg->index_path, ov->index_path, dir, "index_path",
+                       err);
     if (st != KBC_OK) {
       return st;
     }
     ov->index_path = NULL;
+  } else if (data_dir_given) {
+    st = cfg_put(&cfg->index_path, cfg_join(cfg->data_dir, "index"),
+                 "index_path", err);
+    if (st != KBC_OK) {
+      return st;
+    }
   }
   if (ov->token_path != NULL) {
-    st = cfg_put(&cfg->token_path, ov->token_path, "token_file", err);
+    st = cfg_take_path(&cfg->token_path, ov->token_path, dir, "token_file",
+                       err);
     if (st != KBC_OK) {
       return st;
     }
     ov->token_path = NULL;
+  } else if (data_dir_given) {
+    st = cfg_put(&cfg->token_path, cfg_join(cfg->data_dir, "token"),
+                 "token_file", err);
+    if (st != KBC_OK) {
+      return st;
+    }
   }
+
   if (ov->embedder_cmd != NULL) {
     st = cfg_put(&cfg->embedder_cmd, ov->embedder_cmd, "embedder command", err);
     if (st != KBC_OK) {
@@ -1287,6 +1328,75 @@ void kbc_config_free(kbc_config *cfg) {
    * likely to fault loudly than to read a stale pointer. */
   memset(cfg, 0, sizeof *cfg);
   free(cfg);
+}
+
+/* The one place the bearer token is resolved. Everything that reads
+ * cfg->token — the bind guard, the httpd's auth gate, the CLI's own outbound
+ * requests — must go through here, or the daemon and the CLI can disagree
+ * about what the token is.
+ *
+ * cfg->token already carrying a value is the caller saying "here it is"
+ * (there is deliberately no kb.toml key for a literal secret), so that wins
+ * and this is a no-op: idempotent, and re-resolving picks up a changed token
+ * FILE only after the caller has dropped the previous value. */
+kbc_status kbc_config_load_token(kbc_config *cfg, kbc_err *err) {
+  kbc_str body;
+  char *tok;
+  size_t start;
+  size_t end;
+
+  kbc_err_reset(err);
+  if (cfg == NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "kbc_config_load_token needs a config");
+  }
+  if (cfg->token != NULL) {
+    return KBC_OK;
+  }
+  if (cfg->token_path == NULL || cfg->token_path[0] == '\0') {
+    /* No token file configured at all: the loopback-with-no-auth case. This is
+     * NOT an error, and it is deliberately distinguishable from a configured
+     * file that cannot be read, which would be an error. */
+    return KBC_OK;
+  }
+
+  kbc_str_init(&body);
+  if (kbc_failed(kbc_str_read_file(cfg->token_path, &body, err))) {
+    /* Name the path, because a bare "cannot read" leaves the operator guessing
+     * which file, and because the distinction that matters here is
+     * "configured but unreadable", not "no token". The path is bounded and the
+     * underlying reason is dropped rather than risking a truncated copy. */
+    kbc_str_free(&body);
+    return kbc_err_set(err, KBC_ERR_IO,
+                       "token file %.180s cannot be read", cfg->token_path);
+  }
+
+  /* First line only, \r\n tolerated. An empty or all-newline file resolves to
+   * the empty string, which every reader already treats as "no token" — the
+   * bind guard refuses a public bind on it, so an accidentally blank file
+   * cannot quietly open a bind. */
+  start = 0;
+  end = 0;
+  while (end < body.len && body.ptr[end] != '\n' && body.ptr[end] != '\r') {
+    end++;
+  }
+  tok = malloc(end - start + 1u);
+  if (tok == NULL) {
+    kbc_str_free(&body);
+    return kbc_err_set(err, KBC_ERR_NOMEM,
+                       "out of memory reading the token from %s",
+                       cfg->token_path);
+  }
+  (void)memcpy(tok, body.ptr + start, end - start);
+  tok[end - start] = '\0';
+  kbc_str_free(&body);
+
+  /* KBC_OWN: free whatever was there before replacing it. cfg->token is NULL
+   * here (the early return above proved it), but the free keeps this correct
+   * if that ever changes. */
+  free(cfg->token);
+  cfg->token = tok;
+  return KBC_OK;
 }
 
 /* ------------------------------------------------------------- loading -- */

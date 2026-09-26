@@ -251,20 +251,21 @@ static pending_entry *pending_find(kbc_watcher *w, size_t corpus,
 
 /* ---------------------------------------------------------------- publish -- */
 
+/* The payload's `path` is CORPUS-RELATIVE, and `corpus` names which corpus it
+ * belongs to. The index, the store and kbc_app's own touch/remove path are all
+ * keyed on the relative path, so a subscriber that joined the root on again
+ * would look up a document that never existed — and a real edit would read as
+ * a removal. It is also the safer wire shape: an absolute path in an event
+ * leaks the server's filesystem layout into every consumer (SSE, webhooks).
+ * The root is the subscriber's business, not the event's. */
 static void publish(kbc_watcher *w, size_t corpus, const char *rel,
                     bool removed) {
   const corpus_cfg *c = &w->corpora[corpus];
-  char path[KBC_WATCH_PATH_MAX];
-  int n;
-  if (rel[0] == '\0') {
-    n = snprintf(path, sizeof path, "%s", c->path);
-  } else {
-    n = snprintf(path, sizeof path, "%s/%s", c->path, rel);
-  }
-  if (n < 0 || (size_t)n >= sizeof path) {
-    KBC_LOGW("watcher: path too long to report, dropping %s/%s", c->path, rel);
+  if (rel[0] == '\0' || strlen(rel) >= KBC_WATCH_PATH_MAX) {
+    KBC_LOGW("watcher: %s: path too long to report, dropping %s", c->name, rel);
     return;
   }
+  const size_t n = strlen(rel);
 
   kbc_str js;
   kbc_str_init(&js);
@@ -272,11 +273,11 @@ static void publish(kbc_watcher *w, size_t corpus, const char *rel,
   if (kbc_str_puts(&js, "{\"corpus\":") != KBC_OK ||
       kbc_str_append_json_string(&js, c->name, strlen(c->name)) != KBC_OK ||
       kbc_str_puts(&js, ",\"path\":") != KBC_OK ||
-      kbc_str_append_json_string(&js, path, (size_t)n) != KBC_OK ||
+      kbc_str_append_json_string(&js, rel, n) != KBC_OK ||
       kbc_str_puts(&js, ",\"action\":") != KBC_OK ||
       kbc_str_append_json_string(&js, action, strlen(action)) != KBC_OK ||
       kbc_str_puts(&js, "}") != KBC_OK) {
-    KBC_LOGE("watcher: out of memory building the event for %s", path);
+    KBC_LOGE("watcher: out of memory building the event for %s/%s", c->name, rel);
     kbc_str_free(&js);
     return;
   }

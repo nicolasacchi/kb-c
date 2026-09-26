@@ -6,7 +6,7 @@ the port exists, what is being built in what order, how the performance claim
 is measured, and what would have to be true for kb-c to be a drop-in.
 
 Scope in one line: 231,379 LOC of Rust across six crates, of which kb-c today
-claims 81,146 (35%) and a further 38,350 (17%) is scheduled below. The
+claims 82,756 (35.7%) and a further 36,740 (15.9%) is scheduled below. The
 remaining 48.4% is out of scope and stays in Rust. Those three figures are the
 PORTED+PARTIAL, PLANNED and OUT-OF-SCOPE row sums in `INVENTORY.md`,
 recomputed from the rows on 2026-09-26.
@@ -95,11 +95,14 @@ pays it in stage 3:
    │             extension gate, dotfile/ignore gate, exclusions.
    │             No periodic reconcile walk yet (stage 1).
    ▼  WatchWork{kind, path}
-   │  app.c      every event triggers a full corpus rebuild: walk corpora
-   │             → gate (extension/ignore/exclusion) → read → identity →
-   │             dedup (mtime+size) → UTF-8 check → parse
-   │             (a per-file incremental add is not possible: the index has
-   │             no add-to-open operation — see reindex_one)
+   │  app.c      a watcher event re-indexes THAT file: read → identity →
+   │             parse → store row → in-place index update. There is no
+   │             add-to-open, but there is an incremental in-place path, and
+   │             it is guarded at both ends: the watcher publishes a
+   │             corpus-relative path, and reindex_one treats an unresolvable
+   │             one as a removal rather than as an edit.
+   │             (kbc_index_save refuses to write a file its own loader would
+   │             reject — see §2.4.5.)
    ├──────────────▶ parse.c   Markdown | HTML blocks, stable element anchors,
    │                         heading levels, title fallback
    └──────────────▶ embed.c   NDJSON to `kb-embedder`:
@@ -115,7 +118,9 @@ pays it in stage 3:
    ── query ──
 
    q ─▶ search.c   tokenize the query (stopwords, ≤KBC_MAX_TERM_LEN);
-        │         the kb query grammar (AND/OR/NOT, key:value) is stage 2
+        │         the kb query grammar (AND/OR/NOT, folder:, text:) — done,
+        │         in the shape the index can answer; keys it cannot evaluate
+        │         are refused with a 400 rather than searched as literals
         ├▶ index.c   BM25 over mmap'd postings, k1/b from config
         │            (1.2 / 0.75 defaults), IDF = ln(1 + (N−n+0.5)/(n+0.5));
         │            the caller supplies the searchable text, title counted
@@ -125,12 +130,14 @@ pays it in stage 3:
         │               score = 1/(1+distance), ties by doc id ASC
         └▶ RRF k=60, dedup on id, score = Σ 1/(60+rank)
              sort DESC, take(limit, ceiling KBC_MAX_HITS)
-             title boost ×1.5  [not implemented; fusion.rs's other boost]
-             graph boost + w/60·√in/√in_max   [not implemented]
+             title boost, +0.5 × the fused score  [ported: fusion.rs:145]
+             graph boost + w/60·√in/√in_max   [not implemented: no edge graph]
    ▼
    httpd.c  epoll accept → HTTP/1.1 → dispatch → handler → JSON;
-            bearer auth on every /api route but /api/health, JSON errors
-            (not problem+json), a 256-entry SSE ring with Last-Event-ID
+            bearer auth on every /api route but /api/health, RFC 7807
+            application/problem+json errors, same-origin-only CORS with an
+            exact allowlist, a per-connection request cap, a 256-entry SSE
+            ring with Last-Event-ID
    cli/main.c  the same requests over a blocking socket, falling back to an
             in-process app for reindex/search/get/list when no daemon answers
 ```
@@ -168,7 +175,7 @@ states.
 
 ### 2.4 Decisions the build made that the design did not
 
-Four of them, recorded here because each changed a contract this document
+Five of them, recorded here because each changed a contract this document
 originally stated:
 
 1. **The artifact id is derived from `(corpus, path)` only** — FNV-1a over
@@ -184,41 +191,59 @@ originally stated:
    sequential scan.
 3. **Query scratch is thread-local**, not mutex-guarded — see §2.3.
 4. **The JSON writer and the daemon's own test suite found defects a design
-   document would not have.** The test suite is 11 ctest binaries with 215
+   document would not have.** The test suite is 11 ctest binaries with 271
    case functions, and it found 24 defects during the build, among them two
    use-after-frees, a data race across query threads, and the CLI's offline
    path. Treat a stage's acceptance gate as unproven until a test exists that
    fails when the behaviour is wrong.
+5. **Two more defects, found by measuring the running daemon rather than by
+   reading it, both in the ingest path.** The incremental path wrote an index
+   its own loader rejected: two whole sections were declared in the header and
+   never written, because an opened index keeps its arenas in the `mmap` while
+   `save` wrote the empty heap copies. `save` now runs a self-check and refuses
+   to write a file `kbc_index_open` would reject — the failure is now
+   impossible to produce rather than merely unlikely. Separately, the watcher
+   published an **absolute** path which `app.c` read as corpus-relative, so a
+   file save in a running daemon resolved to nothing, was recorded as a
+   *removal*, and swept the document out of the index. That is why a "one file
+   changed" measurement taken while it was live came out at 355 ms rather than
+   9–14 ms: it was measuring the remove-and-sweep path, not the incremental
+   one. Both have end-to-end proofs.
 
 ---
 
 ## 3. Staged migration
 
-Stage 0 is built. Stages 1 and 2 are **PLANNED** and nothing in them is in
-the tree. Stages 3–6 are **PLANNED** as routes, middleware and verbs, but
-their core is partly in already: a 7-route JSON API, bearer auth, an SSE
-stream, and the CLI's client and verbs. Those stages are therefore *gaps in
-what exists*, not greenfield.
+Stage 0 is built. Stage 2 is **partly** built: the query grammar and prefix
+expansion landed, in the shape the index can answer, and the keys it cannot
+answer are refused with a 400 rather than mis-searched. Stage 3 is **mostly**
+built: `problem+json`, `/api/identity`, `/api/kbs`, CORS and rate limiting are
+in, so what remains there is the route table, the identity ladder, the SSE gap
+probe and the query-embedding cache. Stages 1, 4, 5 and 6 are **PLANNED** and
+nothing in them is in the tree. The stages that are partly in already are
+therefore *gaps in what exists*, not greenfield.
 
 ### Stage 0 — the core (BUILT)
 
 Units, as they are in the tree: `config.c`, `store.c` + one migration,
 `parse.c` + the tokenizer and its stopword table, `ids.c`, `index.c`
 (inverted index + BM25), `search.c` (RRF), `embed.c` (sidecar client) and
-`kbc_vecstore`, `httpd.c` (epoll, SO_REUSEPORT, 7 routes, bearer, SSE),
-`watcher.c` (inotify), `json.c`, `mem.c`, `log.c`, `kbc.c`, `cli/main.c`,
-the 14 frozen headers. 14,865 lines of C outside the CLI, 2,495 in it.
+`kbc_vecstore`, `httpd.c` (epoll, SO_REUSEPORT, 9 JSON routes plus the `/`
+banner, bearer, SSE), `watcher.c` (inotify), `json.c`, `mem.c`, `log.c`,
+`kbc.c`, `cli/main.c`, the 14 frozen headers. 14,865 lines of C outside the
+CLI, 2,495 in it.
 
 Acceptance gate (met): Release and `-DKBC_SANITIZE=ON` builds clean under
 `-Wall -Wextra -Wpedantic -Wshadow -Wcast-qual -Wstrict-prototypes
 -Wmissing-prototypes -Wwrite-strings -Wvla -Wformat=2 -Werror`; `ctest` green
-in both — 11 suites, 215 case functions.
+in both — 11 suites, 271 case functions.
 
 Behaviour it matches, per the contracts extracted from the Rust source: BM25
 at tantivy's defaults (`k1 = 1.2`, `b = 0.75`, configurable); RRF at
-`k = 60`; the embedder's envelope names and `req_id` discipline; constant-
-time bearer comparison; delete cascades from `artifacts` to `chunks` and
-`comments`.
+`k = 60` plus the title boost at `fusion.rs`'s own constants; the embedder's
+envelope names and `req_id` discipline, verified against the **production**
+`kb-embedder` rather than a fake one; constant-time bearer comparison; delete
+cascades from `artifacts` to `chunks` and `comments`.
 
 Behaviour it does **not** match, which an earlier draft of this plan claimed
 it did — each is a later stage, not a stage-0 unit:
@@ -229,11 +254,25 @@ it did — each is a later stage, not a stage-0 unit:
   stem — there is no `"untitled"` literal;
 - chunking is **one chunk per parsed block**, not a 280-word window with
   60-word overlap, and chunk 0 is not `title\nheadings`;
-- no query grammar, no prefix expansion wired into the BM25 arm;
-- no `title ×1.5` or graph boost — `fusion.rs` is RRF and nothing else;
-- the daemon serves JSON errors, not `application/problem+json`.
+- no `since:` dates, no `docs_query.rs` filter overlay, and no phrase search —
+  the original has none either, a quoted `"…"` there quotes an atom *value*
+  (`folder:"deep notes"`), not a phrase;
+- the **title boost** is ported (`TITLE_BOOST = 0.5`, `fusion.rs:145`, applied
+  to the fused score before filtering and truncation); the **graph boost** is
+  deliberately not — it needs an in-degree edge graph kb-c does not have;
+- the daemon serves RFC 7807 `application/problem+json` errors, and
+  `/api/identity` and `/api/kbs` exist, both token-gated.
 
-### Stage 1 — storage completeness — PLANNED
+### Stage 1 — storage completeness — MOSTLY PLANNED
+
+One unit's substance has landed since this was written, and it is the one the
+acceptance gate cares about most: **the incremental in-place index update**.
+`app.c` re-indexes a single file rather than rebuilding the corpus
+(`reindex_one`), at 9–14 ms for a 1,114-document corpus, with the store row
+committed before the index so a reader never sees an index naming an
+uncommitted document. That work also produced the two defects in §2.4.5 and
+their fixes. Units 1–6 below are otherwise untouched: no new tables, no
+reconcile pass, no quarantine, no enrich hooks, no `chunk.c`.
 
 Units:
 1. `store.c`: the remaining tables kb-c claims — `sources`, `index_runs`,
@@ -271,74 +310,87 @@ reconciled, and re-indexed with no orphan rows in `artifacts` or
 Behaviour it must match: the four ingest constants
 (`INGEST_QUEUE_CAPACITY = 1024`, `INGEST_BATCH_MAX_DOCS = 32`,
 `INGEST_BATCH_MAX_BYTES = 8 MiB`, `QUARANTINE_THRESHOLD = 3`) and the
-enrich hook ordering, which is run order. Note that stage 0 has no batch
-drain at all: every watcher event triggers a full corpus rebuild
-(`reindex_one` in `app.c`), so these constants govern the first
-implementation of batching, not the current one.
+enrich hook ordering, which is run order. Note that there is still no batch
+drain: a watcher event re-indexes that one file (`reindex_one` in `app.c`), so
+these constants govern the first implementation of batching, not the current
+one.
 
-### Stage 2 — query grammar and filters — PLANNED
+### Stage 2 — query grammar and filters — PARTLY BUILT
 
-Units: the `query.rs` grammar, `docs_query.rs` filter evaluation, prefix
-expansion (`index.c` already has `kbc_index_expand_prefix`).
+Done: the `query.rs` grammar in the shape the index can answer — `AND`/`OR`/
+`NOT` in both spellings plus `&&`/`||`/`!`, `(…)` groups, implicit AND, a
+bareword with no colon becoming free text, depth 64, the 64-conjunct DNF cap
+with the original's warning text, and De Morgan (in DNF, exactly "flip every
+literal"). `folder:` works as a path-prefix facet and `text:`/`q:` collect
+free text in document order, space-joined across the whole expression, exactly
+as `query.rs:419` does. Prefix expansion is wired into the BM25 arm.
 
-Dependency order: grammar → DNF lowering → filter evaluation → prefix
-expansion wired into the BM25 arm.
+Not done: `docs_query.rs` filter evaluation, and every key the index cannot
+evaluate — `tag:`, `cap:`, `since:`, `index:`, `scope:`. Those are **refused
+with HTTP 400** rather than searched as literal terms, which is a deliberate
+departure from a silent misfilter: a query that quietly means something else
+is worse than an error.
+
+There is no phrase search, and there is none to port: in the original a quoted
+`"…"` quotes an atom *value* (`folder:"deep notes"`), not a phrase, and the kb
+SEARCH path hands `?q=` unparsed to BM25 (`routes/search.rs:1163`), so its
+boolean structure never reached the lexical arm either. A quoted phrase is two
+terms on both sides, and a test pins that reading.
 
 Acceptance gate: the port of `query.rs`'s own unit tests passes — n-ary
-`AND`/`OR` flattening, De Morgan over groups, `since:Nd|Nh|<unix>`,
-`since:all` as an error, the 64-conjunct cap with its exact warning string,
-depth 64, and the bareword-becomes-`Key::Text` rule. Each of those is a
-separate test because each is a separate user-visible behaviour.
+`AND`/`OR` flattening, De Morgan over groups, the 64-conjunct cap with its
+exact warning string, depth 64, and the bareword-becomes-`Key::Text` rule. Each
+of those is a separate test because each is a separate user-visible behaviour.
+`since:Nd|Nh|<unix>` and `since:all`-as-an-error are **not** in the gate while
+`since:` is refused, so they are deferred with the rest of the key.
 
 Behaviour it must match: `MAX_DNF_CONJUNCTS = 64`,
 `MAX_PARSE_DEPTH = 64`, `Text` collection in document order space-joined
-across the whole expression, `NOT since:` / `NOT text:` / `NOT scope:` as
-warnings rather than silent misfilters.
+across the whole expression, `NOT text:` / `NOT scope:` as warnings rather than
+silent misfilters.
 
-### Stage 3 — HTTP surface and CLI parity — PLANNED
+### Stage 3 — HTTP surface and CLI parity — MOSTLY BUILT
 
-Units: the router (the Rust route table is generated by
-`crates/kb-server/tests/api_docs.rs`, which regex-scans `router.rs`;
-kb-c reproduces the extractor rather than hand-transcribing), the identity
-ladder, CORS, the origin allowlist, fixed-window rate limiting,
-problem+json errors, the SSE gap/lag probe, `/api/identity` and `/api/kbs`
-(two rows `INVENTORY.md` used to call PORTED and are not), the query-
-embedding cache, and the verbs that depend on the above.
+Done since this section was written: **RFC 7807 `application/problem+json`
+errors** across the whole status map with `urn:kb:errors:*` types (an unmatched
+`/api/*` is a problem+json 404); **`GET /api/identity`** and **`GET
+/api/kbs`**, both token-gated and both in the exported `KBC_ROUTES` table,
+which unblocks the CLI's two probes; **CORS**, same-origin by default,
+reflecting an `Origin` only on an exact `KBC_CORS_ORIGINS` allowlist match
+with no wildcard anywhere; and **fixed-window rate limiting**, per connection,
+120 req/s by default via `KBC_RATE_LIMIT_RPS`, answering 429 with
+`Retry-After`. The rate limit exists to protect **worker fairness, not the
+corpus** — a per-connection window cannot tell one busy client from many, so
+it is a politeness bound and nothing more.
 
-Already in stage 0, and therefore this stage's baseline rather than its
-work: bearer auth on every `/api` route but `/api/health`, the loopback
-determination and the non-loopback-without-token refusal, the SSE stream with
-its keep-alive and `Last-Event-ID` replay, the CLI's blocking HTTP client,
-and the eleven verbs it dispatches. The failure mode to design against is
-treating the daemon as blank because this section once said "PLANNED".
+Also worth recording, because it made a whole tier of this design dead code:
+nothing ever set `cfg->token`, so the bearer tier could never be satisfied and
+a non-loopback bind was **always** refused. `kbc_config_load_token` now
+resolves the token once, from the literal value or the token file, and the
+daemon calls it before validate/bind, so a `0.0.0.0` bind with a token works —
+no header 401, wrong token 403, correct token 200. The token value never
+appears in `kbc config show`.
 
-Dependency order: problem+json error mapping → `/api/identity`, `/api/kbs`
-(the CLI's two probes — nothing else can be tested until these exist) →
-identity → the route table → CORS/origin/rate limit → SSE gap probe → CLI
-verbs.
-
-Acceptance gate: the parity contract in §5, invariants P1–P9, each with a
-failing test that fails when the behaviour is wrong. In particular: an
-unmatched `/api/*` returns 404 `application/problem+json` with
-`type = "urn:kb:errors:no-such-route"` (stage 0 returns a plain JSON 404);
-a non-loopback bind with no token refuses — that half already exists, in
-`config.c` at validation time rather than after the listener is bound — and
-`X-Kb-Token` becomes the second accepted carrier beside
-`Authorization: Bearer`.
+Still to do: the router that reproduces the Rust route table (generated by
+`crates/kb-server/tests/api_docs.rs`, which regex-scans `router.rs`; kb-c
+reproduces the extractor rather than hand-transcribing), the multi-tier
+identity ladder and `X-Kb-Token` as a second carrier beside
+`Authorization: Bearer`, the SSE gap/lag probe, the query-embedding cache, and
+the verbs that depend on the above.
 
 The 226 route registrations are the scope, not 226 units. The kb-c subset is
 the `PORTED` + `PLANNED` rows in `INVENTORY.md`; the rest stay in Rust
 forever.
 
 The routes `cli/main.c` depends on, which `httpd.c` serves today, verified
-against the running binary: `GET /api/health`, `GET /api/stats`,
-`GET /api/search` (`q`, `kb`, `kind`, `mode`, `limit`, `offset`; an object
-whose array is `hits[]` or `results[]`), `GET /api/artifacts` (`kb`, `kind`,
-`limit`, `offset`), `GET /api/artifacts/{id}` (`source=1`),
-`POST /api/reindex` (`{}` or `{"kb":"…"}`), and `GET /api/events` (SSE).
-`GET /` returns a plain-text route banner. There is no `/api/metrics` in the
-frozen contract; the Prometheus text endpoint is a separate top-level surface
-in stage 5. `/api/identity` and `/api/kbs` do not exist yet.
+against the running binary and exported in `KBC_ROUTES`: `GET /api/health`,
+`GET /api/identity`, `GET /api/kbs`, `GET /api/stats`, `GET /api/search`
+(`q`, `kb`, `kind`, `mode`, `limit`, `offset`; an object whose array is
+`hits[]` or `results[]`), `GET /api/artifacts` (`kb`, `kind`, `limit`,
+`offset`), `GET /api/artifacts/{id}` (`source=1`), `POST /api/reindex`
+(`{}` or `{"kb":"…"}`), and `GET /api/events` (SSE). `GET /` returns a
+plain-text route banner. There is no `/api/metrics` in the frozen contract;
+the Prometheus text endpoint is a separate top-level surface in stage 5.
 
 `POST /api/reindex` answers **202** with `{"docs":N,"took_us":N}` after a
 synchronous rescan — the count is there today and the CLI prints it. If a
@@ -379,23 +431,28 @@ Acceptance gate: the traversal suite — `..` in a segment, an absolute path, a
 symlink out of the source root, a percent-encoded `..` — each returns 404 or
 400 and never a byte outside the root.
 
-### Stage 6 — measurement, backup, maintenance — PLANNED
+### Stage 6 — measurement, backup, maintenance — PARTLY BUILT
 
-Units: `bench init/discover/run` in the CLI (the harness §4 needs), the
-`VACUUM INTO` + tar backup, retention pruning, metrics export.
+Done: the measurement half. `BENCHMARKS.md` exists and is written from runs on
+this host, and it covers the head-to-head latency comparison, a matched-corpus
+concurrency A/B, the vector lane against the production sidecar, and a scale
+ladder that stops at 5,000 documents and **locates no knee**. `bench/` holds
+the harnesses (`bench-kbc.sh`, `bench-rust.sh`, `bench-rust-concurrency.sh`,
+`bench-scale.sh`, `bench-vector.sh`) and `kbc bench` is the in-process one.
 
-Acceptance gate: the benchmark suite in §4 runs end to end and writes its
-report. This stage is where the performance claims in this document stop
-being hypotheses.
+Not done: `bench init`/`discover` as CLI subcommands, the `VACUUM INTO` + tar
+backup, retention pruning, metrics export.
 
 ---
 
 ## 4. The performance thesis, and how each claim is measured
 
-**There is no `BENCHMARKS.md` in this repo and no measured number in this
-document. Every figure below is a mechanism, not a result.** The claims
-become results when stage 6's harness exists, and until then the correct
-statement is that the mechanism is in place and unmeasured.
+**`BENCHMARKS.md` exists and holds the measured numbers**, and it is the
+authority for anything in this document that sounds like a result. What
+follows is the thesis: a mechanism per claim and the measurement that turns it
+into a result. Where a claim has been measured, the number is in
+`BENCHMARKS.md` and not repeated here; where it has not, this is a mechanism
+and an unmeasured claim, and is labelled as one.
 
 ### M1 — mmap'd postings
 
@@ -519,15 +576,22 @@ formula fails if any default moves.
 **P4 — The tie-break chain is exactly** (1) arm-internal score DESC then id
 ASC, (2) fusion score DESC then first-appearance ordinal ASC, (3) title boost
 stable sort, (4) graph boost stable sort, (5) filters, (6) `take(limit)`.
-Test: a fixture with deliberate exact ties at every step, asserting the
-document order the chain produces.
+Steps 1–3, 5 and 6 are implemented; **step 4 is not**, because the graph boost
+has no edge graph to read (see §3 stage 0). Test: a fixture with deliberate
+exact ties at every implemented step, asserting the document order the chain
+produces.
 
 **P5 — The embedder protocol is a contract, not an implementation detail.**
-`{"kind":"ready","model":…,"dim":…}` is written before any request is read; a
-`req_id` that does not match kills the transport; a mid-stream `ready` is an
-error; an `error` envelope is *not* a desync; transport death is retried once
-on respawn, an application error is returned as-is. Test: a fake sidecar that
-replays each of those five, asserting the daemon's exact reaction.
+Read against the real sidecar, not a draft: there is **no health op**;
+readiness is an **unsolicited** `{"kind":"ready","model":…,"dim":…}` that
+`kbc_embedder` must absorb wherever it arrives, including while waiting for a
+reply; a `req_id` that does not match the request kills the transport; the
+replies are `kind=embed_ok` and `kind=error`; an `error` envelope is *not* a
+desync; transport death is retried once on respawn, an application error is
+returned as-is. And because the sidecar reads stdin as UTF-8 and exits on a
+line that is not, **no byte >= 0x80 may reach the wire** — text is escaped
+locally to `\u00XX`. Test: a fake sidecar that replays each of those cases,
+including a non-UTF-8 line, asserting the daemon's exact reaction.
 
 **P6 — Layer order is behaviour.** For a matched `/api` request, outermost to
 innermost: trace → origin allowlist → CORS → request counter → bearer auth →
@@ -684,8 +748,8 @@ softened, Zig is the first alternative to re-evaluate.
 | R6 | Scope creep: 48.4% of the in-scope LOC is untaken, and the pressure to "just add slate" or "just add sessions" is real. | The port never finishes and the delivered thing is neither a drop-in nor fast. | `INVENTORY.md` is the scope contract, with the reason on every OUT-OF-SCOPE row. Adding a subsystem means changing this document first, with a cost, not slipping into a stage. |
 | R7 | The two daemons (`kb`, `kb-code`) drift further apart as kb-c diverges from kb. | A workspace with two incompatible `kb`s. | Out of scope by decision and stated as such, in both documents. When kb-c becomes production-replacement, the migration story is "run the new daemon, keep the old one for the code lane" — they never shared a store. |
 | R8 | The `kb-code-*` subtree is 240,255 LOC of Rust that nobody maintains after the port lands. | Silent bit-rot in a subsystem kb-c does not replace. | Explicitly not this project's problem, and said so rather than left implicit. |
-| R9 | Performance work is done before correctness work, because the performance claim is the reason the port exists. | A fast, wrong index ships. | The stage order in §3 puts storage completeness, grammar and HTTP parity ahead of measurement (stage 6). §4 opens by saying there are no measured numbers. |
+| R9 | Performance work is done before correctness work, because the performance claim is the reason the port exists. | A fast, wrong index ships. | The stage order in §3 puts storage completeness, grammar and HTTP parity ahead of measurement (stage 6), and the measurement stage found two severe correctness defects in the ingest path (§2.4.5) — which is the argument for the order, made by the order itself. |
 | R10 | The debounce and batching constants are tuned for the Rust daemon's latency. | kb-c either re-indexes too eagerly or too slowly. | P3-style treatment: `watcher_debounce_ms` (250 ms today, configurable) and the batch constants are in one place and listed in stage 1's gate, and are revisited once kb-c has a corpus to tune against. There is no 60 s reconcile in the tree yet — stage 1's unit 2 adds it, and the constant arrives with it. |
-| R11 | Every watcher event triggers a **full corpus rebuild** (`reindex_one` → `kbc_app_reindex`), because the frozen index has no add-to-open operation. | Ingestion throughput is a function of corpus size, not change size: N files touched means N rebuilds until stage 1's batching drain lands. | Stated rather than hidden, and mitigated by the debounce coalescing in `watcher.c`. The real fix is stage 1's batch drain (≤32 docs / ≤8 MiB), and until it lands, ingestion cost is a known weakness of kb-c, not a surprise. |
+| R11 | A watcher event re-indexes **that one file** in place (`reindex_one`), because the frozen index has no add-to-open operation. | Ingestion cost is a function of change size rather than corpus size, which is the point, but there is still no batch drain: N files touched in a debounce window means N single-file updates rather than one transaction. | Deliberate and measured: 9–14 ms for a 1,114-document corpus, proportional to the file rather than the corpus. The remaining work is stage 1's batch drain (≤32 docs / ≤8 MiB). Until it lands, many small changes in one window cost more than they should — a known weakness, not a surprise. |
 | R12 | The artifact id is a pure function of `(corpus, path)`, so a **rename** is a delete plus an insert, not an update. | A renamed file loses its id, its comment threads and its chunk history unless the move is observed. | Deliberate: the alternative mints a new id on every save, which is worse. The mitigation is stage 4's `mv` and the `moves` rename-race log, plus stage 1's reconcile delete pass, which is what makes an unobserved rename disappear rather than linger. Until both land, a rename orphans a row. |
-| R13 | A design document can describe a behaviour convincingly enough that nobody tests it. | Stage 0 shipped claiming a `sha256(rel_path)` id, 280-word chunk windows and `problem+json` errors — none of which the code does. | The test suite is the arbiter, and it earns that position: 11 suites, 215 cases, 24 defects found during the build, including two use-after-frees and a cross-thread data race (§2.4.4). Any behaviour added to §3 without a test that fails when it is wrong is not done. |
+| R13 | A design document can describe a behaviour convincingly enough that nobody tests it. | Stage 0 shipped claiming a `sha256(rel_path)` id, 280-word chunk windows and plain JSON errors — and later drafts of this plan described an embedder wire protocol the real sidecar does not speak, and quoted a 10.3 ms incremental update that was never measured clean. | The test suite is the arbiter, and it earns that position: 11 suites, 271 cases, 24 defects found during the build, including two use-after-frees and a cross-thread data race (§2.4.4). A number that no run on the current code produced does not belong in this document, even as a placeholder. Any behaviour added to §3 without a test that fails when it is wrong is not done. |

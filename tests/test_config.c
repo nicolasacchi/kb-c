@@ -9,6 +9,10 @@
 #include "kbc/mem.h"
 #include "kbc_test.h"
 
+/* An absolute data_dir for the cases that want one, so the assertions are
+ * about resolution and not about what a relative value turns into. */
+#define TESTDATA_DIR "/tmp/kbc-config-data-dir"
+
 /* -Wwrite-strings: config fields are owned char*, so literals need copying. */
 static char *dup_str(const char *s) {
   size_t n;
@@ -144,6 +148,10 @@ KBC_TEST(full_file_lands_every_key_in_its_field) {
   char c2[KBC_TEST_PATH_MAX];
   char want1[KBC_TEST_PATH_MAX];
   char want2[KBC_TEST_PATH_MAX];
+  char want3[KBC_TEST_PATH_MAX];
+  char want4[KBC_TEST_PATH_MAX];
+  char want5[KBC_TEST_PATH_MAX];
+  char want6[KBC_TEST_PATH_MAX];
   char want_cfg[KBC_TEST_PATH_MAX];
   const kbc_corpus_cfg *beta;
   kbc_err err;
@@ -203,10 +211,16 @@ KBC_TEST(full_file_lands_every_key_in_its_field) {
 
   KBC_CHECK_EQ_STR(cfg->bind_addr, "127.0.0.1");
   KBC_CHECK_EQ_INT(cfg->port, 8080);
-  KBC_CHECK_EQ_STR(cfg->data_dir, "state");
-  KBC_CHECK_EQ_STR(cfg->db_path, "state/kb.db");
-  KBC_CHECK_EQ_STR(cfg->index_path, "state/idx");
-  KBC_CHECK_EQ_STR(cfg->token_path, "state/tok");
+  /* Every relative path in a config is relative to the CONFIG FILE's
+   * directory, never to the process cwd — same rule the corpus paths use. */
+  join(want3, sizeof want3, dir, "state");
+  join(want4, sizeof want4, dir, "state/kb.db");
+  join(want5, sizeof want5, dir, "state/idx");
+  join(want6, sizeof want6, dir, "state/tok");
+  KBC_CHECK_EQ_STR(cfg->data_dir, want3);
+  KBC_CHECK_EQ_STR(cfg->db_path, want4);
+  KBC_CHECK_EQ_STR(cfg->index_path, want5);
+  KBC_CHECK_EQ_STR(cfg->token_path, want6);
   KBC_CHECK_EQ_INT(cfg->http_workers, 12);
   KBC_CHECK_EQ_INT(cfg->log_level, KBC_LOG_DEBUG);
   KBC_CHECK(cfg->json_logs);
@@ -242,6 +256,205 @@ KBC_TEST(full_file_lands_every_key_in_its_field) {
   KBC_CHECK_NULL(kbc_config_corpus(cfg, "gamma"));
 
   kbc_config_free(cfg);
+  kbc_test_rmrf(dir);
+}
+
+/* The whole point of deriving the three paths from data_dir: a config that
+ * says only data_dir must put db, index AND token inside it. The token file
+ * used to stay at its "data/token" default, which is relative to the process
+ * cwd, so the daemon died with "token: token file data/token cannot be read"
+ * for anyone who started it from anywhere but the data directory's parent. */
+KBC_TEST(data_dir_alone_puts_every_path_inside_the_data_dir) {
+  char dir[KBC_TEST_PATH_MAX];
+  char want[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_config *cfg = NULL;
+
+  kbc_test_tmpdir(dir, sizeof dir);
+  write_cfg(dir, "d.toml", "[daemon]\ndata_dir = \"" TESTDATA_DIR "\"\n");
+
+  KBC_CHECK_OK(load_text(&cfg, dir, "d.toml", &err));
+  if (cfg == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+  /* Absolute data_dir, asserted on the RESOLVED path: no part of any of them
+   * may still hang off the cwd. */
+  join(want, sizeof want, TESTDATA_DIR, "kb.db");
+  KBC_CHECK_EQ_STR(cfg->data_dir, TESTDATA_DIR);
+  KBC_CHECK_EQ_STR(cfg->db_path, want);
+  join(want, sizeof want, TESTDATA_DIR, "index");
+  KBC_CHECK_EQ_STR(cfg->index_path, want);
+  join(want, sizeof want, TESTDATA_DIR, "token");
+  KBC_CHECK_EQ_STR(cfg->token_path, want);
+
+  kbc_config_free(cfg);
+  kbc_test_rmrf(dir);
+}
+
+/* A relative data_dir resolves against the config file's directory, so the
+ * derived paths are absolute too and are still inside that data_dir. */
+KBC_TEST(a_relative_data_dir_derives_paths_below_the_config_directory) {
+  char dir[KBC_TEST_PATH_MAX];
+  char want[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_config *cfg = NULL;
+
+  kbc_test_tmpdir(dir, sizeof dir);
+  write_cfg(dir, "d.toml", "[daemon]\ndata_dir = \"sd\"\n");
+
+  KBC_CHECK_OK(load_text(&cfg, dir, "d.toml", &err));
+  if (cfg == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+  join(want, sizeof want, dir, "sd");
+  KBC_CHECK_EQ_STR(cfg->data_dir, want);
+  join(want, sizeof want, dir, "sd/kb.db");
+  KBC_CHECK_EQ_STR(cfg->db_path, want);
+  join(want, sizeof want, dir, "sd/index");
+  KBC_CHECK_EQ_STR(cfg->index_path, want);
+  join(want, sizeof want, dir, "sd/token");
+  KBC_CHECK_EQ_STR(cfg->token_path, want);
+
+  kbc_config_free(cfg);
+  kbc_test_rmrf(dir);
+}
+
+KBC_TEST(an_explicit_token_file_still_wins_over_the_derived_one) {
+  char dir[KBC_TEST_PATH_MAX];
+  char want[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_config *cfg = NULL;
+
+  kbc_test_tmpdir(dir, sizeof dir);
+  write_cfg(dir, "d.toml",
+            "[daemon]\n"
+            "data_dir = \"" TESTDATA_DIR "\"\n"
+            "token_file = \"" TESTDATA_DIR "/keys/tok\"\n"
+            "index_path = \"" TESTDATA_DIR "/idx\"\n");
+
+  KBC_CHECK_OK(load_text(&cfg, dir, "d.toml", &err));
+  if (cfg == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+  join(want, sizeof want, TESTDATA_DIR, "keys/tok");
+  KBC_CHECK_EQ_STR(cfg->token_path, want);
+  join(want, sizeof want, TESTDATA_DIR, "idx");
+  KBC_CHECK_EQ_STR(cfg->index_path, want);
+  /* The one it did NOT pin is still derived, and still inside data_dir. */
+  join(want, sizeof want, TESTDATA_DIR, "kb.db");
+  KBC_CHECK_EQ_STR(cfg->db_path, want);
+
+  kbc_config_free(cfg);
+  kbc_test_rmrf(dir);
+}
+
+KBC_TEST(a_relative_explicit_token_file_resolves_against_the_config_dir) {
+  char dir[KBC_TEST_PATH_MAX];
+  char want[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_config *cfg = NULL;
+
+  kbc_test_tmpdir(dir, sizeof dir);
+  write_cfg(dir, "d.toml",
+            "[daemon]\ntoken_file = \"keys/tok\"\n"
+            "db_path = \"db/kb.db\"\n");
+
+  KBC_CHECK_OK(load_text(&cfg, dir, "d.toml", &err));
+  if (cfg == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+  join(want, sizeof want, dir, "keys/tok");
+  KBC_CHECK_EQ_STR(cfg->token_path, want);
+  join(want, sizeof want, dir, "db/kb.db");
+  KBC_CHECK_EQ_STR(cfg->db_path, want);
+  /* No data_dir in this file, so the omitted path keeps its documented
+   * default rather than being invented from a data_dir that was never set. */
+  KBC_CHECK_EQ_STR(cfg->index_path, "data/index");
+
+  kbc_config_free(cfg);
+  kbc_test_rmrf(dir);
+}
+
+/* The property a user actually feels: `kbc token generate` writes to
+ * cfg->token_path and the daemon reads from cfg->token_path, so a token
+ * generated after loading this config IS the token the daemon serves. Two
+ * different resolutions here would be a silent "I generated a token and the
+ * daemon still says it has none". */
+KBC_TEST(the_derived_token_file_is_the_one_the_daemon_reads) {
+  char dir[KBC_TEST_PATH_MAX];
+  char ddir[KBC_TEST_PATH_MAX];
+  char want[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_config *cfg = NULL;
+
+  kbc_test_tmpdir(dir, sizeof dir);
+  join(ddir, sizeof ddir, dir, "sd");
+  kbc_test_mkdir_p(ddir);
+  write_cfg(dir, "d.toml", "[daemon]\ndata_dir = \"sd\"\n");
+
+  KBC_CHECK_OK(load_text(&cfg, dir, "d.toml", &err));
+  if (cfg == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+  /* `kbc token generate` writes cfg->token_path; kbc_config_load_token — the
+   * daemon's own read path — reads that same field. */
+  kbc_test_write_file(cfg->token_path, "secret-token\n");
+  /* What `kbc daemon` does: read the token back through this same config. */
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_config_load_token(cfg, &err));
+  KBC_CHECK_EQ_STR(cfg->token, "secret-token");
+  /* And it is the path the config asked for, not a cwd-relative guess. */
+  join(want, sizeof want, ddir, "token");
+  KBC_CHECK_EQ_STR(cfg->token_path, want);
+
+  kbc_config_free(cfg);
+  kbc_test_rmrf(dir);
+}
+
+/* Moving data_dir must move all three, with nothing still pointing at the
+ * old directory. */
+KBC_TEST(moving_data_dir_moves_every_derived_path) {
+  char dir[KBC_TEST_PATH_MAX];
+  char a[KBC_TEST_PATH_MAX];
+  char b[KBC_TEST_PATH_MAX];
+  char want[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_config *one = NULL;
+  kbc_config *two = NULL;
+
+  kbc_test_tmpdir(dir, sizeof dir);
+  join(a, sizeof a, dir, "a");
+  join(b, sizeof b, dir, "b");
+  write_cfg(dir, "a.toml", "[daemon]\ndata_dir = \"a\"\n");
+  write_cfg(dir, "b.toml", "[daemon]\ndata_dir = \"b\"\n");
+
+  KBC_CHECK_OK(load_text(&one, dir, "a.toml", &err));
+  KBC_CHECK_OK(load_text(&two, dir, "b.toml", &err));
+  if (one == NULL || two == NULL) {
+    kbc_config_free(one);
+    kbc_config_free(two);
+    kbc_test_rmrf(dir);
+    return;
+  }
+  join(want, sizeof want, b, "kb.db");
+  KBC_CHECK_EQ_STR(two->db_path, want);
+  join(want, sizeof want, b, "index");
+  KBC_CHECK_EQ_STR(two->index_path, want);
+  join(want, sizeof want, b, "token");
+  KBC_CHECK_EQ_STR(two->token_path, want);
+  /* Nothing may still name the first directory. */
+  KBC_CHECK(strstr(two->data_dir, "/a") == NULL);
+  KBC_CHECK(strstr(two->db_path, "/a/") == NULL);
+  KBC_CHECK(strstr(two->index_path, "/a/") == NULL);
+  KBC_CHECK(strstr(two->token_path, "/a/") == NULL);
+
+  kbc_config_free(one);
+  kbc_config_free(two);
   kbc_test_rmrf(dir);
 }
 
@@ -528,6 +741,267 @@ KBC_TEST(bind_safety_is_null_safe) {
   KBC_CHECK(!kbc_config_bind_is_safe(NULL, NULL, 0u));
 }
 
+/* ------------------------------------------------------- token resolution -- */
+
+/* A config whose only non-default is where the token lives. */
+static kbc_config *token_cfg(const char *dir, const char *path) {
+  kbc_config *cfg = kbc_config_defaults();
+  KBC_CHECK_NOT_NULL(cfg);
+  if (cfg == NULL) {
+    return NULL;
+  }
+  free(cfg->token_path);
+  cfg->token_path = dup_str(path);
+  (void)dir;
+  return cfg;
+}
+
+KBC_TEST(token_resolution_prefers_a_literal_over_the_file) {
+  char dir[KBC_TEST_PATH_MAX];
+  char path[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_config *cfg;
+
+  kbc_test_tmpdir(dir, sizeof dir);
+  join(path, sizeof path, dir, "tok");
+  kbc_test_write_file(path, "from-the-file\n");
+  cfg = token_cfg(dir, path);
+  cfg->token = dup_str("from-the-config");
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_config_load_token(cfg, &err));
+  KBC_CHECK_EQ_STR(cfg->token, "from-the-config");
+  kbc_config_free(cfg);
+  kbc_test_rmrf(dir);
+}
+
+KBC_TEST(token_resolution_reads_the_first_line_of_the_file) {
+  char dir[KBC_TEST_PATH_MAX];
+  char path[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_config *cfg;
+
+  kbc_test_tmpdir(dir, sizeof dir);
+  join(path, sizeof path, dir, "tok");
+  /* A trailing newline and a second line must not leak into the token: a
+   * token is one line, and the newline is what `kbc token generate` writes. */
+  kbc_test_write_file(path, "first-line-token\nsecond-line\n\n");
+  cfg = token_cfg(dir, path);
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_config_load_token(cfg, &err));
+  KBC_CHECK_EQ_STR(cfg->token, "first-line-token");
+  kbc_config_free(cfg);
+
+  /* CRLF: the \r is part of the line terminator, not of the secret. */
+  kbc_test_write_file(path, "crlf-token\r\n");
+  cfg = token_cfg(dir, path);
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_config_load_token(cfg, &err));
+  KBC_CHECK_EQ_STR(cfg->token, "crlf-token");
+  kbc_config_free(cfg);
+
+  /* No trailing newline at all. */
+  kbc_test_write_file(path, "unterminated");
+  cfg = token_cfg(dir, path);
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_config_load_token(cfg, &err));
+  KBC_CHECK_EQ_STR(cfg->token, "unterminated");
+  kbc_config_free(cfg);
+  kbc_test_rmrf(dir);
+}
+
+KBC_TEST(an_empty_token_file_resolves_to_no_token) {
+  char dir[KBC_TEST_PATH_MAX];
+  char path[KBC_TEST_PATH_MAX];
+  char why[KBC_ERR_MSG_MAX];
+  kbc_err err;
+  kbc_config *cfg;
+
+  kbc_test_tmpdir(dir, sizeof dir);
+  join(path, sizeof path, dir, "tok");
+  kbc_test_write_file(path, "\n");
+  cfg = token_cfg(dir, path);
+  free(cfg->bind_addr);
+  cfg->bind_addr = dup_str("0.0.0.0");
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_config_load_token(cfg, &err));
+  KBC_CHECK(cfg->token != NULL);
+  KBC_CHECK_EQ_STR(cfg->token, "");
+  /* An accidentally blank token file must NOT quietly open a public bind. */
+  KBC_CHECK(!kbc_config_bind_is_safe(cfg, why, sizeof why));
+  kbc_config_free(cfg);
+  kbc_test_rmrf(dir);
+}
+
+/* A configured token file that cannot be read is an ERROR, not "no token":
+ * treating it as no token is how a public bind ends up unauthenticated. */
+KBC_TEST(a_missing_token_file_is_an_io_error_naming_the_path) {
+  char dir[KBC_TEST_PATH_MAX];
+  char path[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_config *cfg;
+
+  kbc_test_tmpdir(dir, sizeof dir);
+  join(path, sizeof path, dir, "absent-token");
+  cfg = token_cfg(dir, path);
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_config_load_token(cfg, &err), KBC_ERR_IO);
+  KBC_CHECK_ERR_MSG(err);
+  KBC_CHECK_MSG(strstr(err.msg, path) != NULL,
+                "the error must name the unreadable path, got: %s", err.msg);
+  /* And it must not have invented a token out of the failure. */
+  KBC_CHECK_NULL(cfg->token);
+  kbc_config_free(cfg);
+  kbc_test_rmrf(dir);
+}
+
+KBC_TEST(no_token_file_configured_is_ok_with_no_token) {
+  kbc_err err;
+  kbc_config *cfg = kbc_config_defaults();
+
+  free(cfg->token_path);
+  cfg->token_path = NULL;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_config_load_token(cfg, &err));
+  KBC_CHECK_NULL(cfg->token);
+  kbc_config_free(cfg);
+
+  /* An empty path is "not configured" too, not a read of the cwd. */
+  cfg = kbc_config_defaults();
+  free(cfg->token_path);
+  cfg->token_path = dup_str("");
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_config_load_token(cfg, &err));
+  KBC_CHECK_NULL(cfg->token);
+  kbc_config_free(cfg);
+}
+
+/* Idempotent: a second call must not append to, re-read, or leak the first
+ * result. The contract is "cfg->token if it already carries one", so a value
+ * loaded from a file is a value from then on; a rotation is picked up by
+ * reloading the config, which is what a restarting daemon does. */
+KBC_TEST(token_resolution_is_idempotent) {
+  char dir[KBC_TEST_PATH_MAX];
+  char path[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_config *cfg;
+
+  kbc_test_tmpdir(dir, sizeof dir);
+  join(path, sizeof path, dir, "tok");
+  kbc_test_write_file(path, "rotated-a\n");
+  cfg = token_cfg(dir, path);
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_config_load_token(cfg, &err));
+  KBC_CHECK_EQ_STR(cfg->token, "rotated-a");
+  for (int i = 0; i < 3; i++) {
+    KBC_CHECK_OK(kbc_config_load_token(cfg, &err));
+    KBC_CHECK_EQ_STR(cfg->token, "rotated-a");
+  }
+  kbc_config_free(cfg);
+  kbc_test_rmrf(dir);
+}
+
+KBC_TEST(a_second_resolve_after_the_file_changes_sees_the_new_value) {
+  char dir[KBC_TEST_PATH_MAX];
+  char path[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_config *cfg;
+
+  kbc_test_tmpdir(dir, sizeof dir);
+  join(path, sizeof path, dir, "tok");
+  kbc_test_write_file(path, "token-one\n");
+  cfg = token_cfg(dir, path);
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_config_load_token(cfg, &err));
+  KBC_CHECK_EQ_STR(cfg->token, "token-one");
+  kbc_config_free(cfg);
+
+  /* The rotated file, resolved by a config loaded after the rotation. */
+  kbc_test_write_file(path, "token-two\n");
+  cfg = token_cfg(dir, path);
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_config_load_token(cfg, &err));
+  KBC_CHECK_EQ_STR(cfg->token, "token-two");
+  kbc_config_free(cfg);
+  kbc_test_rmrf(dir);
+}
+
+KBC_TEST(token_resolution_is_null_safe) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_config_load_token(NULL, &err), KBC_ERR_INVALID);
+}
+
+/* The property the whole function exists for: a token FILE, not a literal,
+ * makes a routable bind safe — and its absence still refuses, with the
+ * refusal text. Before the resolver existed, cfg->token was never set from a
+ * file, so this first case was impossible and the second was the only one
+ * reachable. */
+KBC_TEST(a_token_file_makes_a_routable_bind_safe) {
+  char dir[KBC_TEST_PATH_MAX];
+  char path[KBC_TEST_PATH_MAX];
+  char why[KBC_ERR_MSG_MAX];
+  kbc_err err;
+  kbc_config *cfg;
+
+  kbc_test_tmpdir(dir, sizeof dir);
+  join(path, sizeof path, dir, "tok");
+  kbc_test_write_file(path, "file-supplied-secret\n");
+  cfg = token_cfg(dir, path);
+  free(cfg->bind_addr);
+  cfg->bind_addr = dup_str("0.0.0.0");
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_config_load_token(cfg, &err));
+  memset(why, 'x', sizeof why);
+  KBC_CHECK_MSG(kbc_config_bind_is_safe(cfg, why, sizeof why),
+                "a token file must make a public bind safe");
+  KBC_CHECK_EQ_STR(why, "");
+  /* And the daemon gate is live, not the loopback tier: validate agrees. */
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_config_validate(cfg, &err));
+  kbc_config_free(cfg);
+
+  /* No token file at all: still refused, still explained. */
+  join(path, sizeof path, dir, "no-such-token");
+  cfg = token_cfg(dir, path);
+  free(cfg->bind_addr);
+  cfg->bind_addr = dup_str("0.0.0.0");
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_config_load_token(cfg, &err), KBC_ERR_IO);
+  /* Nothing resolved, so the guard refuses rather than opening the bind. */
+  KBC_CHECK(!kbc_config_bind_is_safe(cfg, why, sizeof why));
+  KBC_CHECK(strstr(why, "kbc token generate") != NULL);
+  kbc_config_free(cfg);
+  kbc_test_rmrf(dir);
+}
+
+/* `kbc config show` prints the dump. A secret in there is a secret in every
+ * bug report, every log collector, every paste into a chat. */
+KBC_TEST(dump_never_contains_the_token_value) {
+  char dir[KBC_TEST_PATH_MAX];
+  char path[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_str out;
+  kbc_config *cfg;
+
+  kbc_test_tmpdir(dir, sizeof dir);
+  join(path, sizeof path, dir, "tok");
+  kbc_test_write_file(path, "the-secret-value-9f3a\n");
+  cfg = token_cfg(dir, path);
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_config_load_token(cfg, &err));
+  KBC_CHECK_EQ_STR(cfg->token, "the-secret-value-9f3a");
+  kbc_str_init(&out);
+  KBC_CHECK_OK(kbc_config_dump(cfg, &out, &err));
+  KBC_CHECK_MSG(strstr(out.ptr, "the-secret-value-9f3a") == NULL,
+ "the dump leaks the token value: %s", out.ptr);
+ /* The path is not a secret and is expected in the dump. */
+  KBC_CHECK_MSG(strstr(out.ptr, path) != NULL,
+  "the dump should still name the token FILE: %s", out.ptr);
+  kbc_str_free(&out);
+  kbc_config_free(cfg);
+  kbc_test_rmrf(dir);
+}
+
 /* --------------------------------------------------------- dump round trip -- */
 
 static void same_config(const kbc_config *a, const kbc_config *b) {
@@ -646,6 +1120,7 @@ KBC_TEST(dump_then_load_is_a_fixed_point) {
 KBC_TEST(dump_preserves_a_string_that_looks_like_syntax) {
   char dir[KBC_TEST_PATH_MAX];
   char path[KBC_TEST_PATH_MAX];
+  char want[KBC_TEST_PATH_MAX];
   kbc_str out;
   kbc_err err;
   kbc_config *cfg = kbc_config_defaults();
@@ -665,7 +1140,10 @@ KBC_TEST(dump_preserves_a_string_that_looks_like_syntax) {
   kbc_err_reset(&err);
   KBC_CHECK_OK(kbc_config_load_file(back, path, &err));
   if (back != NULL) {
-    KBC_CHECK_EQ_STR(back->data_dir, "a\"b\\c#d");
+    join(want, sizeof want, dir, "a\"b\\c#d");
+    /* The escaping round-trips, and the value still resolves as a relative
+     * path against the config file's directory, like any other. */
+    KBC_CHECK_EQ_STR(back->data_dir, want);
   }
   kbc_str_free(&out);
   kbc_config_free(cfg);
@@ -728,6 +1206,18 @@ int main(void) {
   static const kbc_test_case cases[] = {
       {"defaults_match_the_documented_values", defaults_match_the_documented_values},
       {"full_file_lands_every_key_in_its_field", full_file_lands_every_key_in_its_field},
+      {"data_dir_alone_puts_every_path_inside_the_data_dir",
+       data_dir_alone_puts_every_path_inside_the_data_dir},
+      {"a_relative_data_dir_derives_paths_below_the_config_directory",
+       a_relative_data_dir_derives_paths_below_the_config_directory},
+      {"an_explicit_token_file_still_wins_over_the_derived_one",
+       an_explicit_token_file_still_wins_over_the_derived_one},
+      {"a_relative_explicit_token_file_resolves_against_the_config_dir",
+       a_relative_explicit_token_file_resolves_against_the_config_dir},
+      {"the_derived_token_file_is_the_one_the_daemon_reads",
+       the_derived_token_file_is_the_one_the_daemon_reads},
+      {"moving_data_dir_moves_every_derived_path",
+       moving_data_dir_moves_every_derived_path},
       {"partial_file_keeps_every_default_it_omits",
        partial_file_keeps_every_default_it_omits},
       {"missing_file_is_ok_and_leaves_the_defaults",
@@ -744,6 +1234,23 @@ int main(void) {
       {"bind_safety_follows_the_token_rule", bind_safety_follows_the_token_rule},
       {"bind_refusal_names_the_token_remedy", bind_refusal_names_the_token_remedy},
       {"bind_safety_is_null_safe", bind_safety_is_null_safe},
+      {"token_resolution_prefers_a_literal_over_the_file",
+       token_resolution_prefers_a_literal_over_the_file},
+      {"token_resolution_reads_the_first_line_of_the_file",
+       token_resolution_reads_the_first_line_of_the_file},
+      {"an_empty_token_file_resolves_to_no_token",
+       an_empty_token_file_resolves_to_no_token},
+      {"a_missing_token_file_is_an_io_error_naming_the_path",
+       a_missing_token_file_is_an_io_error_naming_the_path},
+      {"no_token_file_configured_is_ok_with_no_token",
+       no_token_file_configured_is_ok_with_no_token},
+      {"token_resolution_is_idempotent", token_resolution_is_idempotent},
+      {"a_second_resolve_after_the_file_changes_sees_the_new_value",
+       a_second_resolve_after_the_file_changes_sees_the_new_value},
+      {"token_resolution_is_null_safe", token_resolution_is_null_safe},
+      {"a_token_file_makes_a_routable_bind_safe",
+       a_token_file_makes_a_routable_bind_safe},
+      {"dump_never_contains_the_token_value", dump_never_contains_the_token_value},
       {"dump_then_load_is_a_fixed_point", dump_then_load_is_a_fixed_point},
       {"dump_preserves_a_string_that_looks_like_syntax",
        dump_preserves_a_string_that_looks_like_syntax},

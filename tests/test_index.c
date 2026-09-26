@@ -826,6 +826,10 @@ KBC_TEST(expand_prefix_matches_sorted) {
  * force several grows, and every expectation comes from a reference model
  * built in the test rather than from the index under test. */
 #define GROW_DOCS 1500u
+/* Enough documents that the term arena spans several 64 KiB blocks and the
+ * term table has grown more than once: the save/open accounting has to hold
+ * for an arena with a block boundary in it, not only for one that fits. */
+#define BIG_DOCS 300u
 
 /* Doc d: unique term "u<d>", "shared" when d % 5 == 0, "mid" when d % 7 == 0.
  * The modulus is chosen so every query below matches fewer than 512 documents: the
@@ -1574,10 +1578,333 @@ KBC_TEST(incremental_update_survives_a_term_table_rehash) {
     kbc_hits_free(&hb);
   }
 
+  /* A rehash also has to survive the FILE. The grown table is the one whose
+   * slot indices the postings were never keyed on, and the save that follows
+   * writes term_cap slots, so a header that counts the table before the grow
+   * describes a file the loader walks past the end of. */
+  {
+    char dir[KBC_TEST_PATH_MAX];
+    char path[KBC_TEST_PATH_MAX + 32];
+    kbc_test_tmpdir(dir, sizeof dir);
+    (void)snprintf(path, sizeof path, "%s/rehash.idx", dir);
+    kbc_err_reset(&err);
+    KBC_CHECK_OK(kbc_index_save(ix, path, &err));
+    kbc_err_reset(&err);
+    kbc_index *re = kbc_index_open(path, &err);
+    KBC_CHECK_MSG(re != NULL, "reopen after the rehash: %s", err.msg);
+    if (re != NULL) {
+      KBC_CHECK_EQ_INT(kbc_index_doc_count(re), kbc_index_doc_count(ref));
+      KBC_CHECK_EQ_INT(kbc_index_term_count(re), kbc_index_term_count(ref));
+      KBC_CHECK_EQ_INT((int)kbc_index_posting_count(re),
+                       (int)kbc_index_posting_count(ref));
+      KBC_CHECK_EQ_DBL(kbc_index_avg_doclen(re), kbc_index_avg_doclen(ref), 0.0);
+      for (i = 0; i < 2; i++) {
+        kbc_status sa;
+        kbc_hits ha = query(re, a, i == 0 ? "shared" : "brandnew", GROW_DOCS,
+                            &sa);
+        size_t k;
+        KBC_CHECK_OK(sa);
+        KBC_CHECK_MSG(ha.len > 0, "reopened index answered nothing for %s",
+                      i == 0 ? "shared" : "brandnew");
+        for (k = 0; k < ha.len; k++) {
+          /* Only the term the replaced document introduced lives in doc 3
+           * alone; "shared" is in a third of the corpus. */
+          KBC_CHECK_MSG(i != 1 || ha.items[k].doc == 3,
+                        "query \"brandnew\" hit doc %u; the term was introduced "
+                        "by document 3 alone",
+                        ha.items[k].doc);
+        }
+        kbc_hits_free(&ha);
+      }
+      kbc_index_free(re);
+    }
+    kbc_test_rmrf(dir);
+  }
   kbc_index_free(ref);
   kbc_arena_free(a);
   kbc_index_free(ix);
 }
+
+/* Every document's identity, not just its id: a save/reopen that lost or
+ * swapped a title or a kind still passes an id-order check, because the ids
+ * are in order either way. */
+static void rt_check_meta(kbc_index *ix, const inc_doc *m, size_t n,
+                          const char *what) {
+  size_t i;
+  uint32_t id = 0;
+  for (i = 0; i < n; i++) {
+    const kbc_doc_meta *d;
+    if (m[i].body == NULL) {
+      continue;
+    }
+    d = kbc_index_doc(ix, id);
+    KBC_CHECK_NOT_NULL(d);
+    if (d == NULL) {
+      return;
+    }
+    KBC_CHECK_MSG(strcmp(d->corpus, "kb") == 0, "%s: doc %u corpus is \"%s\"",
+                  what, id, d->corpus);
+    KBC_CHECK_MSG(strcmp(d->path, m[i].path) == 0, "%s: doc %u path is \"%s\"",
+                  what, id, d->path);
+    KBC_CHECK_MSG(strcmp(d->title ? d->title : "", m[i].path) == 0,
+                  "%s: doc %u title is \"%s\"", what, id, d->title);
+    KBC_CHECK_MSG(d->kind == (uint8_t)KBC_KIND_ARTIFACT,
+                  "%s: doc %u kind is %u", what, id, (unsigned)d->kind);
+    id++;
+  }
+}
+
+/* Saves the index, reopens the file, checks the reopened copy against a full
+ * rebuild of the same model, and hands BACK the reopened index: the next
+ * mutation therefore lands on a mapped copy, which is the state a restarted
+ * daemon holds, not the state a freshly built index is in. */
+static kbc_index *rt_step(kbc_index *ix, const inc_doc *m, size_t n,
+                          const char *path, const char *what) {
+  kbc_err err;
+  kbc_index *re;
+  memset(&err, 0, sizeof err);
+  KBC_CHECK_OK(kbc_index_save(ix, path, &err));
+  kbc_err_reset(&err);
+  re = kbc_index_open(path, &err);
+  KBC_CHECK_MSG(re != NULL, "%s: the saved file does not reopen: %s", what,
+                err.msg);
+  if (re == NULL) {
+    kbc_index_free(ix);
+    return NULL;
+  }
+  inc_check(re, m, n, what);
+  rt_check_meta(re, m, n, what);
+  kbc_index_free(ix);
+  return re;
+}
+
+/* Save, reopen, save again: the two files must be byte-identical. A second
+ * save that differs from the first is the same accounting bug seen from the
+ * other side — the header and the sections disagree — and it is invisible to
+ * every other check here, because each file opens on its own. */
+static void rt_check_stable(kbc_index *ix, const char *dir, const char *what) {
+  char a[KBC_TEST_PATH_MAX + 32], b[KBC_TEST_PATH_MAX + 32];
+  char *ba = NULL, *bb = NULL;
+  size_t la = 0, lb = 0;
+  kbc_err err;
+  memset(&err, 0, sizeof err);
+  (void)snprintf(a, sizeof a, "%s/stable-a.idx", dir);
+  (void)snprintf(b, sizeof b, "%s/stable-b.idx", dir);
+  KBC_CHECK_OK(kbc_index_save(ix, a, &err));
+  kbc_index_free(ix);
+  kbc_err_reset(&err);
+  kbc_index *re = kbc_index_open(a, &err);
+  KBC_CHECK_MSG(re != NULL, "%s: reopen for the stability check: %s", what,
+                err.msg);
+  if (re == NULL) {
+    return;
+  }
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_index_save(re, b, &err));
+  kbc_index_free(re);
+  ba = read_bytes(a, &la);
+  bb = read_bytes(b, &lb);
+  KBC_CHECK_MSG(ba != NULL && bb != NULL && la == lb && la > 0,
+                "%s: re-saving an unchanged index produced %zu bytes against "
+                "the original's %zu",
+                what, lb, la);
+  if (ba != NULL && bb != NULL && la == lb) {
+    KBC_CHECK_MSG(memcmp(ba, bb, la) == 0,
+                  "%s: re-saving an unchanged index produced a DIFFERENT file",
+                  what);
+  }
+  free(ba);
+  free(bb);
+}
+
+/* The whole class, in one place: whatever sequence of mutations an index has
+ * been through, the file it saves has to be one kbc_index_open accepts, it has
+ * to decode into the same corpus, and saving it again has to be a no-op.
+ *
+ * The trigger was a save of an index that was OPENED but never mutated: it
+ * keeps its term and doc strings in the mapping and has no heap copy of
+ * either, so the writer described both sections in the header and wrote
+ * neither — a file shorter than its own header by exactly the two arenas,
+ * which is 38% of a 3 MB index and which the daemon's next start rejected.
+ * Every step below therefore begins from a MAPPED index. */
+KBC_TEST(every_mutation_saves_a_reopenable_stable_file) {
+  char dir[KBC_TEST_PATH_MAX];
+  char path[KBC_TEST_PATH_MAX + 32];
+  static inc_doc m[8];
+  kbc_arena *a = kbc_arena_new(1u << 20);
+  kbc_err err;
+  size_t n = 4;
+  kbc_index *ix;
+  memset(&err, 0, sizeof err);
+  memset(m, 0, sizeof m);
+  kbc_test_tmpdir(dir, sizeof dir);
+  (void)snprintf(path, sizeof path, "%s/seq.idx", dir);
+
+  /* A corpus small enough that the reference rebuild after every step is
+   * cheap. The rehash case needs a real vocabulary to force one and gets its
+   * own test, which also has to survive a save. */
+  m[0] = (inc_doc){"a.md", "alpha alpha beta one two"};
+  m[1] = (inc_doc){"b.md", "beta gamma gamma three"};
+  m[2] = (inc_doc){"c.md", "gamma delta four five"};
+  m[3] = (inc_doc){"d.md", "delta epsilon six seven"};
+
+  ix = kbc_index_new();
+  KBC_CHECK_OK(kbc_index_begin_build(ix, &err));
+  for (uint32_t d = 0; d < n; d++) {
+    KBC_CHECK_OK(add(ix, a, d, "kb", m[d].path, m[d].path, m[d].body, &err));
+  }
+  KBC_CHECK_OK(kbc_index_end_build(ix, &err));
+  KBC_CHECK_OK(kbc_index_save(ix, path, &err));
+  kbc_index_free(ix);
+
+  /* Step 0: no mutation at all. A daemon that starts, sees an event it cannot
+   * match, and saves anyway is exactly this call. */
+  kbc_err_reset(&err);
+  ix = kbc_index_open(path, &err);
+  KBC_CHECK_MSG(ix != NULL, "open: %s", err.msg);
+  if (ix == NULL) {
+    kbc_arena_free(a);
+    kbc_test_rmrf(dir);
+    return;
+  }
+  ix = rt_step(ix, m, n, path, "mapped index, unmutated save");
+  if (ix == NULL) {
+    kbc_arena_free(a);
+    kbc_test_rmrf(dir);
+    return;
+  }
+  rt_check_stable(ix, dir, "unmutated");
+  kbc_err_reset(&err);
+  ix = kbc_index_open(path, &err);
+  KBC_CHECK_NOT_NULL(ix);
+  if (ix == NULL) {
+    kbc_arena_free(a);
+    kbc_test_rmrf(dir);
+    return;
+  }
+
+  /* A replace that keeps one term, drops hundreds and gains one. */
+  inc_apply(ix, m, &n, "a.md", "alpha zeta two", a, &err);
+  ix = rt_step(ix, m, n, path, "replace a.md");
+  if (ix == NULL) goto done;
+
+  /* A replace that SHRINKS the document to almost nothing: every term it used
+   * to have except one has to leave with it, and the doc arena it is written
+   * from is far smaller than the one it replaces. */
+  inc_apply(ix, m, &n, "b.md", "beta", a, &err);
+  ix = rt_step(ix, m, n, path, "shrink b.md");
+  if (ix == NULL) goto done;
+
+  /* A removal that COMPACTS: everything after the hole moves down, so the doc
+   * arena is re-laid in doc-id order and the doc hash is rebuilt. */
+  {
+    uint32_t id = kbc_index_id_of(ix, "kb", "c.md");
+    KBC_CHECK(id != UINT32_MAX);
+    inc_retire(m, n, "c.md");
+    KBC_CHECK_OK(kbc_index_remove_doc(ix, id, &err));
+  }
+  ix = rt_step(ix, m, n, path, "remove c.md");
+  if (ix == NULL) goto done;
+
+  /* An append AFTER a removal: the new document lands at the new end, and the
+   * term arena grows by terms nobody in the corpus has had before. */
+  inc_apply(ix, m, &n, "e.md", "mu nu xi kappa", a, &err);
+  ix = rt_step(ix, m, n, path, "append e.md after a removal");
+  if (ix == NULL) goto done;
+
+  /* A last replace that keeps a term and brings several nobody in the corpus
+   * has, so the term table and the term arena both move before the final
+   * save. The rehash itself is incremental_update_survives_a_term_table_rehash,
+   * which has the vocabulary to force one. */
+  inc_apply(ix, m, &n, "d.md", "delta kappa lambda mu", a, &err);
+  ix = rt_step(ix, m, n, path, "replace d.md");
+  if (ix == NULL) goto done;
+
+  /* And the whole sequence, byte for byte: nothing above corrupted a counter,
+   * so nothing above may change the file a second save produces. */
+  rt_check_stable(ix, dir, "after the whole sequence");
+
+done:
+  kbc_arena_free(a);
+  kbc_test_rmrf(dir);
+}
+
+/* The same, on a corpus two orders of magnitude larger, because a fix that
+ * holds at one size is not a fix: the term arena there spans many blocks and
+ * the term table has room to double, and neither may desynchronize the header
+ * from the sections. */
+KBC_TEST(a_large_corpus_saves_a_reopenable_stable_file) {
+  char dir[KBC_TEST_PATH_MAX];
+  char path[KBC_TEST_PATH_MAX + 32];
+  static char bodies[BIG_DOCS][96];
+  static char paths[BIG_DOCS][32];
+  static inc_doc m[BIG_DOCS + 4];
+  kbc_arena *a = kbc_arena_new(1u << 20);
+  kbc_err err;
+  size_t n = BIG_DOCS;
+  kbc_index *ix = kbc_index_new();
+  uint32_t d;
+  memset(&err, 0, sizeof err);
+  kbc_test_tmpdir(dir, sizeof dir);
+  (void)snprintf(path, sizeof path, "%s/big.idx", dir);
+  for (d = 0; d < BIG_DOCS; d++) {
+    (void)snprintf(paths[d], sizeof paths[d], "corpus/dir%u/doc%04u.md", d % 7u,
+                   d);
+    (void)snprintf(bodies[d], sizeof bodies[d],
+                   "alpha beta gamma delta epsilon zeta theta iota kappa "
+                   "doc%u common shared word%u rare%u",
+                   d, d % 37u, d % 11u);
+    m[d].path = paths[d];
+    m[d].body = bodies[d];
+  }
+  KBC_CHECK_OK(kbc_index_begin_build(ix, &err));
+  for (d = 0; d < BIG_DOCS; d++) {
+    KBC_CHECK_OK(add(ix, a, d, "kb", paths[d], paths[d], bodies[d], &err));
+  }
+  KBC_CHECK_OK(kbc_index_end_build(ix, &err));
+  KBC_CHECK_OK(kbc_index_save(ix, path, &err));
+  kbc_index_free(ix);
+  kbc_err_reset(&err);
+  ix = kbc_index_open(path, &err);
+  KBC_CHECK_MSG(ix != NULL, "open: %s", err.msg);
+  if (ix == NULL) {
+    kbc_arena_free(a);
+    kbc_test_rmrf(dir);
+    return;
+  }
+  /* The corpus is big enough that the arenas span blocks; say so, so a fixture
+   * that stops being big fails here rather than passing vacuously. */
+  KBC_CHECK(kbc_index_term_count(ix) > 64u);
+  KBC_CHECK_MSG(strncmp(dir, "/tmp/kbc-test-", 14) == 0, "GUARD before %s: [%s]", "step", dir);
+  ix = rt_step(ix, m, n, path, "large corpus, unmutated save");
+  if (ix == NULL) {
+    kbc_arena_free(a);
+    kbc_test_rmrf(dir);
+    return;
+  }
+  inc_apply(ix, m, &n, paths[3], "replaced body with a handful of new terms",
+            a, &err);
+  KBC_CHECK_MSG(strncmp(dir, "/tmp/kbc-test-", 14) == 0, "GUARD before %s: [%s]", "step", dir);
+  ix = rt_step(ix, m, n, path, "large corpus, one document replaced");
+  if (ix == NULL) {
+    kbc_arena_free(a);
+    kbc_test_rmrf(dir);
+    return;
+  }
+  inc_retire(m, n, paths[100]);
+  KBC_CHECK_OK(kbc_index_remove_doc(ix, 100u, &err));
+  KBC_CHECK_MSG(strncmp(dir, "/tmp/kbc-test-", 14) == 0, "GUARD before %s: [%s]", "step", dir);
+  ix = rt_step(ix, m, n, path, "large corpus, one document removed");
+  if (ix == NULL) {
+    kbc_arena_free(a);
+    kbc_test_rmrf(dir);
+    return;
+  }
+  rt_check_stable(ix, dir, "large corpus");
+  kbc_arena_free(a);
+  kbc_test_rmrf(dir);
+}
+
 
 /* ------------------------------------------------------------- main ------ */
 
@@ -1593,6 +1920,10 @@ int main(void) {
        an_index_loaded_from_disk_can_be_updated_in_place},
       {"incremental_update_survives_a_term_table_rehash",
        incremental_update_survives_a_term_table_rehash},
+      {"every_mutation_saves_a_reopenable_stable_file",
+       every_mutation_saves_a_reopenable_stable_file},
+      {"a_large_corpus_saves_a_reopenable_stable_file",
+       a_large_corpus_saves_a_reopenable_stable_file},
       {"bm25_score_matches_hand_computation", bm25_score_matches_hand_computation},
       {"bm25_returns_exactly_the_matching_docs",
        bm25_returns_exactly_the_matching_docs},

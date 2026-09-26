@@ -519,40 +519,24 @@ static const char *resolve_base_url(void) {
   return g_base_url;
 }
 
-/* The daemon's token: the config value when it carries one, else the first
- * line of the configured token file. No token file is not an error — a
- * loopback daemon runs without one. */
-static char *read_token(const kbc_config *cfg) {
-  if (cfg->token != NULL && cfg->token[0] != '\0') {
-    return xstrdup(cfg->token);
-  }
-  if (cfg->token_path == NULL) {
-    return NULL;
-  }
+/* The daemon's token, for the CLI's OWN outbound requests. The rule itself
+ * lives in kbc_config_load_token: this is the same function the daemon path
+ * calls, so the CLI and the daemon cannot disagree about what the token is.
+ * `cfg` is non-const because resolving stores into it, which also means the
+ * token file is read once per process, not once per request. */
+static char *read_token(kbc_config *cfg) {
   kbc_err e;
   kbc_err_reset(&e);
-  kbc_str body;
-  kbc_str_init(&body);
-  if (kbc_failed(kbc_str_read_file(cfg->token_path, &body, &e))) {
-    kbc_str_free(&body);
+  if (kbc_failed(kbc_config_load_token(cfg, &e))) {
+    /* Not fatal here: the CLI is a client. A daemon on a non-loopback bind
+     * will have refused to start over the same condition, and this request
+     * will come back 401/403, which says the same thing more usefully. */
     return NULL;
   }
-  size_t start = 0;
-  while (start < body.len &&
-         (body.ptr[start] == '\n' || body.ptr[start] == '\r')) {
-    start++;
+  if (cfg->token == NULL || cfg->token[0] == '\0') {
+    return NULL;
   }
-  size_t end = start;
-  while (end < body.len && body.ptr[end] != '\n' && body.ptr[end] != '\r') {
-    end++;
-  }
-  char *tok = strndup(body.ptr + start, end - start);
-  kbc_str_free(&body);
-  if (tok != NULL && tok[0] == '\0') {
-    free(tok);
-    tok = NULL;
-  }
-  return tok;
+  return xstrdup(cfg->token);
 }
 
 /* ---------------------------------------------------------- http client ---- */
@@ -708,7 +692,7 @@ static kbc_status parse_status_line(const char *line, size_t len, int *status,
 static kbc_status http_do(const char *method, const char *path, const char *body,
                           size_t body_len, int *status, kbc_str *resp,
                           kbc_err *err) {
-  const kbc_config *cfg = load_config();
+  kbc_config *cfg = load_config();
   kbc_url u;
   if (!url_parse(resolve_base_url(), &u, err)) {
     return KBC_ERR_INVALID;
@@ -1798,7 +1782,12 @@ static int cmd_add(int argc, char **argv, int start) {
    * the operator run a second command to see the documents. */
   kbc_app *app = kbc_app_open(cfg, &e);
   if (app == NULL) {
-    exit(status_exit(KBC_ERR_IO, &e, "open the store"));
+    /* The status kbc_app_open actually failed with, not a blanket IO: a
+     * corrupt index is a PARSE, and fail_status only prints the reason when it
+     * matches the status it is given — so a hardcoded KBC_ERR_IO threw away the
+     * one line that says WHICH file is bad and WHY, leaving the operator with
+     * "open the store: io". */
+    exit(status_exit(e.status ? e.status : KBC_ERR_IO, &e, "open the store"));
   }
   s = kbc_app_reindex(app, &e);
   if (kbc_failed(s)) {
@@ -2093,7 +2082,8 @@ static int cmd_bench(int argc, char **argv, int start) {
   memset(&stats, 0, sizeof stats);
   kbc_app *app = kbc_app_open(cfg, &e);
   if (app == NULL) {
-    rc = status_exit(KBC_ERR_IO, &e, "bench: open the store");
+    rc = status_exit(e.status ? e.status : KBC_ERR_IO, &e,
+                     "bench: open the store");
     goto cleanup;
   }
   {
@@ -2301,7 +2291,14 @@ static int cmd_daemon(int argc, char **argv, int start) {
   }
   kbc_err e;
   kbc_err_reset(&e);
-  kbc_status s = kbc_config_validate(cfg, &e);
+  /* Resolve the token BEFORE validate and before the bind guard: both read
+   * cfg->token, and a configured-but-unreadable token file must be a startup
+   * failure rather than a silently unauthenticated daemon on a public bind. */
+  kbc_status s = kbc_config_load_token(cfg, &e);
+  if (kbc_failed(s)) {
+    exit(status_exit(s, &e, "token"));
+  }
+  s = kbc_config_validate(cfg, &e);
   if (kbc_failed(s)) {
     exit(status_exit(s, &e, "config"));
   }
@@ -2338,7 +2335,7 @@ static int cmd_daemon(int argc, char **argv, int start) {
 
   kbc_app *app = kbc_app_open(cfg, &e);
   if (app == NULL) {
-    exit(status_exit(KBC_ERR_IO, &e, "open the store"));
+    exit(status_exit(e.status ? e.status : KBC_ERR_IO, &e, "open the store"));
   }
   if (kbc_failed(kbc_app_start_watcher(app, &e))) {
     kbc_app_close(app);
@@ -2360,6 +2357,12 @@ static int cmd_daemon(int argc, char **argv, int start) {
            cfg->bind_addr, kbc_httpd_port(h), cfg->ncorpora,
            (long long)stats.artifacts_indexed, (long long)stats.index_docs,
            (long long)stats.index_terms, (long long)stats.db_bytes);
+  /* Whether the bearer tier is live. Never the value: this line goes to the
+   * operator's terminal and into whatever collects the daemon's stderr. */
+  KBC_LOGI("bearer token %s (source: %s)",
+           (cfg->token != NULL && cfg->token[0] != '\0') ? "active" : "not configured",
+           (cfg->token != NULL && cfg->token[0] != '\0') ? cfg->token_path
+                                                          : "none");
   if (o.foreground && !g_json) {
     printf("kbc daemon listening on http://%s:%d\n", cfg->bind_addr,
            kbc_httpd_port(h));

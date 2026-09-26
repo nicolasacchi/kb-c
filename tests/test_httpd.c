@@ -109,8 +109,9 @@ static void fx_teardown(fixture *f) {
 
 /* ------------------------------------------------------------------ helpers */
 
-static int call(fixture *f, const char *method, const char *path,
-                const char *query, const char *auth, kbc_response *out) {
+static int call_from(fixture *f, const char *method, const char *path,
+                     const char *query, const char *auth, const char *from,
+                     kbc_response *out) {
   kbc_request req;
   memset(&req, 0, sizeof req);
   req.method = method;
@@ -119,12 +120,37 @@ static int call(fixture *f, const char *method, const char *path,
   req.body = "";
   req.body_len = 0;
   req.auth = auth != NULL ? auth : "";
-  req.client_addr = "test";
+  req.client_addr = from;
   kbc_err err;
   kbc_err_reset(&err);
   kbc_status st = kbc_httpd_handle(f->app, f->cfg, &req, out, &err);
   KBC_CHECK_MSG(!kbc_failed(st), "kbc_httpd_handle failed: %s", err.msg);
   return out->status;
+}
+
+static int call(fixture *f, const char *method, const char *path,
+                const char *query, const char *auth, kbc_response *out) {
+  return call_from(f, method, path, query, auth, "test", out);
+}
+
+/* Asserts the RFC 7807 shape: the four members a client dispatches on, and a
+ * `status` that agrees with the status line. Anything less and a client built
+ * against the kb API has to sniff the body to learn what went wrong. */
+static void check_problem(const kbc_response *r, int status) {
+  KBC_CHECK_EQ_INT(r->status, status);
+  KBC_CHECK_MSG(strcmp(r->content_type, "application/problem+json; charset=utf-8") == 0,
+                "error is not problem+json: %s", r->content_type);
+  KBC_CHECK_MSG(strstr(r->body.ptr, "\"type\":\"urn:kb:errors:") != NULL,
+                "no problem type: %s", r->body.ptr);
+  KBC_CHECK_MSG(strstr(r->body.ptr, "\"title\":\"") != NULL,
+                "no problem title: %s", r->body.ptr);
+  KBC_CHECK_MSG(strstr(r->body.ptr, "\"detail\":\"") != NULL,
+                "no problem detail: %s", r->body.ptr);
+  char pat[64];
+  snprintf(pat, sizeof pat, "\"status\":%d", status);
+  KBC_CHECK_MSG(strstr(r->body.ptr, pat) != NULL,
+                "problem status does not match the HTTP status %d: %s", status,
+                r->body.ptr);
 }
 
 /* Extracts the first "id":"..." value from a JSON body. */
@@ -725,8 +751,10 @@ KBC_TEST(response_headers_are_set) {
   KBC_CHECK_EQ_INT(status, 404);
   KBC_CHECK_MSG(strstr(reply, "X-Content-Type-Options: nosniff") != NULL,
                 "no nosniff on a 404: %s", reply);
-  KBC_CHECK_MSG(strstr(reply, "Content-Type: application/json") != NULL,
-                "an error body is not JSON: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "Content-Type: application/problem+json") != NULL,
+                "an error body is not problem+json: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "\"type\":\"urn:kb:errors:not-found\"") != NULL,
+                "a 404 has no problem type: %s", reply);
 
   /* An SSE response declares itself and never claims a length it cannot keep. */
   const char *ev = "GET /api/events HTTP/1.1\r\nHost: x\r\n\r\n";
@@ -740,6 +768,528 @@ KBC_TEST(response_headers_are_set) {
   srv_stop(&s);
   fx_teardown(&f);
 }
+
+/* ------------------------------------------------------- problem+json ----- */
+
+KBC_TEST(errors_are_problem_json) {
+  fixture f;
+  fx_setup(&f, NULL);
+  kbc_response r;
+
+  /* 404, 405 and 400 are different failures and each must carry its own
+   * status in the body, or a client that only reads the body learns nothing. */
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/nope", NULL, NULL, &r), 404);
+  check_problem(&r, 404);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"detail\":\"no route for GET /api/nope\"") != NULL,
+                "detail is not the human reason: %s", r.body.ptr);
+  kbc_response_free(&r);
+
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/reindex", NULL, NULL, &r), 405);
+  check_problem(&r, 405);
+  kbc_response_free(&r);
+
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/search", "q=alpha&limit=0", NULL, &r),
+                   400);
+  check_problem(&r, 400);
+  kbc_response_free(&r);
+
+  /* A detail is never empty: a client that shows `detail` must have something
+   * to show. */
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/artifacts/xyz", NULL, NULL, &r), 400);
+  check_problem(&r, 400);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"detail\":\"\"") == NULL,
+                "an empty detail slipped through: %s", r.body.ptr);
+  kbc_response_free(&r);
+
+  /* A success is still plain JSON, not a problem document. */
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/stats", NULL, NULL, &r), 200);
+  KBC_CHECK_EQ_STR(r.content_type, "application/json; charset=utf-8");
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"type\"") == NULL,
+                "a 200 answered with a problem body: %s", r.body.ptr);
+  kbc_response_free(&r);
+
+  fx_teardown(&f);
+}
+
+KBC_TEST(problem_json_over_a_socket) {
+  fixture f;
+  fx_setup(&f, TOKEN);
+  server s;
+  srv_start(&s, &f);
+  if (s.h == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char reply[8192];
+  int status = 0;
+  /* 401 with no credential, and 404 for a path that is not there once the
+   * caller is admitted: both are refusals and both must be parseable by the
+   * same client code. (The 404 needs a token — the auth gate runs before the
+   * router, so an unauthenticated /api request never reaches a route table.) */
+  const char *noauth = "GET /api/kbs HTTP/1.1\r\nHost: x\r\n\r\n";
+  KBC_CHECK(raw_exchange(&s, noauth, strlen(noauth), &status, reply,
+                         sizeof reply));
+  KBC_CHECK_EQ_INT(status, 401);
+  KBC_CHECK_MSG(strstr(reply, "Content-Type: application/problem+json") != NULL,
+                "a 401 is not problem+json: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "\"status\":401") != NULL,
+                "a 401 body does not say 401: %s", reply);
+
+  const char *miss = "GET /api/nope HTTP/1.1\r\nHost: x\r\n"
+                     "Authorization: Bearer s3cr3t-token\r\n\r\n";
+  KBC_CHECK(raw_exchange(&s, miss, strlen(miss), &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 404);
+  KBC_CHECK_MSG(strstr(reply, "\"type\":\"urn:kb:errors:not-found\"") != NULL,
+                "a 404 has no stable type: %s", reply);
+
+  srv_stop(&s);
+  fx_teardown(&f);
+}
+
+/* ------------------------------------------------------------------ /kbs -- */
+
+KBC_TEST(kbs_lists_the_configured_corpora) {
+  fixture f;
+  fx_setup(&f, NULL);
+  kbc_response r;
+
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/kbs", NULL, NULL, &r), 200);
+  KBC_CHECK_EQ_STR(r.content_type, "application/json; charset=utf-8");
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"name\":\"kb\"") != NULL,
+                "the configured corpus is not listed: %s", r.body.ptr);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"configured\":true") != NULL,
+                "a row does not say it is configured: %s", r.body.ptr);
+  /* Two documents were indexed by the fixture, and the count is per corpus. */
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"docs\":2") != NULL,
+                "doc count is wrong or missing: %s", r.body.ptr);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"docs_truncated\":false") != NULL,
+                "a count that fit is not truncated: %s", r.body.ptr);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"root_exists\":true") != NULL,
+                "the corpus root exists but the row denies it: %s", r.body.ptr);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"index_terms\":") != NULL,
+                "no index term count: %s", r.body.ptr);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"path\":") != NULL,
+                "a row carries no path: %s", r.body.ptr);
+  KBC_CHECK_MSG(strstr(r.body.ptr, f.root) != NULL,
+                "the row's path is not the configured one: %s", r.body.ptr);
+  kbc_response_free(&r);
+
+  /* The filter selects one configured corpus. */
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/kbs", "kb=kb", NULL, &r), 200);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"count\":1") != NULL,
+                "the filter did not select exactly one corpus: %s", r.body.ptr);
+  kbc_response_free(&r);
+
+  /* A corpus the daemon was not configured with is a 404, not an empty 200:
+   * a client that typo'd a corpus name must be able to tell. */
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/kbs", "kb=nosuch", NULL, &r), 404);
+  check_problem(&r, 404);
+  kbc_response_free(&r);
+
+  /* Hostile: a traversal in the name, a separator in it, and an over-long
+   * value are all refused on shape rather than quietly matching nothing. */
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/kbs", "kb=..%2f..%2fetc", NULL, &r),
+                   400);
+  check_problem(&r, 400);
+  kbc_response_free(&r);
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/kbs", "kb=a%2fb", NULL, &r), 400);
+  kbc_response_free(&r);
+  {
+    kbc_str q;
+    kbc_str_init(&q);
+    (void)kbc_str_puts(&q, "kb=");
+    for (size_t i = 0; i < 300; i++) (void)kbc_str_putc(&q, 'k');
+    KBC_CHECK_EQ_INT(call(&f, "GET", "/api/kbs", q.ptr, NULL, &r), 400);
+    check_problem(&r, 400);
+    kbc_response_free(&r);
+    kbc_str_free(&q);
+  }
+  /* An empty filter names no corpus either. */
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/kbs", "kb=", NULL, &r), 400);
+  kbc_response_free(&r);
+
+  KBC_CHECK_EQ_INT(call(&f, "POST", "/api/kbs", NULL, NULL, &r), 405);
+  kbc_response_free(&r);
+
+  fx_teardown(&f);
+}
+
+KBC_TEST(kbs_is_token_gated) {
+  fixture f;
+  fx_setup(&f, TOKEN);
+  kbc_response r;
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/kbs", NULL, NULL, &r), 401);
+  check_problem(&r, 401);
+  kbc_response_free(&r);
+  char good[64];
+  snprintf(good, sizeof good, "Bearer %s", TOKEN);
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/kbs", NULL, good, &r), 200);
+  kbc_response_free(&r);
+  /* A traversal must not slip past the gate to be answered. */
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/kbs", "kb=..%2f..%2fetc", NULL, &r),
+                   401);
+  kbc_response_free(&r);
+  fx_teardown(&f);
+}
+
+/* ------------------------------------------------------------ /identity --- */
+
+KBC_TEST(identity_reports_attribution_only) {
+  fixture f;
+  fx_setup(&f, NULL);
+  kbc_response r;
+
+  /* A loopback peer with no token is "local", resolved from the loopback. */
+  KBC_CHECK_EQ_INT(
+      call_from(&f, "GET", "/api/identity", NULL, NULL, "127.0.0.1", &r), 200);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"identity\":\"local\"") != NULL,
+                "a loopback peer is not local: %s", r.body.ptr);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"source\":\"loopback\"") != NULL,
+                "the resolution source is missing: %s", r.body.ptr);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"loopback\":true") != NULL,
+                "the loopback fact is not reported: %s", r.body.ptr);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"client_addr\":\"127.0.0.1\"") != NULL,
+                "the peer address is not reported: %s", r.body.ptr);
+  /* The answer must say it confers nothing, or a client will treat it as a
+   * capability it can spend. */
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"trust_tiers\":1") != NULL,
+                "the trust tier count is not stated: %s", r.body.ptr);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"authorization\":false") != NULL,
+                "identity claims to authorize: %s", r.body.ptr);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"roles\":[]") != NULL,
+                "roles are claimed: %s", r.body.ptr);
+  kbc_response_free(&r);
+
+  /* IPv6 loopback is loopback. */
+  KBC_CHECK_EQ_INT(
+      call_from(&f, "GET", "/api/identity", NULL, NULL, "::1", &r), 200);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"identity\":\"local\"") != NULL,
+                "::1 is not loopback: %s", r.body.ptr);
+  kbc_response_free(&r);
+
+  /* A routable peer is NOT local, and the route says so rather than guessing. */
+  KBC_CHECK_EQ_INT(
+      call_from(&f, "GET", "/api/identity", NULL, NULL, "10.1.2.3", &r), 200);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"identity\":\"unattributed\"") != NULL,
+                "a routable peer was called local: %s", r.body.ptr);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"loopback\":false") != NULL,
+                "10.1.2.3 was called loopback: %s", r.body.ptr);
+  kbc_response_free(&r);
+
+  /* No address at all fails closed, it does not default to loopback. */
+  KBC_CHECK_EQ_INT(call_from(&f, "GET", "/api/identity", NULL, NULL, "?", &r),
+                   200);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"identity\":\"unattributed\"") != NULL,
+                "an unknown peer was attributed: %s", r.body.ptr);
+  kbc_response_free(&r);
+
+  /* A client cannot name itself. */
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/identity", "as=admin", NULL, &r), 400);
+  check_problem(&r, 400);
+  kbc_response_free(&r);
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/identity", "user=admin", NULL, &r),
+                   400);
+  kbc_response_free(&r);
+  {
+    kbc_str q;
+    kbc_str_init(&q);
+    (void)kbc_str_puts(&q, "identity=");
+    for (size_t i = 0; i < 512; i++) (void)kbc_str_putc(&q, 'a');
+    KBC_CHECK_EQ_INT(call(&f, "GET", "/api/identity", q.ptr, NULL, &r), 400);
+    kbc_response_free(&r);
+    kbc_str_free(&q);
+  }
+  KBC_CHECK_EQ_INT(call(&f, "POST", "/api/identity", NULL, NULL, &r), 405);
+  kbc_response_free(&r);
+
+  fx_teardown(&f);
+}
+
+KBC_TEST(identity_names_the_admission_that_happened) {
+  fixture f;
+  fx_setup(&f, TOKEN);
+  kbc_response r;
+  char good[64];
+  snprintf(good, sizeof good, "Bearer %s", TOKEN);
+
+  /* Admitted by the token, from a routable peer: the token is what let this in,
+   * and the route must report that rather than crediting the address. */
+  KBC_CHECK_EQ_INT(
+      call_from(&f, "GET", "/api/identity", NULL, good, "10.1.2.3", &r), 200);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"identity\":\"operator\"") != NULL,
+                "a token caller is not the operator: %s", r.body.ptr);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"source\":\"token\"") != NULL,
+                "the token admission is not the reported source: %s",
+                r.body.ptr);
+  kbc_response_free(&r);
+
+  /* The same token from loopback is still just the operator, and the identity
+   * it resolves to buys nothing: it gets the same routes, not more. */
+  KBC_CHECK_EQ_INT(
+      call_from(&f, "GET", "/api/identity", NULL, good, "127.0.0.1", &r), 200);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"source\":\"token\"") != NULL,
+                "loopback beat the token in the ladder: %s", r.body.ptr);
+  kbc_response_free(&r);
+
+  /* And the route is gated exactly like its neighbours. */
+  KBC_CHECK_EQ_INT(
+      call_from(&f, "GET", "/api/identity", NULL, NULL, "127.0.0.1", &r), 401);
+  check_problem(&r, 401);
+  kbc_response_free(&r);
+  KBC_CHECK_EQ_INT(
+      call_from(&f, "GET", "/api/identity", NULL, "Bearer wrong", "127.0.0.1",
+                &r),
+      403);
+  check_problem(&r, 403);
+  kbc_response_free(&r);
+
+  fx_teardown(&f);
+}
+
+KBC_TEST(new_routes_are_in_the_route_table) {
+  /* The export is what the docs and the CLI are generated from, so a route
+   * that exists but is not listed is a route nobody can discover — and, worse,
+   * a route whose `needs_auth` nobody checked. */
+  bool found_kbs = false, found_id = false;
+  for (size_t i = 0; i < KBC_ROUTES_LEN; i++) {
+    if (strcmp(KBC_ROUTES[i].path, "/api/kbs") == 0) {
+      found_kbs = true;
+      KBC_CHECK_MSG(KBC_ROUTES[i].needs_auth,
+                    "/api/kbs is listed as open in the route table");
+    }
+    if (strcmp(KBC_ROUTES[i].path, "/api/identity") == 0) {
+      found_id = true;
+      KBC_CHECK_MSG(KBC_ROUTES[i].needs_auth,
+                    "/api/identity is listed as open in the route table");
+    }
+  }
+  KBC_CHECK_MSG(found_kbs, "/api/kbs is missing from KBC_ROUTES");
+  KBC_CHECK_MSG(found_id, "/api/identity is missing from KBC_ROUTES");
+}
+
+/* ------------------------------------------------------------------ CORS -- */
+
+/* Counts the status lines in a reply that carried several pipelined answers. */
+static int count_statuses(const char *reply) {
+  int n = 0;
+  for (const char *p = reply; (p = strstr(p, "HTTP/1.1 ")) != NULL; p += 9) n++;
+  return n;
+}
+
+/* Sends `n` identical pipelined requests down ONE connection and reads until
+ * the daemon closes. The per-connection cap is per connection, so the only way
+ * to observe it is to keep the connection. */
+static bool pipeline_exchange(server *s, int n, char *reply, size_t cap) {
+  reply[0] = '\0';
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return false;
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof a);
+  a.sin_family = AF_INET;
+  a.sin_port = htons((uint16_t)s->port);
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
+    close(fd);
+    return false;
+  }
+  const char *one = "GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n";
+  for (int i = 0; i < n; i++) {
+    size_t len = strlen(one);
+    size_t off = 0;
+    while (off < len) {
+      ssize_t w = send(fd, one + off, len - off, MSG_NOSIGNAL);
+      if (w <= 0) break;
+      off += (size_t)w;
+    }
+  }
+  struct timespec tv = {5, 0};
+  (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  size_t got = 0;
+  for (;;) {
+    if (got + 1 >= cap) break;
+    ssize_t r = recv(fd, reply + got, cap - 1 - got, 0);
+    if (r <= 0) break;
+    got += (size_t)r;
+    reply[got] = '\0';
+  }
+  close(fd);
+  return got > 0;
+}
+
+KBC_TEST(cors_is_same_origin_only_unless_configured) {
+  fixture f;
+  fx_setup(&f, NULL);
+  server s;
+  char reply[8192];
+  int status = 0;
+
+  /* Default: no allowlist, so an Origin is ignored entirely — and never
+   * answered with a wildcard. */
+  (void)unsetenv("KBC_CORS_ORIGINS");
+  srv_start(&s, &f);
+  if (s.h != NULL) {
+    const char *r1 =
+        "GET /api/health HTTP/1.1\r\nHost: x\r\n"
+        "Origin: https://ops.example\r\n\r\n";
+    KBC_CHECK(raw_exchange(&s, r1, strlen(r1), &status, reply, sizeof reply));
+    KBC_CHECK_EQ_INT(status, 200);
+    KBC_CHECK_MSG(strstr(reply, "Vary: Origin") != NULL,
+                  "no Vary: Origin on an unconfigured daemon: %s", reply);
+    KBC_CHECK_MSG(strstr(reply, "Access-Control-Allow-Origin") == NULL,
+                  "an origin was granted with no allowlist: %s", reply);
+    srv_stop(&s);
+  }
+
+  /* Configured: that one origin is reflected, and only that one. */
+  KBC_CHECK(setenv("KBC_CORS_ORIGINS", "https://ops.example", 1) == 0);
+  srv_start(&s, &f);
+  if (s.h != NULL) {
+    const char *ok =
+        "GET /api/health HTTP/1.1\r\nHost: x\r\n"
+        "Origin: https://ops.example\r\n\r\n";
+    KBC_CHECK(raw_exchange(&s, ok, strlen(ok), &status, reply, sizeof reply));
+    KBC_CHECK_EQ_INT(status, 200);
+    KBC_CHECK_MSG(strstr(reply, "Access-Control-Allow-Origin: "
+                              "https://ops.example\r\n") != NULL,
+                  "the configured origin was not reflected: %s", reply);
+    KBC_CHECK_MSG(strstr(reply, "Access-Control-Allow-Origin: *") == NULL,
+                  "a wildcard was served: %s", reply);
+    KBC_CHECK_MSG(strstr(reply, "Vary: Origin") != NULL,
+                  "an allowed origin was not varied on: %s", reply);
+
+    const char *other =
+        "GET /api/health HTTP/1.1\r\nHost: x\r\n"
+        "Origin: https://evil.example\r\n\r\n";
+    KBC_CHECK(raw_exchange(&s, other, strlen(other), &status, reply,
+                           sizeof reply));
+    KBC_CHECK_EQ_INT(status, 200);
+    KBC_CHECK_MSG(strstr(reply, "Access-Control-Allow-Origin") == NULL,
+                  "an unlisted origin was granted: %s", reply);
+
+    /* A prefix of an allowed origin is not an allowed origin. */
+    const char *prefix =
+        "GET /api/health HTTP/1.1\r\nHost: x\r\n"
+        "Origin: https://ops.example.evil.test\r\n\r\n";
+    KBC_CHECK(raw_exchange(&s, prefix, strlen(prefix), &status, reply,
+                           sizeof reply));
+    KBC_CHECK_MSG(strstr(reply, "Access-Control-Allow-Origin") == NULL,
+                  "a prefix of an allowed origin was granted: %s", reply);
+
+    /* The preflight is answered, carries the methods the API really uses, and
+     * is not a way past the token gate: it grants permission, not access. */
+    const char *pre =
+        "OPTIONS /api/stats HTTP/1.1\r\nHost: x\r\n"
+        "Origin: https://ops.example\r\n"
+        "Access-Control-Request-Method: GET\r\n\r\n";
+    KBC_CHECK(raw_exchange(&s, pre, strlen(pre), &status, reply, sizeof reply));
+    KBC_CHECK_EQ_INT(status, 204);
+    KBC_CHECK_MSG(strstr(reply, "Access-Control-Allow-Methods: GET, POST, "
+                                "OPTIONS") != NULL,
+                  "preflight does not list the API's methods: %s", reply);
+    KBC_CHECK_MSG(strstr(reply, "Access-Control-Allow-Headers: Authorization") !=
+                      NULL,
+                  "preflight does not allow the auth header: %s", reply);
+    KBC_CHECK_MSG(strstr(reply, "Access-Control-Max-Age: 600") != NULL,
+                  "preflight does not say how long the answer stands: %s", reply);
+    /* A 204 has no body, so it must not claim a content type or a length. */
+    KBC_CHECK_MSG(strstr(reply, "Content-Type:") == NULL,
+                  "a 204 declares a content type for no body: %s", reply);
+    KBC_CHECK_MSG(strstr(reply, "Content-Length:") == NULL,
+                  "a 204 declares a length: %s", reply);
+
+    /* A preflight from an origin the daemon does not serve is refused, and
+     * gets no allow header. */
+    const char *pre_bad =
+        "OPTIONS /api/stats HTTP/1.1\r\nHost: x\r\n"
+        "Origin: https://evil.example\r\n\r\n";
+    KBC_CHECK(raw_exchange(&s, pre_bad, strlen(pre_bad), &status, reply,
+                           sizeof reply));
+    KBC_CHECK_EQ_INT(status, 403);
+    KBC_CHECK_MSG(strstr(reply, "Content-Type: application/problem+json") !=
+                      NULL,
+                  "a refused preflight is not problem+json: %s", reply);
+    KBC_CHECK_MSG(strstr(reply, "Access-Control-Allow-Origin") == NULL,
+                  "a refused preflight still granted the origin: %s", reply);
+
+    /* No Origin at all is not a preflight. */
+    const char *pre_none = "OPTIONS /api/stats HTTP/1.1\r\nHost: x\r\n\r\n";
+    KBC_CHECK(
+        raw_exchange(&s, pre_none, strlen(pre_none), &status, reply,
+                     sizeof reply));
+    KBC_CHECK_EQ_INT(status, 404);
+
+    srv_stop(&s);
+  }
+  (void)unsetenv("KBC_CORS_ORIGINS");
+  fx_teardown(&f);
+}
+
+KBC_TEST(rate_limit_caps_one_connection) {
+  fixture f;
+  fx_setup(&f, NULL);
+  server s;
+  /* The cap protects the worker from ONE client, not the daemon from an
+   * attacker: there is no untrusted-caller path to defend against here, so the
+   * assertion is the fairness property, not a security claim. */
+  KBC_CHECK(setenv("KBC_RATE_LIMIT_RPS", "5", 1) == 0);
+  srv_start(&s, &f);
+  if (s.h == NULL) {
+    (void)unsetenv("KBC_RATE_LIMIT_RPS");
+    fx_teardown(&f);
+    return;
+  }
+  char reply[65536];
+  bool ok = pipeline_exchange(&s, 12, reply, sizeof reply);
+  KBC_CHECK(ok);
+  /* Five are served, the sixth is refused and the connection is closed: the cap
+   * is a ceiling, not a queue, so the client is told to come back later
+   * instead of being silently slowed. */
+  KBC_CHECK_MSG(count_statuses(reply) == 6,
+                "expected 5 answers plus one 429, got %d",
+                count_statuses(reply));
+  KBC_CHECK_MSG(strstr(reply, "HTTP/1.1 429 Too Many Requests") != NULL,
+                "twelve requests on one connection were never capped: %s",
+                reply);
+  KBC_CHECK_MSG(strstr(reply, "\"type\":\"urn:kb:errors:too-many-requests\"") !=
+                    NULL,
+                "a 429 is not problem+json: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "Retry-After: 1") != NULL,
+                "a 429 does not say when to come back: %s", reply);
+
+  /* A second connection is not charged for the first one's spending. */
+  char reply2[8192];
+  int st2 = 0;
+  const char *one_get = "GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n";
+  KBC_CHECK(
+      raw_exchange(&s, one_get, strlen(one_get), &st2, reply2, sizeof reply2));
+  KBC_CHECK_MSG(strncmp(reply2, "HTTP/1.1 200", 12) == 0,
+                "a fresh connection was refused for another's spending: %s",
+                reply2);
+
+  srv_stop(&s);
+  (void)unsetenv("KBC_RATE_LIMIT_RPS");
+  fx_teardown(&f);
+}
+
+KBC_TEST(a_bad_rate_limit_threshold_refuses_to_start) {
+  fixture f;
+  fx_setup(&f, NULL);
+  KBC_CHECK(setenv("KBC_RATE_LIMIT_RPS", "many", 1) == 0);
+  free(f.cfg->bind_addr);
+  f.cfg->bind_addr = strdup("127.0.0.1");
+  f.cfg->port = 0;
+  f.cfg->http_workers = 1;
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_httpd *h = kbc_httpd_start(f.app, f.cfg, &err);
+  KBC_CHECK_NULL(h);
+  KBC_CHECK_ERR(err.status, KBC_ERR_INVALID);
+  KBC_CHECK_MSG(strstr(err.msg, "KBC_RATE_LIMIT_RPS") != NULL,
+                "the refusal does not name the variable: %s", err.msg);
+  (void)unsetenv("KBC_RATE_LIMIT_RPS");
+  fx_teardown(&f);
+}
+
 
 /* ------------------------------------------------------------------- main -- */
 
@@ -760,6 +1310,19 @@ int main(void) {
       {"absent_offset_is_zero", absent_offset_is_zero},
       {"hostile_requests_are_refused", hostile_requests_are_refused},
       {"response_headers_are_set", response_headers_are_set},
+      {"errors_are_problem_json", errors_are_problem_json},
+      {"problem_json_over_a_socket", problem_json_over_a_socket},
+      {"kbs_lists_the_configured_corpora", kbs_lists_the_configured_corpora},
+      {"kbs_is_token_gated", kbs_is_token_gated},
+      {"identity_reports_attribution_only", identity_reports_attribution_only},
+      {"identity_names_the_admission_that_happened",
+       identity_names_the_admission_that_happened},
+      {"new_routes_are_in_the_route_table", new_routes_are_in_the_route_table},
+      {"cors_is_same_origin_only_unless_configured",
+       cors_is_same_origin_only_unless_configured},
+      {"rate_limit_caps_one_connection", rate_limit_caps_one_connection},
+      {"a_bad_rate_limit_threshold_refuses_to_start",
+       a_bad_rate_limit_threshold_refuses_to_start},
       {NULL, NULL},
   };
   return kbc_test_run("httpd", cases);

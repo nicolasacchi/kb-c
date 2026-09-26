@@ -170,6 +170,11 @@ struct kbc_index {
 
   void *map; /* mmap of a saved index, else NULL */
   const char *tar_base; /* mmap: the term arena, when the index is not built */
+  const char *dar_base; /* mmap: the doc arena, likewise. doc_meta pointers
+                         * point into it, so it is the same condition as
+                         * tar_base: an index that has never been mutated
+                         * keeps BOTH arenas in the mapping and has no heap
+                         * copy of either. */
 
   size_t map_len;
 
@@ -811,6 +816,11 @@ kbc_status kbc_index_begin_build(kbc_index *ix, kbc_err *err) {
   dhash_clear(ix);
   sar_clear(&ix->tar);
   sar_clear(&ix->dar);
+  /* Both arenas are the heap's from here on: a build that reuses an index
+   * opened from a file would otherwise leave the save writing the OLD mapping
+   * under the new arena's lengths. */
+  ix->tar_base = NULL;
+  ix->dar_base = NULL;
   ix->doc_count = 0;
   ix->total_tokens = 0;
   ix->post_len = 0;
@@ -1905,6 +1915,7 @@ kbc_status kbc_index_update_doc(kbc_index *ix, uint32_t doc_id,
   ix->doc_count = dt.count;
   sar_free(&ix->dar);
   ix->dar = dt.dar;
+  ix->dar_base = NULL; /* the heap arena is the doc arena from here on */
   free(ix->dhash);
   ix->dhash = dt.dhash;
   ix->dhash_cap = dt.dhash_cap;
@@ -1974,6 +1985,7 @@ kbc_status kbc_index_remove_doc(kbc_index *ix, uint32_t doc_id, kbc_err *err) {
   ix->doc_count = dt.count;
   sar_free(&ix->dar);
   ix->dar = dt.dar;
+  ix->dar_base = NULL; /* the heap arena is the doc arena from here on */
   free(ix->dhash);
   ix->dhash = dt.dhash;
   ix->dhash_cap = dt.dhash_cap;
@@ -2095,6 +2107,17 @@ kbc_status kbc_index_save(const kbc_index *ix, const char *path, kbc_err *err) {
                        path, need);
   }
   st = kbc_str_append(&out, (const char *)hdr, sizeof(hdr));
+  /* The section bytes come from wherever the arena LIVES, not from the heap
+   * copy that only a mutation fills in. An index opened from a file points
+   * its term and doc strings into the mapping and has no heap arena at all
+   * until the first mutation, so writing `ix->tar` for it produced a file
+   * that declared an arena it had not written: shorter than its own header
+   * by exactly the arena, which is what kbc_index_open's bounds check
+   * (rightly) rejects. Writing the mapping directly is also the cheap answer:
+   * the bytes are already in the page cache. */
+  if (ix->tar_base != NULL) {
+    st = kbc_str_append(&out, ix->tar_base, ix->tar.total);
+  }
   for (i = 0; i < ix->tar.nblocks && st == KBC_OK; i++) {
     if (ix->tar.blocks[i].used) {
       st = kbc_str_append(&out, ix->tar.blocks[i].p, ix->tar.blocks[i].used);
@@ -2107,6 +2130,9 @@ kbc_status kbc_index_save(const kbc_index *ix, const char *path, kbc_err *err) {
   pad = pad8(out.len);
   for (i = pad; i > 0 && st == KBC_OK; i--) {
     st = kbc_str_putc(&out, '\0');
+  }
+  if (ix->dar_base != NULL) {
+    st = kbc_str_append(&out, ix->dar_base, ix->dar.total);
   }
   for (i = 0; i < ix->dar.nblocks && st == KBC_OK; i++) {
     if (ix->dar.blocks[i].used) {
@@ -2157,6 +2183,24 @@ kbc_status kbc_index_save(const kbc_index *ix, const char *path, kbc_err *err) {
     return kbc_err_set(err, KBC_ERR_NOMEM, "kbc_index_save %s: could not buffer "
                                            "the %zu-byte file (%zu written)",
                        path, need, got);
+  }
+  /* The header's own arithmetic, checked against the file that was actually
+   * produced. kbc_index_open walks exactly `need` bytes and rejects anything
+   * shorter, so a mismatch here is a file the daemon's own loader would
+   * refuse — the failure this save is documented never to produce. Refusing
+   * to write it is the whole point: a loud INTERNAL here keeps the previous
+   * generation on disk, a short file does not. */
+  if (out.len != need) {
+    size_t got = out.len;
+    kbc_str_free(&out);
+    return kbc_err_set(err, KBC_ERR_INTERNAL,
+                       "kbc_index_save %s: the header describes %zu bytes but "
+                       "%zu were written (doc_count %u, term_cap %zu, "
+                       "dhash_cap %zu, postings %zu, term arena %zu, doc arena "
+                       "%zu)",
+                       path, need, got, ix->doc_count, ix->term_cap,
+                       ix->dhash_cap, ix->post_len, ix->tar.total,
+                       ix->dar.total);
   }
   st = kbc_str_write_file_atomic(path, out.ptr, out.len, err);
   kbc_str_free(&out);
@@ -2299,6 +2343,7 @@ kbc_index *kbc_index_open(const char *path, kbc_err *err) {
   docs_at += pad8(docs_at);
   cur = docs_at + (size_t)doc_arena_len;
   cur += pad8(cur);
+  ix->dar_base = (const char *)p + docs_at;
 
   if (doc_count > 0) {
     size_t at = docs_at;

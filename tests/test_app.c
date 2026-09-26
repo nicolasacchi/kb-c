@@ -623,6 +623,190 @@ KBC_TEST(deleting_a_file_removes_it_from_index_and_store) {
   fx_teardown(&f);
 }
 
+/* Everything above calls kbc_app_reindex*_file/_remove directly, which is why
+ * a watcher that published an ABSOLUTE path could pass all of it: the daemon's
+ * own path is inotify -> event -> reindex, and this is the first case in the
+ * suite that drives it. */
+
+static const char DOC_D[] = "# Delta Dispatch\n\nThe dispatch lists wombat "
+                            "pallets.\n";
+static const char DOC_D_EDITED[] = "# Delta Dispatch\n\nThe dispatch now lists "
+                                   "quokka crates instead.\n";
+
+/* Generous: inotify delivery is asynchronous and the watcher debounces before
+ * it publishes, so a tight deadline would teach the next reader to re-run
+ * rather than trust this. */
+#define LIVE_WAIT_MS 10000
+
+static long now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+static void nap_ms(long ms) {
+  struct timespec ts;
+  ts.tv_sec = ms / 1000;
+  ts.tv_nsec = (ms % 1000) * 1000000L;
+  (void)nanosleep(&ts, NULL);
+}
+
+/* Polls until the index holds `want` documents; returns what it holds when the
+ * deadline passed, so the caller can assert either way. */
+static int64_t wait_docs(kbc_app *app, int64_t want, long timeout_ms) {
+  long deadline = now_ms() + timeout_ms;
+  for (;;) {
+    kbc_err err;
+    kbc_err_reset(&err);
+    kbc_app_stats st;
+    if (!kbc_failed(kbc_app_stats_get(app, &st, &err)) && st.index_docs == want) {
+      return want;
+    }
+    if (now_ms() >= deadline) {
+      kbc_err_reset(&err);
+      if (kbc_failed(kbc_app_stats_get(app, &st, &err))) return -1;
+      return st.index_docs;
+    }
+    nap_ms(25);
+  }
+}
+
+/* Polls until `q` returns (or stops returning) `want` rows. */
+static size_t wait_hits(kbc_app *app, const char *q, size_t want,
+                        long timeout_ms) {
+  long deadline = now_ms() + timeout_ms;
+  for (;;) {
+    char path[64], title[64], id[32];
+    size_t n =
+        first_hit_path(app, q, NULL, path, sizeof path, title, sizeof title, id,
+                       sizeof id, NULL);
+    if (n == want || now_ms() >= deadline) return n;
+    nap_ms(25);
+  }
+}
+
+static int64_t wait_store_count(const kbc_config *cfg, int64_t want,
+                                long timeout_ms) {
+  long deadline = now_ms() + timeout_ms;
+  for (;;) {
+    int64_t n = store_count(cfg);
+    if (n == want || now_ms() >= deadline) return n;
+    nap_ms(25);
+  }
+}
+
+/* The logger writes to stderr and has no sink hook, so "the edit was recorded
+ * as a removal" is only observable by capturing the descriptor for the length
+ * of the phase under test. */
+typedef struct {
+  int saved_fd;
+  char path[KBC_TEST_PATH_MAX];
+} log_capture;
+
+static void log_capture_begin(log_capture *c) {
+  kbc_test_tmpdir(c->path, sizeof c->path);
+  char file[KBC_TEST_PATH_MAX];
+  join(file, sizeof file, c->path, "log.txt");
+  snprintf(c->path, sizeof c->path, "%s", file);
+  c->saved_fd = dup(STDERR_FILENO);
+  int fd = open(file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0) {
+    c->saved_fd = -1;
+    return;
+  }
+  (void)dup2(fd, STDERR_FILENO);
+  close(fd);
+}
+
+/* Restores stderr and returns the captured text; the caller frees it. */
+static char *log_capture_end(log_capture *c) {
+  fflush(stderr);
+  if (c->saved_fd >= 0) {
+    (void)dup2(c->saved_fd, STDERR_FILENO);
+    close(c->saved_fd);
+  }
+  char *text = kbc_test_read_file(c->path);
+  kbc_test_rmrf(c->path);
+  return text;
+}
+
+KBC_TEST(a_save_in_a_running_daemon_updates_the_document) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  KBC_CHECK_OK(kbc_app_start_watcher(f.app, &err));
+
+  char p[KBC_TEST_PATH_MAX], path[64], title[64], id[32];
+  join(p, sizeof p, f.corpus_a, "d.md");
+
+  log_capture cap;
+  log_capture_begin(&cap);
+
+  /* A new file arrives. */
+  kbc_test_write_file(p, DOC_D);
+  KBC_CHECK_EQ_INT(wait_docs(f.app, 4, LIVE_WAIT_MS), 4);
+  KBC_CHECK_EQ_INT(wait_hits(f.app, "wombat", 1, LIVE_WAIT_MS), 1);
+  size_t n = first_hit_path(f.app, "wombat", NULL, path, sizeof path, title,
+                            sizeof title, id, sizeof id, NULL);
+  KBC_CHECK_EQ_STR(path, "d.md");
+  KBC_CHECK_EQ_INT(wait_store_count(f.cfg, 4, LIVE_WAIT_MS), 4);
+
+  /* Then it is saved over, in place — the most common thing a user does. */
+  kbc_test_write_file(p, DOC_D_EDITED);
+  KBC_CHECK_EQ_INT(wait_hits(f.app, "quokka", 1, LIVE_WAIT_MS), 1);
+  n = first_hit_path(f.app, "quokka", NULL, path, sizeof path, title,
+                     sizeof title, id, sizeof id, NULL);
+  KBC_CHECK_EQ_STR(path, "d.md");
+  n = first_hit_path(f.app, "wombat", NULL, path, sizeof path, title,
+                    sizeof title, id, sizeof id, NULL);
+  KBC_CHECK_MSG(n == 0, "the previous revision is still searchable after a save");
+  KBC_CHECK_EQ_INT(wait_docs(f.app, 4, LIVE_WAIT_MS), 4);
+  KBC_CHECK_EQ_INT(wait_store_count(f.cfg, 4, LIVE_WAIT_MS), 4);
+
+  char *log_text = log_capture_end(&cap);
+  KBC_CHECK_NOT_NULL(log_text);
+  if (log_text != NULL) {
+    /* The defect's own symptom: an edit logged as a removal of a document that
+     * was never indexed under that key. */
+    bool logged_removal = false;
+    for (const char *line = log_text; line != NULL && *line != '\0';) {
+      const char *eol = strchr(line, '\n');
+      size_t len = eol != NULL ? (size_t)(eol - line) : strlen(line);
+      char buf[512];
+      if (len >= sizeof buf) len = sizeof buf - 1;
+      memcpy(buf, line, len);
+      buf[len] = '\0';
+      if (strstr(buf, "d.md") != NULL && strstr(buf, "removed") != NULL) {
+        logged_removal = true;
+      }
+      line = eol != NULL ? eol + 1 : NULL;
+    }
+    KBC_CHECK_MSG(!logged_removal,
+                  "the daemon logged a removal for d.md during a save");
+    free(log_text);
+  }
+
+  /* The removal path must still work: a fix that made edits work by ignoring
+   * removals would get this far and no further. */
+  KBC_CHECK_MSG(unlink(p) == 0, "unlink %s: %s", p, strerror(errno));
+  KBC_CHECK_EQ_INT(wait_docs(f.app, 3, LIVE_WAIT_MS), 3);
+  KBC_CHECK_EQ_INT(wait_store_count(f.cfg, 3, LIVE_WAIT_MS), 3);
+  KBC_CHECK_EQ_INT(wait_hits(f.app, "quokka", 0, LIVE_WAIT_MS), 0);
+  /* And the documents nobody touched are all still there. */
+  KBC_CHECK_EQ_INT(wait_hits(f.app, "quixotic", 1, LIVE_WAIT_MS), 1);
+  KBC_CHECK_EQ_INT(wait_hits(f.app, "accruals", 1, LIVE_WAIT_MS), 1);
+  KBC_CHECK_EQ_INT(wait_hits(f.app, "verdigris", 1, LIVE_WAIT_MS), 1);
+
+  kbc_app_stop_watcher(f.app);
+  fx_teardown(&f);
+}
+
 KBC_TEST(get_artifact_round_trips_and_rejects_unknown_ids) {
   fixture f;
   fx_setup(&f, false);
@@ -965,6 +1149,8 @@ int main(void) {
        reindexing_one_file_leaves_the_other_documents_alone},
       {"deleting_a_file_removes_it_from_index_and_store",
        deleting_a_file_removes_it_from_index_and_store},
+      {"a_save_in_a_running_daemon_updates_the_document",
+       a_save_in_a_running_daemon_updates_the_document},
       {"get_artifact_round_trips_and_rejects_unknown_ids",
        get_artifact_round_trips_and_rejects_unknown_ids},
       {"list_artifacts_filters_by_corpus_and_honours_limit",

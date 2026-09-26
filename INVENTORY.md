@@ -27,9 +27,9 @@ recomputed from the rows on 2026-09-26.
 
 | Status | Files | LOC | % |
 |---|---:|---:|---:|
-| PORTED | 19 | 5,556 | 2.4% |
-| PARTIAL | 33 | 75,590 | 32.7% |
-| PLANNED | 77 | 38,350 | 16.6% |
+| PORTED | 22 | 5,978 | 2.6% |
+| PARTIAL | 34 | 76,778 | 33.2% |
+| PLANNED | 73 | 36,740 | 15.9% |
 | OUT-OF-SCOPE | 123 | 112,011 | 48.4% |
 | **total** | **252** | **231,507** | **100%** |
 
@@ -38,8 +38,8 @@ OUT-OF-SCOPE (table below).
 
 > These counts are the row statuses in this document, not a claim about what
 > is finished. The port's live surface today is the PORTED + PARTIAL set:
-> 81,146 LOC of Rust that kb-c claims, of which 5,556 is a row-for-row port
-> and 75,590 is a deliberately narrower replacement. The bulk of the
+> 82,756 LOC of Rust that kb-c claims, of which 5,978 is a row-for-row port
+> and 76,778 is a deliberately narrower replacement. The bulk of the
 > difference is `storage/sqlite.rs` and `storage/lance.rs`, whose C
 > counterparts are `store.c` and `index.c` — a three-table SQLite schema and
 > a hand-rolled mmap'd index respectively, against 42 migrations and a
@@ -116,7 +116,7 @@ of roughly the same size as this one, not a stage of it. It stays in Rust.
 | `kb-core/src/storage/lance.rs` | 6,171 | Lance/Arrow columnar store: FTS indices, IVF-PQ, chunk kNN, compact, backup hook | PARTIAL | `src/index.c` + `src/embed.c` + `kbc_vecstore` — replaced, not ported; no columnar store, no IVF-PQ; the vector lane is a brute-force cosine scan over an mmap'd f32 matrix |
 | `kb-core/src/sessions.rs` | 6,023 | Session transcript parsing, digest rendering, aggregation | OUT-OF-SCOPE | — |
 | `kb-core/src/slate.rs` | 4,683 | Slate board model and engine | OUT-OF-SCOPE | — |
-| `kb-core/src/config.rs` | 4,535 | Whole `kb.toml` schema, resolvers, `validate()`, save/preserve | PARTIAL | `src/config.c` — `[daemon] [search] [watcher] [embedder] [[corpus]]`, an unknown key is a parse error, and the non-loopback-without-token bind refusal lives here; no TOML re-emit |
+| `kb-core/src/config.rs` | 4,535 | Whole `kb.toml` schema, resolvers, `validate()`, save/preserve | PARTIAL | `src/config.c` — `[daemon] [search] [watcher] [embedder] [[corpus]]`, an unknown key is a parse error, and the non-loopback-without-token bind refusal lives here; `kbc_config_load_token` resolves the token once, from the literal value or the token file, and the daemon calls it before validate/bind — the token value never appears in `kbc config show`. No TOML re-emit |
 | `kb-core/src/sessions/view.rs` | 4,441 | Session HTML rendering | OUT-OF-SCOPE | — |
 | `kb-core/src/memory.rs` | 3,678 | Memory types, decay, salience, recall scoring | OUT-OF-SCOPE | — |
 | `kb-core/src/share/mod.rs` | 3,268 | Share/deploy orchestration | OUT-OF-SCOPE | — |
@@ -132,9 +132,9 @@ of roughly the same size as this one, not a stage of it. It stays in Rust.
 | `kb-core/src/docs_query.rs` | 1,300 | In-memory filter evaluation over candidate rows | PLANNED | `src/search.c` (stage 3) |
 | `kb-core/src/sessions/live.rs` | 1,256 | Live-transcript tailing | OUT-OF-SCOPE | — |
 | `kb-core/src/sessions/replay.rs` | 1,231 | Session replay export | OUT-OF-SCOPE | — |
-| `kb-core/src/embed_ipc.rs` | 1,220 | NDJSON subprocess protocol to `kb-embedder`, handshake, timeouts, respawn | PORTED | `src/embed.c` — same envelope names, same `req_id` rules |
+| `kb-core/src/embed_ipc.rs` | 1,220 | NDJSON subprocess protocol to `kb-embedder`, handshake, timeouts, respawn | PORTED | `src/embed.c` — the protocol is now verified against the **production** `kb-embedder` with `bge-small-en-v1.5`, not a fake sidecar, and the header's earlier description of it was wrong in every respect: there is no health op, readiness is an unsolicited `{"kind":"ready"}` absorbed wherever it arrives, `req_id` is mandatory and must be echoed, replies are `kind=embed_ok` / `kind=error`, and the sidecar **exits on non-UTF-8 stdin** so no byte >= 0x80 may reach the wire (text is escaped to `\u00XX` locally) |
 | `kb-core/src/session_render.rs` | 1,204 | Session digest renderer | OUT-OF-SCOPE | — |
-| `kb-core/src/query.rs` | 1,188 | Query grammar: `AND`/`OR`/`NOT`, keys, DNF, `since:` | PLANNED | `src/search.c` (stage 3) |
+| `kb-core/src/query.rs` | 1,188 | Query grammar: `AND`/`OR`/`NOT`, keys, DNF, `since:` | PARTIAL | `src/search.c` — the grammar as the index can answer it: `AND`/`OR`/`NOT`, groups, implicit AND, depth 64, the 64-conjunct DNF cap, `folder:` as a path-prefix facet, `text:`/`q:`. `tag:`, `cap:`, `since:`, `index:` and `scope:` are **refused with HTTP 400** rather than searched as literal terms, because the index cannot evaluate them. No `since:` dates and no `docs_query.rs` filter overlay. **There is no phrase search anywhere in the original either** — a quoted `"…"` in `query.rs` quotes an atom *value* (`folder:"deep notes"`), not a phrase, and the kb SEARCH path hands `?q=` unparsed to BM25, so the boolean structure never reached the lexical arm in Rust either. A quoted string is two terms, and a test pins that reading |
 | `kb-core/src/mentions.rs` | 1,108 | `@mention` resolution | OUT-OF-SCOPE | — |
 | `kb-core/src/atlas_field.rs` | 1,097 | Atlas field values per artifact | OUT-OF-SCOPE | — |
 | `kb-core/src/storage/schema.rs` | 988 | The 45-field `Doc` struct and its Arrow schema | PARTIAL | `src/types.h` — the 20 fields kb-c keeps |
@@ -156,7 +156,7 @@ of roughly the same size as this one, not a stage of it. It stays in Rust.
 | `kb-core/src/procrustes.rs` | 614 | Recall-fidelity measurement | OUT-OF-SCOPE | — |
 | `kb-core/src/metrics.rs` | 610 | Counters, histograms, `/metrics` text | PLANNED | `src/httpd.c` (stage 5) |
 | `kb-core/src/sessions/tail.rs` | 570 | Live transcript tail reader | OUT-OF-SCOPE | — |
-| `kb-core/src/fusion.rs` | 567 | RRF fusion, title boost, graph boost | PARTIAL | `src/search.c` — RRF with `rrf_k` defaulting to 60 and dedup on id; no title boost, no graph boost |
+| `kb-core/src/fusion.rs` | 567 | RRF fusion, title boost, graph boost | PARTIAL | `src/search.c` — RRF with `rrf_k` defaulting to 60 and dedup on id, plus the **title boost**: `TITLE_BOOST = 0.5` (`fusion.rs:145`, `apply_title_boost` at `:155`), terms >= 3 bytes, ASCII-lowercased, **substring** match not word-boundary (the original's own comment records that a word-boundary variant bench-measured worse), multiplied **once** per hit however many terms matched, applied to the **fused** RRF score over the full pool before filtering and truncation. **Graph boost deliberately NOT ported** (`fusion.rs:214`): it needs an in-degree edge graph fed from `storage.edge_counts()`, and kb-c has no edges table. A fake version would be a different ranking function wearing the original's name |
 | `kb-core/src/versions.rs` | 545 | Version timeline reads | OUT-OF-SCOPE | — |
 | `kb-core/src/sessions/live_adapters/opencode.rs` | 545 | opencode live adapter | OUT-OF-SCOPE | — |
 | `kb-core/src/notes.rs` | 535 | Notes model | OUT-OF-SCOPE | — |
@@ -181,7 +181,7 @@ of roughly the same size as this one, not a stage of it. It stays in Rust.
 | `kb-core/src/exclusions.rs` | 302 | Excluded-path gate | PORTED | `src/config.c` |
 | `kb-core/src/ids.rs` | 294 | `hash12`, `SourceSlug`, Crockford `r-`/`e-` ids | PARTIAL | `src/ids.c` — the 12-hex artifact id (FNV-1a over corpus ⨯ 0x1f ⨯ path) plus its validator; no `hash12`, `SourceSlug` or Crockford ids |
 | `kb-core/src/extmap.rs` | 268 | Extension → pipeline map | PORTED | `src/config.c` |
-| `kb-core/src/identity.rs` | 258 | Operator name normalisation and validation | PLANNED | `src/httpd.c` (stage 3) |
+| `kb-core/src/identity.rs` | 258 | Operator name normalisation and validation | PORTED | `src/httpd.c` — `GET /api/identity` reports the resolved identity, its source, the client address and `loopback`, and refuses a caller that tries to claim one (`?as=`, `?identity=`, `?user=`). There is one trust tier: identity is attribution, not authorization, and the response says so in its own body |
 | `kb-core/src/scrub.rs` | 246 | Redaction pattern application | OUT-OF-SCOPE | — |
 | `kb-core/src/share/host.rs` | 245 | Share host routing | PLANNED | `src/httpd.c` (stage 5) |
 | `kb-core/src/sibling.rs` | 224 | Schema-epoch volume-ahead refusal | PLANNED | `src/store.c` (stage 1) — `kbc_store_schema_version` records the version, but nothing refuses a volume that is ahead |
@@ -214,7 +214,7 @@ of roughly the same size as this one, not a stage of it. It stays in Rust.
 | `kb-server/src/routes/context.rs` | 1,707 | Context bundle assembly | OUT-OF-SCOPE | — |
 | `kb-server/src/routes/daycard.rs` | 1,672 | Daycard HTML/JSON | OUT-OF-SCOPE | — |
 | `kb-server/src/state.rs` | 1,599 | `KbHandles`, per-kb state, caches | PLANNED | `src/app.c` (stage 3) |
-| `kb-server/src/middleware.rs` | 1,511 | Bearer auth, identity ladder, CORS, origin allowlist, rate limit, loopback | PARTIAL | `src/httpd.c` — constant-time `Authorization: Bearer` on every `/api` route except `/api/health`, plus the loopback bind refusal; no identity ladder, CORS, origin allowlist or rate limit |
+| `kb-server/src/middleware.rs` | 1,511 | Bearer auth, identity ladder, CORS, origin allowlist, rate limit, loopback | PARTIAL | `src/httpd.c` — constant-time `Authorization: Bearer` on every `/api` route except `/api/health`, the loopback bind refusal, and a `kbc_config_load_token` that resolves the token once from the literal value or the token file, so a non-loopback bind is possible at all (nothing set `cfg->token` before, so the bearer tier was dead code and a non-loopback bind was ALWAYS refused). CORS is same-origin by default and reflects an `Origin` **only** on an exact allowlist match (`KBC_CORS_ORIGINS`, no wildcard anywhere); rate limiting is a per-connection fixed window, 120 req/s by default (`KBC_RATE_LIMIT_RPS`), 429 + `Retry-After`, and it exists to protect worker fairness rather than the corpus. No multi-tier identity ladder, no `X-Kb-Token` |
 | `kb-server/src/routes/artifact.rs` | 1,367 | Artifact-subdomain serving with traversal guard | PARTIAL | `src/httpd.c` — `GET /api/artifacts/{id}` with `source=1`; no subdomain host model, no CSP/nosniff |
 | `kb-server/src/routes/lists.rs` | 1,203 | List routes | OUT-OF-SCOPE | — |
 | `kb-server/src/router.rs` | 1,029 | 226 route registrations, layer order, fallbacks | PLANNED | `src/httpd.c` (stage 3) |
@@ -264,15 +264,15 @@ of roughly the same size as this one, not a stage of it. It stays in Rust.
 | `kb-server/src/routes/reindex.rs` | 141 | Reindex trigger | PORTED | `src/app.c` |
 | `kb-server/src/routes/sources.rs` | 130 | Source listing | PLANNED | `src/httpd.c` (stage 3) |
 | `kb-server/src/routes/errors.rs` | 122 | Error listing | PLANNED | `src/httpd.c` (stage 3) |
-| `kb-server/src/routes/dispatch.rs` | 118 | `/api` 404 problem+json, trailing-slash, host fallback | PARTIAL | `src/httpd.c` — a JSON 404 (`KBC_ERR_NOTFOUND`) for an unmatched path; errors are not `application/problem+json`, and there is no trailing-slash or host fallback |
+| `kb-server/src/routes/dispatch.rs` | 118 | `/api` 404 problem+json, trailing-slash, host fallback | PARTIAL | `src/httpd.c` — errors are RFC 7807 `application/problem+json` with `urn:kb:errors:*` types across the whole status map, and an unmatched path is a problem+json 404. No trailing-slash or host fallback |
 | `kb-server/src/routes/saved_queries.rs` | 107 | Saved queries | PLANNED | `src/httpd.c` (stage 3) |
 | `kb-server/src/routes/users.rs` | 105 | User registry routes | PLANNED | `src/httpd.c` (stage 3) |
 | `kb-server/src/routes/facets.rs` | 105 | Facets | PLANNED | `src/httpd.c` (stage 3) |
-| `kb-server/src/routes/identity.rs` | 100 | `/api/identity` (the CLI's daemon probe) | PLANNED | `src/httpd.c` (stage 3) — the route does not exist; the CLI probes by connecting |
+| `kb-server/src/routes/identity.rs` | 100 | `/api/identity` (the CLI's daemon probe) | PORTED | `src/httpd.c` — token-gated and in `KBC_ROUTES` |
 | `kb-server/src/main.rs` | 79 | Binary entry | PORTED | `cli/main.c` |
 | `kb-server/src/routes/folders.rs` | 78 | Folder routes | PLANNED | `src/httpd.c` (stage 3) |
 | `kb-server/src/routes/tags.rs` | 75 | Tag routes | PLANNED | `src/httpd.c` (stage 3) |
-| `kb-server/src/routes/kbs.rs` | 64 | `/api/kbs` (the CLI's default-kb probe) | PLANNED | `src/httpd.c` (stage 3) — the route does not exist; corpus names come from the config |
+| `kb-server/src/routes/kbs.rs` | 64 | `/api/kbs` (the CLI's default-kb probe) | PORTED | `src/httpd.c` — token-gated and in `KBC_ROUTES`; one row per configured corpus with a doc count, `?kb=` filters to one, and a corpus at the `KBC_MAX_HITS` clamp says so in `docs_truncated` rather than reporting a fake total |
 | `kb-server/src/routes/compact.rs` | 64 | Lance compaction trigger | OUT-OF-SCOPE | — |
 | `kb-server/src/routes/log_level.rs` | 62 | Log level control | PLANNED | `src/httpd.c` (stage 5) |
 | `kb-server/src/routes/drop.rs` | 61 | kb drop | PLANNED | `src/app.c` (stage 4) |

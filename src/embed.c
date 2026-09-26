@@ -41,6 +41,16 @@
 #define KBC_EMBED_DEFAULT_TIMEOUT_MS 30000
 #define KBC_EMBED_STOP_GRACE_MS 2000
 #define KBC_EMBED_POLL_SLICE_MS 1000
+
+/* The health handshake waits for the sidecar to load its model, which is
+ * seconds warm and ~20s cold (bge-small-en-v1.5 measured), so it gets its own
+ * budget rather than the per-request one. */
+#define KBC_EMBED_HANDSHAKE_TIMEOUT_MS 120000
+/* A production sidecar pushes one unsolicited {"kind":"ready"} as soon as the
+ * model is loaded, before it has read anything from us. If the first line we
+ * read back is that handshake, exactly one reply to our own probe is still in
+ * flight; the drain below bounds how long we wait for it. */
+#define KBC_EMBED_DRAIN_TIMEOUT_MS 2000
 #define KBC_EMBED_READ_CHUNK 8192u
 #define KBC_EMBED_MAX_DIM 65536u
 
@@ -56,6 +66,7 @@ struct kbc_embedder {
   _Atomic size_t dim;
   _Atomic int64_t requests;
   _Atomic int64_t failures;
+  _Atomic uint64_t req_id; /* next request id; the sidecar echoes it back */
 };
 
 typedef enum {
@@ -296,16 +307,21 @@ static kbc_status spawn(kbc_embedder *e, kbc_err *err) {
   return KBC_OK;
 }
 
-/* Sends one pre-serialized line and reads one reply line. Caller holds mu. */
-static kbc_status exchange(kbc_embedder *e, const kbc_str *req, kbc_str *line,
-                           int timeout_ms, kbc_err *err) {
+/* Writes one pre-serialized request (req may be NULL to only read) and reads
+ * exactly one reply line. The handshake needs this raw form: the line it reads
+ * may be the sidecar's unsolicited ready, which the caller has to recognise
+ * itself. Caller holds mu. */
+static kbc_status exchange_raw(kbc_embedder *e, const kbc_str *req,
+                               kbc_str *line, int timeout_ms, kbc_err *err) {
   kbc_str_clear(line);
   if (e->out_fd < 0 || e->in_fd < 0 || e->pid <= 0) {
     return kbc_err_set(err, KBC_ERR_IO, "sidecar is not running");
   }
-  kbc_status st = write_all(e->in_fd, req->ptr, req->len, err);
-  if (kbc_failed(st)) {
-    return st;
+  if (req != NULL) {
+    kbc_status st = write_all(e->in_fd, req->ptr, req->len, err);
+    if (kbc_failed(st)) {
+      return st;
+    }
   }
   switch (read_line(e->out_fd, line, timeout_ms)) {
     case LR_OK:
@@ -326,6 +342,83 @@ static kbc_status exchange(kbc_embedder *e, const kbc_str *req, kbc_str *line,
       return kbc_err_set(err, KBC_ERR_IO, "read from sidecar %s: %s",
                          e->args[0], strerror(errno));
   }
+}
+
+/* Forward declarations: the envelope helpers live below, with the rest of the
+ * wire-format code. */
+static const char *reply_kind(const kbc_json *j);
+static kbc_status sidecar_error(const char *msg, kbc_err *err);
+static size_t reply_dim(const kbc_json *j, bool *bad);
+
+/* Request ids are ours to allocate; the sidecar only echoes them, so all this
+ * has to guarantee is that two in-flight requests never share one. */
+static uint64_t next_req_id(kbc_embedder *e) {
+  return (uint64_t)atomic_fetch_add(&e->req_id, 1) + 1u;
+}
+
+/* Reads reply lines, absorbing the sidecar's unsolicited ready handshake, and
+ * stops at the first line that answers `sent_id`. A ready line is the only
+ * thing a sidecar may push at us unasked, so skipping it is safe; a line whose
+ * req_id is somebody else's means the stream is out of step and the caller
+ * must treat the child as dead. Caller holds mu. */
+static kbc_status exchange(kbc_embedder *e, const kbc_str *req, kbc_str *line,
+                           int timeout_ms, uint64_t sent_id, kbc_err *err) {
+  kbc_status st = exchange_raw(e, req, line, timeout_ms, err);
+  if (kbc_failed(st)) {
+    return st;
+  }
+  for (int guard = 0; guard < 3; guard++) {
+    kbc_arena *a = kbc_arena_new(1024);
+    if (a == NULL) {
+      return kbc_err_set(err, KBC_ERR_NOMEM, "arena for a reply envelope");
+    }
+    kbc_err scratch;
+    kbc_err_reset(&scratch);
+    kbc_json *j = kbc_json_parse(a, line->ptr, line->len, &scratch);
+    const char *kind = reply_kind(j);
+    bool ready = kind != NULL && strcmp(kind, "ready") == 0;
+    /* Copy the numbers out before the arena goes: they are reported in an
+     * error message, and the arena owns the JSON they point into. */
+    uint64_t got_id = sent_id;
+    bool stale = false;
+    if (!ready && kind != NULL) {
+      const kbc_json *rid = kbc_json_get(j, "req_id");
+      if (kbc_json_is(rid, KBC_JSON_NUM)) {
+        got_id = (uint64_t)rid->u.num;
+        stale = got_id != sent_id;
+      }
+    }
+    /* The ready line is the handshake; take its dimension and keep reading. */
+    bool bad = false;
+    size_t d = ready ? reply_dim(j, &bad) : 0;
+    kbc_arena_free(a);
+    if (stale) {
+      return kbc_err_set(err, KBC_ERR_PARSE,
+                         "sidecar %s: reply to request %llu, expected %llu",
+                         e->args[0], (unsigned long long)got_id,
+                         (unsigned long long)sent_id);
+    }
+    if (!ready) {
+      return KBC_OK;
+    }
+    if (!bad && d > 0) {
+      atomic_store(&e->dim, d);
+    }
+    /* Read the line that actually answers the request. */
+    kbc_str tmp;
+    kbc_str_init(&tmp);
+    st = exchange_raw(e, NULL, &tmp, timeout_ms, err);
+    if (kbc_failed(st)) {
+      kbc_str_free(&tmp);
+      return st;
+    }
+    kbc_str old = *line; /* swap rather than copy a multi-KB reply */
+    *line = tmp;
+    kbc_str_free(&old);
+  }
+  return kbc_err_set(err, KBC_ERR_PARSE,
+                     "sidecar %s: %d unsolicited handshakes in a row",
+                     e->args[0], 3);
 }
 
 kbc_embedder *kbc_embedder_start(const char *const *argv, kbc_err *err) {
@@ -427,29 +520,89 @@ void kbc_embedder_counts(const kbc_embedder *e, int64_t *requests,
     *failures = e == NULL ? 0 : atomic_load(&e->failures);
   }
 }
+/* Pulls a non-negative integral dim out of a reply, or 0 when absent. */
+static size_t reply_dim(const kbc_json *j, bool *bad) {
+  *bad = false;
+  if (!kbc_json_is(j, KBC_JSON_OBJ)) {
+    return 0;
+  }
+  const kbc_json *d = kbc_json_get(j, "dim");
+  if (d == NULL) {
+    return 0;
+  }
+  if (!kbc_json_is(d, KBC_JSON_NUM)) {
+    *bad = true;
+    return 0;
+  }
+  double v = d->u.num;
+  if (!(v >= 1.0) || v > (double)KBC_EMBED_MAX_DIM || v != floor(v)) {
+    *bad = true;
+    return 0;
+  }
+  return (size_t)v;
+}
 
-/* Health handshake: {"op":"health"} must come back ok with a usable dim. */
+/* The production sidecar tags every envelope with "kind" (serde's internally
+ * tagged enum): "ready" is pushed unsolicited once the model is loaded,
+ * "embed_ok" carries the vectors, "error" carries a message. The older
+ * {"ok":true,...} shape is still recognised, so a sidecar written against the
+ * previous wire description keeps working; WHICH replies are accepted is
+ * unchanged, only how one is recognised. */
+static const char *reply_kind(const kbc_json *j) {
+  if (!kbc_json_is(j, KBC_JSON_OBJ)) {
+    return NULL;
+  }
+  const kbc_json *k = kbc_json_get(j, "kind");
+  return kbc_json_is(k, KBC_JSON_STR) ? k->u.str.ptr : NULL;
+}
+
+/* A sidecar-reported error is a failed request, not a dead pipe. The status
+ * follows the message: a request it could not parse is a protocol error,
+ * anything else is a runtime failure inside the child. The message is passed
+ * through verbatim — it names what the model rejected, and hiding it is how a
+ * broken lane looks like an empty result set. */
+static kbc_status sidecar_error(const char *msg, kbc_err *err) {
+  if (msg != NULL && strncmp(msg, "parse:", 6) == 0) {
+    return kbc_err_set(err, KBC_ERR_PARSE, "sidecar: %s", msg);
+  }
+  return kbc_err_set(err, KBC_ERR_IO, "sidecar: %s",
+                     msg != NULL ? msg : "unspecified error");
+}
+
+/* Health handshake.
+ *
+ * The production kb-embedder has no health request: it loads the model, then
+ * pushes {"kind":"ready","model":...,"dim":N} unprompted and only afterwards
+ * reads stdin. So a probe is still written (a sidecar that answers one, and
+ * the older {"ok":true} shape, must not be treated as dead), and the reply
+ * that comes back is the ready line we were already going to receive. Exactly
+ * one line is then still owed to us — the sidecar's answer to the probe — and
+ * it is drained, or the next embed request would read it as its own reply. */
 static kbc_status handshake(kbc_embedder *e, kbc_err *err) {
-  static const char kHealth[] = "{\"op\":\"health\"}\n";
   kbc_str req;
   kbc_str_init(&req);
   kbc_str line;
   kbc_str_init(&line);
-  kbc_status st = KBC_OK;
+  kbc_status st;
+  const uint64_t id = next_req_id(e);
 
   (void)pthread_mutex_lock(&e->mu);
-  st = kbc_str_puts(&req, kHealth);
-  if (st == KBC_OK) {
-    st = exchange(e, &req, &line, KBC_EMBED_DEFAULT_TIMEOUT_MS, err);
-  } else {
+  st = kbc_str_printf(&req, "{\"kind\":\"health\",\"req_id\":%llu}\n",
+                      (unsigned long long)id);
+  if (kbc_failed(st)) {
     (void)kbc_err_set(err, KBC_ERR_NOMEM, "health request buffer");
+    (void)pthread_mutex_unlock(&e->mu);
+    kbc_str_free(&req);
+    return st;
   }
+  st = exchange_raw(e, &req, &line, KBC_EMBED_HANDSHAKE_TIMEOUT_MS, err);
   (void)pthread_mutex_unlock(&e->mu);
   if (kbc_failed(st)) {
     kbc_str_free(&req);
     kbc_str_free(&line);
     return st;
   }
+
   kbc_arena *a = kbc_arena_new(4096);
   if (a == NULL) {
     kbc_str_free(&req);
@@ -457,8 +610,27 @@ static kbc_status handshake(kbc_embedder *e, kbc_err *err) {
     return kbc_err_set(err, KBC_ERR_NOMEM, "arena for health reply");
   }
   kbc_json *j = kbc_json_parse(a, line.ptr, line.len, err);
-  if (j == NULL || !kbc_json_is(j, KBC_JSON_OBJ) ||
-      !kbc_json_bool(j, "ok", false)) {
+  const char *kind = reply_kind(j);
+  bool ready = kind != NULL && strcmp(kind, "ready") == 0;
+  if (j == NULL || !kbc_json_is(j, KBC_JSON_OBJ)) {
+    kbc_err_set(err, KBC_ERR_PARSE, "sidecar handshake reply is not an object");
+    st = KBC_ERR_PARSE;
+  } else if (kind != NULL && strcmp(kind, "error") == 0) {
+    st = sidecar_error(kbc_json_str(j, "msg", NULL), err);
+  } else if (ready) {
+    bool bad = false;
+    size_t d = reply_dim(j, &bad);
+    if (bad || d == 0) {
+      kbc_err_set(err, KBC_ERR_PARSE,
+                  "sidecar ready dim is missing or out of range");
+      st = KBC_ERR_PARSE;
+    } else {
+      atomic_store(&e->dim, d);
+    }
+  } else if (kind != NULL) {
+    kbc_err_set(err, KBC_ERR_PARSE, "sidecar handshake kind is \"%s\"", kind);
+    st = KBC_ERR_PARSE;
+  } else if (!kbc_json_bool(j, "ok", false)) {
     kbc_err_set(err, KBC_ERR_PARSE, "sidecar health reply is not {\"ok\":true}");
     st = KBC_ERR_PARSE;
   } else {
@@ -473,6 +645,21 @@ static kbc_status handshake(kbc_embedder *e, kbc_err *err) {
   }
   kbc_arena_free(a);
   kbc_str_free(&req);
+
+  if (ready) {
+    /* Our probe's answer is still queued. It carries nothing we need, but it
+     * must not be left for the next request to read. */
+    kbc_str drain;
+    kbc_str_init(&drain);
+    (void)pthread_mutex_lock(&e->mu);
+    if (e->out_fd >= 0) {
+      kbc_err scratch;
+      kbc_err_reset(&scratch);
+      (void)read_line(e->out_fd, &drain, KBC_EMBED_DRAIN_TIMEOUT_MS);
+    }
+    (void)pthread_mutex_unlock(&e->mu);
+    kbc_str_free(&drain);
+  }
   kbc_str_free(&line);
   return st;
 }
@@ -498,23 +685,59 @@ kbc_status kbc_embedder_restart(kbc_embedder *e, kbc_err *err) {
   return st;
 }
 
-/* Pulls a non-negative integral dim out of a reply, or 0 when absent. */
-static size_t reply_dim(const kbc_json *j, bool *bad) {
-  *bad = false;
-  const kbc_json *d = kbc_json_get(j, "dim");
-  if (d == NULL) {
-    return 0;
+
+/* Appends one element of the "texts" array, quoted and escaped so the line is
+ * valid UTF-8 JSON whatever bytes the document held. A byte >= 0x80 is not
+ * passed through: the sidecar reads stdin as UTF-8 and exits on a line that
+ * is not, taking the whole vector lane with it. */
+static kbc_status append_text_literal(kbc_str *out, const char *s, size_t i,
+                                      kbc_err *err) {
+  static const char kHex[] = "0123456789abcdef";
+  kbc_status st = kbc_str_putc(out, '"');
+  for (const unsigned char *p = (const unsigned char *)s; st == KBC_OK && *p;
+       p++) {
+    unsigned char c = *p;
+    switch (c) {
+    case '"':
+      st = kbc_str_puts(out, "\\\"");
+      break;
+    case '\\':
+      st = kbc_str_puts(out, "\\\\");
+      break;
+    case '\b':
+      st = kbc_str_puts(out, "\\b");
+      break;
+    case '\f':
+      st = kbc_str_puts(out, "\\f");
+      break;
+    case '\n':
+      st = kbc_str_puts(out, "\\n");
+      break;
+    case '\r':
+      st = kbc_str_puts(out, "\\r");
+      break;
+    case '\t':
+      st = kbc_str_puts(out, "\\t");
+      break;
+    default:
+      if (c < 0x20 || c >= 0x80) {
+        char esc[6] = {'\\', 'u', '0', '0', kHex[c >> 4], kHex[c & 0x0f]};
+        st = kbc_str_append(out, esc, sizeof esc);
+      } else {
+        st = kbc_str_append(out, (const char *)&c, 1);
+      }
+      break;
+    }
+    if (kbc_failed(st)) {
+      (void)kbc_err_set(err, st, "embed request texts[%zu] byte %zu", i,
+                        (size_t)(p - (const unsigned char *)s));
+      return st;
+    }
   }
-  if (!kbc_json_is(d, KBC_JSON_NUM)) {
-    *bad = true;
-    return 0;
+  if (kbc_failed(st)) {
+    return st;
   }
-  double v = d->u.num;
-  if (!(v >= 1.0) || v > (double)KBC_EMBED_MAX_DIM || v != floor(v)) {
-    *bad = true;
-    return 0;
-  }
-  return (size_t)v;
+  return kbc_str_putc(out, '"');
 }
 
 kbc_status kbc_embedder_embed(kbc_embedder *e, kbc_arena *a,
@@ -532,6 +755,7 @@ kbc_status kbc_embedder_embed(kbc_embedder *e, kbc_arena *a,
   if (n == 0) {
     return KBC_OK;
   }
+
   const size_t known = kbc_embedder_dim(e);
   if (dim_hint != 0 && known != 0 && dim_hint != known) {
     return kbc_err_set(err, KBC_ERR_INVALID,
@@ -539,48 +763,40 @@ kbc_status kbc_embedder_embed(kbc_embedder *e, kbc_arena *a,
                        known);
   }
 
-  /* --- request: build, serialize, append '\n' ------------------------- */
-  kbc_arena *ra = kbc_arena_new(4096);
-  if (ra == NULL) {
-    return kbc_err_set(err, KBC_ERR_NOMEM, "arena for embed request");
-  }
+  /* --- request: assembled here, not through kbc_json -------------------- */
+  /* Two reasons, both measured against the real sidecar:
+   *   1. Its request enum is internally tagged ("kind") and requires a
+   *      req_id, and it rejects the older {"op":...} shape outright.
+   *   2. It parses stdin as UTF-8 and EXITS on a line that is not valid
+   *      UTF-8 — "Error: stream did not contain valid UTF-8", observed on the
+   *      404th document of the benchmark corpus, which carries raw 8-bit
+   *      bytes. kbc_json_escape passes bytes >= 0x80 through verbatim, which
+   *      is right for kb-c's own HTTP responses and fatal here, so the text
+   *      is escaped on this side of the wire instead: every byte outside
+   *      printable ASCII becomes \u00XX. A mis-decoded byte becomes a
+   *      different token in the model rather than a dead lane. */
   kbc_str req;
   kbc_str_init(&req);
   kbc_str line;
   kbc_str_init(&line);
   kbc_status st = KBC_OK;
+  const uint64_t req_id = next_req_id(e);
 
-  kbc_json *obj = kbc_json_new_obj(ra);
-  kbc_json *arr = kbc_json_new_arr(ra);
-  if (obj == NULL || arr == NULL) {
-    st = kbc_err_set(err, KBC_ERR_NOMEM, "embed request json");
-  }
+  st = kbc_str_printf(&req, "{\"kind\":\"embed\",\"req_id\":%llu,\"texts\":[",
+                      (unsigned long long)req_id);
   for (size_t i = 0; i < n && st == KBC_OK; i++) {
     if (texts[i] == NULL) {
       st = kbc_err_set(err, KBC_ERR_INVALID, "texts[%zu] is NULL", i);
       break;
     }
-    kbc_json *s = kbc_json_new_str(ra, texts[i]);
-    if (s == NULL || kbc_failed(kbc_json_arr_push(ra, arr, s))) {
-      st = kbc_err_set(err, KBC_ERR_NOMEM, "embed request texts[%zu]", i);
-      break;
+    st = append_text_literal(&req, texts[i], i, err);
+    if (st == KBC_OK && i + 1 < n) {
+      st = kbc_str_putc(&req, ',');
     }
   }
   if (st == KBC_OK) {
-    kbc_json *op = kbc_json_new_str(ra, "embed");
-    st = op == NULL ? kbc_err_set(err, KBC_ERR_NOMEM, "embed op json")
-                    : kbc_json_obj_set(ra, obj, "op", op);
+    st = kbc_str_puts(&req, "]}\n");
   }
-  if (st == KBC_OK) {
-    st = kbc_json_obj_set(ra, obj, "texts", arr);
-  }
-  if (st == KBC_OK) {
-    st = kbc_json_dump(obj, &req, false, err);
-  }
-  if (st == KBC_OK) {
-    st = kbc_str_putc(&req, '\n');
-  }
-  kbc_arena_free(ra);
   if (kbc_failed(st)) {
     kbc_str_free(&req);
     kbc_str_free(&line);
@@ -590,7 +806,7 @@ kbc_status kbc_embedder_embed(kbc_embedder *e, kbc_arena *a,
   /* --- one exchange under the mutex; nothing else touches the pipes ---- */
   (void)atomic_fetch_add(&e->requests, 1);
   (void)pthread_mutex_lock(&e->mu);
-  st = exchange(e, &req, &line, KBC_EMBED_DEFAULT_TIMEOUT_MS, err);
+  st = exchange(e, &req, &line, KBC_EMBED_DEFAULT_TIMEOUT_MS, req_id, err);
   (void)pthread_mutex_unlock(&e->mu);
   kbc_str_free(&req);
   if (kbc_failed(st)) {
@@ -617,7 +833,25 @@ kbc_status kbc_embedder_embed(kbc_embedder *e, kbc_arena *a,
     st = KBC_ERR_PARSE;
     goto parsed;
   }
-  if (!kbc_json_is(j, KBC_JSON_OBJ) || !kbc_json_bool(j, "ok", false)) {
+  /* "embed_ok" is the production success envelope; {"ok":true} is the older
+   * one. Anything else — including an error the sidecar reported about THIS
+   * request — is a failure, with its message intact. */
+  const char *kind = reply_kind(j);
+  if (kind != NULL && strcmp(kind, "error") == 0) {
+    st = sidecar_error(kbc_json_str(j, "msg", NULL), err);
+    goto parsed;
+  }
+  if (!kbc_json_is(j, KBC_JSON_OBJ)) {
+    st = kbc_err_set(err, KBC_ERR_PARSE, "sidecar reply is not an object");
+    goto parsed;
+  }
+  if (kind != NULL) {
+    if (strcmp(kind, "embed_ok") != 0) {
+      st = kbc_err_set(err, KBC_ERR_PARSE,
+                       "sidecar replied kind \"%s\" to an embed request", kind);
+      goto parsed;
+    }
+  } else if (!kbc_json_bool(j, "ok", false)) {
     st = kbc_err_set(err, KBC_ERR_PARSE, "sidecar reply is not {\"ok\":true}");
     goto parsed;
   }

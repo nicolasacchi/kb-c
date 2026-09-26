@@ -4,8 +4,8 @@ kb-c is a C17 rewrite of the [kb](https://github.com/nicolasacchi/kb) daemon —
 self-hosted system of record for everything an AI agent writes. Its query path
 is a memory-mapped inverted index, so a search touches no database and copies
 no bytes it does not need, and it links four libraries instead of a runtime
-stack. Whether that is faster in practice is **unmeasured**: see
-[Performance](#performance).
+stack. It is also **~170x cheaper in CPU per query** than the Rust daemon it
+replaces, measured on a matched corpus: [Performance](#performance).
 
 The relationship to the Rust original: same product, same corpus model, new
 engine. A kb-c daemon and the Rust daemon use different default ports (4317 vs
@@ -19,7 +19,7 @@ same corpus.
 Works today:
 
 - `kbc` builds from source with CMake and passes its ctest suite: 11 suites,
-  215 cases, green in the Release and `-DKBC_SANITIZE=ON` lanes.
+  271 cases, green in the Release and `-DKBC_SANITIZE=ON` lanes.
 - Config loading (a strict `kb.toml` subset), the SQLite store and its single
   migration, the Markdown/HTML block parser with stable anchors, the tokenizer
   and its stopword list, the mmap'd inverted index with BM25, RRF fusion over
@@ -28,28 +28,43 @@ Works today:
   HTTP daemon with bearer auth and an SSE stream, and a CLI with eleven verbs
   — all specified in the frozen headers under `include/kbc/` and all wired end
   to end.
-- The daemon serves a route banner on `/` and seven JSON routes: `/api/health`,
-  `/api/stats`, `/api/search`, `/api/artifacts`, `/api/artifacts/{id}`,
-  `POST /api/reindex` and `/api/events`. `reindex`, `search`, `get` and `list`
-  work with or without a running daemon.
-- A vector lane works when `kb-embedder` is configured and healthy. Without
-  one, `hybrid` degrades to keyword and `semantic` returns nothing, and the
+- The daemon serves a route banner on `/` and nine JSON routes: `/api/health`,
+  `/api/identity`, `/api/kbs`, `/api/stats`, `/api/search`, `/api/artifacts`,
+  `/api/artifacts/{id}`, `POST /api/reindex` and `/api/events`. `reindex`,
+  `search`, `get` and `list` work with or without a running daemon.
+- A vector lane works when `kb-embedder` is configured and healthy, verified
+  against the production sidecar with `bge-small-en-v1.5`. Without one,
+  `hybrid` degrades to keyword and `semantic` returns nothing, and the
   response says `degraded: true`.
+- A query grammar: `AND`/`OR`/`NOT`, groups, implicit AND, and `folder:` as a
+  path-prefix facet. The keys the index cannot evaluate — `tag:`, `cap:`,
+  `since:`, `index:`, `scope:` — are refused with a 400 rather than searched
+  as literal terms. There is no phrase search, and there is none to port: a
+  quoted `"…"` in the original quotes an atom *value*, not a phrase.
+- Incremental index update: a file save re-indexes that one file in place,
+  9–14 ms at 1,114 documents, and the update survives a restart.
+- Errors are RFC 7807 `application/problem+json`. CORS is same-origin by
+  default, with an exact allowlist in `KBC_CORS_ORIGINS` and no wildcard
+  anywhere. Rate limiting is a per-connection fixed window, 120 req/s by
+  default (`KBC_RATE_LIMIT_RPS`), answering 429 with `Retry-After`.
+- Bearer auth actually works: `kbc_config_load_token` resolves the token from
+  the literal value or the token file, so a non-loopback bind is possible. A
+  `0.0.0.0` bind with a token answers 401 with no header, 403 with the wrong
+  token and 200 with the right one. The token value never appears in
+  `kbc config show`.
 
 Not done:
 
-- No query grammar. A query is tokenized and every token is a term; `AND`,
-  `OR`, `NOT`, `key:value` and `since:` are not parsed yet (`PORT_PLAN.md`
-  stage 2).
-- No incremental index update: one changed file triggers a full corpus
-  rebuild, because the frozen index has no add-to-open operation.
-- No `problem+json` errors, no CORS, no rate limiting, no `/api/identity`,
-  no `/api/kbs`.
-- No published performance numbers, here or anywhere in this repository. The
-  harness is `kbc bench --queries N --repeat N --corpus DIR`; see
-  [Performance](#performance).
+- No filter overlay over the search results and no date filters — the
+  `docs_query.rs` half of the grammar, and the keys kb-c refuses rather than
+  mis-searches.
+- No graph boost in ranking. It needs an in-degree edge graph kb-c does not
+  have, and a fake version would be a different ranking function wearing the
+  original's name.
 - No web UI. The Rust repo's two React/Vite SPAs, the Claude Code plugins and
   the Playwright e2e suite are out of scope for the C port.
+- The scale ladder stops at 5,000 documents and **locates no knee**. The
+  generator is proven at 100,000 documents; the ingest was not run there.
 - Large parts of the Rust surface are deliberately not ported. `INVENTORY.md`
   maps every crate and says what happened to it; `PORT_PLAN.md` is the phased
   plan. Read both before assuming a feature exists here.
@@ -95,6 +110,16 @@ path = "./corpus"
 
 `examples/kb.toml` is the annotated version. Keys live under a table header —
 a bare `data_dir` on line 1 is a parse error, as is an unknown key.
+
+Paths in a config are relative to **the config file's directory**, not to the
+directory you run `kbc` from — the same rule `[[corpus]] path` uses. Setting
+`data_dir` alone is enough to relocate the daemon: the database, the index and
+the token file then resolve to `<data_dir>/kb.db`, `<data_dir>/index` and
+`<data_dir>/token`, so `kbc token generate` and the daemon always agree on
+which file the token lives in. `db_path`, `index_path` and `token_file` each
+win on their own if you set them; the ones you omit still follow `data_dir`.
+`kbc config show` prints the resolved values, so you never have to guess where
+the daemon will look.
 
 Index it, then search it. Global flags come **before** the verb, so this is
 `kbc --config kb.toml reindex`, not `kbc reindex --config kb.toml`:
@@ -180,17 +205,19 @@ JSON protocol, the same seam the Rust build uses.
 
 ## Performance
 
-There are no published latency numbers for kb-c, so this section makes no
-claims and neither does the rest of the documentation. What exists is the set
-of mechanisms a number would come from — an mmap'd postings walk, a bounded
-top-k heap instead of a full sort, no SQLite on the read path, and per-request
-arenas — described in `PORT_PLAN.md` §4 with the measurement each one still
-needs.
+The measured numbers live in [`BENCHMARKS.md`](BENCHMARKS.md), written from
+runs on this machine and nowhere else. The headline: **~170x less CPU per
+query** than the Rust daemon on a matched 360-document corpus (kb-c ~0.21 ms
+of CPU per query, Rust ~35 ms, both flat across 1/2/4/8 clients), and
+**299,948 kB resident** with a real embedding model loaded against the Rust
+daemon's 321,580 kB. Both comparisons state their own imperfection next to the
+number rather than in a footnote — the concurrency corpus is small and
+deliberately matched, and the latency comparison's corpora are *not* matched
+(1,114 documents against 1,594).
 
-The head-to-head harness is `kbc bench --queries N --repeat N --corpus DIR`.
-Its results belong in `BENCHMARKS.md`, and that file is written from measured
-numbers only — corpus, machine, query set and the Rust build it was compared
-against. Until it exists, this repository makes no performance claim.
+The harnesses are in `bench/` (`bench-kbc.sh`, `bench-rust.sh`,
+`bench-rust-concurrency.sh`, `bench-scale.sh`, `bench-vector.sh`) and the
+in-process one is `kbc bench --queries N --repeat N --corpus DIR`.
 
 ## Layout
 

@@ -2,23 +2,37 @@
  *
  * The daemon never links an inference runtime. kb's Rust build already keeps
  * ONNX Runtime out of the daemon and inside `kb-embedder`, a child process
- * spoken to over stdio; kb-c keeps that seam and speaks the same shape of
- * protocol (newline-delimited JSON), so the same sidecar binary serves both.
+ * spoken to over stdio; kb-c keeps that seam and speaks the SAME protocol, so
+ * the same sidecar binary serves both.
  *
- * Wire format (one JSON object per line, both directions):
- *   -> {"op":"health"}
- *   <- {"ok":true,"dim":384,"model":"...","ready":true}
- *   -> {"op":"embed","texts":["a","b"]}
- *   <- {"ok":true,"dim":384,"vectors":[[0.1,...],[0.2,...]]}
- *   -> {"op":"shutdown"}
- * The reader tolerates `embeddings` as an alias for `vectors`, and infers the
- * dimension from the first vector when `dim` is absent. A malformed line, a
- * non-object, or a short vector array is a protocol error: the sidecar is
- * killed and marked unhealthy rather than half-trusted.
+ * The protocol is newline-delimited JSON, and it is NOT request/response by
+ * default — the sidecar announces itself first. Verified against the real
+ * /home/nik/.local/bin/kb-embedder; the shapes below are what it actually
+ * accepts, established by the sidecar's own parse errors.
+ *
+ *   <- {"kind":"ready","model":"bge-small-en-v1.5","dim":384}   UNSOLICITED,
+ *                                                                   on connect
+ *   -> {"kind":"embed","req_id":N,"texts":["a","b"]}             req_id is
+ *   <- {"kind":"embed_ok","req_id":N,"vectors":[[..],[..]]}        MANDATORY
+ *   <- {"kind":"error","req_id":N,"msg":"..."}                   on failure
+ *   -> {"kind":"shutdown"}
+ *
+ * Three consequences, each of which is a bug that was shipped once:
+ *  1. There is no "health" op. The sidecar replies "unknown variant `health`".
+ *     Readiness is the unsolicited `ready` line; kbc_embedder must absorb it
+ *     wherever it arrives, including in the middle of waiting for a reply.
+ *  2. req_id is mandatory and must be echoed. A reply carrying someone else's
+ *     req_id is a protocol error, not an answer.
+ *  3. The sidecar reads stdin as UTF-8 and EXITS on a line that is not. So no
+ *     byte >= 0x80 may ever reach the wire: text is escaped locally to \u00XX
+ *     rather than passed through as raw UTF-8. A corpus with 8-bit bytes
+ *     otherwise kills the sidecar mid-ingest and silently ends the vector lane.
+ *
+ * `kbc_embedder_start` takes the sidecar's argv (not a shell string): the
+ * binary path, then --model and --cache, are all needed.
  */
 #ifndef KBC_EMBED_H
 #define KBC_EMBED_H
-
 #include "kbc/json.h"
 #include "kbc/kbc.h"
 #include "kbc/mem.h"
