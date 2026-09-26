@@ -11,6 +11,7 @@
 #ifndef KBC_SEARCH_H
 #define KBC_SEARCH_H
 
+#include "kbc/embed.h"
 #include "kbc/index.h"
 #include "kbc/kbc.h"
 #include "kbc/mem.h"
@@ -81,6 +82,13 @@ typedef kbc_status (*kbc_resolve_fn)(void *ctx, kbc_arena *a, uint32_t doc_id,
 kbc_searcher *kbc_searcher_new(const kbc_index *ix, kbc_resolve_fn resolve,
                                void *resolve_ctx, kbc_err *err);
 void kbc_searcher_free(kbc_searcher *s);
+
+/* Hands the searcher the document embeddings it scores the vector lane
+ * against. BORROWS `vs`; pass NULL to take the vector lane off. Without one,
+ * `hybrid` degrades to keyword and `semantic` returns nothing — both set
+ * out->degraded, neither is an error. */
+kbc_status kbc_searcher_set_vecstore(kbc_searcher *s, const kbc_vecstore *vs,
+                                     kbc_err *err);
 
 /* `vec` is the query embedding (may be NULL, or length 0 = lane skipped).
  * The result is ARENA-scoped. `q->limit` rows at most. */

@@ -60,6 +60,7 @@ void kbc_app_unsubscribe(kbc_app *app, uint64_t id);
 void kbc_app_publish(kbc_app *app, const char *type, const char *json_payload);
 
 /* Counters for /api/metrics and `kbc status`. */
+/* Counters for GET /api/stats and `kbc status`. */
 typedef struct {
   int64_t artifacts_indexed;
   int64_t reindex_runs;

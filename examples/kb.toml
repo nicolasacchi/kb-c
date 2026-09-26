@@ -1,0 +1,30 @@
+# kb-c sample configuration.
+#
+# Every key below is optional; this file only overrides defaults, and an
+# unknown key is a parse error rather than a silently ignored line.
+
+[daemon]
+bind = "127.0.0.1"   # a non-loopback bind without a token is refused
+port = 4317          # 4000 belongs to the Rust daemon; the two can coexist
+data_dir = "./state"
+log_level = "info"
+
+[search]
+bm25_k1 = 1.2
+bm25_b = 0.75
+rrf_k = 60
+max_hits = 50
+
+[watcher]
+debounce_ms = 250
+
+# The vector lane needs a sidecar. Without one, mode=hybrid degrades to the
+# keyword lane and mode=semantic returns nothing — both are logged, never
+# silently wrong.
+# [embedder]
+# command = "kb-embedder"
+
+[[corpus]]
+name = "docs"
+path = "./bench/data/corpus"
+ignore = [".git", "node_modules", "target"]

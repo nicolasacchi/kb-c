@@ -46,8 +46,11 @@ void kbc_embedder_counts(const kbc_embedder *e, int64_t *requests,
                          int64_t *failures);
 
 /* Embeds n texts. `out` receives n*dim floats, row-major, ARENA-scoped.
- * KBC_ERR_TIMEOUT if the sidecar does not answer within `timeout_ms`
- * (0 = 30s). KBC_ERR_IO when the pipe dies; the sidecar is marked unhealthy. */
+ * `dim_hint` (0 = unknown) is a consistency check against the sidecar's own
+ * dimension. KBC_ERR_TIMEOUT if the sidecar does not answer within 30s;
+ * KBC_ERR_PARSE on a malformed reply; KBC_ERR_IO when the pipe dies. Each of
+ * those three kills and reaps the child and marks it unhealthy — a
+ * desynchronised stream cannot be reused, so a timeout is not a soft miss. */
 kbc_status kbc_embedder_embed(kbc_embedder *e, kbc_arena *a,
                               const char *const *texts, size_t n,
                               size_t dim_hint, float **out, kbc_err *err);
@@ -64,7 +67,9 @@ void kbc_vecstore_free(kbc_vecstore *v);
 
 size_t kbc_vecstore_dim(const kbc_vecstore *v);
 uint32_t kbc_vecstore_count(const kbc_vecstore *v);
-/* Grows the file if needed. A wrong-length input is KBC_ERR_INVALID. */
+/* Grows the file if needed. `vec` must hold exactly kbc_vecstore_dim(v)
+ * floats; a NULL pointer is KBC_ERR_INVALID. A grow invalidates every
+ * pointer previously returned by kbc_vecstore_get. */
 kbc_status kbc_vecstore_set(kbc_vecstore *v, uint32_t doc_id, const float *vec,
                             kbc_err *err);
 /* NULL when doc_id >= count. */

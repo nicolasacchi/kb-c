@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DKBC_WERROR=ON
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+      - name: Configure
+        run: cmake -B build -DKBC_SANITIZE=ON
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure
+
+  # Release lane on a small generated corpus. It gates the build, not the
+  # timing: latency on a shared runner is noise, so the bench is measured and
+  # reported but never fails the job.
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DKBC_WERROR=ON
+      - name: Build
+        run: cmake --build build -j
+      - name: Generate corpus
+        run: |
+          mkdir -p bench/data/corpus
+          for i in $(seq 1 64); do
+            printf '# Note %s\n\nkb-c indexes markdown and serves it over http. token%s filler text.\n' \
+              "$i" "$i" > "bench/data/corpus/note-$i.md"
+          done
+          printf 'data_dir = "./db"\nport = 4317\n\n[[corpus]]\nname = "bench"\npath = "./corpus"\n' \
+            > bench/data/kb.toml
+      - name: Reindex the generated corpus
+        run: ./build/kbc reindex --config bench/data/kb.toml
+      - name: Bench
+        run: ./build/kbc bench --config bench/data/kb.toml

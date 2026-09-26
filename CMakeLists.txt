@@ -1,7 +1,7 @@
+# kb-c is C17 with no runtime dependency beyond libc, libsqlite3 and pthreads.
 cmake_minimum_required(VERSION 3.20)
 project(kb_c VERSION 0.1.0 LANGUAGES C)
 
-# kb-c is C17 with no runtime dependency beyond libc, libsqlite3 and pthreads.
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -12,6 +12,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(KBC_SANITIZE "build with ASan + UBSan (no -O3)" OFF)
+option(KBC_TSAN "build with ThreadSanitizer (no -O3)" OFF)
 option(KBC_WERROR "treat warnings as errors" ON)
 option(KBC_NATIVE "tune for the build machine (-march=native); off for release" OFF)
 option(KBC_BUILD_TESTS "build the test suite" ON)
@@ -25,6 +26,11 @@ set(KBC_WARNINGS
 if(KBC_SANITIZE)
   add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1)
   add_link_options(-fsanitize=address,undefined)
+elseif(KBC_TSAN)
+  # The index shares one cached scoring accumulator across query threads, so
+  # the concurrency claim needs a lane that can actually see a race.
+  add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g -O1)
+  add_link_options(-fsanitize=thread)
 else()
   add_compile_options(-O3 -fno-plt)
   if(KBC_NATIVE)
@@ -35,6 +41,11 @@ endif()
 if(KBC_WERROR)
   list(APPEND KBC_WARNINGS -Werror)
 endif()
+
+# CMAKE_C_EXTENSIONS OFF compiles with -std=c17, which defines __STRICT_ANSI__
+# and hides opendir/fstatat/inotify/strdup. kb-c is a Linux daemon, so the
+# feature test macros go here once, centrally, instead of per translation unit.
+add_compile_definitions(_POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
 add_compile_options(${KBC_WARNINGS})
 
 find_package(PkgConfig REQUIRED)

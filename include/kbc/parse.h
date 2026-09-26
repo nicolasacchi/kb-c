@@ -42,6 +42,11 @@ typedef struct {
   size_t len, cap;
 } kbc_tokens;
 
+
+/* Zeroes the vector so kbc_tokenize can be handed a fresh one. Required:
+ * kbc_tokenize appends into whatever len/cap it finds and does not clear. */
+void kbc_tokens_init(kbc_tokens *t);
+void kbc_tokens_free(kbc_tokens *t); /* KBC_OWN: frees the item array only */
 /* Splits on non-alphanumeric, case-folds, strips diacritics, drops terms
  * longer than KBC_MAX_TERM_LEN and 1-byte tokens, and applies the stopword
  * list (see KBC_STOPWORDS). Never returns a zero-length token. */
