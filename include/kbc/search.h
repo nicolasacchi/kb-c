@@ -97,7 +97,14 @@ kbc_status kbc_search_run(kbc_searcher *s, kbc_arena *a, const kbc_query *q,
                           kbc_search_result *out, kbc_err *err);
 
 /* Cosine top-k over a caller-supplied (doc_id, embedding) table. Exposed so
- * the vector lane is testable without a sidecar. */
+ * the vector lane is testable without a sidecar.
+ *
+ * Unlike kbc_index_bm25, this one REPLACES rather than appends: it calls
+ * kbc_hits_init(out) on entry, which zeroes the struct without releasing
+ * whatever buffer it already held. So a caller that reuses a kbc_hits across
+ * calls must kbc_hits_free it in between, or the first result leaks. The
+ * asymmetry is deliberate — the caller owns the hits it passed to bm25 and
+ * keeps appending to them, while a top-k is a complete answer of its own. */
 kbc_status kbc_cosine_topk(const float *qvec, size_t qdim,
                            const uint32_t *doc_ids, const float *emb, size_t n,
                            size_t dim, size_t limit, kbc_hits *out,

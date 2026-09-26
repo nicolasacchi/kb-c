@@ -45,7 +45,10 @@ static void fail_at(jparse *s, const char *p, const char *fmt, ...) {
 /* ---------------------------------------------------------------- nodes -- */
 
 static kbc_json *node_new(kbc_arena *a, kbc_json_type t) {
-  kbc_json *v = kbc_arena_alloc(a, sizeof *v);
+  /* calloc, not alloc: the arena hands back recycled bytes, and every field
+   * below left uninitialised (arr.len/cap/items, obj.len/cap/keys) is read
+   * by the first push/set on a programmatically built node. */
+  kbc_json *v = kbc_arena_calloc(a, 1, sizeof *v);
   if (!v) return NULL;
   v->type = t;
   return v;
@@ -580,7 +583,9 @@ static kbc_json *parse_object(jparse *s, unsigned depth) {
 }
 
 static kbc_json *parse_value(jparse *s, unsigned depth) {
-  if (depth > JSON_MAX_DEPTH) {
+  /* The top-level value parses at depth 0, so JSON_MAX_DEPTH nested levels
+   * below it are admitted and the next one is refused. */
+  if (depth >= JSON_MAX_DEPTH) {
     fail_at(s, s->p, "nesting too deep");
     return NULL;
   }
@@ -649,7 +654,7 @@ kbc_status kbc_json_escape(kbc_str *out, const char *s, size_t n) {
     unsigned char c = (unsigned char)s[i];
     const char *esc = NULL;
     char ubuf[7];
-    char one[1];
+    char one[2];
     switch (c) {
     case '"': esc = "\\\""; break;
     case '\\': esc = "\\\\"; break;
@@ -664,6 +669,7 @@ kbc_status kbc_json_escape(kbc_str *out, const char *s, size_t n) {
         esc = ubuf;
       } else {
         one[0] = (char)c;
+        one[1] = '\0';
         esc = one;
       }
     }
@@ -706,7 +712,7 @@ static kbc_status dump_str_body(const char *s, size_t n, kbc_str *out) {
 
 static kbc_status dump_val(const kbc_json *v, kbc_str *out, bool pretty,
                            unsigned depth, kbc_err *err) {
-  if (depth > JSON_MAX_DEPTH)
+  if (depth >= JSON_MAX_DEPTH)
     return kbc_err_set(err, KBC_ERR_INTERNAL, "json_dump: tree deeper than %d",
                        JSON_MAX_DEPTH);
   kbc_status st = KBC_OK;

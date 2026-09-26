@@ -1,0 +1,1 @@
+/usr/bin/cc -g -fsanitize=address,undefined -Wl,--dependency-file=CMakeFiles/test_search.dir/link.d CMakeFiles/test_search.dir/tests/test_search.c.o -o test_search  libkbc_testing.a libkbc.a /usr/lib/libsqlite3.so -lm

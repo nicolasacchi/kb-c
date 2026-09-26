@@ -1,0 +1,2 @@
+/usr/bin/ar qc libkbc.a CMakeFiles/kbc.dir/src/app.c.o CMakeFiles/kbc.dir/src/config.c.o CMakeFiles/kbc.dir/src/embed.c.o CMakeFiles/kbc.dir/src/httpd.c.o CMakeFiles/kbc.dir/src/ids.c.o CMakeFiles/kbc.dir/src/index.c.o CMakeFiles/kbc.dir/src/json.c.o CMakeFiles/kbc.dir/src/kbc.c.o CMakeFiles/kbc.dir/src/log.c.o CMakeFiles/kbc.dir/src/mem.c.o CMakeFiles/kbc.dir/src/parse.c.o CMakeFiles/kbc.dir/src/search.c.o CMakeFiles/kbc.dir/src/store.c.o CMakeFiles/kbc.dir/src/watcher.c.o
+/usr/bin/ranlib libkbc.a

@@ -1,0 +1,515 @@
+Start testing: Sep 26 17:19 CEST
+----------------------------------------------------------
+1/11 Testing: test_app
+1/11 Test: test_app
+Command: "/home/nik/project/kb-c/build-asan/test_app"
+Directory: /home/nik/project/kb-c/build-asan
+"test_app" start time: Sep 26 17:19 CEST
+Output:
+----------------------------------------------------------
+=================================================================
+==1620974==ERROR: AddressSanitizer: heap-use-after-free on address 0x7db24b3f0530 at pc 0x7fa24d4d0192 bp 0x7ffe0eaea780 sp 0x7ffe0eae9ef8
+READ of size 5 at 0x7db24b3f0530 thread T0
+    #0 0x7fa24d4d0191  (/usr/lib/libasan.so.8+0xd0191) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #1 0x7fa24d4f17ce in vsnprintf (/usr/lib/libasan.so.8+0xf17ce) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #2 0x5559758d0755 in kbc_str_printf /home/nik/project/kb-c/src/mem.c:306
+    #3 0x555975887344 in sweep_orphans /home/nik/project/kb-c/src/app.c:1044
+    #4 0x555975887344 in reindex_locked /home/nik/project/kb-c/src/app.c:1133
+    #5 0x555975890c05 in kbc_app_reindex /home/nik/project/kb-c/src/app.c:1451
+    #6 0x555975879ccc in ingest_indexes_every_document /home/nik/project/kb-c/tests/test_app.c:211
+    #7 0x55597587ed54 in kbc_test_run /home/nik/project/kb-c/tests/kbc_test.c:23
+    #8 0x55597587e8fd in main /home/nik/project/kb-c/tests/test_app.c:751
+    #9 0x7fa24c627780  (/usr/lib/libc.so.6+0x27780) (BuildId: 503200d7fda94a5dc6058d7e0694e5d1dcb2e372)
+    #10 0x7fa24c6278b8 in __libc_start_main (/usr/lib/libc.so.6+0x278b8) (BuildId: 503200d7fda94a5dc6058d7e0694e5d1dcb2e372)
+    #11 0x555975875a24 in _start (/home/nik/project/kb-c/build-asan/test_app+0xb9a24) (BuildId: 0c7e4977103dad7a52e2818c3dcfde5590f63b78)
+
+0x7db24b3f0530 is located 48 bytes inside of 4120-byte region [0x7db24b3f0500,0x7db24b3f1518)
+freed by thread T0 here:
+    #0 0x7fa24d52ae91  (/usr/lib/libasan.so.8+0x12ae91) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #1 0x5559758ce9fd in kbc_arena_free /home/nik/project/kb-c/src/mem.c:82
+    #2 0x5559758872a4 in sweep_orphans /home/nik/project/kb-c/src/app.c:1035
+    #3 0x5559758872a4 in reindex_locked /home/nik/project/kb-c/src/app.c:1133
+    #4 0x555975890c05 in kbc_app_reindex /home/nik/project/kb-c/src/app.c:1451
+    #5 0x555975879ccc in ingest_indexes_every_document /home/nik/project/kb-c/tests/test_app.c:211
+    #6 0x55597587ed54 in kbc_test_run /home/nik/project/kb-c/tests/kbc_test.c:23
+    #7 0x55597587e8fd in main /home/nik/project/kb-c/tests/test_app.c:751
+    #8 0x7fa24c627780  (/usr/lib/libc.so.6+0x27780) (BuildId: 503200d7fda94a5dc6058d7e0694e5d1dcb2e372)
+    #9 0x7fa24c6278b8 in __libc_start_main (/usr/lib/libc.so.6+0x278b8) (BuildId: 503200d7fda94a5dc6058d7e0694e5d1dcb2e372)
+    #10 0x555975875a24 in _start (/home/nik/project/kb-c/build-asan/test_app+0xb9a24) (BuildId: 0c7e4977103dad7a52e2818c3dcfde5590f63b78)
+
+previously allocated by thread T0 here:
+    #0 0x7fa24d52c0c1 in malloc (/usr/lib/libasan.so.8+0x12c0c1) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #1 0x5559758ce34c in block_new /home/nik/project/kb-c/src/mem.c:47
+    #2 0x5559758ce86d in kbc_arena_new /home/nik/project/kb-c/src/mem.c:66
+    #3 0x55597588756e in sweep_orphans /home/nik/project/kb-c/src/app.c:1024
+    #4 0x55597588756e in reindex_locked /home/nik/project/kb-c/src/app.c:1133
+    #5 0x555975890c05 in kbc_app_reindex /home/nik/project/kb-c/src/app.c:1451
+    #6 0x555975879ccc in ingest_indexes_every_document /home/nik/project/kb-c/tests/test_app.c:211
+    #7 0x55597587ed54 in kbc_test_run /home/nik/project/kb-c/tests/kbc_test.c:23
+    #8 0x55597587e8fd in main /home/nik/project/kb-c/tests/test_app.c:751
+    #9 0x7fa24c627780  (/usr/lib/libc.so.6+0x27780) (BuildId: 503200d7fda94a5dc6058d7e0694e5d1dcb2e372)
+    #10 0x7fa24c6278b8 in __libc_start_main (/usr/lib/libc.so.6+0x278b8) (BuildId: 503200d7fda94a5dc6058d7e0694e5d1dcb2e372)
+    #11 0x555975875a24 in _start (/home/nik/project/kb-c/build-asan/test_app+0xb9a24) (BuildId: 0c7e4977103dad7a52e2818c3dcfde5590f63b78)
+
+SUMMARY: AddressSanitizer: heap-use-after-free /home/nik/project/kb-c/src/mem.c:306 in kbc_str_printf
+Shadow bytes around the buggy address:
+  0x7db24b3f0280: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x7db24b3f0300: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x7db24b3f0380: fd fd fd fd fd fd fd fd fd fa fa fa fa fa fa fa
+  0x7db24b3f0400: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x7db24b3f0480: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+=>0x7db24b3f0500: fd fd fd fd fd fd[fd]fd fd fd fd fd fd fd fd fd
+  0x7db24b3f0580: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x7db24b3f0600: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x7db24b3f0680: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x7db24b3f0700: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x7db24b3f0780: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+  ASan internal:           fe
+  Left alloca redzone:     ca
+  Right alloca redzone:    cb
+==1620974==ABORTING
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Failed.
+"test_app" end time: Sep 26 17:19 CEST
+"test_app" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/11 Testing: test_config
+2/11 Test: test_config
+Command: "/home/nik/project/kb-c/build-asan/test_config"
+Directory: /home/nik/project/kb-c/build-asan
+"test_config" start time: Sep 26 17:19 CEST
+Output:
+----------------------------------------------------------
+== config ==
+  defaults_match_the_documented_values         ok
+  full_file_lands_every_key_in_its_field       ok
+  partial_file_keeps_every_default_it_omits    ok
+  missing_file_is_ok_and_leaves_the_defaults   ok
+  unsupported_and_out_of_range_syntax_is_rejected ok
+  a_repeated_key_is_rejected                   ok
+  rejection_does_not_half_apply                ok
+  validate_accepts_defaults_and_a_real_corpus  ok
+  validate_rejects_bad_corpora_and_bind        ok
+  validate_rejects_a_public_bind_with_no_token ok
+  bind_safety_follows_the_token_rule           ok
+  bind_refusal_names_the_token_remedy          ok
+  bind_safety_is_null_safe                     ok
+  dump_then_load_is_a_fixed_point              ok
+  dump_preserves_a_string_that_looks_like_syntax ok
+  dump_refuses_a_config_with_nothing_to_dump   ok
+  free_tolerates_a_partially_built_config      ok
+config: 0 check failure(s)
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"test_config" end time: Sep 26 17:19 CEST
+"test_config" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/11 Testing: test_embed
+3/11 Test: test_embed
+Command: "/home/nik/project/kb-c/build-asan/test_embed"
+Directory: /home/nik/project/kb-c/build-asan
+"test_embed" start time: Sep 26 17:19 CEST
+Output:
+----------------------------------------------------------
+== embed ==
+  vecstore_roundtrip                           ok
+  vecstore_hostile_files                       ok
+  vecstore_growth                              ok
+  embedder_health_and_embed                    ok
+  embedder_short_vectors                       ok
+  embedder_wrong_vector_length                 ok
+  embedder_not_ok                              ok
+  embedder_non_object_reply                    ok
+  embedder_child_death                         ok
+  embedder_restart_recovers                    ok
+  embedder_silent_on_embed                     ok
+  embedder_start_rejects_bad_argv              ok
+embed: 0 check failure(s)
+<end of output>
+Test time =  10.14 sec
+----------------------------------------------------------
+Test Passed.
+"test_embed" end time: Sep 26 17:19 CEST
+"test_embed" time elapsed: 00:00:10
+----------------------------------------------------------
+
+4/11 Testing: test_httpd
+4/11 Test: test_httpd
+Command: "/home/nik/project/kb-c/build-asan/test_httpd"
+Directory: /home/nik/project/kb-c/build-asan
+"test_httpd" start time: Sep 26 17:19 CEST
+Output:
+----------------------------------------------------------
+=================================================================
+==1621679==ERROR: AddressSanitizer: heap-use-after-free on address 0x7d5cbe9ec930 at pc 0x7f4cc0ad0192 bp 0x7ffd8b310580 sp 0x7ffd8b30fcf8
+READ of size 9 at 0x7d5cbe9ec930 thread T0
+    #0 0x7f4cc0ad0191  (/usr/lib/libasan.so.8+0xd0191) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #1 0x7f4cc0af17ce in vsnprintf (/usr/lib/libasan.so.8+0xf17ce) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #2 0x560a7d804345 in kbc_str_printf /home/nik/project/kb-c/src/mem.c:306
+    #3 0x560a7d7a51e0 in sweep_orphans /home/nik/project/kb-c/src/app.c:1044
+    #4 0x560a7d7a51e0 in reindex_locked /home/nik/project/kb-c/src/app.c:1133
+    #5 0x560a7d7aeaa1 in kbc_app_reindex /home/nik/project/kb-c/src/app.c:1451
+    #6 0x560a7d795d2a in fx_setup /home/nik/project/kb-c/tests/test_httpd.c:98
+    #7 0x560a7d79b4cf in routing_status_codes /home/nik/project/kb-c/tests/test_httpd.c:153
+    #8 0x560a7d79cbf0 in kbc_test_run /home/nik/project/kb-c/tests/kbc_test.c:23
+    #9 0x560a7d79c799 in main /home/nik/project/kb-c/tests/test_httpd.c:765
+    #10 0x7f4cbfc27780  (/usr/lib/libc.so.6+0x27780) (BuildId: 503200d7fda94a5dc6058d7e0694e5d1dcb2e372)
+    #11 0x7f4cbfc278b8 in __libc_start_main (/usr/lib/libc.so.6+0x278b8) (BuildId: 503200d7fda94a5dc6058d7e0694e5d1dcb2e372)
+    #12 0x560a7d794ae4 in _start (/home/nik/project/kb-c/build-asan/test_httpd+0xdaae4) (BuildId: 3bd1b7ec2840a7c50a3a34ee8c1c4074398e8c47)
+
+0x7d5cbe9ec930 is located 48 bytes inside of 4120-byte region [0x7d5cbe9ec900,0x7d5cbe9ed918)
+freed by thread T0 here:
+    #0 0x7f4cc0b2ae91  (/usr/lib/libasan.so.8+0x12ae91) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #1 0x560a7d8025ed in kbc_arena_free /home/nik/project/kb-c/src/mem.c:82
+    #2 0x560a7d7a5140 in sweep_orphans /home/nik/project/kb-c/src/app.c:1035
+    #3 0x560a7d7a5140 in reindex_locked /home/nik/project/kb-c/src/app.c:1133
+    #4 0x560a7d7aeaa1 in kbc_app_reindex /home/nik/project/kb-c/src/app.c:1451
+    #5 0x560a7d795d2a in fx_setup /home/nik/project/kb-c/tests/test_httpd.c:98
+    #6 0x560a7d79b4cf in routing_status_codes /home/nik/project/kb-c/tests/test_httpd.c:153
+    #7 0x560a7d79cbf0 in kbc_test_run /home/nik/project/kb-c/tests/kbc_test.c:23
+    #8 0x560a7d79c799 in main /home/nik/project/kb-c/tests/test_httpd.c:765
+    #9 0x7f4cbfc27780  (/usr/lib/libc.so.6+0x27780) (BuildId: 503200d7fda94a5dc6058d7e0694e5d1dcb2e372)
+    #10 0x7f4cbfc278b8 in __libc_start_main (/usr/lib/libc.so.6+0x278b8) (BuildId: 503200d7fda94a5dc6058d7e0694e5d1dcb2e372)
+    #11 0x560a7d794ae4 in _start (/home/nik/project/kb-c/build-asan/test_httpd+0xdaae4) (BuildId: 3bd1b7ec2840a7c50a3a34ee8c1c4074398e8c47)
+
+previously allocated by thread T0 here:
+    #0 0x7f4cc0b2c0c1 in malloc (/usr/lib/libasan.so.8+0x12c0c1) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #1 0x560a7d801f3c in block_new /home/nik/project/kb-c/src/mem.c:47
+    #2 0x560a7d80245d in kbc_arena_new /home/nik/project/kb-c/src/mem.c:66
+    #3 0x560a7d7a540a in sweep_orphans /home/nik/project/kb-c/src/app.c:1024
+    #4 0x560a7d7a540a in reindex_locked /home/nik/project/kb-c/src/app.c:1133
+    #5 0x560a7d7aeaa1 in kbc_app_reindex /home/nik/project/kb-c/src/app.c:1451
+    #6 0x560a7d795d2a in fx_setup /home/nik/project/kb-c/tests/test_httpd.c:98
+    #7 0x560a7d79b4cf in routing_status_codes /home/nik/project/kb-c/tests/test_httpd.c:153
+    #8 0x560a7d79cbf0 in kbc_test_run /home/nik/project/kb-c/tests/kbc_test.c:23
+    #9 0x560a7d79c799 in main /home/nik/project/kb-c/tests/test_httpd.c:765
+    #10 0x7f4cbfc27780  (/usr/lib/libc.so.6+0x27780) (BuildId: 503200d7fda94a5dc6058d7e0694e5d1dcb2e372)
+    #11 0x7f4cbfc278b8 in __libc_start_main (/usr/lib/libc.so.6+0x278b8) (BuildId: 503200d7fda94a5dc6058d7e0694e5d1dcb2e372)
+    #12 0x560a7d794ae4 in _start (/home/nik/project/kb-c/build-asan/test_httpd+0xdaae4) (BuildId: 3bd1b7ec2840a7c50a3a34ee8c1c4074398e8c47)
+
+SUMMARY: AddressSanitizer: heap-use-after-free /home/nik/project/kb-c/src/mem.c:306 in kbc_str_printf
+Shadow bytes around the buggy address:
+  0x7d5cbe9ec680: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x7d5cbe9ec700: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x7d5cbe9ec780: fd fd fd fd fd fd fd fd fd fa fa fa fa fa fa fa
+  0x7d5cbe9ec800: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x7d5cbe9ec880: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+=>0x7d5cbe9ec900: fd fd fd fd fd fd[fd]fd fd fd fd fd fd fd fd fd
+  0x7d5cbe9ec980: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x7d5cbe9eca00: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x7d5cbe9eca80: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x7d5cbe9ecb00: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x7d5cbe9ecb80: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+  ASan internal:           fe
+  Left alloca redzone:     ca
+  Right alloca redzone:    cb
+==1621679==ABORTING
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Failed.
+"test_httpd" end time: Sep 26 17:19 CEST
+"test_httpd" time elapsed: 00:00:00
+----------------------------------------------------------
+
+5/11 Testing: test_index
+5/11 Test: test_index
+Command: "/home/nik/project/kb-c/build-asan/test_index"
+Directory: /home/nik/project/kb-c/build-asan
+"test_index" start time: Sep 26 17:19 CEST
+Output:
+----------------------------------------------------------
+  FAIL /home/nik/project/kb-c/tests/test_index.c:194 [bm25_idf_falls_as_df_rises] common.items[0].score: got 0.1487438298, want 0.1108562505 (+-1e-09)
+  FAIL /home/nik/project/kb-c/tests/test_index.c:477 [save_then_open_round_trip] kbc_index_term_count(rx): got 3, want 4
+  FAIL /home/nik/project/kb-c/tests/test_index.c:759 [expand_prefix_matches_sorted] l.len: got 1, want 0
+== index ==
+  bm25_score_matches_hand_computation          ok
+  bm25_returns_exactly_the_matching_docs       ok
+  bm25_idf_falls_as_df_rises                   FAILED
+  bm25_empty_and_stopword_queries              ok
+  bm25_limits                                  ok
+  bm25_ties_break_by_ascending_doc_id          ok
+  zero_token_document_recorded                 ok
+  id_of_finds_by_corpus_and_path               ok
+  add_doc_rejects_bad_doc_ids                  ok
+  add_doc_rejects_null_corpus_or_path          ok
+  add_doc_rejects_too_many_tokens              ok
+  save_then_open_round_trip                    FAILED
+  opened_index_is_sealed                       ok
+  open_rejects_missing_file                    ok
+  open_rejects_bad_magic                       ok
+  open_rejects_wrong_format_version            ok
+  open_rejects_zero_length_file                ok
+  open_rejects_truncated_file                  ok
+  open_rejects_lying_header_counts             ok
+  open_rejects_term_slot_outside_section       ok
+  expand_prefix_matches_sorted                 FAILED
+index: 3 check failure(s)
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Failed.
+"test_index" end time: Sep 26 17:19 CEST
+"test_index" time elapsed: 00:00:00
+----------------------------------------------------------
+
+6/11 Testing: test_json
+6/11 Test: test_json
+Command: "/home/nik/project/kb-c/build-asan/test_json"
+Directory: /home/nik/project/kb-c/build-asan
+"test_json" start time: Sep 26 17:19 CEST
+Output:
+----------------------------------------------------------
+== json ==
+  roundtrip_all_types                          ok
+  number_forms                                 ok
+  escapes                                      ok
+  surrogate_pair                               ok
+  unpaired_surrogate_rejected                  ok
+  raw_utf8_survives                            ok
+  rejects                                      ok
+  rejects_control_byte_in_string               ok
+  rejects_null_arguments                       ok
+  duplicate_key_last_wins                      ok
+  depth_limit                                  ok
+  obj_set_overwrite_does_not_grow              ok
+  arr_push_and_nesting                         ok
+  builder_rejects_bad_arguments                ok
+  null_accessors_are_safe                      ok
+  typed_getters_type_mismatch                  ok
+  dump_nonfinite_is_null                       ok
+  dump_escapes_control_bytes                   ok
+  dump_pretty_reparses                         ok
+  dump_appends_and_null_value                  ok
+json: 0 check failure(s)
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_json" end time: Sep 26 17:19 CEST
+"test_json" time elapsed: 00:00:00
+----------------------------------------------------------
+
+7/11 Testing: test_mem
+7/11 Test: test_mem
+Command: "/home/nik/project/kb-c/build-asan/test_mem"
+Directory: /home/nik/project/kb-c/build-asan
+"test_mem" start time: Sep 26 17:19 CEST
+Output:
+----------------------------------------------------------
+== mem ==
+  arena_hands_back_every_allocation            ok
+  arena_allocations_are_8_byte_aligned         ok
+  arena_zero_byte_allocations_are_distinct     ok
+  arena_bytes_counts_padded_hand_outs          ok
+  arena_reset_keeps_first_block                ok
+  arena_calloc_zeroes_recycled_memory          ok
+  arena_rejects_null_and_overflowing           ok
+  str_appends_keep_len_and_nul_in_step         ok
+  str_append_preserves_embedded_nuls           ok
+  str_rejects_null_data                        ok
+  str_clear_keeps_capacity                     ok
+  str_reserve_prevents_growth                  ok
+  str_json_escapes                             ok
+  str_json_passes_valid_utf8_through           ok
+  str_json_appends                             ok
+  strlist_push_copies                          ok
+  strlist_push_owned                           ok
+  strlist_contains_and_sort                    ok
+  read_file_reports_a_missing_path             ok
+  read_file_refuses_a_directory                ok
+  write_then_read_round_trips_bytes            ok
+  failed_write_leaves_no_temp_file             ok
+  base64_encode_pads_by_remainder              ok
+  base64_round_trips_every_remainder           ok
+  base64_decode_is_strict                      ok
+  hex_round_trips                              ok
+  utf8_len_reads_the_lead_byte                 ok
+  utf8_validate_accepts                        ok
+  utf8_validate_reports_offset                 ok
+  utf8_count_counts_codepoints                 ok
+  fold_lowercases_ascii                        ok
+  fold_strips_latin_diacritics                 ok
+  fold_digraph_stays_inside_out                ok
+  fold_passes_through                          ok
+  fold_never_splits_a_sequence                 ok
+  err_set_truncates                            ok
+  err_set_tolerates_null                       ok
+  status_str_is_distinct                       ok
+  const_time_eq                                ok
+mem: 0 check failure(s)
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_mem" end time: Sep 26 17:19 CEST
+"test_mem" time elapsed: 00:00:00
+----------------------------------------------------------
+
+8/11 Testing: test_parse
+8/11 Test: test_parse
+Command: "/home/nik/project/kb-c/build-asan/test_parse"
+Directory: /home/nik/project/kb-c/build-asan
+"test_parse" start time: Sep 26 17:19 CEST
+Output:
+----------------------------------------------------------
+
+=================================================================
+==1621690==ERROR: LeakSanitizer: detected memory leaks
+
+Direct leak of 24 byte(s) in 1 object(s) allocated from:
+    #0 0x7f873ed2bea9 in calloc (/usr/lib/libasan.so.8+0x12bea9) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #1 0x56436825f329 in kbc_arena_new /home/nik/project/kb-c/src/mem.c:61
+    #2 0x56436825c950 in block_offsets_point_at_the_real_start /home/nik/project/kb-c/tests/test_parse.c:342
+    #3 0x56436825db24 in kbc_test_run /home/nik/project/kb-c/tests/kbc_test.c:23
+    #4 0x56436825d6cd in main /home/nik/project/kb-c/tests/test_parse.c:876
+    #5 0x7f873de27780  (/usr/lib/libc.so.6+0x27780) (BuildId: 503200d7fda94a5dc6058d7e0694e5d1dcb2e372)
+    #6 0x7f873de278b8 in __libc_start_main (/usr/lib/libc.so.6+0x278b8) (BuildId: 503200d7fda94a5dc6058d7e0694e5d1dcb2e372)
+    #7 0x564368252564 in _start (/home/nik/project/kb-c/build-asan/test_parse+0x35564) (BuildId: f46486478989cae3b8cc9f97b29a3330e1a51519)
+
+Indirect leak of 4120 byte(s) in 1 object(s) allocated from:
+    #0 0x7f873ed2c0c1 in malloc (/usr/lib/libasan.so.8+0x12c0c1) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #1 0x56436825ee4c in block_new /home/nik/project/kb-c/src/mem.c:47
+    #2 0x56436825f36d in kbc_arena_new /home/nik/project/kb-c/src/mem.c:66
+    #3 0x56436825c950 in block_offsets_point_at_the_real_start /home/nik/project/kb-c/tests/test_parse.c:342
+    #4 0x56436825db24 in kbc_test_run /home/nik/project/kb-c/tests/kbc_test.c:23
+    #5 0x56436825d6cd in main /home/nik/project/kb-c/tests/test_parse.c:876
+    #6 0x7f873de27780  (/usr/lib/libc.so.6+0x27780) (BuildId: 503200d7fda94a5dc6058d7e0694e5d1dcb2e372)
+    #7 0x7f873de278b8 in __libc_start_main (/usr/lib/libc.so.6+0x278b8) (BuildId: 503200d7fda94a5dc6058d7e0694e5d1dcb2e372)
+    #8 0x564368252564 in _start (/home/nik/project/kb-c/build-asan/test_parse+0x35564) (BuildId: f46486478989cae3b8cc9f97b29a3330e1a51519)
+
+SUMMARY: AddressSanitizer: 4144 byte(s) leaked in 2 allocation(s).
+<end of output>
+Test time =   3.70 sec
+----------------------------------------------------------
+Test Failed.
+"test_parse" end time: Sep 26 17:20 CEST
+"test_parse" time elapsed: 00:00:03
+----------------------------------------------------------
+
+9/11 Testing: test_search
+9/11 Test: test_search
+Command: "/home/nik/project/kb-c/build-asan/test_search"
+Directory: /home/nik/project/kb-c/build-asan
+"test_search" start time: Sep 26 17:20 CEST
+Output:
+----------------------------------------------------------
+
+=================================================================
+==1622171==ERROR: LeakSanitizer: detected memory leaks
+
+Direct leak of 512 byte(s) in 1 object(s) allocated from:
+    #0 0x7feda212b161  (/usr/lib/libasan.so.8+0x12b161) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #1 0x55e305e62ca1 in kbc_hits_push /home/nik/project/kb-c/src/ids.c:83
+    #2 0x55e305e9bd6e in kbc_cosine_topk /home/nik/project/kb-c/src/search.c:244
+    #3 0x55e305e4f258 in cosine_topk_limit_beyond_n_returns_n /home/nik/project/kb-c/tests/test_search.c:589
+    #4 0x55e305e57b97 in kbc_test_run /home/nik/project/kb-c/tests/kbc_test.c:23
+    #5 0x55e305e5769a in main /home/nik/project/kb-c/tests/test_search.c:652
+    #6 0x7feda1227780  (/usr/lib/libc.so.6+0x27780) (BuildId: 503200d7fda94a5dc6058d7e0694e5d1dcb2e372)
+    #7 0x7feda12278b8 in __libc_start_main (/usr/lib/libc.so.6+0x278b8) (BuildId: 503200d7fda94a5dc6058d7e0694e5d1dcb2e372)
+    #8 0x55e305e4d764 in _start (/home/nik/project/kb-c/build-asan/test_search+0x78764) (BuildId: 3cfeedf695a3e7da0e28fa5ca7060a856add1dfd)
+
+SUMMARY: AddressSanitizer: 512 byte(s) leaked in 1 allocation(s).
+<end of output>
+Test time =   0.03 sec
+----------------------------------------------------------
+Test Failed.
+"test_search" end time: Sep 26 17:20 CEST
+"test_search" time elapsed: 00:00:00
+----------------------------------------------------------
+
+10/11 Testing: test_store
+10/11 Test: test_store
+Command: "/home/nik/project/kb-c/build-asan/test_store"
+Directory: /home/nik/project/kb-c/build-asan
+"test_store" start time: Sep 26 17:20 CEST
+Output:
+----------------------------------------------------------
+== store ==
+  open_creates_file_and_parents_is_idempotent  ok
+  schema_version_of_null_store_is_zero         ok
+  get_artifact_round_trips_every_field         ok
+  get_artifact_by_path_resolves_within_a_corpus ok
+  upsert_updates_in_place_and_rejects_a_foreign_id ok
+  unknown_lookups_are_notfound_and_name_the_value ok
+  list_ids_honours_limit_offset_corpus_and_kind ok
+  counts_corpora_and_total_bytes               ok
+  replace_chunks_replaces_and_never_leaves_a_ghost_ord ok
+  replace_chunks_is_per_document               ok
+  comments_list_resolve_and_foreign_key        ok
+  delete_cascades_to_chunks_and_comments       ok
+  null_and_empty_arguments_are_invalid         ok
+  open_rejects_an_unusable_db_path             ok
+store: 0 check failure(s)
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"test_store" end time: Sep 26 17:20 CEST
+"test_store" time elapsed: 00:00:00
+----------------------------------------------------------
+
+11/11 Testing: test_watcher
+11/11 Test: test_watcher
+Command: "/home/nik/project/kb-c/build-asan/test_watcher"
+Directory: /home/nik/project/kb-c/build-asan
+"test_watcher" start time: Sep 26 17:20 CEST
+Output:
+----------------------------------------------------------
+== watcher ==
+  create_publishes_file_changed                ok
+  write_then_rename_yields_one_event           ok
+  rapid_writes_to_one_path_coalesce            ok
+  writes_to_different_paths_do_not_coalesce    ok
+  delete_publishes_file_removed                ok
+  ignored_and_dotfile_names_publish_nothing    ok
+  stop_is_prompt_and_null_safe                 ok
+  start_rejects_null_arguments                 ok
+watcher: 0 check failure(s)
+<end of output>
+Test time =  14.02 sec
+----------------------------------------------------------
+Test Passed.
+"test_watcher" end time: Sep 26 17:20 CEST
+"test_watcher" time elapsed: 00:00:14
+----------------------------------------------------------
+
+End testing: Sep 26 17:20 CEST

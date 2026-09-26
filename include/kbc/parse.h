@@ -44,9 +44,11 @@ typedef struct {
 
 
 /* Zeroes the vector so kbc_tokenize can be handed a fresh one. Required:
- * kbc_tokenize appends into whatever len/cap it finds and does not clear. */
+ * kbc_tokenize appends into whatever len/cap it finds and does not clear.
+ * There is deliberately no kbc_tokens_free: the items array is arena-owned,
+ * so it dies with the arena and freeing it separately would be a free() of
+ * memory this library never allocated. */
 void kbc_tokens_init(kbc_tokens *t);
-void kbc_tokens_free(kbc_tokens *t); /* KBC_OWN: frees the item array only */
 /* Splits on non-alphanumeric, case-folds, strips diacritics, drops terms
  * longer than KBC_MAX_TERM_LEN and 1-byte tokens, and applies the stopword
  * list (see KBC_STOPWORDS). Never returns a zero-length token. */

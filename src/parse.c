@@ -239,7 +239,9 @@ typedef struct {
 
   kbc_str cur;         /* text of the block under construction */
   size_t cur_off;      /* source offset of that block's first byte */
-  size_t cur_line_beg; /* length in `cur` at the start of the last line */
+  size_t src_off;      /* source offset of the byte being appended now */
+  size_t line_off;     /* source offset of the current line's first byte */
+  size_t prev_line_off; /* source offset of the previous line's first byte */
   int cur_level;       /* 0 = prose, 1..6 = heading */
   bool cur_code;       /* fenced code: the id is code-<lang>-<n> */
   const char *cur_id;  /* explicit id for the block being built */
@@ -251,7 +253,9 @@ typedef struct {
   size_t code_n;
 
   bool in_title; /* inside <title>...</title> */
+  bool title_pending; /* whitespace run pending in the title buffer */
   kbc_str title_buf;
+
 
   const char *title_h1;    /* first h1 block, markdown or HTML */
   const char *title_tag;   /* first <title> element */
@@ -301,6 +305,16 @@ bool kbc_parsed_has_anchor(const kbc_parsed *p, const char *id) {
 /* ------------------------------------------------------------- parser --- */
 
 
+/* A run of source whitespace collapses to one space, in the block text and
+ * in the <title> buffer alike; the space itself is materialised only when
+ * more text follows. A decoded entity that is whitespace goes through here
+ * too, so it collapses exactly like a literal space. */
+static kbc_status p_space(parser *p) {
+  if (p->cur.len > 0) p->pending = true;
+  if (p->in_title && p->title_buf.len > 0) p->title_pending = true;
+  return KBC_OK;
+}
+
 static kbc_status p_put(parser *p, const char *d, size_t n) {
   if (n == 0) return KBC_OK;
   kbc_status st;
@@ -309,9 +323,15 @@ static kbc_status p_put(parser *p, const char *d, size_t n) {
     st = kbc_str_putc(&p->cur, ' ');
     if (kbc_failed(st)) return st;
   }
+  if (p->cur.len == 0) p->cur_off = p->src_off; /* this block starts here */
   st = kbc_str_append(&p->cur, d, n);
   if (kbc_failed(st)) return st;
   if (p->in_title) {
+    if (p->title_pending) {
+      p->title_pending = false;
+      st = kbc_str_putc(&p->title_buf, ' ');
+      if (kbc_failed(st)) return st;
+    }
     st = kbc_str_append(&p->title_buf, d, n);
     if (kbc_failed(st)) return st;
   }
@@ -319,12 +339,10 @@ static kbc_status p_put(parser *p, const char *d, size_t n) {
 }
 
 static kbc_status p_put_char(parser *p, unsigned char c) {
-  if (is_space(c)) {
-    if (p->cur.len > 0) p->pending = true;
-    return KBC_OK;
-  }
+  if (is_space(c)) return p_space(p);
   return p_put(p, (const char *)&c, 1);
 }
+
 
 static kbc_status parsed_add_anchor(parser *p, const char *id) {
   if (id == NULL || id[0] == '\0') return KBC_OK;
@@ -344,7 +362,6 @@ static kbc_status p_flush(parser *p) {
     p->cur_level = 0;
     p->cur_id = NULL;
     p->cur_code = false;
-    p->cur_line_beg = 0;
     return KBC_OK;
   }
   char *text = kbc_arena_strndup(p->a, p->cur.ptr, p->cur.len);
@@ -392,7 +409,9 @@ static kbc_status p_flush(parser *p) {
   if (p->cur_level == 0 && p->title_prose == NULL && !p->cur_code) {
     p->title_prose = text;
   }
-  if (p->cur_level > 0 || p->cur_code) {
+  /* a heading, a fenced block, or any block that carries an explicit id is
+   * addressable */
+  if (p->cur_level > 0 || p->cur_code || p->cur_id != NULL) {
     st = parsed_add_anchor(p, id);
     if (kbc_failed(st)) return st;
   }
@@ -400,7 +419,6 @@ static kbc_status p_flush(parser *p) {
   p->cur_level = 0;
   p->cur_id = NULL;
   p->cur_code = false;
-  p->cur_line_beg = 0;
   return KBC_OK;
 }
 
@@ -451,6 +469,9 @@ static size_t tag_end(const char *s, size_t n, size_t i) {
 
 static kbc_status p_tag(parser *p, const char *s, size_t n, size_t *pos) {
   size_t start = *pos;
+
+  /* any byte p_tag appends comes from the tag's own offset */
+  p->src_off = start;
   size_t i = start + 1;
   if (i >= n) { /* a trailing bare '<' */
     *pos = n;
@@ -576,12 +597,14 @@ static kbc_status p_tag(parser *p, const char *s, size_t n, size_t *pos) {
         p->title_tag = kbc_arena_strndup(p->a, p->title_buf.ptr, p->title_buf.len);
       }
       p->in_title = false;
+      p->title_pending = false;
       kbc_str_clear(&p->title_buf);
     } else {
       kbc_status st = p_flush(p);
       if (kbc_failed(st)) return st;
       p->cur_off = start;
       p->in_title = true;
+      p->title_pending = false;
       kbc_str_clear(&p->title_buf);
     }
     return KBC_OK;
@@ -628,7 +651,6 @@ static kbc_status p_open_code(parser *p, const char *info, size_t info_len,
   p->cur_off = off;
   p->cur_level = 0;
   p->cur_code = true;
-  p->cur_line_beg = 0;
   if (ll > 0) {
     p->cur_id = kbc_arena_printf(p->a, "code-%s-%zu", lang, p->code_n);
   } else {
@@ -637,35 +659,59 @@ static kbc_status p_open_code(parser *p, const char *info, size_t info_len,
   return KBC_OK;
 }
 
+/* A setext underline promotes the line above it to a heading. The candidate
+ * is the last line appended to the block, which is located by scanning back
+ * to the previous newline rather than by a stored index: the block may have
+ * been extended by several lines since the last one was recorded. */
 static kbc_status p_setext(parser *p, const char *s, size_t n, size_t *pos,
                            size_t line_len) {
+  (void)line_len;
   char ch = s[*pos];
   size_t k = *pos;
   while (k < n && s[k] == ch) k++;
   size_t e = k;
-  while (e < n && is_space((unsigned char)s[e])) e++;
+  /* only horizontal whitespace may follow the underline run: a newline ends
+   * the line and must not be swallowed by the scan */
+  while (e < n && (s[e] == ' ' || s[e] == '\t' || s[e] == '\r')) e++;
   if (e != n && s[e] != '\n') return KBC_OK; /* not a setext underline */
   if (k - *pos < 1) return KBC_OK;
 
+  /* the pending line, as a slice of the block text */
+  size_t end = p->cur.len;
+  size_t b = 0;
+  for (size_t x = end; x > 0; x--) {
+    if (p->cur.ptr[x - 1] == '\n') {
+      b = x;
+      break;
+    }
+  }
+  while (b < end && p->cur.ptr[b] == ' ') b++;
+  if (end == b) return KBC_OK; /* nothing on the line to promote */
+
+  if (b == 0) {
+    /* the line is the whole block: promote it in place */
+    p->cur_off = p->prev_line_off;
+    p->cur_level = (ch == '=') ? 1 : 2;
+    *pos = (e < n) ? e + 1 : n;
+    return KBC_OK;
+  }
+
+  /* earlier lines share the block: flush them, then promote the last line */
   kbc_str last;
   kbc_str_init(&last);
-  size_t b = p->cur_line_beg;
-  size_t end = p->cur.len;
-  while (b < end && p->cur.ptr[b] == ' ') b++;
   kbc_status st = kbc_str_append(&last, p->cur.ptr + b, end - b);
-  if (!kbc_failed(st) && end > p->cur_line_beg) st = p_flush(p);
+  if (!kbc_failed(st)) st = p_flush(p);
   if (!kbc_failed(st)) {
     kbc_str_clear(&p->cur);
     st = kbc_str_append(&p->cur, last.ptr, last.len);
   }
   if (!kbc_failed(st)) {
+    p->cur_off = p->prev_line_off;
     p->cur_level = (ch == '=') ? 1 : 2;
-    p->cur_line_beg = 0;
   }
   kbc_str_free(&last);
   if (kbc_failed(st)) return st;
   *pos = (e < n) ? e + 1 : n;
-  (void)line_len;
   return KBC_OK;
 }
 
@@ -692,10 +738,19 @@ static kbc_status p_line(parser *p, const char *s, size_t n, size_t *pos) {
         return p_flush(p);
       }
     }
+    p->src_off = *pos;
     kbc_status st = p_put(p, s + j, le - j);
-    p->cur_line_beg = p->cur.len;
     *pos = (le < n) ? le + 1 : n;
     return st;
+  }
+
+  /* A blank line is a block boundary. It is handled here rather than in the
+   * main loop so that a blank line inside a fenced block — consumed by the
+   * branch above — never closes the block. */
+  if (le == j) {
+    *pos = (le < n) ? le + 1 : n;
+    if (p->cur.len == 0) return KBC_OK;
+    return p_flush(p);
   }
 
   if ((s[j] == '`' || s[j] == '~') && j < le) {
@@ -728,18 +783,55 @@ static kbc_status p_line(parser *p, const char *s, size_t n, size_t *pos) {
   if (s[j] == '#') {
     size_t k = j;
     while (k < n && s[k] == '#') k++;
-    if (k - j <= 6 && (k >= n || s[k] == ' ' || s[k] == '\t' || s[k] == '\n')) {
+    bool separated = (k >= n || s[k] == ' ' || s[k] == '\t' || s[k] == '\n');
+    if (k - j <= 6 && separated) {
       size_t te = le;
       while (te > k && is_space((unsigned char)s[te - 1])) te--;
       while (te > k && s[te - 1] == '#') te--;
       while (te > k && is_space((unsigned char)s[te - 1])) te--;
+      /* the separator after the '#' run is not part of the heading text */
+      size_t hs = k;
+      while (hs < te && is_space((unsigned char)s[hs])) hs++;
       kbc_status st = p_flush(p);
       if (kbc_failed(st)) return st;
       p->cur_off = *pos;
       p->cur_level = (int)(k - j);
-      st = p_put(p, s + k, te - k);
+      p->src_off = hs;
+      for (size_t x = hs; x < te; x++) {
+        st = p_put_char(p, (unsigned char)s[x]);
+        if (kbc_failed(st)) return st;
+      }
+      /* a line that continues the heading is separated by one space */
+      p->pending = p->cur.len > 0;
       *pos = (le < n) ? le + 1 : n;
-      return st;
+      return KBC_OK;
+    }
+    if (separated) {
+      /* More than six hashes: not a heading, but the run is a marker rather
+       * than text, so the line becomes prose and keeps its slug as an id. */
+      size_t hs = k;
+      while (hs < le && is_space((unsigned char)s[hs])) hs++;
+      size_t te = le;
+      while (te > hs && is_space((unsigned char)s[te - 1])) te--;
+      kbc_status st = p_flush(p);
+      if (kbc_failed(st)) return st;
+      p->cur_off = *pos;
+      p->src_off = hs;
+      for (size_t x = hs; x < te; x++) {
+        st = p_put_char(p, (unsigned char)s[x]);
+        if (kbc_failed(st)) return st;
+      }
+      kbc_str sl;
+      kbc_str_init(&sl);
+      st = slug_into(p->a, p->cur.ptr, p->cur.len, &sl);
+      if (!kbc_failed(st) && sl.len > 0) {
+        p->cur_id = kbc_arena_strdup(p->a, sl.ptr);
+      }
+      kbc_str_free(&sl);
+      if (kbc_failed(st)) return st;
+      p->pending = p->cur.len > 0;
+      *pos = (le < n) ? le + 1 : n;
+      return KBC_OK;
     }
   }
 
@@ -749,6 +841,7 @@ static kbc_status p_line(parser *p, const char *s, size_t n, size_t *pos) {
   }
   return KBC_OK;
 }
+
 
 /* ------------------------------------------------------------- sniffing -- */
 
@@ -804,11 +897,15 @@ kbc_parsed *kbc_parse(kbc_arena *a, const char *text, size_t len,
   while (pos < len) {
     bool at_line_start = (pos == 0 || text[pos - 1] == '\n');
     if (at_line_start) {
+      p.prev_line_off = p.line_off;
+      p.line_off = pos;
+      p.src_off = pos;
       size_t before = pos;
       st = p_line(&p, text, len, &pos);
       if (kbc_failed(st)) goto fail;
       if (pos > before) continue; /* the line construct consumed the line */
     }
+    p.src_off = pos;
     unsigned char c = (unsigned char)text[pos];
     if (c == '<') {
       size_t before = pos;
@@ -819,39 +916,27 @@ kbc_parsed *kbc_parse(kbc_arena *a, const char *text, size_t len,
       continue;
     }
     if (c == '&') {
-      if (p.pending) {
-        p.pending = false;
-        st = kbc_str_putc(&p.cur, ' ');
-        if (kbc_failed(st)) goto fail;
-        if (p.in_title) {
-          kbc_status t2 = kbc_str_putc(&p.title_buf, ' ');
-          if (kbc_failed(t2)) {
-            st = t2;
-            goto fail;
-          }
-        }
-      }
+      /* Decode first, then feed the bytes through the ordinary append path so
+       * that a decoded space collapses like a literal one. */
+      kbc_str dec;
+      kbc_str_init(&dec);
       size_t used = 0;
-      st = decode_entity(&p.cur, text, len, pos, &used);
-      if (kbc_failed(st)) goto fail;
-      if (p.in_title) {
-        kbc_status t2 = kbc_str_append(&p.title_buf, text + pos, used);
-        if (kbc_failed(t2)) {
-          st = t2;
-          goto fail;
+      st = decode_entity(&dec, text, len, pos, &used);
+      if (!kbc_failed(st)) {
+        for (size_t x = 0; x < dec.len; x++) {
+          st = p_put_char(&p, (unsigned char)dec.ptr[x]);
+          if (kbc_failed(st)) break;
         }
       }
+      kbc_str_free(&dec);
+      if (kbc_failed(st)) goto fail;
       pos += used;
       continue;
     }
-    if (c == '\n') {
-      if (p.cur.len > 0) p.pending = true;
-      p.cur_line_beg = p.cur.len;
-      pos++;
-      continue;
-    }
-    if (is_space(c)) {
-      if (p.cur.len > 0) p.pending = true;
+    if (is_space(c)) { /* a newline is whitespace here: a blank line is
+                        * consumed by p_line, never as whitespace */
+      st = p_space(&p);
+      if (kbc_failed(st)) goto fail;
       pos++;
       continue;
     }
@@ -927,6 +1012,15 @@ static bool is_stopword(const char *tok, size_t len) {
 }
 
 /* ---------------------------------------------------------- tokenizer --- */
+
+void kbc_tokens_init(kbc_tokens *t) {
+  if (t == NULL) {
+    return;
+  }
+  t->items = NULL;
+  t->len = 0;
+  t->cap = 0;
+}
 
 kbc_status kbc_tokenize(kbc_arena *a, const char *text, size_t len,
                         kbc_tokens *out, kbc_err *err) {

@@ -1,0 +1,2 @@
+/usr/bin/ar qc libkbc_testing.a CMakeFiles/kbc_testing.dir/tests/kbc_test.c.o
+/usr/bin/ranlib libkbc_testing.a

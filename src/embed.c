@@ -555,7 +555,7 @@ kbc_status kbc_embedder_embed(kbc_embedder *e, kbc_arena *a,
   if (obj == NULL || arr == NULL) {
     st = kbc_err_set(err, KBC_ERR_NOMEM, "embed request json");
   }
-  for (size_t i = 0; st == KBC_OK; i++) {
+  for (size_t i = 0; i < n && st == KBC_OK; i++) {
     if (texts[i] == NULL) {
       st = kbc_err_set(err, KBC_ERR_INVALID, "texts[%zu] is NULL", i);
       break;

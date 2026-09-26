@@ -74,14 +74,18 @@ typedef struct {
 void kbc_hits_init(kbc_hits *h);
 void kbc_hits_free(kbc_hits *h);
 kbc_status kbc_hits_push(kbc_hits *h, uint32_t doc, double score);
-void kbc_hits_sort_desc(kbc_hits *h); /* by score desc, then doc asc — stable */
+void kbc_hits_sort_desc(kbc_hits *h);
 void kbc_hits_truncate(kbc_hits *h, size_t n);
-
-/* FNV-1a 64 over the fields, hex-encoded to exactly 12 chars (48 bits). Stable
- * across runs and machines: the same (corpus, path, mtime_ns, size) always
- * yields the same id, which is what makes reindex idempotent. */
+/* FNV-1a 64 over the corpus name and the corpus-relative path, hex-encoded to
+ * exactly 12 chars (48 bits).
+ *
+ * Identity is the DOCUMENT, not its current revision: the id deliberately
+ * excludes mtime and size. Including them would mint a new id on every edit,
+ * and since the store also holds UNIQUE(corpus, path), a re-ingest of a changed
+ * file would collide with its own previous row. mtime and size are the
+ * change-detection fast path, not part of the name. */
 void kbc_id_for_artifact(char out[KBC_MAX_ID_LEN + 1], const char *corpus,
-                         const char *path, int64_t mtime_ns, int64_t size_bytes);
+                         const char *path);
 bool kbc_id_is_valid(const char *id);
 
 /* "notes/2026/rfc.md" -> "rfc" when the file has no title, else the caller's

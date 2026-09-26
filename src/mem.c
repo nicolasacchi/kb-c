@@ -109,7 +109,11 @@ void *kbc_arena_alloc(kbc_arena *a, size_t bytes) {
   if (b == NULL) {
     return NULL;
   }
-  b->next = a->cur;
+  /* Append, never prepend: first is the head every consumer (free, reset,
+   * bytes) walks, so a block linked in front of it would be unreachable and
+   * would leak on both reset and free. cur is by construction reachable from
+   * first, so the two never describe different sets. */
+  a->cur->next = b;
   a->cur = b;
   b->used = need;
   return b->data;
@@ -1105,20 +1109,59 @@ size_t kbc_utf8_count(const char *s, size_t n) {
 
 /* Latin-1 (0xC0..0xFF) and Latin Extended-A (0x100..0x17F) folded to ASCII.
  * Each entry packs up to four non-NUL ASCII bytes, low byte first; 0 means
- * "no letters" (the multiplication and division signs). */
+ * "no letters" (the multiplication and division signs).
+ *
+ * The fold is case-canonical: every codepoint folds to LOWERCASE ASCII (or a
+ * lowercase digraph, or nothing), so the upper- and lowercase forms of a
+ * letter agree and a folded search cannot miss a differently-cased document.
+ * Digraphs: ß->ss, Æ/æ->ae, Œ/œ->oe, Ĳ/ĳ->ij, þ->th. Ŋ/ŋ fold to "n", not
+ * "ng", because they are one case pair and must agree.
+ *
+ * GENERATED, not hand-written — one row per 16 codepoints, row N holds
+ * 0xC0+16*N. Reproduce with:
+ *
+ *   python3 - <<'PY' > /tmp/rows.txt
+ *   import unicodedata
+ *   SPECIAL={0xDF:'ss',0xC6:'ae',0xE6:'ae',0x152:'oe',0x153:'oe',0x132:'ij',
+ *     0x133:'ij',0x14A:'n',0x14B:'n',0x149:'n',0xD7:'',0xF7:'',
+ *     0xD0:'d',0xF0:'d',0xD8:'o',0xF8:'o',0xDE:'th',0xFE:'th',
+ *     0x110:'d',0x111:'d',0x126:'h',0x127:'h',0x131:'i',0x138:'k',0x13F:'l',
+ *     0x140:'l',0x141:'l',0x142:'l',0x166:'t',0x167:'t'}
+ *   def fold(ch):
+ *     cp=ord(ch)
+ *     if cp in SPECIAL: return SPECIAL[cp]
+ *     d=unicodedata.normalize('NFKD',ch)
+ *     d=''.join(c for c in d if not unicodedata.combining(c)).lower()
+ *     assert all(ord(c)<128 for c in d),(hex(cp),d)
+ *     return d
+ *   vals=[]
+ *   for cp in range(0xC0,0x180):
+ *     b=fold(chr(cp))
+ *     u=chr(cp).upper()
+ *     if len(u)==1 and 0x100<=ord(u)<=0x17F:
+ *       assert fold(u)==b,(hex(cp),b,hex(ord(u)),fold(u))  # case agreement
+ *     assert b==b.lower() and all('a'<=c<='z' for c in b) and len(b)<=4
+ *     vals.append(b)
+ *   FMT='    '+chr(47)+'* 0x%03X *'+chr(47)+' %s,'
+ *   for i in range(0,192,16):
+ *     c=[('0' if not v else "'"+v+"'" if len(v)==1 else
+ *         "'"+v[0]+"'<<8|'"+v[1]+"'") for v in vals[i:i+16]]
+ *     print(FMT % (0xC0+i, ', '.join(c)))
+ *   PY
+ */
 static const uint32_t latin_fold[0xc0u] = {
-    /* 0x0C0 */ 'A', 'A', 'A', 'A', 'A', 'A', 'A'<<8|'E', 'C', 'E', 'E', 'E', 'E', 'I', 'I', 'I', 'I',
-    /* 0x0D0 */ 'D', 'N', 'O', 'O', 'O', 'O', 'O', 0, 'O', 'U', 'U', 'U', 'U', 'Y', 'T'<<8|'H', 's'<<8|'s',
+    /* 0x0C0 */ 'a', 'a', 'a', 'a', 'a', 'a', 'a'<<8|'e', 'c', 'e', 'e', 'e', 'e', 'i', 'i', 'i', 'i',
+    /* 0x0D0 */ 'd', 'n', 'o', 'o', 'o', 'o', 'o', 0, 'o', 'u', 'u', 'u', 'u', 'y', 't'<<8|'h', 's'<<8|'s',
     /* 0x0E0 */ 'a', 'a', 'a', 'a', 'a', 'a', 'a'<<8|'e', 'c', 'e', 'e', 'e', 'e', 'i', 'i', 'i', 'i',
     /* 0x0F0 */ 'd', 'n', 'o', 'o', 'o', 'o', 'o', 0, 'o', 'u', 'u', 'u', 'u', 'y', 't'<<8|'h', 'y',
-    /* 0x100 */ 'A', 'a', 'A', 'a', 'A', 'a', 'C', 'c', 'C', 'c', 'C', 'c', 'C', 'c', 'D', 'd',
-    /* 0x110 */ 'D', 'd', 'E', 'e', 'E', 'e', 'E', 'e', 'E', 'e', 'E', 'e', 'G', 'g', 'G', 'g',
-    /* 0x120 */ 'G', 'g', 'G', 'g', 'H', 'h', 'H', 'h', 'I', 'i', 'I', 'i', 'I', 'i', 'I', 'i',
-    /* 0x130 */ 'I', 'i', 'I'<<8|'J', 'i'<<8|'j', 'J', 'j', 'K', 'k', 'k', 'L', 'l', 'L', 'l', 'L', 'l', 'L',
-    /* 0x140 */ 'l', 'L', 'N', 'n', 'N', 'n', 'N', 'n', 'n', 'n', 'n'<<8|'g', 'O', 'o', 'O', 'o', 'O',
-    /* 0x150 */ 'o', 'O'<<8|'e', 'o'<<8|'e', 'R', 'r', 'R', 'r', 'R', 'r', 'S', 's', 'S', 's', 'S', 's', 'S',
-    /* 0x160 */ 's', 'Z', 'z', 'Z', 'z', 'Z', 'z', 'Z', 'z', 'R', 'r', 'R', 'r', 'R', 'r', 'S',
-    /* 0x170 */ 's', 'S', 's', 'S', 's', 'S', 's', 'T', 't', 'T', 't', 'T', 't', 'U', 'u', 'U'};
+    /* 0x100 */ 'a', 'a', 'a', 'a', 'a', 'a', 'c', 'c', 'c', 'c', 'c', 'c', 'c', 'c', 'd', 'd',
+    /* 0x110 */ 'd', 'd', 'e', 'e', 'e', 'e', 'e', 'e', 'e', 'e', 'e', 'e', 'g', 'g', 'g', 'g',
+    /* 0x120 */ 'g', 'g', 'g', 'g', 'h', 'h', 'h', 'h', 'i', 'i', 'i', 'i', 'i', 'i', 'i', 'i',
+    /* 0x130 */ 'i', 'i', 'i'<<8|'j', 'i'<<8|'j', 'j', 'j', 'k', 'k', 'k', 'l', 'l', 'l', 'l', 'l', 'l', 'l',
+    /* 0x140 */ 'l', 'l', 'l', 'n', 'n', 'n', 'n', 'n', 'n', 'n', 'n', 'n', 'o', 'o', 'o', 'o',
+    /* 0x150 */ 'o', 'o', 'o'<<8|'e', 'o'<<8|'e', 'r', 'r', 'r', 'r', 'r', 'r', 's', 's', 's', 's', 's', 's',
+    /* 0x160 */ 's', 's', 't', 't', 't', 't', 't', 't', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u',
+    /* 0x170 */ 'u', 'u', 'u', 'u', 'w', 'w', 'y', 'y', 'y', 'z', 'z', 'z', 'z', 'z', 'z', 's'};
 
 size_t kbc_fold_utf8(const char *s, size_t n, char out[32]) {
   if (out == NULL) {

@@ -147,10 +147,24 @@ static kbc_status prepare(kbc_err *err, const kbc_store *s, const char *sql,
   return KBC_OK;
 }
 
-static kbc_status finalize(kbc_err *err, const kbc_store *s,
-                           sqlite3_stmt *st) {
+/* Best-effort ROLLBACK. It must never touch err: the caller is already
+ * holding a specific diagnosis, and a rollback that itself fails is not a
+ * better one to report. */
+static void rollback(const kbc_store *s) {
+  char *emsg = NULL;
+  (void)sqlite3_exec(s->db, "ROLLBACK;", NULL, NULL, &emsg);
+  sqlite3_free(emsg);
+}
+
+/* Release st. `prior` is the caller's own status for the statement's work: when
+ * it is a failure, the caller's diagnosis is the specific one and stays, and a
+ * non-OK return from sqlite3_finalize() (a failed statement hands back its
+ * pending error again) must not replace it. Only when the caller has nothing
+ * to report does a bad finalize become the reported failure. */
+static kbc_status finalize(kbc_err *err, const kbc_store *s, sqlite3_stmt *st,
+                           kbc_status prior) {
   int rc = sqlite3_finalize(st);
-  if (rc != SQLITE_OK) return sql_fail(err, s, "finalize", rc);
+  if (rc != SQLITE_OK && prior == KBC_OK) return sql_fail(err, s, "finalize", rc);
   return KBC_OK;
 }
 
@@ -210,7 +224,7 @@ static kbc_status count_query(kbc_err *err, const kbc_store *s, const char *sql,
   kbc_status rc = prepare(err, s, sql, &st);
   if (rc == KBC_OK && corpus != NULL) rc = bind_text(err, s, st, 1, corpus);
   if (rc != KBC_OK) {
-    (void)finalize(err, s, st);
+    (void)finalize(err, s, st, rc);
     return rc;
   }
   int step = sqlite3_step(st);
@@ -221,7 +235,7 @@ static kbc_status count_query(kbc_err *err, const kbc_store *s, const char *sql,
   } else {
     rc = sql_fail(err, s, sql, step);
   }
-  kbc_status fin = finalize(err, s, st);
+  kbc_status fin = finalize(err, s, st, rc);
   return rc != KBC_OK ? rc : fin;
 }
 
@@ -338,7 +352,7 @@ static kbc_status apply_v1(kbc_store *s, kbc_err *err) {
     if (step != SQLITE_DONE)
       st = sql_fail(err, s, "record schema version", step);
   }
-  kbc_status fin = finalize(err, s, ins);
+  kbc_status fin = finalize(err, s, ins, st);
   return st != KBC_OK ? st : fin;
 }
 
@@ -365,7 +379,7 @@ static kbc_status migrate_locked(kbc_store *s, kbc_err *err) {
   st = apply_v1(s, err);
   if (st == KBC_OK) st = exec_plain(err, s, "COMMIT;");
   if (st != KBC_OK) {
-    (void)exec_plain(err, s, "ROLLBACK;");
+    rollback(s);
     return st;
   }
   atomic_store(s->version, SCHEMA_VERSION);
@@ -420,7 +434,7 @@ kbc_status kbc_store_upsert_artifact(kbc_store *s, const kbc_artifact *a,
       st = sql_fail(err, s, "conflict probe: step", step);
     }
   }
-  kbc_status fin = finalize(err, s, probe);
+  kbc_status fin = finalize(err, s, probe, st);
   if (st == KBC_OK) st = fin;
   if (st != KBC_OK) {
     unlock(s);
@@ -463,13 +477,15 @@ kbc_status kbc_store_upsert_artifact(kbc_store *s, const kbc_artifact *a,
     else if (step != SQLITE_DONE)
       st = sql_fail(err, s, "upsert artifact", step);
   }
-  kbc_status fin2 = finalize(err, s, ins);
+  kbc_status fin2 = finalize(err, s, ins, st);
   if (st == KBC_OK) st = fin2;
 
   unlock(s);
   return st;
 }
 
+/* a2 is the by-path variant's path and is NULL for the by-id variant, so a
+ * miss must name the value that was actually looked up. */
 static kbc_status get_artifact_locked(kbc_store *s, kbc_arena *a,
                                       const char *sql, const char *a1,
                                       const char *a2, bool with_source,
@@ -479,18 +495,21 @@ static kbc_status get_artifact_locked(kbc_store *s, kbc_arena *a,
   if (rc == KBC_OK) rc = bind_text(err, s, st, 1, a1);
   if (rc == KBC_OK && a2 != NULL) rc = bind_text(err, s, st, 2, a2);
   if (rc != KBC_OK) {
-    (void)finalize(err, s, st);
+    (void)finalize(err, s, st, rc);
     return rc;
   }
   int step = sqlite3_step(st);
   if (step == SQLITE_ROW) {
     read_artifact(a, st, with_source, out);
   } else if (step == SQLITE_DONE) {
-    rc = kbc_err_set(err, KBC_ERR_NOTFOUND, "artifact %s: not found", a1);
+    rc = (a2 != NULL)
+             ? kbc_err_set(err, KBC_ERR_NOTFOUND, "artifact %s/%s: not found", a1,
+                           a2)
+             : kbc_err_set(err, KBC_ERR_NOTFOUND, "artifact %s: not found", a1);
   } else {
     rc = sql_fail(err, s, "get artifact: step", step);
   }
-  kbc_status fin = finalize(err, s, st);
+  kbc_status fin = finalize(err, s, st, rc);
   return rc != KBC_OK ? rc : fin;
 }
 
@@ -543,7 +562,7 @@ kbc_status kbc_store_delete_artifact(kbc_store *s, const char *id,
     int step = sqlite3_step(del);
     if (step != SQLITE_DONE) st = sql_fail(err, s, "delete artifact", step);
   }
-  kbc_status fin = finalize(err, s, del);
+  kbc_status fin = finalize(err, s, del, st);
   if (st == KBC_OK) st = fin;
   if (st == KBC_OK && sqlite3_changes(s->db) == 0)
     st = kbc_err_set(err, KBC_ERR_NOTFOUND, "artifact %s: not found", id);
@@ -601,7 +620,7 @@ kbc_status kbc_store_list_artifact_ids(kbc_store *s, const char *corpus,
   if (rc == KBC_OK) rc = bind_i64(err, s, st, first, (int64_t)limit);
   if (rc == KBC_OK) rc = bind_i64(err, s, st, first + 1, (int64_t)offset);
   if (rc != KBC_OK) {
-    (void)finalize(err, s, st);
+    (void)finalize(err, s, st, rc);
     unlock(s);
     return rc;
   }
@@ -637,7 +656,7 @@ kbc_status kbc_store_list_artifact_ids(kbc_store *s, const char *corpus,
     }
     arr[len++] = copy;
   }
-  kbc_status fin = finalize(err, s, st);
+  kbc_status fin = finalize(err, s, st, rc);
   if (rc == KBC_OK) rc = fin;
   unlock(s);
 
@@ -705,7 +724,7 @@ kbc_status kbc_store_list_corpora(kbc_store *s, kbc_strlist *out,
     rc = kbc_strlist_push(out, c); /* copies into the caller's list */
     if (rc != KBC_OK) break;
   }
-  kbc_status fin = finalize(err, s, st);
+  kbc_status fin = finalize(err, s, st, rc);
   if (rc == KBC_OK) rc = fin;
   unlock(s);
   return rc;
@@ -771,7 +790,7 @@ kbc_status kbc_store_replace_chunks(kbc_store *s, const kbc_chunk_in *chunks,
     int step = sqlite3_step(del);
     if (step != SQLITE_DONE) rc = sql_fail(err, s, "delete chunks", step);
   }
-  kbc_status fin = finalize(err, s, del);
+  kbc_status fin = finalize(err, s, del, rc);
   if (rc == KBC_OK) rc = fin;
 
   sqlite3_stmt *ins = NULL;
@@ -797,11 +816,11 @@ kbc_status kbc_store_replace_chunks(kbc_store *s, const kbc_chunk_in *chunks,
       (void)sqlite3_reset(ins);
     }
   }
-  kbc_status fin2 = finalize(err, s, ins);
+  kbc_status fin2 = finalize(err, s, ins, rc);
   if (rc == KBC_OK) rc = fin2;
 
   if (rc == KBC_OK) rc = exec_plain(err, s, "COMMIT;");
-  if (rc != KBC_OK) (void)exec_plain(err, s, "ROLLBACK;");
+  if (rc != KBC_OK) rollback(s);
   unlock(s);
   return rc;
 }
@@ -843,7 +862,7 @@ kbc_status kbc_store_list_chunks(kbc_store *s, kbc_arena *a, const char *doc_id,
                &stq);
   if (st == KBC_OK) st = bind_text(err, s, stq, 1, doc_id);
   if (st != KBC_OK) {
-    (void)finalize(err, s, stq);
+    (void)finalize(err, s, stq, st);
     unlock(s);
     return st;
   }
@@ -871,7 +890,7 @@ kbc_status kbc_store_list_chunks(kbc_store *s, kbc_arena *a, const char *doc_id,
     blocks[i].offset = 0;
     i++;
   }
-  kbc_status fin = finalize(err, s, stq);
+  kbc_status fin = finalize(err, s, stq, st);
   if (st == KBC_OK) st = fin;
   if (st == KBC_OK && i != n)
     st = kbc_err_set(err, KBC_ERR_INTERNAL, "list chunks: %zu of %zu rows", i,
@@ -947,7 +966,7 @@ kbc_status kbc_store_add_comment(kbc_store *s, const char *doc_id,
     else if (step != SQLITE_DONE)
       st = sql_fail(err, s, "add comment", step);
   }
-  kbc_status fin = finalize(err, s, ins);
+  kbc_status fin = finalize(err, s, ins, st);
   if (st == KBC_OK) st = fin;
   unlock(s);
   return st;
@@ -997,7 +1016,7 @@ kbc_status kbc_store_list_comments(kbc_store *s, kbc_arena *a,
   if (st == KBC_OK) st = bind_text(err, s, stq, 1, doc_id);
   if (st == KBC_OK) st = bind_i64(err, s, stq, 2, (int64_t)n);
   if (st != KBC_OK) {
-    (void)finalize(err, s, stq);
+    (void)finalize(err, s, stq, st);
     unlock(s);
     return st;
   }
@@ -1022,7 +1041,7 @@ kbc_status kbc_store_list_comments(kbc_store *s, kbc_arena *a,
     arr[i].resolved = sqlite3_column_int(stq, 6) != 0;
     i++;
   }
-  kbc_status fin = finalize(err, s, stq);
+  kbc_status fin = finalize(err, s, stq, st);
   if (st == KBC_OK) st = fin;
   unlock(s);
   if (st != KBC_OK) return st;
@@ -1050,7 +1069,7 @@ kbc_status kbc_store_set_comment_resolved(kbc_store *s, const char *comment_id,
     int step = sqlite3_step(up);
     if (step != SQLITE_DONE) st = sql_fail(err, s, "resolve comment", step);
   }
-  kbc_status fin = finalize(err, s, up);
+  kbc_status fin = finalize(err, s, up, st);
   if (st == KBC_OK) st = fin;
   if (st == KBC_OK && sqlite3_changes(s->db) == 0)
     st = kbc_err_set(err, KBC_ERR_NOTFOUND, "comment %s: not found", comment_id);

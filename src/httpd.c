@@ -111,8 +111,7 @@ typedef struct conn {
   bool sse;
   kbc_arena *arena;
 
-  kbc_str in;
-  size_t in_len;
+  kbc_str in;         /* the buffered request bytes; `in.len` IS the length */
   kbc_str out;
   size_t out_off;
   size_t header_end; /* offset just past CRLFCRLF, 0 until headers complete */
@@ -396,6 +395,7 @@ static kbc_status path_normalize(kbc_arena *a, const char *raw, char **out,
     if (c == '/') {
       while (i + 1 < n && dec[i + 1] == '/') i++;
       if (i + 1 == n) break; /* trailing slash: drop it */
+      if (o == 1) continue;  /* the leading '/' is already written */
     }
     if (o + 2 > n + 2) {
       return kbc_err_set(err, KBC_ERR_PARSE, "path normalization overflow");
@@ -714,11 +714,20 @@ static kbc_status query_window(const char *query, size_t dflt_limit,
     *limit = (size_t)lim;
   }
   if (*limit > KBC_MAX_HITS) *limit = KBC_MAX_HITS;
-  int64_t off = query_int(query, "offset");
-  if (query_has(query, "offset") && off < 0) {
-    return kbc_err_set(err, KBC_ERR_INVALID, "offset must be an integer >= 0");
+  /* An absent offset means the first page. query_int() cannot tell "absent"
+   * from "present but not a number" — both return -1 — so presence is asked
+   * for separately and only a value the client actually sent is copied. A
+   * present offset that is negative is a client error; one past the store's
+   * ceiling is rejected downstream, not silently clamped here. */
+  *offset = 0;
+  if (query_has(query, "offset")) {
+    int64_t off = query_int(query, "offset");
+    if (off < 0) {
+      return kbc_err_set(err, KBC_ERR_INVALID,
+                         "offset must be an integer >= 0");
+    }
+    *offset = (size_t)off;
   }
-  *offset = (size_t)off;
   return KBC_OK;
 }
 
@@ -1482,7 +1491,7 @@ static void conn_process(conn *c) {
       if (conn_flush(c) == FLUSH_ERROR) conn_close(c->h, c);
       return;
     }
-    if (c->in_len == 0) {
+    if (c->in.len == 0) {
       if (c->eof) conn_close(c->h, c);
       return;
     }
@@ -1492,7 +1501,7 @@ static void conn_process(conn *c) {
     int status = 400;
     kbc_err err;
     kbc_err_reset(&err);
-    kbc_status st = req_parse(&r, c->in.ptr, c->in_len, &status, &err);
+    kbc_status st = req_parse(&r, c->in.ptr, c->in.len, &status, &err);
     if (kbc_failed(st)) {
       conn_fail_and_close(c, status, st, err.msg);
       return;
@@ -1501,11 +1510,11 @@ static void conn_process(conn *c) {
       if (c->eof) conn_close(c->h, c);
       return; /* need more bytes */
     }
-    if (c->in_len < r.header_end + r.body_want) {
+    if (c->in.len < r.header_end + r.body_want) {
       if (!c->eof) return; /* need the body */
       char msg[128];
       snprintf(msg, sizeof msg, "connection ended with %zu of %zu body bytes",
-               c->in_len - r.header_end, r.body_want);
+               c->in.len - r.header_end, r.body_want);
       conn_fail_and_close(c, 400, KBC_ERR_PARSE, msg);
       return;
     }
@@ -1524,7 +1533,7 @@ static void conn_process(conn *c) {
     /* kbc_request.body is documented as NUL-terminated by the server, so a
      * pipelined request behind this one gets a terminator for the length of
      * the dispatch and gets its own byte back afterwards. */
-    bool patched = c->consumed < c->in_len;
+    bool patched = c->consumed < c->in.len;
     char saved = '\0';
     if (patched) {
       saved = c->in.ptr[c->consumed];
@@ -1533,9 +1542,9 @@ static void conn_process(conn *c) {
     serve_request(c, &r);
     if (patched) c->in.ptr[c->consumed] = saved;
 
-    size_t left = c->in_len - c->consumed;
+    size_t left = c->in.len - c->consumed;
     if (left > 0) memmove(c->in.ptr, c->in.ptr + c->consumed, left);
-    c->in_len = left;
+    c->in.len = left; /* the consumed request leaves the buffer */
     kbc_arena_reset(c->arena);
     c->header_end = 0;
     c->body_want = 0;
@@ -1557,7 +1566,7 @@ static void conn_on_readable(conn *c) {
   for (;;) {
     ssize_t n = recv(c->fd, tmp, sizeof tmp, 0);
     if (n > 0) {
-      if (c->in_len + (size_t)n > KBC_REQ_BUF_MAX) {
+      if (c->in.len + (size_t)n > KBC_REQ_BUF_MAX) {
         conn_fail_and_close(c, 413, KBC_ERR_PARSE,
                             "request exceeds the maximum request size");
         return;
@@ -1595,7 +1604,7 @@ static void conn_on_writable(conn *c) {
     return;
   }
   conn_arm(c);
-  if (c->in_len > 0) conn_process(c);
+  if (c->in.len > 0) conn_process(c);
 }
 
 static void conn_on_wake(conn *c) {

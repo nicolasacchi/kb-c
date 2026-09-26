@@ -87,17 +87,25 @@ static void say_err(const char *fmt, ...) {
 }
 
 /* The one JSON object --json promises. Every exit path funnels through here
- * so the shape is identical whether the run succeeded or not. */
-static void json_error(const char *msg) {
+ * so the shape is identical whether the run succeeded or not. `error` stays
+ * the machine-readable status; `reason` is the human text naming the value
+ * that failed, and is omitted when there is nothing to add. */
+static void json_error2(const char *error, const char *reason) {
   kbc_str s;
   kbc_str_init(&s);
   (void)kbc_str_puts(&s, "{\"ok\":false,\"error\":");
-  (void)kbc_str_append_json_string(&s, msg, strlen(msg));
+  (void)kbc_str_append_json_string(&s, error, strlen(error));
+  if (reason != NULL && reason[0] != '\0') {
+    (void)kbc_str_puts(&s, ",\"reason\":");
+    (void)kbc_str_append_json_string(&s, reason, strlen(reason));
+  }
   (void)kbc_str_puts(&s, "}");
   fwrite(s.ptr, 1, s.len, stdout);
   fputc('\n', stdout);
   kbc_str_free(&s);
 }
+
+static void json_error(const char *msg) { json_error2(msg, NULL); }
 
 static void json_errorf(const char *fmt, ...)
     __attribute__((format(printf, 1, 2)));
@@ -109,6 +117,13 @@ static void json_errorf(const char *fmt, ...) {
   va_end(ap);
   json_error(buf);
 }
+
+/* A missing thing the user named is a user error; anything the daemon or the
+ * filesystem refused is an IO error. `e` is only trusted when it describes
+ * this very status: a caller that synthesises a status from an earlier
+ * `kbc_err` would otherwise print a stale reason. */
+static int fail_status(kbc_status s, const kbc_err *e, const char *what,
+                       const char *hint) __attribute__((noreturn));
 
 static int die_user(const char *fmt, ...)
     __attribute__((format(printf, 1, 2), noreturn));
@@ -142,11 +157,31 @@ static int status_exit(kbc_status s, const kbc_err *e, const char *what) {
   if (s == KBC_OK) {
     return EXIT_OK;
   }
-  const char *msg = (e != NULL && e->msg[0] != '\0') ? e->msg : kbc_status_str(s);
-  if (s == KBC_ERR_INVALID || s == KBC_ERR_NOTFOUND || s == KBC_ERR_PARSE) {
-    die_user("%s: %s", what, msg);
+  fail_status(s, e, what, NULL);
+}
+
+static int fail_status(kbc_status s, const kbc_err *e, const char *what,
+                       const char *hint) {
+  const char *reason =
+      (e != NULL && e->status == s && e->msg[0] != '\0') ? e->msg : NULL;
+  char error[KBC_ERR_MSG_MAX];
+  snprintf(error, sizeof error, "%s: %s", what, kbc_status_str(s));
+  /* `what` may be a path, the reason a full errno string: the human line is
+   * the one place the two are shown together, so it gets room for both. */
+  char human[2 * KBC_ERR_MSG_MAX + 64];
+  if (reason != NULL) {
+    snprintf(human, sizeof human, "%s: %s%s%s", what, reason,
+             hint != NULL ? " " : "", hint != NULL ? hint : "");
+  } else if (hint != NULL) {
+    snprintf(human, sizeof human, "%s: %s %s", what, kbc_status_str(s), hint);
+  } else {
+    snprintf(human, sizeof human, "%s", error);
   }
-  die_io("%s: %s", what, msg);
+  json_error2(error, reason);
+  say_err("%s", human);
+  exit((s == KBC_ERR_INVALID || s == KBC_ERR_NOTFOUND || s == KBC_ERR_PARSE)
+           ? EXIT_USER
+           : EXIT_DAEMON);
 }
 
 /* ------------------------------------------------------------- path utils -- */
@@ -804,14 +839,302 @@ static kbc_status http_call(const char *method, const char *path,
 static int call_failed(kbc_status s, const kbc_err *e, const char *what)
     __attribute__((noreturn));
 static int call_failed(kbc_status s, const kbc_err *e, const char *what) {
-  const char *msg = (e != NULL && e->msg[0] != '\0') ? e->msg : kbc_status_str(s);
-  if (s == KBC_ERR_INVALID) {
-    die_user("%s: %s", what, msg);
+  const char *hint = (s == KBC_ERR_IO && e != NULL &&
+                      strncmp(e->msg, "connect ", 8) == 0)
+                         ? "(start one with `kbc daemon`)"
+                         : NULL;
+  fail_status(s, e, what, hint);
+}
+
+/* ------------------------------------------------- local (no daemon) ----- */
+
+/* Which verbs fall back to a local, in-process app when nothing is
+ * listening: search, reindex, get and list. Each is a read over the same
+ * store and index the daemon would use -- reindex re-ingests into that same
+ * store -- and each renders through the same JSON the routes emit, so the
+ * two paths are indistinguishable except for the one stderr line.
+ * `add` does not fall back: it writes the config file itself, which is the
+ * user's intent rather than a query over the store. `status` does not: it
+ * reports the counters of a running daemon, which is the point of asking. */
+
+/* "Unreachable" is a transport failure and never a status code. A 401 or a
+ * 500 means the daemon IS there and is answering, so its answer is the one
+ * the user gets; only a resolve/connect/send/recv failure means nobody is
+ * home. http_call already turns 401 into a KBC_ERR_INVALID, so it can never
+ * reach the fallback. */
+static bool daemon_unreachable(kbc_status s, const kbc_err *e) {
+  if (s != KBC_ERR_IO || e == NULL) {
+    return false;
   }
-  if (s == KBC_ERR_IO && strncmp(msg, "connect ", 8) == 0) {
-    die_io("%s: %s (start one with `kbc daemon`)", what, msg);
+  static const char *const pre[] = { "resolve ", "connect ", "send ", "recv ",
+                                      NULL };
+  for (size_t i = 0; pre[i] != NULL; i++) {
+    if (strncmp(e->msg, pre[i], strlen(pre[i])) == 0) {
+      return true;
+    }
   }
-  die_io("%s: %s", what, msg);
+  return false;
+}
+
+/* The one line that names the path taken. --json promises an empty stderr,
+ * so there the fallback is silent and the JSON is the only output. */
+static void say_local(const char *verb) {
+  if (!g_json) {
+    fprintf(stderr, "%s: no daemon at %s; running locally\n", verb,
+            resolve_base_url());
+  }
+}
+
+/* ---- the JSON the routes emit, built here so both paths render alike ---- */
+
+/* The routes spell an absent artifact_id/summary as null and an absent
+ * corpus/path/title as ""; the local path must spell them the same way or
+ * the two bodies stop being interchangeable. */
+static kbc_status put_json_nullable(kbc_str *out, const char *s) {
+  return s != NULL ? kbc_str_append_json_string(out, s, strlen(s))
+                   : kbc_str_puts(out, "null");
+}
+
+static kbc_status put_json_text(kbc_str *out, const char *s) {
+  return kbc_str_append_json_string(out, s != NULL ? s : "",
+                                    s != NULL ? strlen(s) : 0);
+}
+
+static kbc_status search_row_json(kbc_str *out, const kbc_result_row *row) {
+  kbc_status st = kbc_str_printf(
+      out,
+      "{\"doc_id\":%lu,\"score\":%.6f,\"keyword_score\":%.6f,"
+      "\"vector_score\":%.6f,\"keyword_rank\":%ld,\"vector_rank\":%ld,"
+      "\"artifact_id\":",
+      (unsigned long)row->doc_id, row->score, row->keyword_score,
+      row->vector_score, (long)row->keyword_rank, (long)row->vector_rank);
+  if (kbc_failed(st)) {
+    return st;
+  }
+  st = put_json_nullable(out, row->artifact_id);
+  if (kbc_failed(st)) {
+    return st;
+  }
+  if ((st = kbc_str_puts(out, ",\"corpus\":"), kbc_failed(st))) {
+    return st;
+  }
+  if ((st = put_json_text(out, row->corpus), kbc_failed(st))) {
+    return st;
+  }
+  if ((st = kbc_str_puts(out, ",\"path\":"), kbc_failed(st))) {
+    return st;
+  }
+  if ((st = put_json_text(out, row->path), kbc_failed(st))) {
+    return st;
+  }
+  if ((st = kbc_str_puts(out, ",\"title\":"), kbc_failed(st))) {
+    return st;
+  }
+  if ((st = put_json_text(out, row->title), kbc_failed(st))) {
+    return st;
+  }
+  if ((st = kbc_str_puts(out, ",\"summary\":"), kbc_failed(st))) {
+    return st;
+  }
+  if ((st = put_json_nullable(out, row->summary), kbc_failed(st))) {
+    return st;
+  }
+  return kbc_str_putc(out, '}');
+}
+
+static kbc_status artifact_json(kbc_str *out, const kbc_artifact *art,
+                                bool with_source) {
+  kbc_status st = kbc_str_puts(out, "{\"id\":");
+  if (kbc_failed(st)) {
+    return st;
+  }
+  st = kbc_str_append_json_string(out, art->id, strlen(art->id));
+  if (kbc_failed(st)) {
+    return st;
+  }
+  st = kbc_str_printf(out,
+                      ",\"kind\":\"%s\",\"mtime_ns\":%lld,"
+                      "\"size_bytes\":%lld,\"content_hash\":%lu,"
+                      "\"heading_count\":%d,\"corpus\":",
+                      kbc_kind_str(art->kind), (long long)art->mtime_ns,
+                      (long long)art->size_bytes,
+                      (unsigned long)art->content_hash,
+                      (int)art->heading_count);
+  if (kbc_failed(st)) {
+    return st;
+  }
+  st = kbc_str_append_json_string(out, art->corpus, strlen(art->corpus));
+  if (kbc_failed(st)) {
+    return st;
+  }
+  if ((st = kbc_str_puts(out, ",\"path\":"), kbc_failed(st))) {
+    return st;
+  }
+  if ((st = kbc_str_append_json_string(out, art->path, strlen(art->path)),
+      kbc_failed(st))) {
+    return st;
+  }
+  if ((st = kbc_str_puts(out, ",\"title\":"), kbc_failed(st))) {
+    return st;
+  }
+  if ((st = put_json_text(out, art->title), kbc_failed(st))) {
+    return st;
+  }
+  if ((st = kbc_str_puts(out, ",\"summary\":"), kbc_failed(st))) {
+    return st;
+  }
+  if ((st = put_json_text(out, art->summary), kbc_failed(st))) {
+    return st;
+  }
+  if (!with_source) {
+    return kbc_str_putc(out, '}');
+  }
+  if ((st = kbc_str_puts(out, ",\"source\":"), kbc_failed(st))) {
+    return st;
+  }
+  if ((st = put_json_nullable(out, art->source), kbc_failed(st))) {
+    return st;
+  }
+  return kbc_str_putc(out, '}');
+}
+
+/* The local app: the same config the HTTP path would have used -- the same
+ * --config, token_path, data_dir, corpora -- and therefore the same store and
+ * index, so a daemon started later sees exactly what a local run wrote. */
+static kbc_app *local_open(kbc_err *err) {
+  kbc_err_reset(err);
+  return kbc_app_open(load_config(), err);
+}
+
+static kbc_status local_search_json(kbc_str *out, const kbc_query *kq,
+                                    kbc_err *err) {
+  kbc_app *app = local_open(err);
+  if (app == NULL) {
+    return KBC_ERR_IO;
+  }
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  kbc_search_result res;
+  memset(&res, 0, sizeof res);
+  kbc_status st = a != NULL ? KBC_OK
+                            : kbc_err_set(err, KBC_ERR_NOMEM,
+                                          "search: out of memory");
+  if (!kbc_failed(st)) {
+    st = kbc_app_search(app, a, kq, &res, err);
+  }
+  size_t emitted = 0;
+  if (!kbc_failed(st)) {
+    st = kbc_str_puts(out, "{\"results\":[");
+  }
+  for (size_t i = 0; !kbc_failed(st) && i < res.len && emitted < kq->limit;
+       i++) {
+    if (emitted > 0) {
+      st = kbc_str_putc(out, ',');
+      if (kbc_failed(st)) {
+        break;
+      }
+    }
+    st = search_row_json(out, &res.rows[i]);
+    if (kbc_failed(st)) {
+      break;
+    }
+    emitted++;
+  }
+  if (!kbc_failed(st)) {
+    st = kbc_str_printf(
+        out,
+        "],\"took_us\":%lld,\"candidates\":%zu,\"degraded\":%s,\"limit\":%zu,"
+        "\"offset\":0,\"count\":%zu}",
+        (long long)res.took_us, res.candidates, res.degraded ? "true" : "false",
+        kq->limit, emitted);
+  }
+  kbc_arena_free(a);
+  kbc_app_close(app);
+  return st;
+}
+
+/* The counters come from the app itself, exactly as route_reindex reads
+ * them, so the printed line is the same line. `kb` is not a filter here
+ * either: the route ignores it, so the local path ignores it too. */
+static kbc_status local_reindex_json(kbc_str *out, kbc_err *err) {
+  kbc_app *app = local_open(err);
+  if (app == NULL) {
+    return KBC_ERR_IO;
+  }
+  int64_t t0 = kbc_now_ns();
+  kbc_status st = kbc_app_reindex(app, err);
+  int64_t took_us = (kbc_now_ns() - t0) / 1000;
+  kbc_app_stats stats;
+  memset(&stats, 0, sizeof stats);
+  if (!kbc_failed(st)) {
+    kbc_err local;
+    kbc_err_reset(&local);
+    (void)kbc_app_stats_get(app, &stats, &local);
+  }
+  if (!kbc_failed(st)) {
+    st = kbc_str_printf(out, "{\"docs\":%lld,\"took_us\":%lld}",
+                        (long long)stats.last_reindex_docs,
+                        (long long)took_us);
+  }
+  kbc_app_close(app);
+  return st;
+}
+
+static kbc_status local_get_json(kbc_str *out, const char *id, bool with_source,
+                                 kbc_err *err) {
+  kbc_app *app = local_open(err);
+  if (app == NULL) {
+    return KBC_ERR_IO;
+  }
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  kbc_status st = a != NULL ? KBC_OK : kbc_err_set(err, KBC_ERR_NOMEM,
+                                                 "get: out of memory");
+  if (!kbc_failed(st)) {
+    st = kbc_app_get_artifact(app, a, id, with_source, &art, err);
+  }
+  if (!kbc_failed(st)) {
+    st = artifact_json(out, &art, with_source);
+  }
+  kbc_arena_free(a);
+  kbc_app_close(app);
+  return st;
+}
+
+static kbc_status local_list_json(kbc_str *out, const char *kb, size_t limit,
+                                  kbc_err *err) {
+  kbc_app *app = local_open(err);
+  if (app == NULL) {
+    return KBC_ERR_IO;
+  }
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  kbc_artifact *rows = NULL;
+  size_t n = 0;
+  kbc_status st = a != NULL ? KBC_OK : kbc_err_set(err, KBC_ERR_NOMEM,
+                                                 "list: out of memory");
+  if (!kbc_failed(st)) {
+    st = kbc_app_list_artifacts(app, a, kb, KBC_KIND__COUNT, limit, 0, &rows,
+                                &n, err);
+  }
+  if (!kbc_failed(st)) {
+    st = kbc_str_puts(out, "{\"artifacts\":[");
+  }
+  for (size_t i = 0; !kbc_failed(st) && i < n; i++) {
+    if (i > 0) {
+      st = kbc_str_putc(out, ',');
+      if (kbc_failed(st)) {
+        break;
+      }
+    }
+    st = artifact_json(out, &rows[i], false);
+  }
+  if (!kbc_failed(st)) {
+    st = kbc_str_printf(out, "],\"total\":%zu,\"limit\":%zu,\"offset\":0}", n,
+                        limit);
+  }
+  kbc_arena_free(a);
+  kbc_app_close(app);
+  return st;
 }
 
 /* --------------------------------------------------------------- output ---- */
@@ -1081,13 +1404,29 @@ static int cmd_search(int argc, char **argv, int start) {
   kbc_status s = http_call("GET", path.ptr, NULL, 0, &status, &resp);
   kbc_str_free(&path);
   if (kbc_failed(s)) {
-    return call_failed(s, &e, "search");
-  }
-  if (status == 404) {
+    if (!daemon_unreachable(s, &e)) {
+      return call_failed(s, &e, "search");
+    }
+    kbc_query kq;
+    memset(&kq, 0, sizeof kq);
+    kq.q = q;
+    kq.corpus = o.has_kb ? o.kb : NULL;
+    kq.kind = KBC_KIND__COUNT;
+    kq.mode = m;
+    kq.limit = limit;
+    kq.rrf_k = load_config()->rrf_k;
+    say_local("search");
+    kbc_str_init(&resp);
+    kbc_err_reset(&e);
+    s = local_search_json(&resp, &kq, &e);
+    if (kbc_failed(s)) {
+      kbc_str_free(&resp);
+      return call_failed(s, &e, "search");
+    }
+  } else if (status == 404) {
     kbc_str_free(&resp);
     die_user("search: no such corpus %s", o.has_kb ? o.kb : "(any)");
-  }
-  if (status < 200 || status >= 300) {
+  } else if (status < 200 || status >= 300) {
     kbc_str_free(&resp);
     die_io("search: HTTP %d", status);
   }
@@ -1133,13 +1472,25 @@ static int cmd_get(int argc, char **argv, int start) {
   kbc_status s = http_call("GET", path.ptr, NULL, 0, &status, &resp);
   kbc_str_free(&path);
   if (kbc_failed(s)) {
-    return call_failed(s, &e, "get");
-  }
-  if (status == 404) {
+    if (!daemon_unreachable(s, &e)) {
+      return call_failed(s, &e, "get");
+    }
+    say_local("get");
+    kbc_str_init(&resp);
+    kbc_err_reset(&e);
+    s = local_get_json(&resp, id, o.source, &e);
+    if (s == KBC_ERR_NOTFOUND) {
+      kbc_str_free(&resp);
+      die_user("no artifact %s", id);
+    }
+    if (kbc_failed(s)) {
+      kbc_str_free(&resp);
+      return call_failed(s, &e, "get");
+    }
+  } else if (status == 404) {
     kbc_str_free(&resp);
     die_user("no artifact %s", id);
-  }
-  if (status < 200 || status >= 300) {
+  } else if (status < 200 || status >= 300) {
     kbc_str_free(&resp);
     die_io("get: HTTP %d", status);
   }
@@ -1202,13 +1553,21 @@ static int cmd_list(int argc, char **argv, int start) {
   kbc_status s = http_call("GET", path.ptr, NULL, 0, &status, &resp);
   kbc_str_free(&path);
   if (kbc_failed(s)) {
-    return call_failed(s, &e, "list");
-  }
-  if (status == 404) {
+    if (!daemon_unreachable(s, &e)) {
+      return call_failed(s, &e, "list");
+    }
+    say_local("list");
+    kbc_str_init(&resp);
+    kbc_err_reset(&e);
+    if (kbc_failed(s = local_list_json(&resp, o.has_kb ? o.kb : NULL, limit,
+                                       &e))) {
+      kbc_str_free(&resp);
+      return call_failed(s, &e, "list");
+    }
+  } else if (status == 404) {
     kbc_str_free(&resp);
     die_user("list: no such corpus %s", o.has_kb ? o.kb : "(any)");
-  }
-  if (status < 200 || status >= 300) {
+  } else if (status < 200 || status >= 300) {
     kbc_str_free(&resp);
     die_io("list: HTTP %d", status);
   }
@@ -1251,9 +1610,19 @@ static int cmd_reindex(int argc, char **argv, int start) {
   kbc_status s = http_call("POST", R_REINDEX, body.ptr, body.len, &status, &resp);
   kbc_str_free(&body);
   if (kbc_failed(s)) {
-    return call_failed(s, &e, "reindex");
-  }
-  if (status < 200 || status >= 300) {
+    if (!daemon_unreachable(s, &e)) {
+      return call_failed(s, &e, "reindex");
+    }
+    /* The local app writes to the configured store and index, so a daemon
+     * started later sees exactly what this run indexed. */
+    say_local("reindex");
+    kbc_str_init(&resp);
+    kbc_err_reset(&e);
+    if (kbc_failed(s = local_reindex_json(&resp, &e))) {
+      kbc_str_free(&resp);
+      return call_failed(s, &e, "reindex");
+    }
+  } else if (status < 200 || status >= 300) {
     kbc_str_free(&resp);
     die_io("reindex: HTTP %d", status);
   }

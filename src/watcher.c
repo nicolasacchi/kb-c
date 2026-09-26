@@ -650,10 +650,14 @@ kbc_watcher *kbc_watcher_start(const kbc_config *cfg, kbc_event_fn fn,
   }
   w->wake_r = pipefd[0];
   w->wake_w = pipefd[1];
-  /* The write end is blocking-on-purpose: a full pipe already means a wakeup
-   * is pending, and stop() must not fail or block. */
-  (void)fcntl(w->wake_r, F_SETFD, FD_CLOEXEC);
+  /* The read end MUST be non-blocking: the loop drains it in a
+   * `while (read(...) > 0)` and the second read on an empty pipe would park
+   * the thread forever, so stop() would hang in pthread_join. A blocking
+   * write end is still what we want — a full pipe already means a wakeup is
+   * pending, and stop() must not fail or block. */
+  (void)fcntl(w->wake_r, F_SETFL, O_NONBLOCK);
   (void)fcntl(w->wake_w, F_SETFD, FD_CLOEXEC);
+  (void)fcntl(w->wake_r, F_SETFD, FD_CLOEXEC);
 
   w->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
   if (w->epoll_fd < 0) {

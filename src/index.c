@@ -141,6 +141,14 @@ struct kbc_index {
 
   kbc_posting *post;
   size_t post_len, post_cap;
+  /* Build-time only: the term slot index each appended posting belongs to.
+   * The commit loop appends one posting per DISTINCT TERM per document, so
+   * the global array is interleaved and post_off/post_len (a count, not a
+   * span) cannot describe a term's postings. This sidecar carries the missing
+   * term identity through the build so end_build can materialize one
+   * contiguous run per term. It is freed by end_build and never saved. */
+  uint32_t *post_term;
+  size_t post_term_cap;
 
   bool sealed;
 
@@ -195,8 +203,10 @@ static size_t round_up_pow2(size_t n) {
   return c;
 }
 
-/* kbc_str_reserve's contract is "extra more bytes"; this tolerates either
- * reading and doubles as a last resort. */
+/* kbc_str_reserve's contract is "extra MORE bytes" and its return is a bool
+ * (true = success; KBC_OK == 0 would read a successful reserve as a failure).
+ * The doubling call is sized in absolute bytes, so the whole amount is passed
+ * as `extra`; the re-read of s->cap is the authoritative check. */
 static kbc_status buf_reserve(kbc_str *s, size_t extra) {
   size_t need;
   if (extra > SIZE_MAX - s->len) {
@@ -206,10 +216,10 @@ static kbc_status buf_reserve(kbc_str *s, size_t extra) {
   if (s->cap >= need) {
     return KBC_OK;
   }
-  if (kbc_str_reserve(s, need - s->len) != KBC_OK) {
+  if (!kbc_str_reserve(s, need - s->len) && s->cap < need) {
     return KBC_ERR_NOMEM;
   }
-  if (s->cap < need && kbc_str_reserve(s, need) != KBC_OK) {
+  if (s->cap < need && !kbc_str_reserve(s, need) && s->cap < need) {
     return KBC_ERR_NOMEM;
   }
   return s->cap >= need ? KBC_OK : KBC_ERR_NOMEM;
@@ -731,6 +741,7 @@ void kbc_index_free(kbc_index *ix) {
   free(ix->dhash);
   free(ix->docs);
   free(ix->post);
+  free(ix->post_term);
   scratch_free(ix);
   acc_free(ix->acc);
   free(ix);
@@ -749,6 +760,9 @@ kbc_status kbc_index_begin_build(kbc_index *ix, kbc_err *err) {
   ix->doc_count = 0;
   ix->total_tokens = 0;
   ix->post_len = 0;
+  free(ix->post_term);
+  ix->post_term = NULL;
+  ix->post_term_cap = 0;
   ix->sealed = false;
   scratch_free(ix); /* a stale scratch carries stale term offsets */
   return KBC_OK;
@@ -849,6 +863,31 @@ kbc_status kbc_index_add_doc(kbc_index *ix, uint32_t doc_id, const char *corpus,
       }
       ix->post = np;
       ix->post_cap = cap;
+    }
+    /* The sidecar tracks ix->post one-for-one, so it is sized independently of
+     * whether the postings array happened to need to grow — the commit loop
+     * writes both and must not be able to fail halfway. */
+    if (n > ix->post_term_cap - ix->post_len) {
+      size_t cap = ix->post_term_cap ? ix->post_term_cap : 1024;
+      uint32_t *nt;
+      while (cap - ix->post_len < n) {
+        if (cap > SIZE_MAX / 2 || cap * 2 > SIZE_MAX / sizeof(uint32_t)) {
+          return kbc_err_set(err, KBC_ERR_NOMEM,
+                             "kbc_index_add_doc(doc %u): posting term sidecar "
+                             "overflow",
+                             doc_id);
+        }
+        cap *= 2;
+      }
+      nt = (uint32_t *)realloc(ix->post_term, cap * sizeof(*nt));
+      if (!nt) {
+        return kbc_err_set(err, KBC_ERR_NOMEM,
+                           "kbc_index_add_doc(doc %u): posting term sidecar "
+                           "alloc failed",
+                           doc_id);
+      }
+      ix->post_term = nt;
+      ix->post_term_cap = cap;
     }
   }
   if (n > 0 && ix->post_len + n > (size_t)UINT32_MAX) {
@@ -954,6 +993,7 @@ kbc_status kbc_index_add_doc(kbc_index *ix, uint32_t doc_id, const char *corpus,
     }
     ix->post[ix->post_len].doc = doc_id;
     ix->post[ix->post_len].tf = sc->tf[i];
+    ix->post_term[ix->post_len] = (uint32_t)ti;
     ix->post_len++;
     sl->post_len++;
   }
@@ -968,9 +1008,86 @@ kbc_status kbc_index_end_build(kbc_index *ix, kbc_err *err) {
   if (!ix) {
     return kbc_err_set(err, KBC_ERR_INVALID, "kbc_index_end_build: ix is NULL");
   }
-  /* Appending in doc order already gives ascending lists; assert it rather than
-   * re-sorting, so a caller that breaks the dense-id contract is caught here
-   * instead of showing up as a subtly wrong ranking. */
+  /* The build-time append interleaves terms in the global postings array (one
+   * posting per distinct term, in document order), so a term's postings are
+   * NOT the contiguous run every other layer — the header, the on-disk
+   * TSLOT/POST records, kbc_index_bm25 — assumes they are, and post_len is a
+   * COUNT, not a span, so the slots alone cannot say which postings are whose.
+   * The build-time sidecar ix->post_term does. Materialize the runs here, once:
+   * a stable counting sort keyed on the term slot, in slot order. Stability
+   * keeps doc_id ascending inside every run (documents are appended in
+   * ascending doc_id order), so nothing is compared or reordered. O(postings),
+   * no extra hashing. Failure-atomic: both scratch buffers are obtained and
+   * filled before anything is swapped, so a NOMEM leaves the index exactly as
+   * it was. */
+  {
+    size_t total = 0, run = 0, k;
+    kbc_posting *np;
+    uint32_t *cursor;
+
+    for (i = 0; i < ix->term_cap; i++) {
+      const kbc_term_slot *s = &ix->terms[i];
+      if (s->term_off == SLOT_EMPTY || s->term_off == SLOT_TOMB) {
+        continue;
+      }
+      total += s->post_len;
+    }
+    if (total == 0) {
+      free(ix->post_term);
+      ix->post_term = NULL;
+      ix->post_term_cap = 0;
+      ix->sealed = true;
+      scratch_free(ix);
+      return KBC_OK;
+    }
+    np = (kbc_posting *)malloc(total * sizeof(*np));
+    cursor = ix->term_cap ? (uint32_t *)malloc(ix->term_cap * sizeof(*cursor))
+                          : NULL;
+    if (!np || (ix->term_cap && !cursor)) {
+      free(np);
+      free(cursor);
+      return kbc_err_set(err, KBC_ERR_NOMEM,
+                         "kbc_index_end_build: cannot allocate the packed "
+                         "postings array (%zu postings over %zu term slots)",
+                         total, (size_t)ix->term_cap);
+    }
+    for (i = 0; i < ix->term_cap; i++) {
+      kbc_term_slot *s = &ix->terms[i];
+      if (s->term_off == SLOT_EMPTY || s->term_off == SLOT_TOMB) {
+        continue;
+      }
+      s->post_off = (uint32_t)run;
+      cursor[i] = (uint32_t)run;
+      run += s->post_len;
+    }
+    for (k = 0; k < ix->post_len; k++) {
+      uint32_t ti = ix->post_term[k];
+      kbc_term_slot *s;
+      /* A term retired mid-build (only the add_doc overflow rollback does that,
+       * and it truncates ix->post_len with it) leaves no run; the postings it
+       * owned are dead weight and are dropped here. The bound check is the
+       * belt to that braces: a sidecar entry can never name a slot past the
+       * table, and never reads out of it if one ever did. */
+      if (ti >= ix->term_cap) {
+        continue;
+      }
+      s = &ix->terms[ti];
+      if (s->term_off == SLOT_EMPTY || s->term_off == SLOT_TOMB) {
+        continue;
+      }
+      np[cursor[ti]++] = ix->post[k];
+    }
+    free(cursor);
+    free(ix->post);
+    free(ix->post_term);
+    ix->post = np;
+    ix->post_len = total;
+    ix->post_cap = total;
+    ix->post_term = NULL;
+    ix->post_term_cap = 0;
+  }
+  /* Assert the invariant the rest of the file (and the format) depends on:
+   * every term's postings are now one contiguous doc_id-ascending run. */
   for (i = 0; i < ix->term_cap; i++) {
     const kbc_term_slot *s = &ix->terms[i];
     const char *t;
@@ -1072,7 +1189,7 @@ size_t kbc_index_heap_bytes(const kbc_index *ix) {
 kbc_status kbc_index_save(const kbc_index *ix, const char *path, kbc_err *err) {
   kbc_str out;
   uint8_t hdr[HDR_SIZE];
-  size_t i, need;
+  size_t i, need, pad;
   kbc_status st = KBC_OK;
 
   if (!ix || !path) {
@@ -1117,7 +1234,12 @@ kbc_status kbc_index_save(const kbc_index *ix, const char *path, kbc_err *err) {
       st = kbc_str_append(&out, ix->tar.blocks[i].p, ix->tar.blocks[i].used);
     }
   }
-  for (i = 0; i < pad8(out.len) && st == KBC_OK; i++) {
+  /* The pad length is computed ONCE. Re-evaluating pad8(out.len) inside the
+   * loop condition made the bound drift as out.len grew, so the loop stopped
+   * short (3 bytes instead of 5 after the term arena) and every section after
+   * it landed at the wrong offset — a file this same loader rejected. */
+  pad = pad8(out.len);
+  for (i = pad; i > 0 && st == KBC_OK; i--) {
     st = kbc_str_putc(&out, '\0');
   }
   for (i = 0; i < ix->dar.nblocks && st == KBC_OK; i++) {
@@ -1125,7 +1247,8 @@ kbc_status kbc_index_save(const kbc_index *ix, const char *path, kbc_err *err) {
       st = kbc_str_append(&out, ix->dar.blocks[i].p, ix->dar.blocks[i].used);
     }
   }
-  for (i = 0; i < pad8(out.len) && st == KBC_OK; i++) {
+  pad = pad8(out.len);
+  for (i = pad; i > 0 && st == KBC_OK; i--) {
     st = kbc_str_putc(&out, '\0');
   }
   /* Doc table: lengths only. The writer emits corpus, path, title in that
@@ -1328,6 +1451,7 @@ kbc_index *kbc_index_open(const char *path, kbc_err *err) {
     }
     for (i = 0; i < doc_count; i++) {
       const uint8_t *rec = p + cur + (size_t)i * DREC_SIZE;
+      size_t base = at; /* this doc's first string; `at` runs forward only */
       uint32_t l[3];
       int k;
       l[0] = get_u32(rec + 0);
@@ -1335,7 +1459,9 @@ kbc_index *kbc_index_open(const char *path, kbc_err *err) {
       l[2] = get_u32(rec + 8);
       /* The writer emits corpus, path, title per document in that order, each
        * NUL terminated, so one checked walk rebuilds every pointer and no
-       * string read can leave the arena. */
+       * string read can leave the arena. `at` is a running cursor: rewinding
+       * it to each doc's base after the walk (as this once did) made every
+       * document re-read document 0's strings. */
       for (k = 0; k < 3; k++) {
         if ((uint64_t)(at - docs_at) + l[k] + 1 > doc_arena_len ||
             p[at + l[k]] != 0) {
@@ -1348,10 +1474,9 @@ kbc_index *kbc_index_open(const char *path, kbc_err *err) {
         }
         at += l[k] + 1;
       }
-      at -= (size_t)l[0] + l[1] + l[2] + 3; /* back to this doc's first string */
-      ix->docs[i].corpus = (const char *)p + at;
-      ix->docs[i].path = (const char *)p + at + l[0] + 1;
-      ix->docs[i].title = (const char *)p + at + l[0] + 1 + l[1] + 1;
+      ix->docs[i].corpus = (const char *)p + base;
+      ix->docs[i].path = (const char *)p + base + l[0] + 1;
+      ix->docs[i].title = (const char *)p + base + l[0] + 1 + l[1] + 1;
       ix->docs[i].kind = rec[16];
       ix->docs[i].token_count = get_u32(rec + 12);
     }
@@ -1690,8 +1815,9 @@ kbc_status kbc_index_expand_prefix(const kbc_index *ix, kbc_arena *a,
     if (!t || memcmp(t, pre, plen) != 0) {
       continue;
     }
-    if (kbc_strlist_push_owned(out, kbc_arena_strndup(a, t, s->term_len)) !=
-        KBC_OK) {
+    /* kbc_strlist_free free()s what it owns, and the caller's arena is not the
+     * heap: an owned arena pointer would abort in free(). Push a heap copy. */
+    if (kbc_strlist_push(out, t) != KBC_OK) {
       return kbc_err_set(err, KBC_ERR_NOMEM,
                          "kbc_index_expand_prefix(\"%s\"): out of memory", pre);
     }

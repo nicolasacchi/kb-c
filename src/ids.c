@@ -178,9 +178,13 @@ static uint64_t fnv1a64_update(uint64_t h, const void *data, size_t n) {
   return h;
 }
 
+/* Identity is the DOCUMENT, not its current revision: the name is a pure
+ * function of (corpus, path) so that editing a file updates its row in place
+ * instead of colliding with the UNIQUE(corpus, path) row that is already
+ * there. mtime and size remain the change-detection fast path; they are
+ * inputs to the "did this change?" decision, never to the name. */
 void kbc_id_for_artifact(char out[KBC_MAX_ID_LEN + 1], const char *corpus,
-                         const char *path, int64_t mtime_ns,
-                         int64_t size_bytes) {
+                         const char *path) {
   if (out == NULL) {
     return;
   }
@@ -194,26 +198,12 @@ void kbc_id_for_artifact(char out[KBC_MAX_ID_LEN + 1], const char *corpus,
 
   /* 0x1f is the ASCII unit separator: it cannot occur in a corpus name or a
    * corpus-relative path, so ("kb", "a/b") and ("k", "b/a") cannot collide
-   * into the same hash. The integers go in little-endian byte order, which is
-   * fixed by the standard rather than by the machine's byte order. */
+   * into the same hash. */
   const uint64_t basis = 0xcbf29ce484222325ull;
   uint64_t h = basis;
   h = fnv1a64_update(h, corpus, strlen(corpus));
   h = fnv1a64_update(h, "\x1f", 1);
   h = fnv1a64_update(h, path, strlen(path));
-  h = fnv1a64_update(h, "\x1f", 1);
-
-  uint64_t mt = (uint64_t)mtime_ns;
-  unsigned char mt_le[8];
-  uint64_t sz = (uint64_t)size_bytes;
-  unsigned char sz_le[8];
-  for (size_t i = 0; i < 8; i++) {
-    mt_le[i] = (unsigned char)((mt >> (8u * i)) & 0xffu);
-    sz_le[i] = (unsigned char)((sz >> (8u * i)) & 0xffu);
-  }
-  h = fnv1a64_update(h, mt_le, sizeof(mt_le));
-  h = fnv1a64_update(h, "\x1f", 1);
-  h = fnv1a64_update(h, sz_le, sizeof(sz_le));
 
   /* First 48 bits, hex, lowercase: 12 chars plus the NUL. */
   uint64_t top = h >> 16;

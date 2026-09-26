@@ -37,6 +37,9 @@
 #define KBC_CFG_MAX_WORKERS 256u
 #define KBC_CFG_MAX_CHUNK_BYTES (64u * 1024u * 1024u)
 #define KBC_CFG_MAX_RRF_K 1000
+/* A single table may not define more distinct keys than the format defines;
+ * the bound is what keeps the seen-key set below from being unbounded. */
+#define CFG_MAX_SEEN_KEYS 32u
 
 /* The tables and keys this build understands, as a closed set. */
 typedef enum {
@@ -70,6 +73,12 @@ typedef struct {
   kbc_corpus_cfg cfg;
   bool has_ignore;
 } cfg_corpus_stage;
+/* One key already applied in the current table. Bounded by CFG_MAX_SEEN_KEYS,
+ * well above the number of keys the format actually defines. */
+typedef struct {
+  char name[KBC_CFG_MAX_KEY_LEN + 1u];
+} cfg_seen_key;
+
 
 /* The overlay: unset fields are NULL, or false under their has_* flag. */
 typedef struct {
@@ -111,6 +120,10 @@ typedef struct {
   size_t ncorpora;
   size_t ccorpora; /* capacity */
   bool any_corpus;
+  /* Keys already applied in the current table; cleared at every table header,
+   * including each new [[corpus]] block, which is its own namespace. */
+  cfg_seen_key seen[CFG_MAX_SEEN_KEYS];
+  size_t nseen;
 } cfg_overlay;
 
 /* ------------------------------------------------------------- helpers -- */
@@ -192,7 +205,8 @@ static kbc_status cfg_corpus_push(cfg_overlay *ov, const char *file,
     p = (cfg_corpus_stage *)realloc(ov->corpora, cap * sizeof *ov->corpora);
     if (p == NULL) {
       return cfg_err_at(file, line, err, KBC_ERR_NOMEM,
-                        "out of memory growing corpora");
+                        "out of memory growing corpora for the [[corpus]] at "
+                        "this line");
     }
     ov->corpora = p;
     ov->ccorpora = cap;
@@ -270,11 +284,13 @@ static kbc_status cfg_scan_string(const char *s, size_t n, const char *file,
 
   if (n >= 3u && s[1] == quote && s[2] == quote) {
     return cfg_err_at(file, line, err, KBC_ERR_PARSE,
-                      "multi-line strings are not supported");
+                      "multi-line strings are not supported, found %c%c%c", quote,
+                      quote, quote);
   }
   buf = (char *)malloc(cap);
   if (buf == NULL) {
-    return cfg_err_at(file, line, err, KBC_ERR_NOMEM, "out of memory");
+    return cfg_err_at(file, line, err, KBC_ERR_NOMEM,
+                      "out of memory reading the string on this line");
   }
   while (i < n && s[i] != quote) {
     unsigned char c = (unsigned char)s[i];
@@ -309,13 +325,15 @@ static kbc_status cfg_scan_string(const char *s, size_t n, const char *file,
       if (cap > (size_t)KBC_MAX_ARTIFACT_BYTES) {
         free(buf);
         return cfg_err_at(file, line, err, KBC_ERR_INVALID,
-                          "string literal exceeds the maximum length");
+                          "string literal exceeds the %u-byte maximum",
+                          KBC_MAX_ARTIFACT_BYTES);
       }
       cap *= 2u;
       nb = (char *)realloc(buf, cap);
       if (nb == NULL) {
         free(buf);
-        return cfg_err_at(file, line, err, KBC_ERR_NOMEM, "out of memory");
+        return cfg_err_at(file, line, err, KBC_ERR_NOMEM,
+                          "out of memory growing the string on this line");
       }
       buf = nb;
     }
@@ -382,7 +400,7 @@ static kbc_status cfg_scan_array(const char *s, size_t n, const char *file,
       free(item);
       if (st != KBC_OK) {
         return cfg_err_at(file, line, err, KBC_ERR_NOMEM,
-                          "out of memory building array");
+                          "out of memory building the array on this line");
       }
       i += off + used;
     }
@@ -445,7 +463,7 @@ static kbc_status cfg_parse_value(const char *s, size_t n, const char *file,
   }
   if (m >= sizeof tmp) {
     return cfg_err_at(file, line, err, KBC_ERR_PARSE,
-                      "unquoted value is too long");
+                      "unquoted value is too long: %.*s", cfg_show(m), p);
   }
   memcpy(tmp, p, m);
   tmp[m] = '\0';
@@ -518,7 +536,7 @@ static kbc_status cfg_parse_key(const char *s, size_t n, const char *file,
     if (after != 0 || i + 1u > out_cap) {
       free(q);
       return cfg_err_at(file, line, err, KBC_ERR_PARSE,
-                        "malformed key on this line");
+                        "malformed key: %.*s", cfg_show(m), p);
     }
     memcpy(out, q, i + 1u);
     free(q);
@@ -614,7 +632,9 @@ static kbc_status cfg_take_str(char **slot, const cfg_value *v, const char *key,
   }
   dup = cfg_strdup(v->s);
   if (dup == NULL) {
-    return cfg_err_at(file, line, err, KBC_ERR_NOMEM, "out of memory");
+    return cfg_err_at(file, line, err, KBC_ERR_NOMEM,
+                      "out of memory copying the value of key \"%s\" (%s)", key,
+                      v->s);
   }
   free(*slot);
   *slot = dup;
@@ -630,13 +650,37 @@ static kbc_status cfg_range(const char *key, int64_t val, int64_t lo, int64_t hi
   }
   return KBC_OK;
 }
+/* Records `key` as seen in the current table, or rejects it if this table
+ * already carried it. A repeated key is a parse error, never a silent
+ * last-one-wins: a config the daemon does not fully understand must not be
+ * half-applied. State lives in the overlay, which is per-file, and is reset
+ * at every table header — so the same key may appear once per table, and
+ * `name`/`path`/`ignore` once per [[corpus]] block. */
+static kbc_status cfg_note_key(cfg_overlay *ov, const char *key,
+                               const char *file, size_t line, kbc_err *err) {
+  size_t i;
+  for (i = 0; i < ov->nseen; i++) {
+    if (strcmp(ov->seen[i].name, key) == 0) {
+      return cfg_err_at(file, line, err, KBC_ERR_PARSE,
+                        "key \"%s\" is already set earlier in this table", key);
+    }
+  }
+  if (ov->nseen >= CFG_MAX_SEEN_KEYS) {
+    return cfg_err_at(file, line, err, KBC_ERR_PARSE,
+                      "table defines more than %u keys (at key \"%s\")",
+                      CFG_MAX_SEEN_KEYS, key);
+  }
+  memcpy(ov->seen[ov->nseen].name, key, strlen(key) + 1u);
+  ov->nseen++;
+  return KBC_OK;
+}
+
 
 static kbc_status cfg_apply_key(cfg_overlay *ov, cfg_section sec,
                                 cfg_corpus_stage *corpus, const char *key,
                                 cfg_value *v, const char *file, size_t line,
                                 kbc_err *err) {
   kbc_status st;
-
   if (sec == SEC_CORPUS) {
     if (corpus == NULL) {
       return cfg_err_at(file, line, err, KBC_ERR_PARSE,
@@ -655,15 +699,14 @@ static kbc_status cfg_apply_key(cfg_overlay *ov, cfg_section sec,
                           "key ignore expects an array of strings, found %s",
                           v->text);
       }
-      if (corpus->has_ignore) {
-        kbc_strlist_free(&corpus->cfg.ignore);
-        kbc_strlist_init(&corpus->cfg.ignore);
-      }
       corpus->has_ignore = true;
       for (i = 0; i < v->arr.len; i++) {
         st = kbc_strlist_push(&corpus->cfg.ignore, v->arr.items[i]);
         if (st != KBC_OK) {
-          return cfg_err_at(file, line, err, KBC_ERR_NOMEM, "out of memory");
+          return cfg_err_at(file, line, err, KBC_ERR_NOMEM,
+                            "out of memory building the ignore list of "
+                            "corpus \"%s\"",
+                            corpus->cfg.name != NULL ? corpus->cfg.name : "(unnamed)");
         }
       }
       return KBC_OK;
@@ -854,14 +897,16 @@ static kbc_status cfg_parse_line(cfg_overlay *ov, cfg_section *sec,
     return KBC_OK;
   }
   if (m > KBC_CFG_MAX_LINE_BYTES) {
-    return cfg_err_at(file, lineno, err, KBC_ERR_INVALID, "line is too long");
+    return cfg_err_at(file, lineno, err, KBC_ERR_INVALID,
+                      "line is longer than %u bytes", KBC_CFG_MAX_LINE_BYTES);
   }
 
   if (line[0] == '[') {
     if (m >= 2u && line[1] == '[') {
       if (m < 5u || line[m - 1u] != ']' || line[m - 2u] != ']') {
         return cfg_err_at(file, lineno, err, KBC_ERR_PARSE,
-                          "malformed array-of-tables header");
+                          "malformed array-of-tables header: %.*s", cfg_show(m),
+                          line);
       }
       st = cfg_parse_key(line + 2, m - 4u, file, lineno, key, sizeof key, err);
       if (st != KBC_OK) {
@@ -878,17 +923,19 @@ static kbc_status cfg_parse_line(cfg_overlay *ov, cfg_section *sec,
         return st;
       }
       *sec = SEC_CORPUS;
+      ov->nseen = 0; /* a new [[corpus]] block is its own key namespace */
       *cur = &ov->corpora[ov->ncorpora - 1u];
       return KBC_OK;
     }
     if (line[m - 1u] != ']') {
       return cfg_err_at(file, lineno, err, KBC_ERR_PARSE,
-                        "unterminated table header");
+                        "unterminated table header: %.*s", cfg_show(m), line);
     }
     st = cfg_parse_key(line + 1, m - 2u, file, lineno, key, sizeof key, err);
     if (st != KBC_OK) {
       return st;
     }
+    ov->nseen = 0;
     *sec = cfg_section_named(key);
     *cur = NULL;
     if (*sec == SEC_NONE) {
@@ -897,7 +944,9 @@ static kbc_status cfg_parse_line(cfg_overlay *ov, cfg_section *sec,
     }
     if (*sec == SEC_CORPUS) {
       return cfg_err_at(file, lineno, err, KBC_ERR_PARSE,
-                        "corpora are declared with [[corpus]], not [corpus]");
+                        "corpora are declared with [[corpus]], not [corpus]: "
+                        "[%s]",
+                        key);
     }
     return KBC_OK;
   }
@@ -931,6 +980,11 @@ static kbc_status cfg_parse_line(cfg_overlay *ov, cfg_section *sec,
   }
   st = cfg_parse_value(line + eq + 1u, m - eq - 1u, file, lineno, &v, err);
   if (st != KBC_OK) {
+    return st;
+  }
+  st = cfg_note_key(ov, key, file, lineno, err);
+  if (st != KBC_OK) {
+    cfg_value_free(&v);
     return st;
   }
   st = cfg_apply_key(ov, *sec, *cur, key, &v, file, lineno, err);
@@ -1201,7 +1255,6 @@ kbc_config *kbc_config_defaults(void) {
   if (c->bind_addr == NULL || c->data_dir == NULL || c->db_path == NULL ||
       c->index_path == NULL || c->token_path == NULL) {
     kbc_config_free(c);
-    free(c);
     return NULL;
   }
   return c;
@@ -1226,7 +1279,14 @@ void kbc_config_free(kbc_config *cfg) {
     kbc_strlist_free(&cfg->corpora[i].ignore);
   }
   free(cfg->corpora);
+  /* The struct is caller-owned memory too (KBC_OWN on kbc_config_defaults), so
+   * it goes with everything it owns. Every free above tolerates a NULL field,
+   * but this function is called EXACTLY ONCE per config: KBC_OWN means once, so
+   * a second call on the same pointer is a use-after-free, not a no-op. The
+   * memset is there so a post-free read of the caller's own pointer is more
+   * likely to fault loudly than to read a stale pointer. */
   memset(cfg, 0, sizeof *cfg);
+  free(cfg);
 }
 
 /* ------------------------------------------------------------- loading -- */

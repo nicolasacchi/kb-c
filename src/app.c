@@ -299,7 +299,8 @@ static kbc_status read_bounded(const char *path, kbc_str *out, kbc_err *err) {
 
 /* Reads, parses, stores and chunks one file. The id is minted here because
  * the store row and the index must agree on it (types.h: the same
- * (corpus, path, mtime_ns, size) always yields the same 12-hex id). */
+ * (corpus, path) always yields the same 12-hex id, so an edited file updates
+ * its row in place instead of colliding with the UNIQUE(corpus, path) one). */
 static kbc_status ingest_file(kbc_app *app, const char *corpus_name,
                               const char *root, const char *rel,
                               int64_t mtime_ns, int64_t size_bytes,
@@ -348,7 +349,7 @@ static kbc_status ingest_file(kbc_app *app, const char *corpus_name,
   }
 
   char id[KBC_MAX_ID_LEN + 1];
-  kbc_id_for_artifact(id, corpus_name, rel, mtime_ns, size_bytes);
+  kbc_id_for_artifact(id, corpus_name, rel);
 
   int32_t headings = 0;
   for (size_t i = 0; i < blocks->len; i++) {
@@ -534,14 +535,13 @@ static kbc_status walk_dir(kbc_app *app, const kbc_corpus_cfg *cc,
     row.mtime_ns = (int64_t)st.st_mtim.tv_sec * 1000000000LL +
                    (int64_t)st.st_mtim.tv_nsec;
     row.size_bytes = (int64_t)st.st_size;
-    kbc_id_for_artifact(row.id, cc->name, row.path, row.mtime_ns,
-                        row.size_bytes);
+    kbc_id_for_artifact(row.id, cc->name, row.path);
     kbc_str_free(&rel);
 
     /* The unchanged check is one indexed lookup against the stored row, which
-     * already carries the previous mtime and size. This is the whole point of
-     * the (mtime_ns, size) mint: an unedited file costs one stat and one
-     * primary-key read, and no read of its bytes. */
+     * already carries the previous mtime and size. (mtime_ns, size) is the
+     * change-detection fast path, never part of the name: an unedited file
+     * costs one stat and one lookup, and no read of its bytes. */
     kbc_arena *qa = kbc_arena_new(4096u);
     if (!qa) {
       s = kbc_err_set(err, KBC_ERR_NOMEM, "arena for %s", row.path);
@@ -556,7 +556,6 @@ static kbc_status walk_dir(kbc_app *app, const kbc_corpus_cfg *cc,
     kbc_err_reset(&local);
     kbc_status q = kbc_store_get_artifact_by_path(app->store, qa, cc->name,
                                                   row.path, &prev, &local);
-    kbc_arena_free(qa);
     if (kbc_failed(q)) {
       row.changed = true;
     } else {
@@ -564,6 +563,7 @@ static kbc_status walk_dir(kbc_app *app, const kbc_corpus_cfg *cc,
                       prev.size_bytes == row.size_bytes);
     }
     row.title = dup_cstr(prev.title ? prev.title : "");
+    kbc_arena_free(qa);
     if (!row.title) {
       row.title = dup_cstr("");
     }
@@ -684,7 +684,40 @@ static kbc_status build_index(kbc_app *app, kbc_app_manifest *m,
 
     kbc_str raw;
     kbc_str_init(&raw);
-    s = read_bounded(full.ptr, &raw, err);
+    bool have_source = false;
+    if (!row->changed) {
+      /* The whole point of the (mtime_ns, size) fast path: an unedited file
+       * must not have its bytes read. Its indexed text is whatever the last
+       * committed store row holds, so re-reading the file here would smuggle
+       * unindexed edits into the index behind the walk's back. */
+      kbc_artifact prev;
+      memset(&prev, 0, sizeof(prev));
+      kbc_err local;
+      kbc_err_reset(&local);
+      kbc_status g = kbc_store_get_artifact(app->store, fa, row->id, true,
+                                            &prev, &local);
+      if (!kbc_failed(g) && prev.source) {
+        s = kbc_str_append(&raw, prev.source, strlen(prev.source));
+        if (kbc_failed(s)) {
+          s = kbc_err_set(err, KBC_ERR_NOMEM, "stored source for %s",
+                          row->path);
+          kbc_str_free(&raw);
+          kbc_arena_free(fa);
+          kbc_str_free(&full);
+          goto fail;
+        }
+        have_source = true;
+      } else {
+        /* No committed row behind the skip: the store is the authority and it
+         * has nothing, so fall back to the file rather than index an empty
+         * document. */
+        KBC_LOGW("%s: no stored source for an unchanged file (%s), reading it",
+                 row->path, local.msg);
+      }
+    }
+    if (!have_source) {
+      s = read_bounded(full.ptr, &raw, err);
+    }
     if (kbc_failed(s)) {
       kbc_str_free(&raw);
       kbc_arena_free(fa);
@@ -855,6 +888,203 @@ static kbc_status promote_file(const char *path, kbc_err *err) {
   return KBC_OK;
 }
 
+/* -------------------------------------------------------- orphan sweep */
+
+/* The corpus on disk is the authority, and a full walk is the moment that
+ * authority is re-established. A store row whose (corpus, path) this walk did
+ * not see belongs to a file that has since been renamed or deleted on disk;
+ * leaving it behind is a permanent orphan, because no later reindex will ever
+ * see the path either. Deleting it here also keeps the row count in step with
+ * the corpus: a rename is a delete plus an insert, never a silent second row.
+ *
+ * The sweep is scoped to the corpora in this config and matches on the exact
+ * (corpus, path) pair, so a row of a different corpus — or the same path under
+ * a different corpus — is never touched. */
+
+/* Sorted set of "corpus\x1fpath" keys. 0x1f cannot occur in either part, so
+ * the join is unambiguous. Sorted + bsearch rather than a hash table: one
+ * comparison function, no per-entry allocation beyond the key itself. */
+typedef struct {
+  char **keys; /* KBC_OWN, each a strdup'd key */
+  size_t n, cap;
+} path_set;
+
+static void path_set_free(path_set *ps) {
+  for (size_t i = 0; i < ps->n; i++) {
+    free(ps->keys[i]);
+  }
+  free(ps->keys);
+  ps->keys = NULL;
+  ps->n = 0;
+  ps->cap = 0;
+}
+
+static int path_key_cmp(const void *a, const void *b) {
+  return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+static kbc_status path_set_push(path_set *ps, const char *key, kbc_err *err) {
+  if (ps->n == ps->cap) {
+    size_t cap = ps->cap ? ps->cap * 2u : 64u;
+    if (cap < ps->cap || cap > SIZE_MAX / sizeof(*ps->keys)) {
+      return kbc_err_set(err, KBC_ERR_NOMEM, "path set would exceed %zu keys",
+                         SIZE_MAX / sizeof(*ps->keys));
+    }
+    char **grown = (char **)realloc(ps->keys, cap * sizeof(*grown));
+    if (!grown) {
+      return kbc_err_set(err, KBC_ERR_NOMEM, "realloc for %zu path keys", cap);
+    }
+    ps->keys = grown;
+    ps->cap = cap;
+  }
+  char *copy = dup_cstr(key);
+  if (!copy) {
+    return kbc_err_set(err, KBC_ERR_NOMEM, "path key copy for \"%s\"", key);
+  }
+  ps->keys[ps->n++] = copy;
+  return KBC_OK;
+}
+
+static bool path_set_has(const path_set *ps, const char *key) {
+  if (ps->n == 0) {
+    return false;
+  }
+  return bsearch(&key, ps->keys, ps->n, sizeof(*ps->keys), path_key_cmp) !=
+         NULL;
+}
+
+/* One store row, one arena: the artifact's `path` is carved out of `qa`, so
+ * the arena has to outlive every use of it — the probe key, the delete
+ * warning and the log line all read `prev.path`. Keeping the arena inside
+ * this function makes that lifetime the block it belongs to. */
+static kbc_status sweep_one_id(kbc_app *app, const kbc_corpus_cfg *cc,
+                               const char *id, const path_set *seen,
+                               kbc_str *probe, size_t *removed, kbc_err *err) {
+  kbc_arena *qa = kbc_arena_new(4096u);
+  if (!qa) {
+    return kbc_err_set(err, KBC_ERR_NOMEM, "arena for %s", id);
+  }
+  kbc_artifact prev;
+  memset(&prev, 0, sizeof(prev));
+  kbc_err local;
+  kbc_err_reset(&local);
+  kbc_status q =
+      kbc_store_get_artifact(app->store, qa, id, false, &prev, &local);
+  if (kbc_failed(q)) {
+    /* Deleted between the id list and the read: nothing to orphan. */
+    KBC_LOGW("sweep: artifact %s vanished mid-sweep: %s", id, local.msg);
+    kbc_arena_free(qa);
+    return KBC_OK;
+  }
+
+  kbc_status s = KBC_OK;
+  kbc_str_clear(probe);
+  s = kbc_str_printf(probe, "%s\x1f%s", cc->name,
+                     prev.path ? prev.path : "");
+  if (kbc_failed(s)) {
+    s = kbc_err_set(err, KBC_ERR_NOMEM, "sweep key for %s", id);
+  } else if (path_set_has(seen, probe->ptr)) {
+    s = KBC_OK;
+  } else {
+    kbc_status d = kbc_store_delete_artifact(app->store, id, err);
+    if (kbc_failed(d)) {
+      /* One stuck row must not cost the whole rescan: the row stays
+       * visible and the next reindex tries again. */
+      KBC_LOGW("sweep: cannot drop %s/%s: %s", cc->name,
+               prev.path ? prev.path : "?", err->msg);
+      kbc_err_reset(err);
+      s = KBC_OK;
+    } else {
+      (*removed)++;
+      KBC_LOGI("sweep: %s/%s is no longer in the corpus, dropped", cc->name,
+               prev.path ? prev.path : "?");
+    }
+  }
+  kbc_arena_free(qa);
+  return s;
+}
+
+/* Deletes the store rows for paths the walk did not see. `removed` is the
+ * caller's log counter, not a manifest stat. */
+static kbc_status sweep_orphans(kbc_app *app, const kbc_app_manifest *m,
+                                size_t *removed, kbc_err *err) {
+  path_set seen;
+  memset(&seen, 0, sizeof(seen));
+  kbc_str key;
+  kbc_str_init(&key);
+
+  kbc_status s = KBC_OK;
+  for (size_t i = 0; i < m->len && !kbc_failed(s); i++) {
+    kbc_str_clear(&key);
+    s = kbc_str_printf(&key, "%s\x1f%s",
+                       app->cfg->corpora[m->items[i].corpus_index].name,
+                       m->items[i].path);
+    if (kbc_failed(s)) {
+      s = kbc_err_set(err, KBC_ERR_NOMEM, "seen-path key for %s",
+                      m->items[i].path);
+      break;
+    }
+    s = path_set_push(&seen, key.ptr, err);
+  }
+  if (!kbc_failed(s) && seen.n > 1) {
+    qsort(seen.keys, seen.n, sizeof(*seen.keys), path_key_cmp);
+  }
+  kbc_str_free(&key);
+  if (kbc_failed(s)) {
+    path_set_free(&seen);
+    return s;
+  }
+
+  for (size_t i = 0; i < app->cfg->ncorpora && !kbc_failed(s); i++) {
+    const kbc_corpus_cfg *cc = &app->cfg->corpora[i];
+
+    /* Every id for this corpus, collected before any delete: the paging
+     * offset would skip rows once deleted rows shrink the result set. */
+    kbc_strlist ids;
+    kbc_strlist_init(&ids);
+    for (size_t offset = 0; !kbc_failed(s);) {
+      char **page = NULL;
+      size_t np = 0;
+      s = kbc_store_list_artifact_ids(app->store, cc->name, KBC_KIND_ARTIFACT,
+                                     KBC_MAX_HITS, offset, &page, &np, err);
+      if (kbc_failed(s)) {
+        break;
+      }
+      for (size_t j = 0; j < np; j++) {
+        kbc_status ps = kbc_strlist_push(&ids, page[j]);
+        free(page[j]);
+        if (kbc_failed(ps)) {
+          s = kbc_err_set(err, KBC_ERR_NOMEM, "%zu stored ids for %s", np,
+                          cc->name);
+        }
+      }
+      free(page);
+      if (kbc_failed(s) || np == 0) {
+        break;
+      }
+      offset += np;
+    }
+    if (kbc_failed(s)) {
+      kbc_strlist_free(&ids);
+      break;
+    }
+
+    kbc_str probe;
+    kbc_str_init(&probe);
+    for (size_t j = 0; j < ids.len; j++) {
+      s = sweep_one_id(app, cc, ids.items[j], &seen, &probe, removed, err);
+      if (kbc_failed(s)) {
+        break;
+      }
+    }
+    kbc_str_free(&probe);
+    kbc_strlist_free(&ids);
+  }
+
+  path_set_free(&seen);
+  return s;
+}
+
 /* Walk -> ingest -> build -> save -> promote -> swap. On any failure before
  * the swap the old index keeps serving: the daemon never publishes a
  * half-built index, and the store keeps the rows it already committed. */
@@ -906,6 +1136,15 @@ static kbc_status reindex_locked(kbc_app *app, kbc_err *err) {
       g.title = NULL;
     }
     ingested_free(&g);
+  }
+
+  /* The walk is the authority on what the corpus contains, so the rows it did
+   * not see go now — before the build, so the published index and the store
+   * agree on the same document set. */
+  size_t n_removed = 0;
+  if (kbc_failed(s = sweep_orphans(app, &m, &n_removed, err))) {
+    manifest_free(&m);
+    return s;
   }
 
   kbc_index *ix = NULL;
@@ -979,8 +1218,9 @@ static kbc_status reindex_locked(kbc_app *app, kbc_err *err) {
   manifest_free(&m);
 
   KBC_LOGI("reindex: %" PRId64 " docs, %" PRId64 " terms (%zu changed, %zu "
-           "unchanged, %zu skipped, %" PRId64 " embedded) in %" PRId64 " us",
-           docs, terms, n_changed, n_unchanged, n_skipped, embedded,
+           "unchanged, %zu skipped, %zu removed, %" PRId64 " embedded) in %"
+           PRId64 " us",
+           docs, terms, n_changed, n_unchanged, n_skipped, n_removed, embedded,
            (t1 - t0) / 1000);
   return KBC_OK;
 }
