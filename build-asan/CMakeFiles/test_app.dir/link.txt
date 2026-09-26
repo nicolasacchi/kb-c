@@ -1,1 +1,0 @@
-/usr/bin/cc -O3 -DNDEBUG -fsanitize=address,undefined -Wl,--dependency-file=CMakeFiles/test_app.dir/link.d CMakeFiles/test_app.dir/tests/test_app.c.o -o test_app  libkbc_testing.a libkbc.a /usr/lib/libsqlite3.so -lm

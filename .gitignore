@@ -20,3 +20,8 @@ compile_commands.json
 .idea/
 *.swp
 .DS_Store
+
+# sanitizer / thread-sanitizer build trees (kept local, never committed)
+/build-asan/
+/build-tsan/
+/build-*/
