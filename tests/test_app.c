@@ -1296,6 +1296,30 @@ static void order_of_hits(kbc_app *app, const char *q, const char *corpus,
   kbc_arena_free(a);
 }
 
+/* Membership in a comma-joined ordering, counted. The three linkers share an
+ * in-degree, so they share a fused score and their relative order is decided by
+ * the index doc id tie-break, which the corpus walk assigns in readdir order.
+ * That differs between filesystems, so no test may pin their sequence — only
+ * the set. */
+static int order_count(const char *order, const char *name) {
+  int n = 0;
+  size_t len = strlen(name);
+  for (const char *p = order; (p = strstr(p, name)) != NULL; p += len) {
+    bool left = (p == order) || p[-1] == ',';
+    bool right = p[len] == '\0' || p[len] == ',';
+    if (left && right) n++;
+  }
+  return n;
+}
+
+/* The first entry of a comma-joined ordering, or "" when it is empty. */
+static bool order_starts_with(const char *order, const char *name) {
+  size_t len = strlen(name);
+  return strncmp(order, name, len) == 0 &&
+         (order[len] == '\0' || order[len] == ',');
+}
+
+
 KBC_TEST(the_graph_boost_is_off_by_default_and_reorders_when_configured) {
   fixture f;
   fx_setup(&f, false);
@@ -1331,6 +1355,11 @@ KBC_TEST(the_graph_boost_is_off_by_default_and_reorders_when_configured) {
   order_of_hits(f.app, "verdigris", CORPUS_A, off, sizeof off);
   KBC_CHECK_MSG(strncmp(off, "hub.md", 6) != 0,
                 "with the graph off the hub wins on text: %s", off);
+  /* ...and it is the same ordering every time in one process, so what follows
+   * compares a rerun, not a coin flip. */
+  char off2[KBC_TEST_PATH_MAX * 2];
+  order_of_hits(f.app, "verdigris", CORPUS_A, off2, sizeof off2);
+  KBC_CHECK_EQ_STR(off2, off);
 
   /* The same corpus, the same query, one config key added: the most-linked
    * document takes the top rank. The app takes its own copy of the config at
@@ -1339,7 +1368,12 @@ KBC_TEST(the_graph_boost_is_off_by_default_and_reorders_when_configured) {
   reopen_with_graph_boost(&f, 2.0);
   char on[KBC_TEST_PATH_MAX * 2];
   order_of_hits(f.app, "verdigris", CORPUS_A, on, sizeof on);
-  KBC_CHECK_EQ_STR(on, "hub.md,linker2.md,linker1.md,linker0.md,c.md");
+  KBC_CHECK_MSG(order_starts_with(on, "hub.md"),
+                "with the graph on the in-degree does not win: %s", on);
+  KBC_CHECK_EQ_INT(order_count(on, "linker0.md"), 1);
+  KBC_CHECK_EQ_INT(order_count(on, "linker1.md"), 1);
+  KBC_CHECK_EQ_INT(order_count(on, "linker2.md"), 1);
+  KBC_CHECK_EQ_INT(order_count(on, "c.md"), 1);
 
   /* The key removed: the off ranking returns, byte for byte. */
   reopen_with_graph_boost(&f, 0.0);
