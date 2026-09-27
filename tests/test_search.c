@@ -6,6 +6,7 @@
 #include "kbc_test.h"
 
 #include "kbc/search.h"
+
 /* Five docs, one searchable token each beyond the shared "search rank fusion"
  * stem, so every doc scores identically on a bare "search" query and the
  * tie-break (doc id ascending) is the only thing ordering them.
@@ -705,6 +706,263 @@ static kbc_status gram_run(kbc_searcher *s, kbc_arena *a, const char *text,
   return kbc_search_run(s, a, &q, NULL, 0, r, err);
 }
 
+/* --------------------------------------------------------------- facets -- */
+
+/* A facet evaluator the test owns, so the grammar's DNF grouping and the
+ * searcher's membership filter can be exercised without a store. It records
+ * the atoms it was handed and admits whatever `allow` says. */
+typedef struct {
+  kbc_facet_atom atoms[16];
+  size_t n_atoms;
+  size_t conj[8];
+  size_t n_conj;
+  int calls;
+  const uint32_t *allow;
+  size_t n_allow;
+} facet_probe;
+
+static kbc_status probe_facets(void *ctx, const char *corpus,
+                               const kbc_facets *facets, uint32_t **ids_out,
+                               size_t *n_out, kbc_err *err) {
+  (void)corpus;
+  facet_probe *p = ctx;
+  p->calls++;
+  p->n_atoms = facets->n_atoms;
+  p->n_conj = facets->n_conj;
+  for (size_t i = 0; i < facets->n_atoms && i < 16; i++)
+    p->atoms[i] = facets->atoms[i];
+  for (size_t i = 0; i <= facets->n_conj && i < 8; i++) p->conj[i] = facets->conj[i];
+  *ids_out = NULL;
+  *n_out = 0;
+  if (p->n_allow == 0) return KBC_OK;
+  *ids_out = malloc(p->n_allow * sizeof(uint32_t));
+  if (*ids_out == NULL)
+    return kbc_err_set(err, KBC_ERR_NOMEM, "probe: %zu ids", p->n_allow);
+  memcpy(*ids_out, p->allow, p->n_allow * sizeof(uint32_t));
+  *n_out = p->n_allow;
+  return KBC_OK;
+}
+
+static kbc_searcher *probe_searcher(const kbc_index *ix, facet_probe *p,
+                                    kbc_err *err) {
+  kbc_searcher *s = kbc_searcher_new(ix, resolver, NULL, err);
+  if (s == NULL) return NULL;
+  KBC_CHECK_OK(kbc_searcher_set_facet_fn(s, probe_facets, p, err));
+  return s;
+}
+
+/* `tag:a OR tag:b` is TWO CONJUNCTS with one atom each, which is the reading
+ * the original implements (query.rs:339 dnf_build, then any-conjunct at
+ * query.rs:246). A single conjunct holding both atoms would be an AND, and
+ * would answer a different question. */
+KBC_TEST(two_tags_in_an_or_become_two_conjuncts) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_index *ix = build_gram_index(a, &err);
+  facet_probe p;
+  memset(&p, 0, sizeof p);
+  static const uint32_t allow[] = {0, 2};
+  p.allow = allow;
+  p.n_allow = 2;
+  kbc_searcher *s = probe_searcher(ix, &p, &err);
+  KBC_CHECK_NOT_NULL(s);
+
+  kbc_search_result r;
+  KBC_CHECK_OK(gram_run(s, a, "tag:a OR tag:b", &r, &err));
+  KBC_CHECK_EQ_INT(p.calls, 1);
+  KBC_CHECK_EQ_INT(p.n_conj, 2);
+  KBC_CHECK_EQ_INT(p.n_atoms, 2);
+  KBC_CHECK_EQ_INT(p.conj[0], 0);
+  KBC_CHECK_EQ_INT(p.conj[1], 1);
+  KBC_CHECK_EQ_INT(p.conj[2], 2);
+  KBC_CHECK_EQ_STR(p.atoms[0].value, "a");
+  KBC_CHECK_EQ_STR(p.atoms[1].value, "b");
+  KBC_CHECK_EQ_INT(p.atoms[0].key, KBC_FACET_TAG);
+  /* The free text around the facets is empty: a facet atom never leaks into
+   * the BM25 string as the literal words "tag" and "a". */
+  KBC_CHECK_EQ_INT(r.len, 2);
+  KBC_CHECK_EQ_INT(r.rows[0].doc_id, 0);
+  KBC_CHECK_EQ_INT(r.rows[1].doc_id, 2);
+
+  kbc_searcher_free(s);
+  kbc_index_free(ix);
+  kbc_arena_free(a);
+}
+
+/* Two tags AND-ed are ONE conjunct with two atoms: the original ANDs every
+ * positive tag literal inside a conjunct (query.rs:286 is an any-OF over the
+ * row's tags, but the atoms are a conjunction of PREDICATES). */
+KBC_TEST(two_tags_anded_are_one_conjunct) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_index *ix = build_gram_index(a, &err);
+  facet_probe p;
+  memset(&p, 0, sizeof p);
+  kbc_searcher *s = probe_searcher(ix, &p, &err);
+  KBC_CHECK_NOT_NULL(s);
+
+  kbc_search_result r;
+  KBC_CHECK_OK(gram_run(s, a, "tag:a AND tag:b", &r, &err));
+  KBC_CHECK_EQ_INT(p.n_conj, 1);
+  KBC_CHECK_EQ_INT(p.n_atoms, 2);
+  kbc_searcher_free(s);
+  kbc_index_free(ix);
+  kbc_arena_free(a);
+}
+
+/* THE invariant: a facet filter that matches nothing is ZERO rows. If the
+ * membership set can be empty and the answer is still "every document", then
+ * `tag:nonexistent` is indistinguishable from no filter at all — which is
+ * what the whole refusal design exists to prevent. */
+KBC_TEST(a_facet_filter_that_matches_nothing_returns_zero_rows) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_index *ix = build_gram_index(a, &err);
+  facet_probe p;
+  memset(&p, 0, sizeof p);
+  p.allow = NULL;
+  p.n_allow = 0;
+  kbc_searcher *s = probe_searcher(ix, &p, &err);
+  KBC_CHECK_NOT_NULL(s);
+
+  kbc_search_result r;
+  KBC_CHECK_OK(gram_run(s, a, "tag:nonexistent", &r, &err));
+  KBC_CHECK_EQ_INT(p.calls, 1);
+  KBC_CHECK_EQ_INT(r.len, 0);
+  /* …and the same when there is free text alongside it. */
+  KBC_CHECK_OK(gram_run(s, a, "tag:nonexistent alpha", &r, &err));
+  KBC_CHECK_EQ_INT(r.len, 0);
+
+  kbc_searcher_free(s);
+  kbc_index_free(ix);
+  kbc_arena_free(a);
+}
+
+/* A filter-only query (`tag:rust` with no words) LISTS what matches, the way
+ * `folder:notes` does, rather than returning nothing because there was no text
+ * to score. */
+KBC_TEST(a_facet_only_query_lists_the_documents_that_match) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_index *ix = build_gram_index(a, &err);
+  facet_probe p;
+  memset(&p, 0, sizeof p);
+  static const uint32_t allow[] = {1, 3};
+  p.allow = allow;
+  p.n_allow = 2;
+  kbc_searcher *s = probe_searcher(ix, &p, &err);
+  KBC_CHECK_NOT_NULL(s);
+
+  kbc_search_result r;
+  KBC_CHECK_OK(gram_run(s, a, "tag:rust", &r, &err));
+  KBC_CHECK_EQ_INT(r.len, 2);
+  KBC_CHECK_EQ_INT(r.rows[0].doc_id, 1);
+  KBC_CHECK_EQ_INT(r.rows[1].doc_id, 3);
+
+  kbc_searcher_free(s);
+  kbc_index_free(ix);
+  kbc_arena_free(a);
+}
+
+/* Without an evaluator the facets are REFUSED, not dropped: a searcher that
+ * ignored `tag:rust` would answer a search for the literal words. */
+KBC_TEST(facets_without_an_evaluator_are_refused_not_ignored) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_index *ix = build_gram_index(a, &err);
+  kbc_searcher *s = kbc_searcher_new(ix, resolver, NULL, &err);
+  KBC_CHECK_NOT_NULL(s);
+
+  static const char *const qs[] = {"tag:rust", "cap:code", "caps:code",
+                                   "index:true"};
+  for (size_t i = 0; i < sizeof(qs) / sizeof(qs[0]); i++) {
+    kbc_search_result r;
+    kbc_err_reset(&err);
+    KBC_CHECK_EQ_INT(gram_run(s, a, qs[i], &r, &err), KBC_ERR_UNSUPPORTED);
+    KBC_CHECK_EQ_INT(r.len, 0);
+    KBC_CHECK(err.msg[0] != '\0');
+  }
+  kbc_searcher_free(s);
+  kbc_index_free(ix);
+  kbc_arena_free(a);
+}
+
+/* `index:` normalises to exactly one of two predicates, and the negation is
+ * folded into it: `NOT index:true` excludes index pages, which is what the
+ * original does (query.rs:392 exclude_index), while `NOT index:false` has
+ * nothing to exclude and is dropped with a warning. */
+KBC_TEST(index_negation_folds_into_the_exclusion_predicate) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_index *ix = build_gram_index(a, &err);
+  facet_probe p;
+  memset(&p, 0, sizeof p);
+  kbc_searcher *s = probe_searcher(ix, &p, &err);
+  KBC_CHECK_NOT_NULL(s);
+
+  /* `index:""` is the presence form this tokenizer can spell: a bare `index:`
+   * is a parse error, because the grammar requires a value token after the
+   * colon (the same rule that makes `tag:` a parse error). */
+  static const char *const truthy[] = {"index:true", "index:1", "index:yes",
+                                       "index:\"\""};
+  for (size_t i = 0; i < sizeof(truthy) / sizeof(truthy[0]); i++) {
+    kbc_search_result r;
+    kbc_err_reset(&err);
+    KBC_CHECK_OK(gram_run(s, a, truthy[i], &r, &err));
+    KBC_CHECK_EQ_INT(p.n_atoms, 1);
+    KBC_CHECK_EQ_INT(p.atoms[0].key, KBC_FACET_INDEX);
+    KBC_CHECK_EQ_STR(p.atoms[0].value, "index_only");
+  }
+  kbc_err_reset(&err);
+  kbc_search_result r;
+  KBC_CHECK_OK(gram_run(s, a, "NOT index:true", &r, &err));
+  KBC_CHECK_EQ_INT(p.n_atoms, 1);
+  KBC_CHECK_EQ_STR(p.atoms[0].value, "not_index");
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(gram_run(s, a, "index:false", &r, &err));
+  KBC_CHECK_EQ_STR(p.atoms[0].value, "not_index");
+
+  /* A value that is not a boolean is refused rather than guessed at. */
+  kbc_err_reset(&err);
+  KBC_CHECK_EQ_INT(gram_run(s, a, "index:maybe", &r, &err), KBC_ERR_INVALID);
+  KBC_CHECK(strstr(err.msg, "index") != NULL);
+  kbc_searcher_free(s);
+  kbc_index_free(ix);
+  kbc_arena_free(a);
+}
+
+/* An OR whose branches are not all the same path prefix is refused: kbc_query
+ * carries ONE path_prefix, so applying one branch's folder to another
+ * branch's facets would answer a different query. */
+KBC_TEST(an_or_mixing_a_folder_with_a_facet_is_refused) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_index *ix = build_gram_index(a, &err);
+  facet_probe p;
+  memset(&p, 0, sizeof p);
+  kbc_searcher *s = probe_searcher(ix, &p, &err);
+  KBC_CHECK_NOT_NULL(s);
+
+  kbc_search_result r;
+  KBC_CHECK_EQ_INT(gram_run(s, a, "folder:notes OR tag:a", &r, &err),
+                   KBC_ERR_UNSUPPORTED);
+  KBC_CHECK(strstr(err.msg, "folder") != NULL);
+  /* Every conjunct carrying the same folder is expressible, though. */
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(gram_run(s, a, "folder:notes AND (tag:a OR tag:b)", &r, &err));
+  KBC_CHECK_EQ_INT(p.n_conj, 2);
+  kbc_searcher_free(s);
+  kbc_index_free(ix);
+  kbc_arena_free(a);
+}
+
 /* fusion.rs:175 multiplies the score by (1 + TITLE_BOOST) when ANY query
  * term of 3+ bytes occurs anywhere in the title. Docs 0 and 1 have identical
  * bodies, so BM25 alone cannot order them; only the title can. */
@@ -845,10 +1103,13 @@ KBC_TEST(title_boost_is_a_substring_match_not_a_word_match) {
 }
 
 /* An atom the index cannot evaluate is an ERROR, never a search for the
- * literal words "tag" and "rust". `tag:` is a real key in the original
- * (query.rs:47) whose predicate — a tag facet — has no counterpart in a
- * kbc_doc_meta, so kb-c must refuse it by name. */
-KBC_TEST(an_unsupported_key_is_rejected_loudly_not_searched_literally) {
+ * literal words "tag" and "rust". Which atoms those are CHANGED when the
+ * overlay landed: `tag:`/`cap:`/`index:` are now real filters, and they are
+ * refused only by a searcher with no evaluator attached — the layer that owns
+ * no store. `scope:` is refused on its own terms, because the original does
+ * not evaluate it either (query.rs:404, an empty arm with a comment saying it
+ * belongs to /memory). An unknown key is still an error. */
+KBC_TEST(an_unevaluable_key_is_rejected_loudly_not_searched_literally) {
   kbc_err err;
   kbc_err_reset(&err);
   kbc_arena *a = kbc_arena_new(4096);
@@ -868,6 +1129,27 @@ KBC_TEST(an_unsupported_key_is_rejected_loudly_not_searched_literally) {
     KBC_CHECK_EQ_INT(r.len, 0);
   }
 
+  /* With an evaluator the same three keys are filters, not errors — and the
+   * rows they admit come from the membership set, never from the text. */
+  facet_probe p;
+  memset(&p, 0, sizeof p);
+  static const uint32_t allow[] = {2};
+  p.allow = allow;
+  p.n_allow = 1;
+  kbc_searcher *with = probe_searcher(ix, &p, &err);
+  KBC_CHECK_NOT_NULL(with);
+  static const char *const filterable[] = {"tag:rust", "cap:table",
+                                           "index:true"};
+  for (size_t i = 0; i < sizeof(filterable) / sizeof(filterable[0]); i++) {
+    kbc_search_result r;
+    kbc_err_reset(&err);
+    KBC_CHECK_OK(gram_run(with, a, filterable[i], &r, &err));
+    KBC_CHECK_EQ_INT(p.calls, (int)i + 1);
+    KBC_CHECK_EQ_INT(r.len, 1);
+    if (r.len == 1) KBC_CHECK_EQ_INT(r.rows[0].doc_id, 2);
+  }
+
+  kbc_searcher_free(with);
   kbc_searcher_free(s);
   kbc_index_free(ix);
   kbc_arena_free(a);
@@ -884,9 +1166,15 @@ KBC_TEST(an_unsupported_key_error_names_the_key) {
   kbc_searcher *s = kbc_searcher_new(ix, resolver, NULL, &err);
   KBC_CHECK_NOT_NULL(s);
 
+  /* The key the user typed is named in the message. `scope:` is the key the
+   * original does not evaluate either, so it is the one that still fails on
+   * its own terms; `tag:` now needs an evaluator and says so. */
   kbc_search_result r;
+  KBC_CHECK_EQ_INT(gram_run(s, a, "scope:kb", &r, &err), KBC_ERR_UNSUPPORTED);
+  KBC_CHECK(strstr(err.msg, "scope") != NULL);
+  kbc_err_reset(&err);
   KBC_CHECK_EQ_INT(gram_run(s, a, "tag:rust", &r, &err), KBC_ERR_UNSUPPORTED);
-  KBC_CHECK(strstr(err.msg, "tag") != NULL);
+  KBC_CHECK(strstr(err.msg, "metadata") != NULL);
   kbc_err_reset(&err);
   KBC_CHECK_EQ_INT(gram_run(s, a, "wibble:1", &r, &err), KBC_ERR_INVALID);
   KBC_CHECK(strstr(err.msg, "wibble") != NULL);
@@ -1597,8 +1885,8 @@ int main(void) {
                            title_boost_ignores_terms_shorter_than_three_bytes},
                           {"title_boost_is_a_substring_match_not_a_word_match",
                            title_boost_is_a_substring_match_not_a_word_match},
-                          {"an_unsupported_key_is_rejected_loudly_not_searched_literally",
-                           an_unsupported_key_is_rejected_loudly_not_searched_literally},
+                          {"an_unevaluable_key_is_rejected_loudly_not_searched_literally",
+                           an_unevaluable_key_is_rejected_loudly_not_searched_literally},
                           {"an_unsupported_key_error_names_the_key",
                            an_unsupported_key_error_names_the_key},
                           {"folder_atom_filters_by_path_prefix_and_leaves_the_text_alone",
@@ -1631,6 +1919,20 @@ int main(void) {
                            graph_boost_adds_exactly_the_formula_and_can_lift_a_row_past_the_limit},
                           {"graph_boost_absent_docs_count_zero_and_an_empty_graph_is_a_no_op",
                            graph_boost_absent_docs_count_zero_and_an_empty_graph_is_a_no_op},
+                          {"two_tags_in_an_or_become_two_conjuncts",
+                           two_tags_in_an_or_become_two_conjuncts},
+                          {"two_tags_anded_are_one_conjunct",
+                           two_tags_anded_are_one_conjunct},
+                          {"a_facet_filter_that_matches_nothing_returns_zero_rows",
+                           a_facet_filter_that_matches_nothing_returns_zero_rows},
+                          {"a_facet_only_query_lists_the_documents_that_match",
+                           a_facet_only_query_lists_the_documents_that_match},
+                          {"facets_without_an_evaluator_are_refused_not_ignored",
+                           facets_without_an_evaluator_are_refused_not_ignored},
+                          {"index_negation_folds_into_the_exclusion_predicate",
+                           index_negation_folds_into_the_exclusion_predicate},
+                          {"an_or_mixing_a_folder_with_a_facet_is_refused",
+                           an_or_mixing_a_folder_with_a_facet_is_refused},
                           {NULL, NULL},
                       });
 }

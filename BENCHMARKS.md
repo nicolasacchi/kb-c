@@ -1,16 +1,18 @@
 # BENCHMARKS
 
 Measured numbers only. Every figure came from a run on this machine (8-core
-x86-64, Linux 7.0, 62 GB) on **2026-09-26**. Nothing here is estimated or
-extrapolated. Where a comparison is imperfect, the imperfection is stated next to
-the number, not in a footnote.
+x86-64, Linux 7.0, 62 GB) on **2026-09-26**, except the C-client concurrency
+ladder, which is **2026-09-27**. Nothing here is estimated or extrapolated.
+Where a comparison is imperfect, the imperfection is stated next to the number,
+not in a footnote.
 
 Reproduce with:
 
 ```bash
 ./bench/make-corpus.sh                                  # stage the corpus
 QUERY_FILE=bench/queries.txt ./bench/bench-rust.sh       # the Rust baseline
-./bench/bench-kbc.sh                                    # kb-c, single + concurrent
+CLIENT=c ./bench/bench-kbc.sh                           # kb-c, single + concurrent
+CLIENT=python ./bench/bench-kbc.sh                      # the same, GIL-limited
 ./build/kbc --config <cfg> bench                        # kb-c, in-process
 ./bench/bench-rust-concurrency.sh bench/data/corpus/web-code  # matched-corpus A/B
 ./bench/bench-scale.sh 1000 && ./bench/bench-scale.sh 5000     # the scale ladder
@@ -95,9 +97,11 @@ end-to-end proof; the incremental number to quote is 9–14 ms. The earlier
 10.3 ms is not repeated in the table because it predates the fix and would
 imply a clean measurement it never was.
 
-The full-corpus gap is also partly "kb-c does less per document" — no links,
-wikilinks, attachments, capability flags, frontmatter or provenance edges, and
-no embedding model at ingest. Read it as a bound, not as "C is 140x faster".
+The full-corpus gap is also partly "kb-c does less per document" — no
+attachments, no capability analysis and no embedding model at ingest. It now
+does extract links and wikilinks and reads Markdown front matter, but the
+`cap:` facet it filters on is declared metadata rather than an analysis
+kb-c does not perform. Read the gap as a bound, not as "C is 140x faster".
 
 ## Memory and startup
 
@@ -128,13 +132,57 @@ So with the same model doing the same embedding work, kb-c holds ~7% *less*
 resident memory than the Rust daemon. The daemon's own footprint barely moves
 (18,816 kB → 22,844 kB) because the vector matrix is `mmap`ed, not copied.
 
+## Concurrency — kb-c, with a client that is not the bottleneck
+
+`bench/bench-kbc.sh` with `CLIENT=c` — the load client in
+[`kbcbench-client.c`](kbcbench-client.c) — on the same corpus, the same query
+file and the same `limit=10` the script defaults to, 4 workers, REPS=200,
+2026-09-27. Both CPU columns are printed by the script at every level, so the
+reader can see which side saturated.
+
+| conc | rps | p50 | p95 | p99 | client CPU | daemon CPU |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 3,387 | 0.26 ms | 0.55 ms | 0.63 ms | 0.054 | 0.889 |
+| 2 | 4,985 | 0.35 ms | 0.89 ms | 1.10 ms | 0.081 | 1.433 |
+| 4 | 6,948 | 0.47 ms | 1.04 ms | 1.43 ms | 0.118 | 2.019 |
+| 8 | 8,113 | 0.78 ms | 1.98 ms | 2.68 ms | 0.137 | 2.497 |
+| 16 | 8,747 | 1.39 ms | 3.65 ms | 5.61 ms | 0.150 | 2.617 |
+| 32 | 9,233 | 2.84 ms | 7.23 ms | 9.64 ms | 0.160 | 2.824 |
+
+**The client-vs-daemon CPU comparison is the acceptance evidence.** At 32
+clients the client burns 0.160 cores against the daemon's 2.824 — about 17x
+cheaper — and it is cheaper at every level in the table. That is the whole
+point of writing the client in C: the python client's GIL saturated before
+the daemon did, so the number it reported was a property of the harness.
+These rps are the server's.
+
+**The knee is at 16, not at 32.** 16→32 buys +6% rps while p50 more than
+doubles and p99 grows 1.7x, so past 16 the extra connections buy queueing, not
+throughput. Past 32 it goes backwards: **48 → 6,667 rps, 64 → 5,513 rps**, and
+the daemon's CPU *falls* to 1.80 then 1.34 cores. Falling server CPU at rising
+latency means the daemon is blocked, not searching.
+
+Absolute values track this host's loadavg (about 40, from other users), and
+are not portable; the shape is, and was reproduced across three runs.
+
+### The same workload with the python client
+
+Kept because the comparison is the interesting part — same corpus, same query
+set, same `limit=10`, same percentile code, one GIL apart. On the same run the
+python client reached **4,843 rps at 8 clients with 1.12 client cores against
+the daemon's 1.55** — more client CPU than server CPU, and 60% less
+throughput. Every kb-c concurrency figure in the sections below was taken
+this way, and every one of them is a floor rather than a ceiling for the same
+reason.
+
 ## Concurrency, Rust vs kb-c — MATCHED corpora
 
 `bench/bench-rust-concurrency.sh` against `bench/bench-kbc.sh`, both engines on
 the **same 360-document corpus** (`bench/data/corpus/web-code`, 360 documents
 indexed by each), the same query file, `REPS=30`, `mode=keyword`, 1/2/4/8
 clients, 2026-09-26. The corpora are matched here, which the latency table
-above is not.
+above is not. **The kb-c columns are the python-client measurement** — see the
+section above for the same workload with a client that is not the bottleneck.
 
 | clients | Rust rps | kb-c rps | Rust p50 | kb-c p50 |
 |---|---|---|---|---|
@@ -166,9 +214,11 @@ not the daemon, is what stops it.
 
 ## Concurrency — the two resolve fixes (kb-c only)
 
-`bench/bench-kbc.sh`, 8 clients, REPS=30, the `limit=10` the script uses by
-default. Before and after the resolve fix, run back to back on the same corpus
-on 2026-09-26:
+`bench/bench-kbc.sh`, **python client**, 8 clients, REPS=30, the `limit=10`
+the script uses by default. Before and after the resolve fix, run back to back
+on the same corpus on 2026-09-26. These are the python-client figures the
+resolve work was diagnosed against, kept as the record of that diagnosis; the
+C-client ladder is above.
 
 | clients | rps before | rps after | p50 before | p50 after | p99 before | p99 after |
 |---|---|---|---|---|---|---|
@@ -311,10 +361,10 @@ document comes from ingesting it.
 - **Cold page cache** for query latency; all query figures are warm.
 - **kb-c startup, cold** (no index on disk).
 
-## Two defects these measurements found
+## Three defects these measurements found
 
-Both were found by running the thing, not by reading it, and both are fixed
-with end-to-end proofs.
+All three were found by running the thing, not by reading it, and all three are
+fixed with end-to-end proofs.
 
 1. **The incremental path wrote an index its own loader rejected.** Two whole
    sections were declared in the header and never written, because an opened
@@ -326,6 +376,37 @@ with end-to-end proofs.
    could not be resolved, and the event was recorded as a *removal* — sweeping
    the document out of the index on every save. This is what the 355 ms
    "one file changed" number above was actually measuring.
+3. **The daemon double-freed its connection table under concurrent load.** The
+   daemon keeps ONE array of live connections that every worker appends to, and
+   the append grew that array with `realloc` **without** the mutex the close
+   path and the SSE fan-out already take. Two workers accepting at the same
+   instant both realloc'd the same block; one buffer was freed while
+   connections were still being written into it, and the process died with
+   glibc's `double free or corruption (!prev)`. It needs enough connections
+   arriving at once to reallocate the array while two workers are inside it:
+   the daemon first died in the load harness at 24+ concurrent connections,
+   and **reproducing it on demand took 5 attempts**, because below 64
+   connections the race essentially never fires. That is why neither the test
+   suite nor the old python client ever saw it.
+
+   Reproduced under ASan, which named the two stacks: `httpd_track`
+   (`src/httpd.c`) reallocating the same block in three different worker
+   threads. One mutex around the growth — the `conns_mu` the close path and
+   the SSE fan-out already take — is the whole fix.
+
+   | | before | after |
+   |---|---|---|
+   | 64 conns, ASan daemon | **daemon dead** (`attempting double-free`, level aborted) | 3/3 runs clean, 0 errors |
+   | 32 / 48 / 64 conns, release | 0 errors (survived by luck of the timing) | 3/3 runs, 0 errors at every level |
+   | new `concurrent_connects_do_not_corrupt_the_conn_table` under ASan | 5 of 10 runs abort | 10 of 10 clean |
+   | the same test under TSan | 3 of 3 report the data race | 3 of 3 clean |
+
+   The regression test hammers the real accept path — 32 threads released at
+   one barrier against a 4-worker daemon, 4 waves of 40 connections each — and
+   asserts what a user can see (every connection answered, the daemon still
+   serving afterwards). It is a real race, so a green run is not proof the old
+   code always failed; the sanitizer lanes are what make it decisive, and TSan
+   is deterministic about it.
 
 ## Why the query path is faster, and what is unproven
 

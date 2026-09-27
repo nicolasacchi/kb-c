@@ -973,6 +973,242 @@ KBC_TEST(links_a_pointy_bracket_target_and_a_title_are_read) {
   kbc_arena_free(a);
 }
 
+KBC_TEST(wikilinks_are_links_and_resolve_like_markdown_ones) {
+  kbc_arena *a = kbc_arena_new(4096);
+  const kbc_parsed *p = parse_links(
+      a, "ops/note.md",
+      "[[deploy]] [[../runbooks/x.md|the runbook]] [[y.md#part]] "
+      "[z](w.md)\n");
+  const kbc_links *ls = kbc_parsed_links(p);
+  KBC_CHECK_EQ_INT(ls->len, 4);
+  /* `[[deploy]]` has no visible text, so the text IS the target — the same
+   * value comrak puts in the no-pipe form's label. */
+  KBC_CHECK_EQ_STR(ls->items[0].target, "ops/deploy");
+  KBC_CHECK_EQ_STR(ls->items[0].text, "deploy");
+  KBC_CHECK_EQ_STR(ls->items[1].target, "runbooks/x.md");
+  KBC_CHECK_EQ_STR(ls->items[1].text, "the runbook");
+  /* '#section' is dropped by the one normaliser, exactly as for [a](y#p). */
+  KBC_CHECK_EQ_STR(ls->items[2].target, "ops/y.md");
+  KBC_CHECK_EQ_STR(ls->items[2].text, "y.md#part");
+  KBC_CHECK_EQ_STR(ls->items[3].target, "ops/w.md");
+  kbc_arena_free(a);
+}
+
+KBC_TEST(wikilinks_an_alias_is_display_text_only_and_duplicates_are_kept) {
+  kbc_arena *a = kbc_arena_new(4096);
+  const kbc_parsed *p =
+      parse_links(a, "n.md", "[[t.md]] [[t.md|two]] [[t.md]] [[t.md|three]]\n");
+  const kbc_links *ls = kbc_parsed_links(p);
+  /* Four references, one identity: the alias never reaches resolution. */
+  KBC_CHECK_EQ_INT(ls->len, 4);
+  for (size_t i = 0; i < ls->len; i++) {
+    KBC_CHECK_EQ_STR(ls->items[i].target, "t.md");
+  }
+  KBC_CHECK_EQ_STR(ls->items[1].text, "two");
+  KBC_CHECK_EQ_STR(ls->items[3].text, "three");
+  kbc_arena_free(a);
+}
+
+KBC_TEST(wikilinks_that_name_no_document_are_not_links) {
+  kbc_arena *a = kbc_arena_new(4096);
+  const kbc_parsed *p = parse_links(
+      a, "n/x.md",
+      "[[]] [[|x]] [[   ]] [[#section]] [[self]] [[https://e.com/a]] "
+      "[[../../escape.md]] [[../ok.md]] ![[embed.md]] [real](r.md)\n");
+  const kbc_links *ls = kbc_parsed_links(p);
+  /* empty, alias-only, blank, a self-anchor, a URL, a root escape and an
+   * embed are all out; `../ok.md` is a corpus document and so is [real]. */
+  KBC_CHECK_EQ_INT(ls->len, 3);
+  KBC_CHECK_EQ_STR(ls->items[0].target, "n/self");
+  KBC_CHECK_EQ_STR(ls->items[1].target, "ok.md");
+  KBC_CHECK_EQ_STR(ls->items[2].target, "n/r.md");
+  kbc_arena_free(a);
+}
+
+KBC_TEST(wikilinks_inside_a_fenced_code_block_are_not_links) {
+  kbc_arena *a = kbc_arena_new(4096);
+  const kbc_parsed *p =
+      parse_links(a, "n/x.md", "```\n[[inside.md]]\n```\n[[outside.md]]\n");
+  const kbc_links *ls = kbc_parsed_links(p);
+  KBC_CHECK_EQ_INT(ls->len, 1);
+  KBC_CHECK_EQ_STR(ls->items[0].target, "n/outside.md");
+  kbc_arena_free(a);
+}
+
+KBC_TEST(wikilinks_do_not_change_the_block_text) {
+  kbc_arena *a = kbc_arena_new(4096);
+  const kbc_parsed *bare = parse_links(a, "n.md", "Go to deploy now.\n");
+  const kbc_parsed *aliased =
+      parse_links(a, "n.md", "Go to [[deploy|the guide]] now.\n");
+  const kbc_parsed *plain = parse_links(a, "n.md", "Go to the guide now.\n");
+  const kbc_parsed *noalias = parse_links(a, "n.md", "Go to [[deploy]] now.\n");
+  KBC_CHECK_EQ_STR(kbc_parsed_blocks(aliased)->items[0].text,
+                   kbc_parsed_blocks(plain)->items[0].text);
+  KBC_CHECK_EQ_STR(kbc_parsed_blocks(noalias)->items[0].text,
+                   kbc_parsed_blocks(bare)->items[0].text);
+  kbc_arena_free(a);
+}
+
+KBC_TEST(wikilinks_that_do_not_close_on_their_line_are_not_links) {
+  kbc_arena *a = kbc_arena_new(4096);
+  const kbc_parsed *p =
+      parse_links(a, "n/x.md", "[[open\nmore]] [[a] [b](r.md)\n");
+  const kbc_links *ls = kbc_parsed_links(p);
+  /* a wikilink does not run across a line, so the first is plain prose and
+   * the second is the markdown link it always was */
+  KBC_CHECK_EQ_INT(ls->len, 1);
+  KBC_CHECK_EQ_STR(ls->items[0].target, "n/r.md");
+  kbc_arena_free(a);
+}
+
+/* ----------------------------------------------------------------- metas -- */
+
+static const kbc_metas *metas_of(kbc_parsed *p) {
+  const kbc_metas *m = kbc_parsed_metas(p);
+  KBC_CHECK_NOT_NULL(m);
+  return m;
+}
+
+/* The HTML form: only kb-* metas, the key lowercased, the value trimmed. */
+KBC_TEST(metas_html_kb_prefix_only) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a,
+                            "<html><head>"
+                            "<meta name=\"kb-Tags\" content=\" Search , index \">"
+                            "<meta name=\"author\" content=\"nobody\">"
+                            "<meta name=\"description\" content=\"no\">"
+                            "<meta name=\"kb-index\" content=\"true\">"
+                            "</head><body><h1>T</h1><p>body</p></body></html>");
+  const kbc_metas *m = metas_of(p);
+  /* two tags from one comma-separated content, one boolean, and nothing from
+   * the two metas that are not kb-* */
+  KBC_CHECK_EQ_INT(m->len, 3);
+  KBC_CHECK_EQ_STR(m->items[0].key, "tags");
+  KBC_CHECK_EQ_STR(m->items[0].value, "Search");
+  KBC_CHECK_EQ_STR(m->items[1].key, "tags");
+  KBC_CHECK_EQ_STR(m->items[1].value, "index");
+  KBC_CHECK_EQ_STR(m->items[2].key, "index");
+  KBC_CHECK_EQ_STR(m->items[2].value, "true");
+  kbc_arena_free(a);
+}
+
+/* `caps` is multi-valued like `tags`; every other key carries its content
+ * whole, commas and all, because a value that is not a list is not a list. */
+KBC_TEST(metas_caps_expands_and_a_scalar_key_does_not) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a,
+                            "<meta name=\"kb-caps\" content=\"code, svg\">"
+                            "<meta name=\"kb-locale\" content=\"pt-BR, en\">");
+  const kbc_metas *m = metas_of(p);
+  KBC_CHECK_EQ_INT(m->len, 3);
+  KBC_CHECK_EQ_STR(m->items[0].key, "caps");
+  KBC_CHECK_EQ_STR(m->items[0].value, "code");
+  KBC_CHECK_EQ_STR(m->items[1].key, "caps");
+  KBC_CHECK_EQ_STR(m->items[1].value, "svg");
+  KBC_CHECK_EQ_STR(m->items[2].key, "locale");
+  KBC_CHECK_EQ_STR(m->items[2].value, "pt-BR, en");
+  kbc_arena_free(a);
+}
+
+/* A valueless <meta> is still a declaration: `<meta name="kb-index">` says
+ * "this is an index" and an empty value is what it says it with. */
+KBC_TEST(metas_a_valueless_element_declares_an_empty_value) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a, "<meta name=\"kb-index\"><h1>T</h1>");
+  const kbc_metas *m = metas_of(p);
+  KBC_CHECK_EQ_INT(m->len, 1);
+  KBC_CHECK_EQ_STR(m->items[0].key, "index");
+  KBC_CHECK_EQ_STR(m->items[0].value, "");
+  kbc_arena_free(a);
+}
+
+/* Markdown front matter says the same thing, and is read the same way: the
+ * kb- prefix is required there too, so a document's `title:` stays a
+ * document. */
+KBC_TEST(metas_front_matter_is_read_like_the_html_form) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a,
+                            "---\n"
+                            "title: Not a facet\n"
+                            "kb-tags: search, index\n"
+                            "kb-index: true\n"
+                            "---\n"
+                            "# Heading\n\nProse.\n");
+  const kbc_metas *m = metas_of(p);
+  KBC_CHECK_EQ_INT(m->len, 3);
+  KBC_CHECK_EQ_STR(m->items[0].key, "tags");
+  KBC_CHECK_EQ_STR(m->items[0].value, "search");
+  KBC_CHECK_EQ_STR(m->items[1].key, "tags");
+  KBC_CHECK_EQ_STR(m->items[1].value, "index");
+  KBC_CHECK_EQ_STR(m->items[2].key, "index");
+  KBC_CHECK_EQ_STR(m->items[2].value, "true");
+  kbc_arena_free(a);
+}
+
+/* The block-list form, which is how a YAML writer spells a list. Dropping it
+ * would silently lose every tag in this shape. */
+KBC_TEST(metas_front_matter_block_list) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a,
+                            "---\n"
+                            "kb-tags:\n"
+                            "  - rust\n"
+                            "  - c\n"
+                            "---\n"
+                            "Body.\n");
+  const kbc_metas *m = metas_of(p);
+  KBC_CHECK_EQ_INT(m->len, 2);
+  KBC_CHECK_EQ_STR(m->items[0].key, "tags");
+  KBC_CHECK_EQ_STR(m->items[0].value, "rust");
+  KBC_CHECK_EQ_STR(m->items[1].key, "tags");
+  KBC_CHECK_EQ_STR(m->items[1].value, "c");
+  kbc_arena_free(a);
+}
+
+/* A horizontal rule at the top of a document is not an unterminated front
+ * matter block, and a document that opens with `---` and never closes it
+ * must not have its whole text read as metadata. */
+KBC_TEST(metas_an_unclosed_front_matter_fence_is_not_front_matter) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a, "---\n\nkb-tags: rust\n\nMore prose.\n");
+  KBC_CHECK_EQ_INT(metas_of(p)->len, 0);
+  kbc_arena_free(a);
+}
+
+/* THE INVARIANT: reading metadata must not move a byte of what the index
+ * tokenizes. A `<meta>` element between two paragraphs is the case that
+ * would break it — a scanner that fed the tag through the block builder
+ * would glue "Meta" into the prose. */
+KBC_TEST(metas_do_not_change_the_block_text) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *plain = parse_doc(a, "First paragraph.\n\nSecond paragraph.\n");
+  kbc_parsed *tagged =
+      parse_doc(a,
+                "First paragraph.\n"
+                "<meta name=\"kb-tags\" content=\"x, y\">\n"
+                "\n"
+                "Second paragraph.\n");
+  const kbc_blocks *bp = kbc_parsed_blocks(plain);
+  const kbc_blocks *bt = kbc_parsed_blocks(tagged);
+  KBC_CHECK_EQ_INT(bp->len, bt->len);
+  if (bp->len == bt->len && bt->len > 0) {
+    KBC_CHECK_EQ_STR(bp->items[0].text, bt->items[0].text);
+    KBC_CHECK_EQ_STR(bp->items[1].text, bt->items[1].text);
+  }
+  KBC_CHECK_EQ_INT(kbc_parsed_links(tagged)->len, 0);
+  kbc_arena_free(a);
+}
+
+/* A document that declares nothing yields an empty list, never NULL: the
+ * caller iterates it without a null check, and a filter over a missing facet
+ * has to be "no rows", not a crash. */
+KBC_TEST(metas_a_document_without_any_yields_an_empty_list) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a, "# Plain\n\nNo metadata here.\n");
+  KBC_CHECK_EQ_INT(metas_of(p)->len, 0);
+  kbc_arena_free(a);
+}
+
 static const kbc_test_case cases[] = {
     {"md_atx_headings", md_atx_headings},
     {"md_atx_heading_trims_closing_hashes", md_atx_heading_trims_closing_hashes},
@@ -1044,6 +1280,30 @@ static const kbc_test_case cases[] = {
      links_inside_a_fenced_code_block_are_not_links},
     {"links_a_pointy_bracket_target_and_a_title_are_read",
      links_a_pointy_bracket_target_and_a_title_are_read},
+    {"wikilinks_are_links_and_resolve_like_markdown_ones",
+     wikilinks_are_links_and_resolve_like_markdown_ones},
+    {"wikilinks_an_alias_is_display_text_only_and_duplicates_are_kept",
+     wikilinks_an_alias_is_display_text_only_and_duplicates_are_kept},
+    {"wikilinks_that_name_no_document_are_not_links",
+     wikilinks_that_name_no_document_are_not_links},
+    {"wikilinks_inside_a_fenced_code_block_are_not_links",
+     wikilinks_inside_a_fenced_code_block_are_not_links},
+    {"wikilinks_do_not_change_the_block_text", wikilinks_do_not_change_the_block_text},
+    {"wikilinks_that_do_not_close_on_their_line_are_not_links",
+     wikilinks_that_do_not_close_on_their_line_are_not_links},
+    {"metas_html_kb_prefix_only", metas_html_kb_prefix_only},
+    {"metas_caps_expands_and_a_scalar_key_does_not",
+     metas_caps_expands_and_a_scalar_key_does_not},
+    {"metas_a_valueless_element_declares_an_empty_value",
+     metas_a_valueless_element_declares_an_empty_value},
+    {"metas_front_matter_is_read_like_the_html_form",
+     metas_front_matter_is_read_like_the_html_form},
+    {"metas_front_matter_block_list", metas_front_matter_block_list},
+    {"metas_an_unclosed_front_matter_fence_is_not_front_matter",
+     metas_an_unclosed_front_matter_fence_is_not_front_matter},
+    {"metas_do_not_change_the_block_text", metas_do_not_change_the_block_text},
+    {"metas_a_document_without_any_yields_an_empty_list",
+     metas_a_document_without_any_yields_an_empty_list},
     {NULL, NULL},
 };
 

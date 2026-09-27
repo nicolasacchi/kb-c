@@ -83,7 +83,46 @@ static const char *const SCHEMA_V2 =
     " PRIMARY KEY(corpus, src_path, dst_path));"
     "CREATE INDEX IF NOT EXISTS edges_dst ON edges(corpus, dst_path);";
 
-#define SCHEMA_VERSION 2
+/* v3 — pending links: the link targets a document named that were not an
+ * indexed document when the source was written. An edge is owned by its
+ * source, so a document that appears AFTER the documents that link to it
+ * would otherwise stay at in-degree 0 forever: nothing ever rewrites those
+ * sources' edges. This table is the only record that the link exists, and it
+ * is what makes the graph independent of the order documents were visited
+ * in — kbc_store_drain_pending materialises the edge the moment the target
+ * lands. Path-keyed like edges, for the same reason. */
+static const char *const SCHEMA_V3 =
+    "CREATE TABLE IF NOT EXISTS pending_links ("
+    " corpus TEXT NOT NULL,"
+    " src_path TEXT NOT NULL,"
+    " dst_path TEXT NOT NULL,"
+    " PRIMARY KEY(corpus, src_path, dst_path));"
+    "CREATE INDEX IF NOT EXISTS pending_links_dst"
+    " ON pending_links(corpus, dst_path);";
+
+/* v4 — per-document metadata, the facets the query overlay filters on. One
+ * row per (corpus, path, key, value), and one entry per VALUE of a
+ * multi-valued key, so `kb-tags="search, index"` is two rows and matching
+ * one tag is an index probe rather than a string scan. The (corpus, key,
+ * value) index is the query the overlay actually runs; (corpus, path) is
+ * what makes replace-on-ingest a single DELETE.
+ *
+ * Path-keyed like edges and pending_links, for the same reason: a document's
+ * id is minted from (corpus, path) but a facet is a name in a source file,
+ * and a re-ingest must be able to REPLACE the document's facets without
+ * knowing anything else about it. */
+static const char *const SCHEMA_V4 =
+    "CREATE TABLE IF NOT EXISTS doc_metas ("
+    " corpus TEXT NOT NULL,"
+    " path TEXT NOT NULL,"
+    " key TEXT NOT NULL,"
+    " value TEXT NOT NULL,"
+    " PRIMARY KEY(corpus, path, key, value));"
+    "CREATE INDEX IF NOT EXISTS doc_metas_kv"
+    " ON doc_metas(corpus, key, value);";
+
+ 
+#define SCHEMA_VERSION 4
 
 #define ARTIFACT_COLS                                                          \
   "id, corpus, path, title, kind, mtime_ns, size_bytes, content_hash, "     \
@@ -98,6 +137,7 @@ enum {
   COL_MTIME,
   COL_SIZE,
   COL_HASH,
+
   COL_HEADINGS,
   COL_SUMMARY,
   COL_SOURCE,
@@ -131,6 +171,7 @@ enum {
 static kbc_status migrate_locked(kbc_store *s, kbc_err *err);
 static kbc_status require_text(kbc_err *err, const char *what, const char *v,
                                size_t max);
+
 
 /* ------------------------------------------------------------ plumbing --- */
 
@@ -413,6 +454,43 @@ static kbc_status apply_v2(kbc_store *s, kbc_err *err) {
   return st != KBC_OK ? st : fin;
 }
 
+static kbc_status apply_v3(kbc_store *s, kbc_err *err) {
+  kbc_status st = exec_plain(err, s, SCHEMA_V3);
+  if (st != KBC_OK) return st;
+  sqlite3_stmt *ins = NULL;
+  st = prepare(err, s,
+               "INSERT OR IGNORE INTO schema_version(version) VALUES (?1);",
+               &ins);
+  if (st != KBC_OK) return st;
+  st = bind_i64(err, s, ins, 1, 3);
+  if (st == KBC_OK) {
+    int step = sqlite3_step(ins);
+    if (step != SQLITE_DONE)
+      st = sql_fail(err, s, "record schema version", step);
+  }
+  kbc_status fin = finalize(err, s, ins, st);
+  return st != KBC_OK ? st : fin;
+}
+
+static kbc_status apply_v4(kbc_store *s, kbc_err *err) {
+  kbc_status st = exec_plain(err, s, SCHEMA_V4);
+  if (st != KBC_OK) return st;
+  sqlite3_stmt *ins = NULL;
+  st = prepare(err, s,
+               "INSERT OR IGNORE INTO schema_version(version) VALUES (?1);",
+               &ins);
+  if (st != KBC_OK) return st;
+  st = bind_i64(err, s, ins, 1, 4);
+  if (st == KBC_OK) {
+    int step = sqlite3_step(ins);
+    if (step != SQLITE_DONE)
+      st = sql_fail(err, s, "record schema version", step);
+  }
+  kbc_status fin = finalize(err, s, ins, st);
+  return st != KBC_OK ? st : fin;
+}
+
+
 static kbc_status migrate_locked(kbc_store *s, kbc_err *err) {
   kbc_status st = exec_plain(err, s,
                              "CREATE TABLE IF NOT EXISTS schema_version ("
@@ -438,6 +516,8 @@ static kbc_status migrate_locked(kbc_store *s, kbc_err *err) {
   if (st != KBC_OK) return st;
   if (have < 1) st = apply_v1(s, err);
   if (st == KBC_OK && have < 2) st = apply_v2(s, err);
+  if (st == KBC_OK && have < 3) st = apply_v3(s, err);
+  if (st == KBC_OK && have < 4) st = apply_v4(s, err);
   if (st == KBC_OK) st = exec_plain(err, s, "COMMIT;");
   if (st != KBC_OK) {
     rollback(s);
@@ -1114,6 +1194,474 @@ int64_t kbc_store_edge_count(kbc_store *s, const char *corpus, kbc_err *err) {
   unlock(s);
   return kbc_failed(st) ? st : out;
 }
+
+/* ------------------------------------------------------------- pending --- */
+
+/* Records the link targets a document named that were not indexed documents.
+ * OR IGNORE, in ONE transaction: a target named twice collapses on the
+ * primary key, and a failure leaves the previous pending set rather than half
+ * of a new one. */
+kbc_status kbc_store_add_pending_links(kbc_store *s, const char *corpus,
+                                       const char *src_path,
+                                       const char *const *dst_paths, size_t n,
+                                       kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "add_pending_links: null store");
+  if (n > 0 && dst_paths == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "add_pending_links: null "
+                       "dst_paths");
+  kbc_status st = require_text(err, "pending corpus", corpus, 255);
+  if (st == KBC_OK)
+    st = require_text(err, "pending src_path", src_path, KBC_MAX_PATH_LEN);
+  for (size_t i = 0; st == KBC_OK && i < n; i++) {
+    st = require_text(err, "pending dst_path", dst_paths[i], KBC_MAX_PATH_LEN);
+  }
+  if (st != KBC_OK) return st;
+  if (n == 0) return KBC_OK;
+
+  lock(s);
+  st = exec_plain(err, s, "BEGIN IMMEDIATE;");
+  if (st == KBC_OK) {
+    sqlite3_stmt *ins = NULL;
+    st = prepare(err, s,
+                 "INSERT OR IGNORE INTO pending_links(corpus, src_path, "
+                 "dst_path) VALUES(?1,?2,?3);",
+                 &ins);
+    for (size_t i = 0; st == KBC_OK && i < n; i++) {
+      st = bind_text(err, s, ins, 1, corpus);
+      if (st == KBC_OK) st = bind_text(err, s, ins, 2, src_path);
+      if (st == KBC_OK) st = bind_text(err, s, ins, 3, dst_paths[i]);
+      if (st == KBC_OK) {
+        int step = sqlite3_step(ins);
+        if (step != SQLITE_DONE)
+          st = sql_fail(err, s, "insert pending link", step);
+        (void)sqlite3_reset(ins);
+      }
+    }
+    kbc_status fin = finalize(err, s, ins, st);
+    if (st == KBC_OK) st = fin;
+  }
+  if (st == KBC_OK) st = exec_plain(err, s, "COMMIT;");
+  if (st != KBC_OK) rollback(s);
+  unlock(s);
+  return st;
+}
+
+/* Removes a document from the graph, as a removal must.
+ *
+ * A document that goes takes its OUTBOUND edges and its outbound pending links
+ * with it: it is no longer a document, so it can neither make a link nor be
+ * the source of one. Its INBOUND edges go too — an edge to a path with no
+ * document is not an edge — but each one is demoted to a pending link first,
+ * because the link the source wrote is still true and the target may come back.
+ * Dropping those rows instead is how a corpus that deletes and re-adds a hub
+ * silently loses every backlink to it.
+ *
+ * Pending links POINTING at the path are left alone: they are the record of a
+ * link waiting for a target that has not arrived, and this document is a
+ * target that has just left. The next drain finds nothing to do and the next
+ * arrival of the document materialises them.
+ *
+ * ONE transaction: a half-forgotten document would leave the graph claiming a
+ * link that nobody wrote, or dropping one that somebody did. */
+kbc_status kbc_store_forget_document(kbc_store *s, const char *corpus,
+                                      const char *path, kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "forget_document: null store");
+  kbc_status st = require_text(err, "pending corpus", corpus, 255);
+  if (st == KBC_OK)
+    st = require_text(err, "document path", path, KBC_MAX_PATH_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  st = exec_plain(err, s, "BEGIN IMMEDIATE;");
+  if (st == KBC_OK) {
+    static const char *const SQLS[] = {
+        /* The demotion runs first: once the edges are gone there is nothing
+         * left to say which of them pointed here. */
+        "INSERT OR IGNORE INTO pending_links(corpus, src_path, dst_path) "
+        "SELECT corpus, src_path, dst_path FROM edges"
+        " WHERE corpus = ?1 AND dst_path = ?2;",
+        "DELETE FROM edges WHERE corpus = ?1 AND (src_path = ?2 OR dst_path = "
+        "?2);",
+        "DELETE FROM pending_links WHERE corpus = ?1 AND src_path = ?2;",
+        /* A facet is a name the document wrote into itself, so a document
+         * that is gone has no facets: leaving them would keep it matching
+         * `tag:` after its bytes were deleted. */
+        "DELETE FROM doc_metas WHERE corpus = ?1 AND path = ?2;",
+    };
+    for (size_t i = 0; st == KBC_OK && i < sizeof(SQLS) / sizeof(SQLS[0]);
+         i++) {
+      sqlite3_stmt *q = NULL;
+      st = prepare(err, s, SQLS[i], &q);
+      if (st == KBC_OK) st = bind_text(err, s, q, 1, corpus);
+      if (st == KBC_OK) st = bind_text(err, s, q, 2, path);
+      if (st == KBC_OK) {
+        int step = sqlite3_step(q);
+        if (step != SQLITE_DONE)
+          st = sql_fail(err, s, "forget document: step", step);
+      }
+      kbc_status fin = finalize(err, s, q, st);
+      if (st == KBC_OK) st = fin;
+    }
+  }
+  if (st == KBC_OK) st = exec_plain(err, s, "COMMIT;");
+  if (st != KBC_OK) rollback(s);
+  unlock(s);
+  return st;
+}
+
+
+/* These three are declared in include/kbc/store.h, beside the edge contract.
+ * Declared here on the same terms as the header would carry so -Wmissing-
+ * prototypes stays green and app.c can reach them:
+ *   kbc_status kbc_store_replace_metas(kbc_store *s, const char *corpus,
+ *                                      const char *path,
+ *                                      const char *const *keys,
+ *                                      const char *const *values, size_t n,
+ *                                      kbc_err *err);
+ *   kbc_status kbc_store_forget_metas(kbc_store *s, const char *corpus,
+ *                                     const char *path, kbc_err *err);
+ *   kbc_status kbc_store_docs_with_meta(kbc_store *s, const char *corpus,
+ *                                       const char *key, const char *value,
+ *                                       char ***paths_out, size_t *n_out,
+ *                                       kbc_err *err); */
+kbc_status kbc_store_replace_metas(kbc_store *s, const char *corpus,
+                                   const char *path,
+                                   const char *const *keys,
+                                   const char *const *values, size_t n,
+                                   kbc_err *err);
+kbc_status kbc_store_forget_metas(kbc_store *s, const char *corpus,
+                                  const char *path, kbc_err *err);
+kbc_status kbc_store_docs_with_meta(kbc_store *s, const char *corpus,
+                                    const char *key, const char *value,
+                                    char ***paths_out, size_t *n_out,
+                                    kbc_err *err);
+
+/* --------------------------------------------------------------- metas --- */
+
+
+/* REPLACE, not merge. A document is re-ingested with the facets it declares
+ * NOW, so a tag the author removed stops matching on the next reindex
+ * instead of living on as a row nothing will ever clean up. ONE transaction,
+ * for the reason replace_edges has: a half-applied facet set is a filter
+ * matching a document that never existed. */
+kbc_status kbc_store_replace_metas(kbc_store *s, const char *corpus,
+                                   const char *path,
+                                   const char *const *keys,
+                                   const char *const *values, size_t n,
+                                   kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "replace_metas: null store");
+  if (n > 0 && (keys == NULL || values == NULL))
+    return kbc_err_set(err, KBC_ERR_INVALID, "replace_metas: null facet list");
+  kbc_status st = require_text(err, "meta corpus", corpus, 255);
+  if (st == KBC_OK)
+    st = require_text(err, "meta path", path, KBC_MAX_PATH_LEN);
+  for (size_t i = 0; st == KBC_OK && i < n; i++) {
+    /* A facet key is a bare lowercase name; the value is author text and
+     * only has to fit the artifact it came from. */
+    if (keys[i] == NULL || keys[i][0] == '\0')
+      st = kbc_err_set(err, KBC_ERR_INVALID, "meta key %zu is empty", i);
+    else if (strlen(keys[i]) > 64)
+      st = kbc_err_set(err, KBC_ERR_INVALID,
+                       "meta key \"%s\" is over the 64 byte cap", keys[i]);
+    else if (values[i] == NULL)
+      st = kbc_err_set(err, KBC_ERR_INVALID, "meta value %zu is NULL", i);
+    else if (strlen(values[i]) > KBC_MAX_PATH_LEN)
+      st = kbc_err_set(err, KBC_ERR_INVALID,
+                       "meta value for \"%s\" is over the %u byte cap",
+                       keys[i], (unsigned)KBC_MAX_PATH_LEN);
+  }
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  st = exec_plain(err, s, "BEGIN IMMEDIATE;");
+  if (st != KBC_OK) {
+    unlock(s);
+    return st;
+  }
+  sqlite3_stmt *del = NULL;
+  st = prepare(err, s,
+               "DELETE FROM doc_metas WHERE corpus = ?1 AND path = ?2;", &del);
+  if (st == KBC_OK) st = bind_text(err, s, del, 1, corpus);
+  if (st == KBC_OK) st = bind_text(err, s, del, 2, path);
+  if (st == KBC_OK) {
+    int step = sqlite3_step(del);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "delete metas: step", step);
+  }
+  kbc_status fin = finalize(err, s, del, st);
+  if (st == KBC_OK) st = fin;
+
+  sqlite3_stmt *ins = NULL;
+  if (st == KBC_OK) {
+    st = prepare(err, s,
+                 "INSERT OR IGNORE INTO doc_metas(corpus, path, key, value) "
+                 "VALUES(?1,?2,?3,?4);",
+                 &ins);
+    for (size_t i = 0; st == KBC_OK && i < n; i++) {
+      st = bind_text(err, s, ins, 1, corpus);
+      if (st == KBC_OK) st = bind_text(err, s, ins, 2, path);
+      if (st == KBC_OK) st = bind_text(err, s, ins, 3, keys[i]);
+      if (st == KBC_OK) st = bind_text(err, s, ins, 4, values[i]);
+      if (st == KBC_OK) {
+        int step = sqlite3_step(ins);
+        if (step != SQLITE_DONE) st = sql_fail(err, s, "insert meta", step);
+        (void)sqlite3_reset(ins);
+      }
+    }
+    kbc_status fin2 = finalize(err, s, ins, st);
+    if (st == KBC_OK) st = fin2;
+  }
+  if (st == KBC_OK) st = exec_plain(err, s, "COMMIT;");
+  if (st != KBC_OK) rollback(s);
+  unlock(s);
+  return st;
+}
+
+kbc_status kbc_store_forget_metas(kbc_store *s, const char *corpus,
+                                  const char *path, kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "forget_metas: null store");
+  kbc_status st = require_text(err, "meta corpus", corpus, 255);
+  if (st == KBC_OK)
+    st = require_text(err, "meta path", path, KBC_MAX_PATH_LEN);
+  if (st != KBC_OK) return st;
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s, "DELETE FROM doc_metas WHERE corpus = ?1 AND path = ?2;",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, corpus);
+  if (st == KBC_OK) st = bind_text(err, s, q, 2, path);
+  if (st == KBC_OK) {
+    int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "forget metas: step", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  return st != KBC_OK ? st : fin;
+}
+
+/* The documents carrying (key, value), as KBC_OWN paths. ONE indexed query,
+ * and an EMPTY result is zero rows — never "no filter". That is the whole
+ * point of the table existing: a filter that matches nothing must say so.
+ *
+ * `value` NULL asks for the documents carrying `key` with ANY value, which is
+ * what a boolean facet (`index`) needs. */
+kbc_status kbc_store_docs_with_meta(kbc_store *s, const char *corpus,
+                                    const char *key, const char *value,
+                                    char ***paths_out, size_t *n_out,
+                                    kbc_err *err) {
+  if (s == NULL || paths_out == NULL || n_out == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "docs_with_meta: null argument");
+  *paths_out = NULL;
+  *n_out = 0;
+  kbc_status st = require_text(err, "meta corpus", corpus, 255);
+  if (st == KBC_OK && (key == NULL || key[0] == '\0'))
+    st = kbc_err_set(err, KBC_ERR_INVALID, "docs_with_meta: empty meta key");
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               value != NULL
+                   ? "SELECT DISTINCT path FROM doc_metas"
+                     " WHERE corpus = ?1 AND key = ?2 AND value = ?3;"
+                   : "SELECT DISTINCT path FROM doc_metas"
+                     " WHERE corpus = ?1 AND key = ?2;",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, corpus);
+  if (st == KBC_OK) st = bind_text(err, s, q, 2, key);
+  if (st == KBC_OK && value != NULL) st = bind_text(err, s, q, 3, value);
+  char **paths = NULL;
+  size_t n = 0;
+  size_t cap = 0;
+  while (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_DONE) break;
+    if (step != SQLITE_ROW) {
+      st = sql_fail(err, s, "docs_with_meta: step", step);
+      break;
+    }
+    if (n == cap) {
+      const size_t ncap = cap == 0 ? 32 : cap * 2;
+      char **grown = (char **)realloc(paths, ncap * sizeof(*grown));
+      if (grown == NULL) {
+        st = kbc_err_set(err, KBC_ERR_NOMEM, "docs_with_meta: %zu paths", ncap);
+        break;
+      }
+      paths = grown;
+      cap = ncap;
+    }
+    const unsigned char *text = sqlite3_column_text(q, 0);
+    paths[n] = text != NULL ? strdup((const char *)text) : NULL;
+    if (paths[n] == NULL) {
+      st = kbc_err_set(err, KBC_ERR_NOMEM, "docs_with_meta: path copy");
+      break;
+    }
+    n++;
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  if (st != KBC_OK) {
+    for (size_t i = 0; i < n; i++) free(paths[i]);
+    free(paths);
+    return st != KBC_OK ? st : fin;
+  }
+  *paths_out = paths;
+  *n_out = n;
+  return KBC_OK;
+}
+
+/* Materialises every pending link pointing AT `dst_path` whose source is still
+ * an indexed document, then deletes those pending rows. ONE transaction, and
+ * the order is the point: a graph that gained the edge but kept the pending
+ * row would be re-inserted on every later drain, and a graph that deleted the
+ * row without the edge would lose the link forever.
+ *
+ * A source that is no longer a document contributes nothing and its pending
+ * row still goes: the link was recorded, and the only thing it named is this
+ * target, which now exists. A source re-ingested later re-records it.
+ *
+ * The source list is collected before the writes rather than stepped through
+ * while they run: the same connection is doing the insert and the delete, and
+ * a statement being stepped is the one whose rows the writes would disturb. */
+kbc_status kbc_store_drain_pending(kbc_store *s, const char *corpus,
+                                   const char *dst_path, kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "drain_pending: null store");
+  kbc_status st = require_text(err, "pending corpus", corpus, 255);
+  if (st == KBC_OK)
+    st = require_text(err, "pending dst_path", dst_path, KBC_MAX_PATH_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  char **srcs = NULL;
+  size_t n_srcs = 0;
+  st = exec_plain(err, s, "BEGIN IMMEDIATE;");
+  if (st == KBC_OK) {
+    sqlite3_stmt *q = NULL;
+    st = prepare(err, s,
+                 "SELECT src_path FROM pending_links"
+                 " WHERE corpus = ?1 AND dst_path = ?2;",
+                 &q);
+    if (st == KBC_OK) st = bind_text(err, s, q, 1, corpus);
+    if (st == KBC_OK) st = bind_text(err, s, q, 2, dst_path);
+    while (st == KBC_OK) {
+      int step = sqlite3_step(q);
+      if (step == SQLITE_DONE) break;
+      if (step != SQLITE_ROW) {
+        st = sql_fail(err, s, "read pending links: step", step);
+        break;
+      }
+      char **grown = realloc(srcs, (n_srcs + 1u) * sizeof(*srcs));
+      if (grown == NULL) {
+        st = kbc_err_set(err, KBC_ERR_NOMEM, "drain %zu pending links",
+                        n_srcs + 1u);
+        break;
+      }
+      srcs = grown;
+      const char *p = (const char *)sqlite3_column_text(q, 0);
+      srcs[n_srcs] = dup_str(p ? p : "");
+      if (srcs[n_srcs] == NULL) {
+        st = kbc_err_set(err, KBC_ERR_NOMEM, "drain %zu pending links",
+                        n_srcs + 1u);
+        break;
+      }
+      n_srcs++;
+    }
+    kbc_status fin = finalize(err, s, q, st);
+    if (st == KBC_OK) st = fin;
+  }
+
+  if (st == KBC_OK) {
+    for (size_t i = 0; st == KBC_OK && i < n_srcs; i++) {
+      sqlite3_stmt *edge = NULL;
+      /* The source must still be a document: an edge is a link between two
+       * indexed documents, and a deleted source has no place to hang one. */
+      st = prepare(err, s,
+                   "INSERT OR IGNORE INTO edges(corpus, src_path, dst_path) "
+                   "SELECT ?1, p.path, ?2 FROM artifacts p"
+                   " WHERE p.corpus = ?1 AND p.path = ?3;",
+                   &edge);
+      if (st == KBC_OK) st = bind_text(err, s, edge, 1, corpus);
+      if (st == KBC_OK) st = bind_text(err, s, edge, 2, dst_path);
+      if (st == KBC_OK) st = bind_text(err, s, edge, 3, srcs[i]);
+      if (st == KBC_OK) {
+        int step = sqlite3_step(edge);
+        if (step != SQLITE_DONE)
+          st = sql_fail(err, s, "drain pending link: step", step);
+      }
+      kbc_status fin = finalize(err, s, edge, st);
+      if (st == KBC_OK) st = fin;
+    }
+  }
+
+  if (st == KBC_OK) {
+    sqlite3_stmt *del = NULL;
+    st = prepare(err, s,
+                 "DELETE FROM pending_links WHERE corpus = ?1 AND dst_path = "
+                 "?2;",
+                 &del);
+    if (st == KBC_OK) st = bind_text(err, s, del, 1, corpus);
+    if (st == KBC_OK) st = bind_text(err, s, del, 2, dst_path);
+    if (st == KBC_OK) {
+      int step = sqlite3_step(del);
+      if (step != SQLITE_DONE)
+        st = sql_fail(err, s, "delete drained links: step", step);
+    }
+    kbc_status fin = finalize(err, s, del, st);
+    if (st == KBC_OK) st = fin;
+  }
+
+  for (size_t i = 0; i < n_srcs; i++) free(srcs[i]);
+  free(srcs);
+  if (st == KBC_OK) st = exec_plain(err, s, "COMMIT;");
+  if (st != KBC_OK) rollback(s);
+  unlock(s);
+  return st;
+}
+
+/* Drops every pending link LEAVING a source. Called with its edges when a
+ * document is removed: the pending rows name links that document made, and
+ * nothing else records that it made them. */
+kbc_status kbc_store_delete_pending(kbc_store *s, const char *corpus,
+                                    const char *src_path, kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "delete_pending: null store");
+  kbc_status st = require_text(err, "pending corpus", corpus, 255);
+  if (st == KBC_OK)
+    st = require_text(err, "pending src_path", src_path, KBC_MAX_PATH_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *st1 = NULL;
+  st = prepare(err, s,
+               "DELETE FROM pending_links WHERE corpus = ?1 AND src_path = "
+               "?2;",
+               &st1);
+  if (st == KBC_OK) st = bind_text(err, s, st1, 1, corpus);
+  if (st == KBC_OK) st = bind_text(err, s, st1, 2, src_path);
+  if (st == KBC_OK) {
+    int step = sqlite3_step(st1);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "delete pending: step", step);
+  }
+  kbc_status fin = finalize(err, s, st1, st);
+  unlock(s);
+  return st != KBC_OK ? st : fin;
+}
+
+int64_t kbc_store_pending_count(kbc_store *s, kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "pending_count: null store");
+  int64_t out = 0;
+  lock(s);
+  kbc_status st = count_query(err, s, "SELECT COUNT(*) FROM pending_links;",
+                              NULL, &out);
+  unlock(s);
+  return kbc_failed(st) ? st : out;
+}
+
 /* --------------------------------------------------------------- chunks -- */
 
 kbc_status kbc_store_replace_chunks(kbc_store *s, const kbc_chunk_in *chunks,

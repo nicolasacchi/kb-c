@@ -3,7 +3,7 @@
 Source of truth for LOC: `find /home/nik/project/kb/crates -name '*.rs' -not -path '*/tests/*' -not -path '*/benches/*' | xargs wc -l`.
 Total: **471,634 LOC across 540 files in 8 crates.**
 
-kb-c's side is the frozen contract in `include/kbc/*.h` (14 headers) and its
+kb-c's side is the frozen contract in `include/kbc/*.h` (15 headers) and its
 implementation, one file per subsystem (`src/<name>.c`, `cli/main.c`).
 `src/` is the owner column below; where a responsibility moved rather than
 ported, the reason says so.
@@ -28,8 +28,8 @@ recomputed from the rows on 2026-09-26.
 | Status | Files | LOC | % |
 |---|---:|---:|---:|
 | PORTED | 22 | 5,978 | 2.6% |
-| PARTIAL | 34 | 76,778 | 33.2% |
-| PLANNED | 73 | 36,740 | 15.9% |
+| PARTIAL | 36 | 78,734 | 34.0% |
+| PLANNED | 71 | 34,784 | 15.0% |
 | OUT-OF-SCOPE | 123 | 112,011 | 48.4% |
 | **total** | **252** | **231,507** | **100%** |
 
@@ -38,12 +38,12 @@ OUT-OF-SCOPE (table below).
 
 > These counts are the row statuses in this document, not a claim about what
 > is finished. The port's live surface today is the PORTED + PARTIAL set:
-> 82,756 LOC of Rust that kb-c claims, of which 5,978 is a row-for-row port
-> and 76,778 is a deliberately narrower replacement. The bulk of the
+> 84,712 LOC of Rust that kb-c claims, of which 5,978 is a row-for-row port
+> and 78,734 is a deliberately narrower replacement. The bulk of the
 > difference is `storage/sqlite.rs` and `storage/lance.rs`, whose C
-> counterparts are `store.c` and `index.c` — a three-table SQLite schema and
-> a hand-rolled mmap'd index respectively, against 42 migrations and a
-> columnar store with IVF-PQ.
+> counterparts are `store.c` and `index.c` — a six-table SQLite schema at
+> schema v4 and a hand-rolled mmap'd index respectively, against 42
+> migrations and a columnar store with IVF-PQ.
 
 ## Out-of-scope crates: `kb-code-server`, `kb-code-cli`
 
@@ -88,7 +88,7 @@ with a C owner. `module (files, LOC) — what it is`:
 - `…/prose_refs/*` (1, 532) — prose reference extraction
 - `…/frameworks/*` (1, 405) — framework registry
 
-**Why the whole subtree is out of scope for milestone 1.** `kb-code-server`
+**Why the whole subtree is out of scope for milestone 1** — the full decision, with alternatives and a revisit trigger, is [DECISIONS.md ADR-001](DECISIONS.md). In short:** `kb-code-server`
 is a *different product* that happens to live in the same workspace: a daemon
 over a git checkout whose entire value is language-aware structure —
 tree-sitter grammars for 6+ languages, `frameworks/rails` heuristics, blame
@@ -110,7 +110,7 @@ of roughly the same size as this one, not a stage of it. It stays in Rust.
 
 | Module | LOC | What it does | Status | kb-c owner |
 |---|---:|---|---|---|
-| `kb-core/src/storage/sqlite.rs` | 14,913 | SQLite open/pragmas, 42 embedded migrations, every side table's CRUD, `is_newest` collapse, cascade delete | PARTIAL | `src/store.c` — one migration (v1: `schema_version`, `artifacts`, `chunks`, `comments`), artifact/comment/chunk CRUD and delete-cascade; the session/slate/atlas/recall/slo tables and the other 41 migrations are out of scope |
+| `kb-core/src/storage/sqlite.rs` | 14,913 | SQLite open/pragmas, 42 embedded migrations, every side table's CRUD, `is_newest` collapse, cascade delete | PARTIAL | `src/store.c` — **four** migrations, `KBC_SCHEMA_VERSION 4`: v1 (`schema_version`, `artifacts`, `chunks`, `comments`), v2 (`edges`), v3 (`pending_links`), v4 (`doc_metas`); artifact/comment/chunk CRUD and delete-cascade; the session/slate/atlas/recall/slo tables and the remaining 38 migrations are out of scope |
 | `kb-core/src/indexer.rs` | 9,028 | Watcher→queue→batch→parse→embed→write pipeline, dedup, quarantine, reconcile | PARTIAL | `src/app.c` — watch→queue→batch drain→parse→id→upsert→index→embed; no reconcile delete pass, no quarantine, no enrich tail, no session substitution |
 | `kb-core/src/storage/actor.rs` | 7,205 | Tokio actor wrapping `Storage`, mpsc back-pressure for writers | PARTIAL | `src/store.c` — direct calls under a mutex, no actor; the batch boundary is the store transaction |
 | `kb-core/src/storage/lance.rs` | 6,171 | Lance/Arrow columnar store: FTS indices, IVF-PQ, chunk kNN, compact, backup hook | PARTIAL | `src/index.c` + `src/embed.c` + `kbc_vecstore` — replaced, not ported; no columnar store, no IVF-PQ; the vector lane is a brute-force cosine scan over an mmap'd f32 matrix |
@@ -129,12 +129,12 @@ of roughly the same size as this one, not a stage of it. It stays in Rust.
 | `kb-core/src/capture.rs` | 1,585 | Capture pipeline: slug, stamp, atomic write, id | PARTIAL | `src/app.c` — write/stamp/id, no HTML sanitizer |
 | `kb-core/src/relocate.rs` | 1,505 | Move log and path relocation | OUT-OF-SCOPE | — |
 | `kb-core/src/watcher.rs` | 1,390 | Filesystem watch, debounce, reconcile walk | PARTIAL | `src/watcher.c` (inotify) — per-path debounce/coalescing into one publish and a prompt, null-safe stop; no periodic reconcile walk |
-| `kb-core/src/docs_query.rs` | 1,300 | In-memory filter evaluation over candidate rows | PLANNED | `src/search.c` (stage 3) |
+| `kb-core/src/docs_query.rs` | 1,300 | In-memory filter evaluation over candidate rows | PARTIAL | `src/search.c` + `src/app.c` + `src/store.c` — the filter overlay is built. Facets come from the document's own markup (`<meta name="kb-tags" content="a, b">` and Markdown front matter), extracted into `doc_metas` (schema v4) and evaluated **once per query** as a membership set of index doc ids. `tag:`, `cap:`/`caps:` and `index:` are no longer HTTP 400s. A filter that matches nothing returns **zero** rows, never everything — that invariant is tested at the store, search and app layers. Value comparison is CASE-SENSITIVE, as in the original (`docs_query.rs:258` compares `String`s with `==`). `cap:` matches declared `kb-caps` metadata rather than the original's capability ANALYSIS (`svg_count`, `has_canvas`, `code_block_count`), which kb-c does not perform — a deliberate deviation |
 | `kb-core/src/sessions/live.rs` | 1,256 | Live-transcript tailing | OUT-OF-SCOPE | — |
 | `kb-core/src/sessions/replay.rs` | 1,231 | Session replay export | OUT-OF-SCOPE | — |
 | `kb-core/src/embed_ipc.rs` | 1,220 | NDJSON subprocess protocol to `kb-embedder`, handshake, timeouts, respawn | PORTED | `src/embed.c` — the protocol is now verified against the **production** `kb-embedder` with `bge-small-en-v1.5`, not a fake sidecar, and the header's earlier description of it was wrong in every respect: there is no health op, readiness is an unsolicited `{"kind":"ready"}` absorbed wherever it arrives, `req_id` is mandatory and must be echoed, replies are `kind=embed_ok` / `kind=error`, and the sidecar **exits on non-UTF-8 stdin** so no byte >= 0x80 may reach the wire (text is escaped to `\u00XX` locally) |
 | `kb-core/src/session_render.rs` | 1,204 | Session digest renderer | OUT-OF-SCOPE | — |
-| `kb-core/src/query.rs` | 1,188 | Query grammar: `AND`/`OR`/`NOT`, keys, DNF, `since:` | PARTIAL | `src/search.c` — the grammar as the index can answer it: `AND`/`OR`/`NOT`, groups, implicit AND, depth 64, the 64-conjunct DNF cap, `folder:` as a path-prefix facet, `text:`/`q:`. `tag:`, `cap:`, `since:`, `index:` and `scope:` are **refused with HTTP 400** rather than searched as literal terms, because the index cannot evaluate them. No `since:` dates and no `docs_query.rs` filter overlay. **There is no phrase search anywhere in the original either** — a quoted `"…"` in `query.rs` quotes an atom *value* (`folder:"deep notes"`), not a phrase, and the kb SEARCH path hands `?q=` unparsed to BM25, so the boolean structure never reached the lexical arm in Rust either. A quoted string is two terms, and a test pins that reading |
+| `kb-core/src/query.rs` | 1,188 | Query grammar: `AND`/`OR`/`NOT`, keys, DNF, `since:` | PARTIAL | `src/search.c` — the grammar as the index can answer it: `AND`/`OR`/`NOT`, groups, implicit AND, depth 64, the 64-conjunct DNF cap, `folder:` as a path-prefix facet, `text:`/`q:`, and the `tag:` / `cap:` / `caps:` / `index:` facet atoms, which are handed to the `docs_query.rs` overlay below rather than scored. **`since:` remains refused with HTTP 400** (its value grammar is parsed, `kbc_since_value_ns`, but the layer that would apply it does not exist) and **`scope:` remains refused**, because the original's `apply_atom` has an empty arm for it (`query.rs:403-406`) — the original evaluates it nowhere either. **There is no phrase search anywhere in the original either** — a quoted `"…"` in `query.rs` quotes an atom *value* (`folder:"deep notes"`), not a phrase, and the kb SEARCH path hands `?q=` **unparsed** to BM25, so the boolean structure never reached the lexical arm in Rust either |
 | `kb-core/src/mentions.rs` | 1,108 | `@mention` resolution | OUT-OF-SCOPE | — |
 | `kb-core/src/atlas_field.rs` | 1,097 | Atlas field values per artifact | OUT-OF-SCOPE | — |
 | `kb-core/src/storage/schema.rs` | 988 | The 45-field `Doc` struct and its Arrow schema | PARTIAL | `src/types.h` — the 20 fields kb-c keeps |
@@ -147,7 +147,7 @@ of roughly the same size as this one, not a stage of it. It stays in Rust.
 | `kb-core/src/meta_edit.rs` | 700 | `kb-*` frontmatter/meta rewriting | OUT-OF-SCOPE | — |
 | `kb-core/src/sessions/narrative.rs` | 674 | Session narrative assembly | OUT-OF-SCOPE | — |
 | `kb-core/src/session_render_tests.rs` | 672 | Tests that live in `src/` | OUT-OF-SCOPE | — |
-| `kb-core/src/links.rs` | 656 | Wikilink parsing and canonical-path resolution | PLANNED | `src/parse.c` (stage 4) |
+| `kb-core/src/links.rs` | 656 | Wikilink parsing and canonical-path resolution | PARTIAL | `src/parse.c` — **extraction and normalisation are ported**: the bare and the aliased wikilink forms go through the same normaliser as `[text](target)` and `<a href>`, so `[[y.md#part]]` and `[y](y.md#part)` produce the identical `y.md`; a bare `[[target]]` takes the target as its visible text, matching `links.rs`, which collapses label == url to `alias: None`; `![[embed]]` is an image, not a link. **Not ported:** the four-tier id/path/title/basename resolution ladder in `links.rs` `resolve` / `ResolveIndex`, including its `Ambiguous` outcome |
 | `kb-core/src/events.rs` | 652 | Event bus: ring, broadcast, filters, replay | PARTIAL | `src/httpd.c` — a 256-entry ring, `Last-Event-ID` replay and an SSE stream; no per-subscriber filters, no cold-replay gap probe |
 | `kb-core/src/share/cloudflare.rs` | 651 | Cloudflare Pages/Access deploy | OUT-OF-SCOPE | — |
 | `kb-core/src/paths.rs` | 630 | State/config/cache roots, rel-path derivation | PORTED | `src/mem.c` + `src/config.c` |
@@ -156,7 +156,7 @@ of roughly the same size as this one, not a stage of it. It stays in Rust.
 | `kb-core/src/procrustes.rs` | 614 | Recall-fidelity measurement | OUT-OF-SCOPE | — |
 | `kb-core/src/metrics.rs` | 610 | Counters, histograms, `/metrics` text | PLANNED | `src/httpd.c` (stage 5) |
 | `kb-core/src/sessions/tail.rs` | 570 | Live transcript tail reader | OUT-OF-SCOPE | — |
-| `kb-core/src/fusion.rs` | 567 | RRF fusion, title boost, graph boost | PARTIAL | `src/search.c` — RRF with `rrf_k` defaulting to 60 and dedup on id, plus the **title boost**: `TITLE_BOOST = 0.5` (`fusion.rs:145`, `apply_title_boost` at `:155`), terms >= 3 bytes, ASCII-lowercased, **substring** match not word-boundary (the original's own comment records that a word-boundary variant bench-measured worse), multiplied **once** per hit however many terms matched, applied to the **fused** RRF score over the full pool before filtering and truncation. **Graph boost deliberately NOT ported** (`fusion.rs:214`): it needs an in-degree edge graph fed from `storage.edge_counts()`, and kb-c has no edges table. A fake version would be a different ranking function wearing the original's name |
+| `kb-core/src/fusion.rs` | 567 | RRF fusion, title boost, graph boost | PARTIAL | `src/search.c` — RRF with `rrf_k` defaulting to 60 and dedup on id, plus the **title boost**: `TITLE_BOOST = 0.5` (`fusion.rs:145`, `apply_title_boost` at `:155`), terms >= 3 bytes, ASCII-lowercased, **substring** match not word-boundary (the original's own comment records that a word-boundary variant bench-measured worse), multiplied **once** per hit however many terms matched, applied to the **fused** RRF score over the full pool before filtering and truncation. The **graph boost is ported** (`fusion.rs:214` `apply_graph_boost`): in-degree is read from the `edges` table (schema v2, present since the graph work landed), and the boost adds `weight / rrf_k * sqrt(in)/sqrt(in_max)` to each row's fused score. It ships **disabled** — `graph_boost` defaults to `0.0` and only a weight in (0, 4] turns it on, because the weight is unmeasured; see DECISIONS.md ADR-004. The graph it reads now converges, which is what removed the first reason for shipping it off |
 | `kb-core/src/versions.rs` | 545 | Version timeline reads | OUT-OF-SCOPE | — |
 | `kb-core/src/sessions/live_adapters/opencode.rs` | 545 | opencode live adapter | OUT-OF-SCOPE | — |
 | `kb-core/src/notes.rs` | 535 | Notes model | OUT-OF-SCOPE | — |

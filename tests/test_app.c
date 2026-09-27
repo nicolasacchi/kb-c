@@ -22,6 +22,12 @@
 #include "kbc/store.h"
 #include "kbc_test.h"
 
+/* include/kbc/store.h is the orchestrator's file; the pending-links contract
+ * is proposed there and these are the signatures it will carry. */
+kbc_status kbc_store_drain_pending(kbc_store *s, const char *corpus,
+                                   const char *dst_path, kbc_err *err);
+int64_t kbc_store_pending_count(kbc_store *s, kbc_err *err);
+
 #define CORPUS_A "alpha"
 #define CORPUS_B "beta"
 
@@ -1258,6 +1264,204 @@ KBC_TEST(reindex_records_only_edges_whose_target_is_an_indexed_document) {
   fx_teardown(&f);
 }
 
+/* THE CONVERGENCE PROPERTY: the order documents are ingested in must not be
+ * observable in the graph. `a.md` links to `b.md`; visiting a first and
+ * visiting b first must leave the same edge set and the same in-degrees.
+ *
+ * The order is forced by what is on disk when the first reindex runs, not by
+ * any test-only hook: b.md does not exist while a.md is indexed, so a.md's
+ * link has nothing to resolve against. Both scenarios then end with the same
+ * two files and a second reindex. */
+typedef struct {
+  int64_t edges;
+  int64_t pending;
+  uint32_t deg_a;
+  uint32_t deg_b;
+} graph_shape;
+
+/* An EMPTY corpus: the convergence cases need a document that genuinely does
+ * not exist yet, and the standard fixture ships a.md, b.md and c.md. */
+static void fx_setup_empty(fixture *f) {
+  memset(f, 0, sizeof(*f));
+  kbc_test_tmpdir(f->root, sizeof f->root);
+  join(f->data, sizeof f->data, f->root, "data");
+  join(f->corpus_a, sizeof f->corpus_a, f->root, CORPUS_A);
+  join(f->corpus_b, sizeof f->corpus_b, f->root, CORPUS_B);
+  kbc_test_mkdir_p(f->corpus_a);
+  f->cfg = make_cfg(f->data, f->corpus_a, NULL);
+  KBC_CHECK_NOT_NULL(f->cfg);
+  kbc_err err;
+  kbc_err_reset(&err);
+  f->app = f->cfg ? kbc_app_open(f->cfg, &err) : NULL;
+  if (f->app == NULL) fprintf(stderr, "  app_open: %s\n", err.msg);
+  KBC_CHECK_NOT_NULL(f->app);
+}
+
+/* Writes only the first file, indexes, then writes the second and indexes
+ * again. `first` is the document the corpus walk sees before the other. */
+static graph_shape graph_after_staged_ingest(const char *first, const char *second) {
+  fixture f;
+  fx_setup_empty(&f);
+  graph_shape g = {-1, -1, 9, 9};
+  char p[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_err_reset(&err);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return g;
+  }
+  /* a.md is the linker, b.md the linked. Whichever of the two is written
+   * first is the order under test; the corpus is otherwise the fixture's. */
+  const char *linker =
+      "# Linker\n\nSee [beta](b.md) and the verdigris digest.\n";
+  const char *linked = "# Linked\n\nThe chronicle mentions quokka burrows.\n";
+  join(p, sizeof p, f.corpus_a, first);
+  kbc_test_write_file(p, strcmp(first, "a.md") == 0 ? linker : linked);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  join(p, sizeof p, f.corpus_a, second);
+  kbc_test_write_file(p, strcmp(second, "a.md") == 0 ? linker : linked);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  kbc_store *store = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(store);
+  g.edges = kbc_store_edge_count(store, CORPUS_A, &err);
+  g.pending = kbc_store_pending_count(store, &err);
+  static const char *const want[] = {"a.md", "b.md"};
+  uint32_t deg[2] = {9, 9};
+  KBC_CHECK_OK(kbc_store_edge_degrees_for(store, CORPUS_A, want, 2, deg, &err));
+  g.deg_a = deg[0];
+  g.deg_b = deg[1];
+  kbc_store_close(store);
+  fx_teardown(&f);
+  return g;
+}
+
+KBC_TEST(the_link_graph_does_not_depend_on_the_ingest_order) {
+  /* b.md first: a.md is indexed against a corpus that does not contain its
+   * link target yet. a.md first: the mirror image, and the one that used to
+   * leave b.md at in-degree 0 forever. */
+  graph_shape b_first = graph_after_staged_ingest("b.md", "a.md");
+  graph_shape a_first = graph_after_staged_ingest("a.md", "b.md");
+
+  KBC_CHECK_MSG(a_first.edges == b_first.edges,
+                "edge count differs by order: a-first %lld, b-first %lld",
+                (long long)a_first.edges, (long long)b_first.edges);
+  KBC_CHECK_EQ_INT(a_first.edges, 1);
+  KBC_CHECK_EQ_INT(a_first.pending, 0);
+  KBC_CHECK_EQ_INT(b_first.pending, 0);
+  KBC_CHECK_MSG(a_first.deg_a == b_first.deg_a && a_first.deg_b == b_first.deg_b,
+                "in-degrees differ by order: a-first (%u,%u), b-first (%u,%u)",
+                a_first.deg_a, a_first.deg_b, b_first.deg_a, b_first.deg_b);
+  KBC_CHECK_EQ_INT(a_first.deg_b, 1); /* b.md is linked from a.md */
+  KBC_CHECK_EQ_INT(a_first.deg_a, 0); /* a.md links out and is linked to by
+                                        nobody */
+}
+
+/* A full reindex over a corpus whose sources have not changed still drains:
+ * the pending rows are the only record of the link, and a pass that visits
+ * every document is the pass that can complete the graph. */
+KBC_TEST(a_full_reindex_drains_links_left_pending) {
+  fixture f;
+  fx_setup_empty(&f);
+  char p[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_err_reset(&err);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  /* Only a.md, linking to a b.md that does not exist yet. */
+  join(p, sizeof p, f.corpus_a, "a.md");
+  kbc_test_write_file(p, "# Linker\n\nSee [beta](b.md) now.\n");
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  kbc_store *store = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(store);
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(store, CORPUS_A, &err), 0);
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(store, &err), 1);
+
+  /* The target arrives. Only a full reindex follows — a.md itself is
+   * unchanged, so it contributes no edge write of its own. */
+  join(p, sizeof p, f.corpus_a, "b.md");
+  kbc_test_write_file(p, "# Linked\n\nThe chronicle mentions quokka burrows.\n");
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(store, CORPUS_A, &err), 1);
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(store, &err), 0);
+  static const char *const want[] = {"b.md"};
+  uint32_t deg[1] = {9};
+  KBC_CHECK_OK(kbc_store_edge_degrees_for(store, CORPUS_A, want, 1, deg, &err));
+  KBC_CHECK_EQ_INT(deg[0], 1);
+
+  /* A link to a document that never arrives is pending forever and is never
+   * an edge: a dangling edge would be an in-degree nothing can attach to. */
+  join(p, sizeof p, f.corpus_a, "a.md");
+  kbc_test_write_file(p, "# Linker\n\nSee [ghost](never.md) and [beta](b.md).\n");
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(store, CORPUS_A, &err), 1);
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(store, &err), 1);
+
+  /* And re-running the reindex changes nothing: same edges, same one pending
+   * row — not two. */
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(store, CORPUS_A, &err), 1);
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(store, &err), 1);
+
+  kbc_store_close(store);
+  fx_teardown(&f);
+}
+
+/* Removing a document takes its edges AND its pending links with it, and
+ * leaves the pending links pointing AT it: those are another document's
+ * claim, and the target may come back. */
+KBC_TEST(removing_a_document_takes_its_edges_and_its_pending_links) {
+  fixture f;
+  fx_setup_empty(&f);
+  char p[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_err_reset(&err);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  join(p, sizeof p, f.corpus_a, "a.md");
+  kbc_test_write_file(p, "# Linker\n\nSee [beta](b.md) and [ghost](never.md).\n");
+  join(p, sizeof p, f.corpus_a, "b.md");
+  kbc_test_write_file(p, "# Linked\n\nThe chronicle mentions quokka burrows.\n");
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  kbc_store *store = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(store);
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(store, CORPUS_A, &err), 1);
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(store, &err), 1);
+
+  /* The source goes: the edge and the pending link both leave with it. */
+  join(p, sizeof p, f.corpus_a, "a.md");
+  KBC_CHECK_EQ_INT(unlink(p), 0);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(store, CORPUS_A, &err), 0);
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(store, &err), 0);
+
+  /* The TARGET goes: nothing of a.md's survives it, because the graph is
+   * rebuilt from the documents that are there. */
+  join(p, sizeof p, f.corpus_a, "a.md");
+  kbc_test_write_file(p, "# Linker\n\nSee [beta](b.md).\n");
+  join(p, sizeof p, f.corpus_a, "b.md");
+  KBC_CHECK_EQ_INT(unlink(p), 0);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(store, CORPUS_A, &err), 0);
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(store, &err), 1);
+
+  /* b.md comes back and the link is whole again, with no re-write of a.md. */
+  join(p, sizeof p, f.corpus_a, "b.md");
+  kbc_test_write_file(p, "# Linked\n\nThe chronicle mentions quokka burrows.\n");
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(store, CORPUS_A, &err), 1);
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(store, &err), 0);
+
+  kbc_store_close(store);
+  fx_teardown(&f);
+}
+
 /* The graph boost is opt-in and its weight comes from the config. The hub is
  * deliberately a poor text match — long, with the query term once — so the
  * only thing that can promote it is in-degree: the ordering is then a real
@@ -1384,6 +1588,365 @@ KBC_TEST(the_graph_boost_is_off_by_default_and_reorders_when_configured) {
   fx_teardown(&f);
 }
 
+/* --------------------------------------------------------- facet overlay -- */
+
+/* Every row's path, copied out of the arena, joined by '|'. Returns the count.
+ * A filter that matches nothing must produce an empty string and a count of
+ * zero — never the whole corpus, which is the failure the refusal design
+ * exists to prevent. */
+static size_t search_paths(kbc_app *app, const char *q, const char *corpus,
+                           char *out, size_t cap) {
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) return 0;
+  kbc_query query;
+  memset(&query, 0, sizeof query);
+  query.q = q;
+  query.corpus = corpus;
+  query.kind = KBC_KIND__COUNT;
+  query.mode = KBC_MODE_KEYWORD;
+  query.limit = 10;
+  kbc_search_result res;
+  memset(&res, 0, sizeof res);
+  kbc_err err;
+  kbc_err_reset(&err);
+  const kbc_status st = kbc_app_search(app, a, &query, &res, &err);
+  KBC_CHECK_MSG(st == KBC_OK, "search %s: %s", q, err.msg);
+  if (out != NULL && cap > 0) out[0] = '\0';
+  for (size_t i = 0; st == KBC_OK && i < res.len; i++) {
+    const char *p = res.rows[i].path != NULL ? res.rows[i].path : "?";
+    if (out != NULL && cap > 0)
+      (void)snprintf(out + strlen(out), cap - strlen(out), "%s%s", i ? "|" : "",
+                     p);
+  }
+  kbc_arena_free(a);
+  return res.len;
+}
+
+/* Row order is the index's doc-id order — the order documents were ingested —
+ * so a set of paths is compared as a set, not as a string. */
+static int cmp_seg(const void *a, const void *b) {
+  return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+static void check_paths(const char *got, const char *want) {
+  char *copy = strdup(got);
+  char *wcopy = strdup(want);
+  KBC_CHECK_NOT_NULL(copy);
+  KBC_CHECK_NOT_NULL(wcopy);
+  if (copy == NULL || wcopy == NULL) {
+    free(copy);
+    free(wcopy);
+    return;
+  }
+  char *g[16];
+  char *w[16];
+  size_t ng = 0;
+  size_t nw = 0;
+  for (char *t = strtok(copy, "|"); t != NULL && ng < 16;
+       t = strtok(NULL, "|"))
+    g[ng++] = t;
+  for (char *t = strtok(wcopy, "|"); t != NULL && nw < 16;
+       t = strtok(NULL, "|"))
+    w[nw++] = t;
+  if (ng > 1) qsort(g, ng, sizeof(*g), cmp_seg);
+  if (nw > 1) qsort(w, nw, sizeof(*w), cmp_seg);
+  KBC_CHECK_EQ_INT(ng, nw);
+  for (size_t i = 0; i < ng && i < nw; i++)
+    KBC_CHECK_EQ_STR(g[i], w[i]);
+  free(copy);
+  free(wcopy);
+}
+
+/* A corpus whose documents declare their own facets. Each word is unique to
+ * one file, so a hit names a file rather than a score. */
+static const char TAGGED_A[] =
+    "---\n"
+    "kb-tags: rust, search\n"
+    "---\n"
+    "# Ferrous Ledger\n\nThe ferrous ledger reconciles accruals.\n";
+static const char TAGGED_B[] =
+    "---\n"
+    "kb-tags: rust\n"
+    "kb-caps: code, svg\n"
+    "---\n"
+"# Chromium Chronicle\n\nThe chromium chronicle mentions zephyrus towns.\n";
+static const char TAGGED_C[] =
+    "---\n"
+    "kb-index: true\n"
+    "---\n"
+"# Verdigris Digest\n\nThe verdigris digest catalogues quixotic places.\n";
+
+static void fx_setup_tagged(fixture *f) {
+  fx_setup(f, false);
+  if (f->app == NULL) return;
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f->corpus_a, "a.md");
+  kbc_test_write_file(p, TAGGED_A);
+  join(p, sizeof p, f->corpus_a, "b.md");
+  kbc_test_write_file(p, TAGGED_B);
+  join(p, sizeof p, f->corpus_a, "c.md");
+  kbc_test_write_file(p, TAGGED_C);
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f->app, &err));
+}
+
+/* THE invariant, end to end through the daemon's own entry point: a tag nobody
+ * carries is zero rows. The same query with the tag removed is a search, and
+ * the difference has to be visible. */
+KBC_TEST(a_tag_filter_that_matches_nothing_returns_zero_rows) {
+  fixture f;
+  fx_setup_tagged(&f);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char got[512];
+  KBC_CHECK_EQ_INT(search_paths(f.app, "tag:nonesuch", CORPUS_A, got,
+                                sizeof got),
+                   0);
+  check_paths(got, "");
+  /* …while the tags that ARE declared find exactly their documents. */
+  KBC_CHECK_EQ_INT(
+      search_paths(f.app, "tag:search", CORPUS_A, got, sizeof got), 1);
+  check_paths(got, "a.md");
+  KBC_CHECK_EQ_INT(search_paths(f.app, "tag:rust", CORPUS_A, got, sizeof got),
+                   2);
+  check_paths(got, "a.md|b.md");
+  fx_teardown(&f);
+}
+
+/* `caps` is ALL-of inside a conjunct (query.rs:297) and `tags` is ANY-of
+ * (query.rs:286), so one cap and one tag is the intersection, not the union. */
+KBC_TEST(a_tag_and_a_cap_together_are_an_intersection) {
+  fixture f;
+  fx_setup_tagged(&f);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char got[512];
+  KBC_CHECK_EQ_INT(
+      search_paths(f.app, "cap:code tag:rust", CORPUS_A, got, sizeof got), 1);
+  check_paths(got, "b.md");
+  KBC_CHECK_EQ_INT(
+      search_paths(f.app, "cap:svg tag:search", CORPUS_A, got, sizeof got), 0);
+  /* the `caps:` alias parses the same as `cap:` (query.rs:75) */
+  KBC_CHECK_EQ_INT(
+      search_paths(f.app, "caps:svg", CORPUS_A, got, sizeof got), 1);
+  check_paths(got, "b.md");
+  fx_teardown(&f);
+}
+
+/* Two tags OR-ed is the original's DNF: a row matching EITHER satisfies the
+ * query, and a row matching neither does not. */
+KBC_TEST(two_tags_or_ed_match_either_document) {
+  fixture f;
+  fx_setup_tagged(&f);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char got[512];
+  KBC_CHECK_EQ_INT(
+      search_paths(f.app, "tag:rust OR tag:search", CORPUS_A, got, sizeof got),
+      2);
+  check_paths(got, "a.md|b.md");
+  KBC_CHECK_EQ_INT(search_paths(f.app, "tag:search OR tag:absent", CORPUS_A,
+                                got, sizeof got),
+                   1);
+  check_paths(got, "a.md");
+  fx_teardown(&f);
+}
+
+/* `NOT tag:x` drops the documents carrying x (query.rs:287 exclude_tags). */
+KBC_TEST(a_negated_tag_drops_the_documents_carrying_it) {
+  fixture f;
+  fx_setup_tagged(&f);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char got[512];
+  KBC_CHECK_EQ_INT(
+      search_paths(f.app, "NOT tag:rust", CORPUS_A, got, sizeof got), 1);
+  check_paths(got, "c.md");
+  fx_teardown(&f);
+}
+
+/* The overlay composes with the filters that were already there: a tag, a
+ * folder and a since: all narrow, and a row failing any one of them is out. */
+KBC_TEST(a_tag_composes_with_folder_and_since) {
+  fixture f;
+  fx_setup_tagged(&f);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char got[512];
+  KBC_CHECK_EQ_INT(search_paths(f.app, "tag:rust", CORPUS_A, got, sizeof got),
+                   2);
+  /* a folder that excludes both of them narrows to nothing */
+  KBC_CHECK_EQ_INT(
+      search_paths(f.app, "tag:rust folder:nowhere", CORPUS_A, got,
+                   sizeof got),
+      0);
+  /* a since: far in the past keeps both; a since: in the future drops both */
+  KBC_CHECK_EQ_INT(
+      search_paths(f.app, "tag:rust since:1d", CORPUS_A, got, sizeof got), 2);
+  KBC_CHECK_EQ_INT(
+      search_paths(f.app, "tag:rust since:4102444800", CORPUS_A, got,
+                   sizeof got),
+      0);
+  /* free text still scores alongside the filter */
+  KBC_CHECK_EQ_INT(
+      search_paths(f.app, "tag:rust chronicle", CORPUS_A, got, sizeof got), 1);
+  check_paths(got, "b.md");
+  fx_teardown(&f);
+}
+
+/* Replace-on-ingest: a tag the author deleted stops matching after ONE
+ * reindex of that file. This is the property a merge cannot have. */
+KBC_TEST(a_removed_tag_stops_matching_after_one_reindex) {
+  fixture f;
+  fx_setup_tagged(&f);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char got[512];
+  KBC_CHECK_EQ_INT(search_paths(f.app, "tag:rust", CORPUS_A, got, sizeof got),
+                   2);
+  /* The author takes the tag off a.md and puts a different one on. */
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, "a.md");
+  kbc_test_write_file(p,
+                      "---\n"
+                      "kb-tags: ledger\n"
+                      "---\n"
+                      "# Ferrous Ledger\n\nThe ferrous ledger reconciles "
+                      "accruals.\n");
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex_file(f.app, CORPUS_A, "a.md", &err));
+  KBC_CHECK_EQ_INT(search_paths(f.app, "tag:rust", CORPUS_A, got, sizeof got),
+                   1);
+  check_paths(got, "b.md");
+  KBC_CHECK_EQ_INT(
+      search_paths(f.app, "tag:search", CORPUS_A, got, sizeof got), 0);
+  KBC_CHECK_EQ_INT(
+      search_paths(f.app, "tag:ledger", CORPUS_A, got, sizeof got), 1);
+  check_paths(got, "a.md");
+  fx_teardown(&f);
+}
+
+/* A deleted document takes its facets with it: a tag must never outlive the
+ * file that declared it. */
+KBC_TEST(a_deleted_document_takes_its_tags_with_it) {
+  fixture f;
+  fx_setup_tagged(&f);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, "a.md");
+  KBC_CHECK(unlink(p) == 0);
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex_file(f.app, CORPUS_A, "a.md", &err));
+  char got[512];
+  KBC_CHECK_EQ_INT(search_paths(f.app, "tag:search", CORPUS_A, got, sizeof got),
+                   0);
+  KBC_CHECK_EQ_INT(search_paths(f.app, "tag:rust", CORPUS_A, got, sizeof got),
+                   1);
+  check_paths(got, "b.md");
+  fx_teardown(&f);
+}
+
+/* `index:` is the original's index_only predicate (docs_query.rs:434): a
+ * document is an index page when its basename is `index.html`, and kb-c adds
+ * `index.md` plus the `kb-index` declaration. */
+KBC_TEST(index_selects_only_the_documents_that_declare_themselves_indexes) {
+  fixture f;
+  fx_setup_tagged(&f);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char got[512];
+  KBC_CHECK_EQ_INT(
+      search_paths(f.app, "index:true", CORPUS_A, got, sizeof got), 1);
+  check_paths(got, "c.md");
+  KBC_CHECK_EQ_INT(
+      search_paths(f.app, "NOT index:true", CORPUS_A, got, sizeof got), 2);
+  check_paths(got, "a.md|b.md");
+  /* An `index.md` basename is the same page. */
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, "index.md");
+  kbc_test_write_file(p, "# Hub\n\nThe hub links the rest.\n");
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  KBC_CHECK_EQ_INT(
+      search_paths(f.app, "index:true", CORPUS_A, got, sizeof got), 2);
+  check_paths(got, "c.md|index.md");
+  fx_teardown(&f);
+}
+
+/* A filter is case-SENSITIVE on the value, the way the original is: query.rs
+ * compares the atom's value with the document's tag by string equality, and
+ * the meta extractor lowercases the KEY only. `tag:Search` therefore does not
+ * match a document declaring `Search` — which is a narrowing, never a widening,
+ * so it cannot turn a filter into a no-op. */
+KBC_TEST(a_tag_value_is_case_sensitive_as_it_is_in_the_original) {
+  fixture f;
+  fx_setup_tagged(&f);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char got[512];
+  KBC_CHECK_EQ_INT(
+      search_paths(f.app, "tag:Search", CORPUS_A, got, sizeof got), 0);
+  /* The KEY is not case-sensitive: the extractor lowercases it, and the
+   * grammar lowercases the atom, so KB-Tags and tags are one predicate. */
+  KBC_CHECK_EQ_INT(
+      search_paths(f.app, "tag:search", CORPUS_A, got, sizeof got), 1);
+  check_paths(got, "a.md");
+  fx_teardown(&f);
+}
+
+/* `scope:` stays refused: the original gives it an empty arm (query.rs:404)
+ * because it belongs to /memory and is read from the URL, so evaluating it
+ * here would invent a meaning the Rust daemon cannot reproduce. */
+KBC_TEST(scope_is_still_refused) {
+  fixture f;
+  fx_setup_tagged(&f);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char got[512];
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_query query;
+  memset(&query, 0, sizeof query);
+  query.q = "scope:kb";
+  query.corpus = CORPUS_A;
+  query.mode = KBC_MODE_KEYWORD;
+  kbc_search_result res;
+  memset(&res, 0, sizeof res);
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_EQ_INT(kbc_app_search(f.app, a, &query, &res, &err),
+                   KBC_ERR_UNSUPPORTED);
+  KBC_CHECK(strstr(err.msg, "scope") != NULL);
+  kbc_arena_free(a);
+  (void)got;
+  fx_teardown(&f);
+}
+
 int main(void) {
   static const kbc_test_case cases[] = {
       {"ingest_indexes_every_document", ingest_indexes_every_document},
@@ -1417,8 +1980,32 @@ int main(void) {
        since_filters_on_the_store_mtime_and_an_impossible_since_returns_nothing},
       {"reindex_records_only_edges_whose_target_is_an_indexed_document",
        reindex_records_only_edges_whose_target_is_an_indexed_document},
+      {"the_link_graph_does_not_depend_on_the_ingest_order",
+       the_link_graph_does_not_depend_on_the_ingest_order},
+      {"a_full_reindex_drains_links_left_pending",
+       a_full_reindex_drains_links_left_pending},
+      {"removing_a_document_takes_its_edges_and_its_pending_links",
+       removing_a_document_takes_its_edges_and_its_pending_links},
       {"the_graph_boost_is_off_by_default_and_reorders_when_configured",
        the_graph_boost_is_off_by_default_and_reorders_when_configured},
+    {"a_tag_filter_that_matches_nothing_returns_zero_rows",
+     a_tag_filter_that_matches_nothing_returns_zero_rows},
+    {"a_tag_and_a_cap_together_are_an_intersection",
+     a_tag_and_a_cap_together_are_an_intersection},
+    {"two_tags_or_ed_match_either_document",
+     two_tags_or_ed_match_either_document},
+    {"a_negated_tag_drops_the_documents_carrying_it",
+     a_negated_tag_drops_the_documents_carrying_it},
+    {"a_tag_composes_with_folder_and_since", a_tag_composes_with_folder_and_since},
+    {"a_removed_tag_stops_matching_after_one_reindex",
+     a_removed_tag_stops_matching_after_one_reindex},
+    {"a_deleted_document_takes_its_tags_with_it",
+     a_deleted_document_takes_its_tags_with_it},
+    {"index_selects_only_the_documents_that_declare_themselves_indexes",
+     index_selects_only_the_documents_that_declare_themselves_indexes},
+    {"a_tag_value_is_case_sensitive_as_it_is_in_the_original",
+     a_tag_value_is_case_sensitive_as_it_is_in_the_original},
+    {"scope_is_still_refused", scope_is_still_refused},
       {NULL, NULL},
   };
   return kbc_test_run("app", cases);

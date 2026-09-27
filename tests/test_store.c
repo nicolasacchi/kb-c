@@ -6,6 +6,33 @@
 #include "kbc/store.h"
 #include "kbc/types.h"
 
+/* include/kbc/store.h is the orchestrator's file; the pending-links contract
+ * is proposed there and these are the signatures it will carry. */
+kbc_status kbc_store_add_pending_links(kbc_store *s, const char *corpus,
+                                       const char *src_path,
+                                       const char *const *dst_paths, size_t n,
+                                       kbc_err *err);
+kbc_status kbc_store_drain_pending(kbc_store *s, const char *corpus,
+                                   const char *dst_path, kbc_err *err);
+kbc_status kbc_store_delete_pending(kbc_store *s, const char *corpus,
+                                    const char *src_path, kbc_err *err);
+
+int64_t kbc_store_pending_count(kbc_store *s, kbc_err *err);
+
+/* Same CONTRACT GAP as the pending-links block above: the facet API the
+ * overlay needs, on the terms the header will carry. */
+kbc_status kbc_store_replace_metas(kbc_store *s, const char *corpus,
+                                   const char *path,
+                                   const char *const *keys,
+                                   const char *const *values, size_t n,
+                                   kbc_err *err);
+kbc_status kbc_store_forget_metas(kbc_store *s, const char *corpus,
+                                  const char *path, kbc_err *err);
+kbc_status kbc_store_docs_with_meta(kbc_store *s, const char *corpus,
+                                    const char *key, const char *value,
+                                    char ***paths_out, size_t *n_out,
+                                    kbc_err *err);
+
 /* ------------------------------------------------------------- helpers --- */
 
 /* kbc_store_open reads exactly one field of the config — db_path — so the
@@ -68,7 +95,7 @@ KBC_TEST(open_creates_file_and_parents_is_idempotent) {
     return;
   }
   KBC_CHECK(kbc_path_exists(db_path));
-  KBC_CHECK_EQ_INT(kbc_store_schema_version(s), 2);
+  KBC_CHECK_EQ_INT(kbc_store_schema_version(s), 4);
   kbc_store_close(s);
 
   /* Reopening an existing store neither fails nor re-runs the migration. */
@@ -76,7 +103,7 @@ KBC_TEST(open_creates_file_and_parents_is_idempotent) {
   s = open_at(root, "nested/deeper/kb.db", &err);
   KBC_CHECK_MSG(s != NULL, "reopen failed: %s", err.msg);
   if (s != NULL) {
-    KBC_CHECK_EQ_INT(kbc_store_schema_version(s), 2);
+    KBC_CHECK_EQ_INT(kbc_store_schema_version(s), 4);
     kbc_store_close(s);
   }
   kbc_test_rmrf(root);
@@ -1209,14 +1236,14 @@ KBC_TEST(edges_survive_an_upgrade_from_the_previous_schema) {
   kbc_err_reset(&err);
   kbc_store *v1 = open_at(root, "old.db", &err);
   KBC_CHECK_NOT_NULL(v1);
-  KBC_CHECK_EQ_INT(kbc_store_schema_version(v1), 2);
+  KBC_CHECK_EQ_INT(kbc_store_schema_version(v1), 4);
   kbc_store_close(v1);
 
   /* Re-open: the migration ladder is a no-op the second time, and the edges
    * table is still there and still writable. */
   kbc_store *s = open_at(root, "old.db", &err);
   KBC_CHECK_NOT_NULL(s);
-  KBC_CHECK_EQ_INT(kbc_store_schema_version(s), 2);
+  KBC_CHECK_EQ_INT(kbc_store_schema_version(s), 4);
   static const char *const dst[] = {"t.md"};
   KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "s.md", dst, 1, &err));
   KBC_CHECK_EQ_INT(kbc_store_edge_count(s, "kb", &err), 1);
@@ -1224,6 +1251,306 @@ KBC_TEST(edges_survive_an_upgrade_from_the_previous_schema) {
 
   kbc_test_rmrf(root);
   (void)db_path;
+}
+
+/* A link whose target is not an indexed document is recorded as PENDING, not
+ * as an edge: a document that arrives later must be able to pick the link up,
+ * and an edge to a path with no document has no in-degree to attach to. */
+KBC_TEST(pending_links_are_recorded_drained_and_never_dangle) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_MSG(s != NULL, "open: %s", err.msg);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+
+  static const char *const two[] = {"b.md", "never.md"};
+  KBC_CHECK_OK(kbc_store_add_pending_links(s, "kb", "a.md", two, 2, &err));
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(s, &err), 2);
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(s, "kb", &err), 0);
+
+  /* a.md is not a document, so draining b.md materialises nothing — but the
+   * pending row still goes: it named a link, and the thing it named now
+   * exists. The graph never claims an edge a store cannot back. */
+  kbc_artifact a;
+  fill(&a, "aaaaaaaaaaaa", "kb", "a.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_drain_pending(s, "kb", "b.md", &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(s, "kb", &err), 0);
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(s, &err), 1);
+
+  KBC_CHECK_OK(kbc_store_add_pending_links(s, "kb", "a.md", two, 2, &err));
+  kbc_artifact b;
+  fill(&b, "bbbbbbbbbbbb", "kb", "b.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &b, &err));
+  /* Re-adding is idempotent: the primary key collapses the duplicate. */
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(s, &err), 2);
+  KBC_CHECK_OK(kbc_store_drain_pending(s, "kb", "b.md", &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(s, "kb", &err), 1);
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(s, &err), 1);
+  static const char *const want[] = {"b.md"};
+  uint32_t deg[1] = {9};
+  KBC_CHECK_OK(kbc_store_edge_degrees_for(s, "kb", want, 1, deg, &err));
+  KBC_CHECK_EQ_INT(deg[0], 1);
+
+  /* Draining again is a no-op: the row is gone, so no second edge. */
+  KBC_CHECK_OK(kbc_store_drain_pending(s, "kb", "b.md", &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(s, "kb", &err), 1);
+
+  /* Dropping the source drops what it was waiting for. */
+  KBC_CHECK_OK(kbc_store_delete_pending(s, "kb", "a.md", &err));
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(s, &err), 0);
+  /* ...and not the edge it already had. */
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(s, "kb", &err), 1);
+
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* The drain is per corpus: a pending link in one corpus must not be
+ * materialised by a document of the same path in another. */
+KBC_TEST(pending_links_do_not_cross_corpora) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_MSG(s != NULL, "open: %s", err.msg);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  static const char *const dst[] = {"t.md"};
+  KBC_CHECK_OK(kbc_store_add_pending_links(s, "one", "s.md", dst, 1, &err));
+  kbc_artifact t;
+  fill(&t, "tttttttttttt", "two", "t.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &t, &err));
+  KBC_CHECK_OK(kbc_store_drain_pending(s, "two", "t.md", &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(s, "one", &err), 0);
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(s, &err), 1);
+  KBC_CHECK_OK(kbc_store_drain_pending(s, "one", "t.md", &err));
+  /* The source is still not a document in corpus one, so nothing materialises
+   * and the row is dropped: the link was recorded, and the corpus it names
+   * has no t.md. */
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(s, &err), 0);
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(s, "one", &err), 0);
+
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* --------------------------------------------------------------- metas --- */
+
+static void free_paths(char **paths, size_t n) {
+  for (size_t i = 0; i < n; i++) free(paths[i]);
+  free(paths);
+}
+
+/* The invariant the whole refusal design exists to protect, at the layer that
+ * decides it: a facet nobody carries is ZERO rows. A query that returned
+ * everything here would return everything for every un-filtered query too. */
+KBC_TEST(metas_a_key_nobody_carries_returns_no_rows) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "m.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  static const char *const keys[] = {"tags"};
+  static const char *const vals[] = {"rust"};
+  KBC_CHECK_OK(kbc_store_replace_metas(s, "kb", "a.md", keys, vals, 1, &err));
+  char **paths = NULL;
+  size_t n = 1;
+  KBC_CHECK_OK(
+      kbc_store_docs_with_meta(s, "kb", "tags", "nope", &paths, &n, &err));
+  KBC_CHECK_EQ_INT(n, 0);
+  KBC_CHECK(paths == NULL);
+
+  /* …and the value that IS there comes back, once. */
+  KBC_CHECK_OK(kbc_store_docs_with_meta(s, "kb", "tags", "rust", &paths, &n,
+                                        &err));
+  KBC_CHECK_EQ_INT(n, 1);
+  if (n == 1) KBC_CHECK_EQ_STR(paths[0], "a.md");
+  free_paths(paths, n);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* Re-ingesting a document REPLACES its facets. A merge would leave a tag the
+ * author deleted matching forever, and nothing else would ever clean it up. */
+KBC_TEST(metas_replace_drops_a_value_the_document_no_longer_declares) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "m.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  static const char *const k1[] = {"tags", "tags"};
+  static const char *const v1[] = {"rust", "search"};
+  KBC_CHECK_OK(kbc_store_replace_metas(s, "kb", "a.md", k1, v1, 2, &err));
+  char **paths = NULL;
+  size_t n = 0;
+  KBC_CHECK_OK(
+      kbc_store_docs_with_meta(s, "kb", "tags", "search", &paths, &n, &err));
+  KBC_CHECK_EQ_INT(n, 1);
+  free_paths(paths, n);
+
+  /* The second ingest declares one tag. */
+  static const char *const k2[] = {"tags"};
+  static const char *const v2[] = {"rust"};
+  KBC_CHECK_OK(kbc_store_replace_metas(s, "kb", "a.md", k2, v2, 1, &err));
+  KBC_CHECK_OK(
+      kbc_store_docs_with_meta(s, "kb", "tags", "rust", &paths, &n, &err));
+  KBC_CHECK_EQ_INT(n, 1);
+  free_paths(paths, n);
+  KBC_CHECK_OK(
+      kbc_store_docs_with_meta(s, "kb", "tags", "search", &paths, &n, &err));
+  KBC_CHECK_EQ_INT(n, 0);
+  free_paths(paths, n);
+
+  /* And an empty declaration removes every facet the document had. */
+  KBC_CHECK_OK(kbc_store_replace_metas(s, "kb", "a.md", NULL, NULL, 0, &err));
+  KBC_CHECK_OK(
+      kbc_store_docs_with_meta(s, "kb", "tags", "rust", &paths, &n, &err));
+  KBC_CHECK_EQ_INT(n, 0);
+  free_paths(paths, n);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* A path is corpus-relative, so the same relative path under two corpora is
+ * two documents and a facet filter is scoped to its corpus. */
+KBC_TEST(metas_are_scoped_to_their_corpus) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "m.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  static const char *const keys[] = {"tags"};
+  static const char *const vals[] = {"rust"};
+  KBC_CHECK_OK(kbc_store_replace_metas(s, "one", "a.md", keys, vals, 1, &err));
+  char **paths = NULL;
+  size_t n = 0;
+  KBC_CHECK_OK(
+      kbc_store_docs_with_meta(s, "two", "tags", "rust", &paths, &n, &err));
+  KBC_CHECK_EQ_INT(n, 0);
+  free_paths(paths, n);
+  KBC_CHECK_OK(
+      kbc_store_docs_with_meta(s, "one", "tags", "rust", &paths, &n, &err));
+  KBC_CHECK_EQ_INT(n, 1);
+  free_paths(paths, n);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* `value` NULL asks for the key with any value, which is what a boolean facet
+ * needs: "carries the flag", not "carries this exact flag text". */
+KBC_TEST(metas_a_null_value_asks_for_the_key_with_any_value) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "m.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  static const char *const k1[] = {"index"};
+  static const char *const v1[] = {""};
+  KBC_CHECK_OK(kbc_store_replace_metas(s, "kb", "a.md", k1, v1, 1, &err));
+  static const char *const k2[] = {"index"};
+  static const char *const v2[] = {"true"};
+  KBC_CHECK_OK(kbc_store_replace_metas(s, "kb", "b.md", k2, v2, 1, &err));
+  char **paths = NULL;
+  size_t n = 0;
+  KBC_CHECK_OK(
+      kbc_store_docs_with_meta(s, "kb", "index", NULL, &paths, &n, &err));
+  KBC_CHECK_EQ_INT(n, 2);
+  free_paths(paths, n);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* Forgetting a document forgets its facets. A tag outliving the file it was
+ * written in is a filter matching a document that does not exist. */
+KBC_TEST(metas_forget_document_takes_the_facets_with_it) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "m.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  static const char *const keys[] = {"tags"};
+  static const char *const vals[] = {"rust"};
+  KBC_CHECK_OK(kbc_store_replace_metas(s, "kb", "a.md", keys, vals, 1, &err));
+  KBC_CHECK_OK(kbc_store_forget_document(s, "kb", "a.md", &err));
+  char **paths = NULL;
+  size_t n = 0;
+  KBC_CHECK_OK(
+      kbc_store_docs_with_meta(s, "kb", "tags", "rust", &paths, &n, &err));
+  KBC_CHECK_EQ_INT(n, 0);
+  free_paths(paths, n);
+
+  /* forget_metas on its own is the same delete without touching the graph. */
+  KBC_CHECK_OK(kbc_store_replace_metas(s, "kb", "b.md", keys, vals, 1, &err));
+  KBC_CHECK_OK(kbc_store_forget_metas(s, "kb", "b.md", &err));
+  KBC_CHECK_OK(
+      kbc_store_docs_with_meta(s, "kb", "tags", "rust", &paths, &n, &err));
+  KBC_CHECK_EQ_INT(n, 0);
+  free_paths(paths, n);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* A NULL or empty key is refused with a message, not bound as an empty key
+ * that would match every document which declared something at all. */
+KBC_TEST(metas_reject_an_empty_key) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "m.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  static const char *const keys[] = {""};
+  static const char *const vals[] = {"x"};
+  KBC_CHECK_EQ_INT(
+      kbc_store_replace_metas(s, "kb", "a.md", keys, vals, 1, &err),
+      KBC_ERR_INVALID);
+  KBC_CHECK(err.msg[0] != '\0');
+  kbc_err_reset(&err);
+  char **paths = NULL;
+  size_t n = 0;
+  KBC_CHECK_EQ_INT(
+      kbc_store_docs_with_meta(s, "kb", "", "x", &paths, &n, &err),
+      KBC_ERR_INVALID);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
 }
 
 int main(void) {
@@ -1264,6 +1591,19 @@ static const kbc_test_case cases[] = {
        edges_in_degrees_is_one_aggregate_over_the_graph},
       {"edges_survive_an_upgrade_from_the_previous_schema",
        edges_survive_an_upgrade_from_the_previous_schema},
+      {"pending_links_are_recorded_drained_and_never_dangle",
+       pending_links_are_recorded_drained_and_never_dangle},
+      {"pending_links_do_not_cross_corpora", pending_links_do_not_cross_corpora},
+      {"metas_a_key_nobody_carries_returns_no_rows",
+       metas_a_key_nobody_carries_returns_no_rows},
+      {"metas_replace_drops_a_value_the_document_no_longer_declares",
+       metas_replace_drops_a_value_the_document_no_longer_declares},
+      {"metas_are_scoped_to_their_corpus", metas_are_scoped_to_their_corpus},
+      {"metas_a_null_value_asks_for_the_key_with_any_value",
+       metas_a_null_value_asks_for_the_key_with_any_value},
+      {"metas_forget_document_takes_the_facets_with_it",
+       metas_forget_document_takes_the_facets_with_it},
+      {"metas_reject_an_empty_key", metas_reject_an_empty_key},
       {NULL, NULL},
   };
   return kbc_test_run("store", cases);

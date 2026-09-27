@@ -20,7 +20,9 @@
 #include "kbc/mem.h"
 #include "kbc/parse.h"
 #include "kbc/search.h"
+
 #include "kbc/types.h"
+
 
 /* Per-lane depth floor; a caller asking for more still gets at most
  * KBC_MAX_HITS, which is the ceiling the index lane enforces too. */
@@ -35,6 +37,15 @@ struct kbc_searcher {
   kbc_resolve_fn resolve; /* BORROWED, may be NULL */
   void *resolve_ctx;      /* BORROWED */
   const kbc_vecstore *vs; /* BORROWED, NULL = no vector lane available */
+  kbc_facet_fn facets;   /* BORROWED, NULL = facets are refused, never ignored */
+  void *facet_ctx;       /* BORROWED */
+  /* The membership set kbc_search_run resolved for the query in flight: the
+   * index doc ids the facets admit, ascending. Per RUN, never per searcher —
+   * a reused searcher must not answer the next query with the last one's
+   * facets. */
+  uint32_t *allow_ids; /* KBC_OWN, free() with the array */
+  size_t allow_len;
+  bool allow_active;
 };
 
 /* One fused row, before the resolver and the index doc are consulted. */
@@ -376,9 +387,41 @@ kbc_status kbc_searcher_set_vecstore(kbc_searcher *s, const kbc_vecstore *vs,
   return KBC_OK;
 }
 
+/* CONTRACT GAP: the same shape as the vecstore setter, for the same reason —
+ * the facets live in the store and the searcher has no way to reach them.
+ * BORROWS `fn` and `ctx`. Without one, a query naming a facet is REFUSED, not
+ * ignored: a searcher that silently dropped `tag:rust` would answer a
+ * different question from the one that was asked; the evaluator hook is
+ * declared in include/kbc/search.h. */
+kbc_status kbc_searcher_set_facet_fn(kbc_searcher *s, kbc_facet_fn fn,
+                                     void *ctx, kbc_err *err) {
+  if (s == NULL) return kbc_err_set(err, KBC_ERR_INVALID, "set_facet_fn: s");
+  s->facets = fn;
+  s->facet_ctx = ctx;
+  return KBC_OK;
+}
+
+/* True when `doc` is in the membership set the facets resolved to. The set is
+ * ascending, so it is a binary search and a document the set does not name is
+ * a document the facets reject — a lookup, never a skip. */
+static bool facet_allows(const kbc_searcher *s, uint32_t doc) {
+  size_t lo = 0;
+  size_t hi = s->allow_len;
+  while (lo < hi) {
+    const size_t mid = lo + (hi - lo) / 2;
+    if (s->allow_ids[mid] < doc) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo < s->allow_len && s->allow_ids[lo] == doc;
+}
+
 void kbc_searcher_free(kbc_searcher *s) {
   if (s == NULL) return;
-  free(s); /* everything else is borrowed */
+  free(s->allow_ids); /* per-run, never borrowed */
+  free(s);            /* everything else is borrowed */
 }
 
 /* ======================================================== query grammar == */
@@ -788,7 +831,8 @@ static bool parse_expr_or(gram_parser *p, size_t depth, gram_list *out) {
   }
 }
 
-/* What the index can be told, in its own vocabulary. */
+/* What the index can be told, in its own vocabulary, plus the facets only the
+ * store can answer. */
 typedef struct {
   const char *text;   /* arena, space-joined free text; "" when none */
   const char *folder; /* arena, NULL when the query names no folder */
@@ -796,7 +840,37 @@ typedef struct {
    * the index carries no mtime — so it is reported here for the caller that
    * does, and the atom never reaches the free text. 0 = no filter. */
   int64_t since_ns;
+  /* tag:/cap:/caps:/index:, grouped by DNF conjunct. The facets live in the
+   * store, keyed by (corpus, path), so the grammar hands them on and the
+   * evaluator (kbc_searcher_set_facet_fn) turns them into a membership set
+   * the searcher can filter rows by. */
+  kbc_facets facets;
 } gram_query;
+
+/* query.rs:394 — an `index:` value. `true`/`1`/`yes` and the bare presence
+ * `index:` opt into index-only; the negatives opt out of it, which the
+ * original achieves by DROPPING the atom. kb-c evaluates the exclusion
+ * instead: an atom that is dropped is a filter that silently does nothing,
+ * and "only documents that are not index pages" is the one meaning
+ * `index:false` has. `NOT index:false` stays a no-op in the original and is
+ * warned about here, because there is nothing left to exclude. */
+typedef enum { GRAM_IDX_REFUSE = 0, GRAM_IDX_ONLY, GRAM_IDX_EXCLUDE } gram_index;
+
+static gram_index gram_index_value(const char *v, bool negated) {
+  /* Presence: `index:` with an empty value. */
+  if (v[0] == '\0') {
+    return negated ? GRAM_IDX_EXCLUDE : GRAM_IDX_ONLY;
+  }
+  if (g_keyword_is(v, "true") || g_keyword_is(v, "1") ||
+      g_keyword_is(v, "yes")) {
+    return negated ? GRAM_IDX_EXCLUDE : GRAM_IDX_ONLY;
+  }
+  if (g_keyword_is(v, "false") || g_keyword_is(v, "0") ||
+      g_keyword_is(v, "no")) {
+    return negated ? GRAM_IDX_REFUSE : GRAM_IDX_EXCLUDE;
+  }
+  return GRAM_IDX_REFUSE;
+}
 
 /* query.rs:276 parse_since. Accepted: `Nd` (days), `Nh` (hours) and a raw
  * unix timestamp in seconds; `since:all` is the ABSENCE of a filter and is
@@ -910,6 +984,7 @@ kbc_status kbc_query_grammar(kbc_arena *a, const char *q, gram_query *out,
   out->text = "";
   out->folder = NULL;
   out->since_ns = 0;
+  memset(&out->facets, 0, sizeof(out->facets));
   if (q == NULL)
     return kbc_err_set(err, KBC_ERR_INVALID, "query_grammar: q is NULL");
   const size_t n = strlen(q);
@@ -968,6 +1043,37 @@ kbc_status kbc_query_grammar(kbc_arena *a, const char *q, gram_query *out,
       }
       continue;
     }
+    if (f->key == GK_TAG || f->key == GK_CAP) {
+      /* Collected per conjunct below. A capability is matched against the
+       * document's declared `caps` metadata rather than validated against
+       * the original's enum (query.rs:266 parse_cap): kb-c has no per-document
+       * capability analysis, and warning-and-dropping an unknown capability
+       * is exactly the silent no-op this overlay refuses to do. */
+      if (f->value[0] == '\0') {
+        kbc_str_free(&text);
+        return kbc_err_set(err, KBC_ERR_INVALID,
+                           "search: %s: has no value to match", f->name);
+      }
+      continue;
+    }
+    if (f->key == GK_INDEX) {
+      if (gram_index_value(f->value, f->negated) == GRAM_IDX_REFUSE) {
+        if (f->negated) {
+          /* query.rs:395 — `NOT index:false` has nothing to exclude, and the
+          * original warns. */
+          KBC_LOGW("search: NOT index:\"%s\" has nothing to exclude; "
+                   "ignoring",
+                   f->value);
+        } else {
+          kbc_str_free(&text);
+          return kbc_err_set(err, KBC_ERR_INVALID,
+                             "search: index:\"%s\" is not a boolean; expected "
+                             "true/false, 1/0, yes/no, or nothing",
+                             f->value);
+        }
+      }
+      continue;
+    }
     if (f->key == GK_FOLDER) {
       if (f->negated) {
         kbc_str_free(&text);
@@ -1016,14 +1122,90 @@ kbc_status kbc_query_grammar(kbc_arena *a, const char *q, gram_query *out,
       kbc_str_free(&text);
       return kbc_err_set(err, KBC_ERR_INVALID,
                          "search: unknown query key \"%s\"; valid keys: "
-                         "folder, since, text",
+                         "tag, cap(s), index, folder, since, text",
                          f->name);
     }
+    /* `scope:` is refused, and stays refused: query.rs:404 gives it an empty
+     * arm with the comment that it belongs to /memory and is read from the
+     * URL, so the original evaluates it nowhere either. Inventing a meaning
+     * here would be a filter the Rust daemon cannot reproduce. */
     kbc_str_free(&text);
     return kbc_err_set(err, KBC_ERR_UNSUPPORTED,
-                       "search: query key \"%s\" is not supported by the "
-                       "kb-c index (valid keys: folder, since, text)",
+                       "search: query key \"%s\" is not evaluated by kb-c "
+                       "(it is a /memory route parameter, not a document "
+                       "filter); valid keys: tag, cap(s), index, folder, "
+                       "since, text",
                        gram_key_name(f->key));
+  }
+
+  /* The facets, grouped by DNF conjunct. query.rs:339 `dnf_build` already
+   * produced the conjuncts; the fold above read each atom ONCE for the fields
+   * the whole query shares, and this pass reads the copies so that
+   * `tag:a OR tag:b` is two conjuncts with one tag each — the original's
+   * shape, where a row matches if it satisfies ANY conjunct (query.rs:246
+   * `matches_conjunct(r, q) || q.alternatives.iter().any(...)`). */
+  if (top.len > 0) {
+    kbc_facet_atom *atoms =
+        kbc_arena_calloc(a, GRAM_MAX_FACTS, sizeof(*atoms));
+    size_t *conj = kbc_arena_calloc(a, top.len + 1, sizeof(*conj));
+    if (atoms == NULL || conj == NULL) {
+      kbc_str_free(&text);
+      return kbc_err_set(err, KBC_ERR_NOMEM, "query_grammar: %zu conjuncts",
+                         top.len);
+    }
+    size_t n_atoms = 0;
+    size_t n_with_folder = 0;
+    for (size_t j = 0; j < top.len; j++) {
+      const gram_span span = top.items[j];
+      conj[j] = n_atoms;
+      bool conj_has_folder = false;
+      for (size_t k = 0; k < span.len; k++) {
+        const gram_fact *f = &p.facts[span.start + k];
+        if (f->key == GK_FOLDER) {
+          conj_has_folder = true;
+          continue;
+        }
+        kbc_facet_key fk;
+        const char *fv;
+        if (f->key == GK_TAG) {
+          fk = KBC_FACET_TAG;
+          fv = f->value;
+        } else if (f->key == GK_CAP) {
+          fk = KBC_FACET_CAP;
+          fv = f->value;
+        } else if (f->key == GK_INDEX) {
+          const gram_index gi = gram_index_value(f->value, f->negated);
+          if (gi == GRAM_IDX_REFUSE) continue; /* warned or refused above */
+          fk = KBC_FACET_INDEX;
+          fv = gi == GRAM_IDX_ONLY ? "index_only" : "not_index";
+        } else {
+          continue;
+        }
+        atoms[n_atoms].key = fk;
+        atoms[n_atoms].value = fv;
+        atoms[n_atoms].negated = f->negated;
+        n_atoms++;
+      }
+      if (conj_has_folder) n_with_folder++;
+    }
+    conj[top.len] = n_atoms;
+    out->facets.atoms = atoms;
+    out->facets.n_atoms = n_atoms;
+    out->facets.conj = conj;
+    out->facets.n_conj = top.len;
+    out->facets.any = n_atoms > 0;
+    /* `folder:` is one path prefix on kbc_query, so it can only be a filter
+     * every conjunct agrees on. A conjunct that omits it would be given the
+     * prefix by the index lane and answer a DIFFERENT query from the one the
+     * original would run (`folder:x OR tag:a` is "in x, or tagged"). */
+    if (out->facets.any && top.len > 1 && n_with_folder > 0 &&
+        n_with_folder != top.len) {
+      kbc_str_free(&text);
+      return kbc_err_set(
+          err, KBC_ERR_UNSUPPORTED,
+          "search: OR between a folder filter and another conjunct is "
+          "unsupported (kb-c has one path prefix, not one per branch)");
+    }
   }
   out->since_ns = since_ns;
   out->text = kbc_arena_strndup(a, text.ptr != NULL ? text.ptr : "", text.len);
@@ -1273,6 +1455,41 @@ kbc_status kbc_search_run(kbc_searcher *s, kbc_arena *a, const kbc_query *q,
   eq.q = gq.text;
   if (gq.folder != NULL) eq.path_prefix = gq.folder;
 
+  /* The facets resolve to a MEMBERSHIP SET once, here, and the rest of the
+   * run filters rows against it. The set is in index doc ids because that is
+   * the only vocabulary the lanes speak, and the store — which is where the
+   * facets live, keyed by (corpus, path) — is one layer up, exactly as the
+   * graph boost's in-degree array is. */
+  free(s->allow_ids); /* a reused searcher must never answer with the last set */
+  s->allow_ids = NULL;
+  s->allow_len = 0;
+  s->allow_active = false;
+  if (gq.facets.any) {
+    if (s->facets == NULL) {
+      return kbc_err_set(
+          err, KBC_ERR_UNSUPPORTED,
+          "search: this query filters on document metadata, which needs a "
+          "kbc_searcher_set_facet_fn evaluator (the facets live in the "
+          "store)");
+    }
+    st = s->facets(s->facet_ctx, q->corpus, &gq.facets, &s->allow_ids,
+                   &s->allow_len, err);
+    if (st != KBC_OK) return st;
+    s->allow_active = true;
+    /* An active filter admitting nothing ends the query HERE, before a lane
+     * runs. This is the invariant the whole refusal design exists to protect:
+     * `tag:rust` matching nothing is zero rows, and it must never reach the
+     * point where "no rows scored" is indistinguishable from "every row was
+     * filtered out by something". */
+    if (s->allow_len == 0) {
+      out->degraded = false;
+      out->took_us = (kbc_now_ns() - started) / 1000;
+      return KBC_OK;
+    }
+    KBC_LOGD("search: facet filter admits %zu of %u documents",
+             s->allow_len, (unsigned)kbc_index_doc_count(s->ix));
+  }
+
   size_t limit = q->limit == 0 ? SEARCH_DEFAULT_LIMIT : q->limit;
   if (limit > KBC_MAX_HITS) limit = KBC_MAX_HITS;
   size_t depth = q->candidate_k == 0 ? SEARCH_DEFAULT_CANDIDATES : q->candidate_k;
@@ -1289,12 +1506,13 @@ kbc_status kbc_search_run(kbc_searcher *s, kbc_arena *a, const kbc_query *q,
   memset(&toks, 0, sizeof(toks));
   st = kbc_tokenize(a, eq.q, strlen(eq.q), &toks, err);
   if (st != KBC_OK) return st;
-  /* A facet-only query (`folder:notes`) filters the corpus instead of
-   * scoring it: every doc that passes the filter is a hit, all scoring zero
+  /* A facet-only query (`folder:notes`, `tag:rust`) filters the corpus instead
+   * of scoring it: every doc that passes the filter is a hit, all scoring zero
    * and tie-breaking by doc id. Without a filter, zero tokens means stopwords
    * and punctuation only, and returning "everything" there is how a search
    * starts lying — an empty result is the truth. */
-  const bool filter_only = toks.len == 0 && gq.folder != NULL;
+  const bool filter_only =
+      toks.len == 0 && (gq.folder != NULL || s->allow_active);
   if (toks.len == 0 && !filter_only) {
     out->degraded = vec_expected;
     out->took_us = (kbc_now_ns() - started) / 1000;
@@ -1331,6 +1549,21 @@ kbc_status kbc_search_run(kbc_searcher *s, kbc_arena *a, const kbc_query *q,
       if (st != KBC_OK) {
         kbc_hits_free(&hits);
         return st;
+      }
+    } else if (s->allow_active) {
+      /* The membership set IS the candidate list, and it is already in doc-id
+       * order, which is the tie-break order of a query that scores nothing.
+       * Capped at the lane depth, which is never below the caller's limit, so
+       * nothing the caller could have been shown is dropped. */
+      for (size_t i = 0; i < s->allow_len && hits.len < depth; i++) {
+        const uint32_t d = s->allow_ids[i];
+        if (!row_passes(s->ix, d, &eq)) continue;
+        const kbc_status ps = kbc_hits_push(&hits, d, 0.0);
+        if (ps != KBC_OK) {
+          kbc_hits_free(&hits);
+          return kbc_err_set(err, ps, "search: %zu facet rows: out of memory",
+                             hits.len);
+        }
       }
     } else {
       const uint32_t count = kbc_index_doc_count(s->ix);
@@ -1511,6 +1744,21 @@ kbc_status kbc_search_run(kbc_searcher *s, kbc_arena *a, const kbc_query *q,
    * `q`: the grammar may have overridden other fields, and the boost reads
    * the caller's graph either way. */
   apply_graph_boost(rows, uniq, &eq, rrf_k);
+  /* The metadata filter, in the same place the original applies it: after
+   * fusion and the boosts, BEFORE truncation. A filter applied after the
+   * limit would answer with fewer rows than the caller asked for and would
+   * report that as the corpus, which is the one thing a filter must never
+   * do. Compacting here keeps the candidate count honest — `candidates` is
+   * what the lanes produced, facets included. */
+  if (s->allow_active) {
+    size_t kept = 0;
+    for (size_t i = 0; i < uniq; i++) {
+      if (!facet_allows(s, rows[i].doc)) continue;
+      if (kept != i) rows[kept] = rows[i];
+      kept++;
+    }
+    uniq = kept;
+  }
   /* Rust re-sorts stably by score after the boost. kb-c's fused order is
    * already score-desc with a deterministic tie-break, so a plain re-sort by
    * that same comparator IS the stable sort. */

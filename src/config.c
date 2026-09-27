@@ -1412,7 +1412,14 @@ kbc_status kbc_config_load_token(kbc_config *cfg, kbc_err *err) {
                        "out of memory reading the token from %s",
                        cfg->token_path);
   }
-  (void)memcpy(tok, body.ptr + start, end - start);
+  /* An empty token file leaves the kbc_str with a NULL ptr, and
+   * memcpy(dst, NULL, 0) is undefined even though it is benign in
+   * practice — UBSan is right to flag it. The early return above
+   * already proved the file is readable, so a NULL body.ptr here can
+   * only mean the file was empty. */
+  if (end > start) {
+    (void)memcpy(tok, body.ptr + start, end - start);
+  }
   tok[end - start] = '\0';
   kbc_str_free(&body);
 

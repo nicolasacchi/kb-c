@@ -13,6 +13,7 @@
 
 #include "kbc/embed.h"
 #include "kbc/index.h"
+#include "kbc/meta.h"
 #include "kbc/kbc.h"
 #include "kbc/mem.h"
 #include "kbc/parse.h"
@@ -124,6 +125,65 @@ kbc_status kbc_search_run(kbc_searcher *s, kbc_arena *a, const kbc_query *q,
  * filter": a `since:` the caller believes it applied must not quietly not
  * apply. */
 kbc_status kbc_since_value_ns(const char *value, int64_t *ns, kbc_err *err);
+
+
+/* ------------------------------------------------------ facet filtering -- */
+
+/* The facet atoms the query grammar hands to the layer that can evaluate them.
+ *
+ * Evaluation is a CALLBACK and not a field on kbc_query because the searcher
+ * cannot answer it: facets live in the store keyed by (corpus, path), and the
+ * index knows only doc ids. The searcher asks once per query and receives the
+ * set of index doc ids the facets admit.
+ *
+ * The semantics are the Rust overlay's, deliberately, including the part that
+ * surprises: WITHIN one DNF conjunct tags are ANY-OF, so `tag:a AND tag:b`
+ * means "has a or has b" — the original ANDs predicates, not literals
+ * (docs_query.rs:246,258). Caps are the opposite, ALL-of. Negation removes. */
+typedef enum {
+  KBC_FACET_TAG = 0, /* the document carries this value under `tags` */
+  KBC_FACET_CAP,     /* ...under `caps`; ALL of a conjunct's caps */
+  KBC_FACET_INDEX,   /* value is "index_only" or "not_index" */
+  KBC_FACET_KEY__COUNT
+} kbc_facet_key;
+
+typedef struct {
+  kbc_facet_key key;
+  const char *value; /* KBC_ARENA */
+  /* A negated atom is an exclusion, not a filter: it drops the documents
+   * carrying `value` and leaves the conjunct otherwise untouched. The grammar
+   * normalises `index:` into the same shape, so the evaluator never has to
+   * read a negated index atom. */
+  bool negated;
+} kbc_facet_atom;
+
+/* The facet atoms of one query, grouped by DNF conjunct: conjunct j owns
+ * atoms[conj[j] .. conj[j+1]). KBC_ARENA, and `conj` has n_conj + 1 entries.
+ * `any` is false when the query named no facet at all, and the struct is then
+ * meaningless; the callback is not called. A conjunct with no atoms of its own
+ * matches every document, which the evaluator — not the grammar — notices. */
+typedef struct {
+  kbc_facet_atom *atoms; /* KBC_ARENA */
+  size_t n_atoms;
+  size_t *conj; /* KBC_ARENA, n_conj + 1 entries */
+  size_t n_conj;
+  bool any;
+} kbc_facets;
+
+/* Resolves the facets into the index doc ids they admit. `ids_out` is KBC_OWN
+ * (free() the array; it is one block) and ASCENDING, so the searcher can
+ * binary-search it; an active filter admitting nothing is a ZERO-LENGTH array,
+ * never a NULL one. */
+typedef kbc_status (*kbc_facet_fn)(void *ctx, const char *corpus,
+                                   const kbc_facets *facets,
+                                   uint32_t **ids_out, size_t *n_out,
+                                   kbc_err *err);
+
+/* Attaches the facet evaluator. BORROWS `fn` and `ctx`. With no evaluator, a
+ * query naming a facet is REFUSED (KBC_ERR_UNSUPPORTED) — never ignored, which
+ * is the property the whole overlay design exists to protect. */
+kbc_status kbc_searcher_set_facet_fn(kbc_searcher *s, kbc_facet_fn fn, void *ctx,
+                                     kbc_err *err);
 
 /* Cosine top-k over a caller-supplied (doc_id, embedding) table. Exposed so
  * the vector lane is testable without a sidecar.

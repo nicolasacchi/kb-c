@@ -14,20 +14,21 @@ same corpus.
 
 ## Status
 
-**As of 2026-09-26 — the port is in progress. This is a pre-1.0 codebase.**
+**As of 2026-09-27 — the port is in progress. This is a pre-1.0 codebase.**
 
 Works today:
 
 - `kbc` builds from source with CMake and passes its ctest suite: 11 suites,
-  271 cases, green in the Release and `-DKBC_SANITIZE=ON` lanes.
-- Config loading (a strict `kb.toml` subset), the SQLite store and its single
-  migration, the Markdown/HTML block parser with stable anchors, the tokenizer
-  and its stopword list, the mmap'd inverted index with BM25, RRF fusion over
-  the keyword and vector lanes, the mmap'd vector store, the inotify watcher
-  with debounce, the subprocess embedder client, the epoll + `SO_REUSEPORT`
-  HTTP daemon with bearer auth and an SSE stream, and a CLI with eleven verbs
-  — all specified in the frozen headers under `include/kbc/` and all wired end
-  to end.
+  339 cases, green in the Release and `-DKBC_SANITIZE=ON` lanes.
+- Config loading (a strict `kb.toml` subset), the SQLite store and its four
+  migrations (schema v4: v1 tables, v2 `edges`, v3 `pending_links`, v4
+  `doc_metas`), the Markdown/HTML block parser with stable anchors, the
+  tokenizer and its stopword list, the mmap'd inverted index with BM25, RRF
+  fusion over the keyword and vector lanes, the mmap'd vector store, the
+  inotify watcher with debounce, the subprocess embedder client, the epoll +
+  `SO_REUSEPORT` HTTP daemon with bearer auth and an SSE stream, and a CLI
+  with eleven verbs — all specified in the frozen headers under
+  `include/kbc/` and all wired end to end.
 - The daemon serves a route banner on `/` and nine JSON routes: `/api/health`,
   `/api/identity`, `/api/kbs`, `/api/stats`, `/api/search`, `/api/artifacts`,
   `/api/artifacts/{id}`, `POST /api/reindex` and `/api/events`. `reindex`,
@@ -37,10 +38,24 @@ Works today:
   `hybrid` degrades to keyword and `semantic` returns nothing, and the
   response says `degraded: true`.
 - A query grammar: `AND`/`OR`/`NOT`, groups, implicit AND, and `folder:` as a
-  path-prefix facet. The keys the index cannot evaluate — `tag:`, `cap:`,
-  `since:`, `index:`, `scope:` — are refused with a 400 rather than searched
-  as literal terms. There is no phrase search, and there is none to port: a
+  path-prefix facet. There is no phrase search, and there is none to port: a
   quoted `"…"` in the original quotes an atom *value*, not a phrase.
+- A filter overlay over the results. `tag:`, `cap:`/`caps:` and `index:` read
+  the document's own declared metadata (`<meta name="kb-tags">` and Markdown
+  front matter) and are evaluated once per query; a filter matching nothing
+  returns zero rows, never everything. Value comparison is case-sensitive, as
+  in the original. `since:` and `scope:` are still refused with a 400 rather
+  than searched as literal terms.
+- Link extraction, including wikilinks: `[text](target)`, `<a href>`,
+  `[[target]]` and `[[target|alias]]` all normalise to the same target, and
+  `![[embed]]` is an image. The link graph **converges**: a document ingested
+  before the documents it links to still ends up with the right in-degree, and
+  the property is asserted by a test that ingests the same corpus in both
+  orders and requires an identical edge set.
+- A backlink boost in ranking, read from the edge graph. It ships **disabled**:
+  `graph_boost` defaults to `0.0` and the weight is unmeasured. See
+  `DECISIONS.md` ADR-004 for why, and ADR-006 for the concurrency rule the
+  double-free fix established.
 - Incremental index update: a file save re-indexes that one file in place,
   9–14 ms at 1,114 documents, and the update survives a restart.
 - Errors are RFC 7807 `application/problem+json`. CORS is same-origin by
@@ -55,12 +70,16 @@ Works today:
 
 Not done:
 
-- No filter overlay over the search results and no date filters — the
-  `docs_query.rs` half of the grammar, and the keys kb-c refuses rather than
-  mis-searches.
-- No graph boost in ranking. It needs an in-degree edge graph kb-c does not
-  have, and a fake version would be a different ranking function wearing the
-  original's name.
+- **No date filters.** `since:` parses its value grammar but the layer that
+  would apply it does not exist, so the atom is refused with a 400.
+- **The link resolution ladder is not ported.** Extraction and normalisation
+  are; the four-tier id/path/title/basename resolution in the original's
+  `links.rs` — and its *Ambiguous* outcome — is not, so a bare `[[name]]` is
+  normalised but not yet resolved to a document id.
+- **`cap:` is not capability analysis.** The original derives `svg_count`,
+  `has_canvas` and `code_block_count` by inspecting the document. kb-c matches
+  declared `kb-caps` metadata instead. A deliberate deviation, and the one
+  place where a `cap:` query can legitimately return a different answer.
 - No web UI. The Rust repo's two React/Vite SPAs, the Claude Code plugins and
   the Playwright e2e suite are out of scope for the C port.
 - The scale ladder stops at 5,000 documents and **locates no knee**. The
@@ -215,14 +234,23 @@ number rather than in a footnote — the concurrency corpus is small and
 deliberately matched, and the latency comparison's corpora are *not* matched
 (1,114 documents against 1,594).
 
+On concurrency the claim is narrower and more specific: the rps figures are
+the **server's**, because the load client is ~17x cheaper than the daemon it
+measures — 0.160 client cores against 2.824 at 32 concurrent clients. The knee
+is at 16, and past 32 the daemon's CPU *falls* while latency rises, which means
+blocked rather than searching. The earlier figures in that section were taken
+with a python client whose GIL saturated first; they are kept and labelled,
+because the same workload one GIL apart is the interesting comparison.
+
 The harnesses are in `bench/` (`bench-kbc.sh`, `bench-rust.sh`,
-`bench-rust-concurrency.sh`, `bench-scale.sh`, `bench-vector.sh`) and the
-in-process one is `kbc bench --queries N --repeat N --corpus DIR`.
+`bench-rust-concurrency.sh`, `bench-scale.sh`, `bench-vector.sh`,
+`kbcbench-client.c`) and the in-process one is
+`kbc bench --queries N --repeat N --corpus DIR`.
 
 ## Layout
 
 ```
-include/kbc/   the frozen contract — 14 headers, read these first
+include/kbc/   the frozen contract — 15 headers, read these first
 src/           the implementation, one file per subsystem
 cli/main.c     the kbc binary
 tests/         ctest-driven, one binary per test_*.c, harness in kbc_test.h

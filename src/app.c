@@ -57,6 +57,7 @@
 #include "kbc/store.h"
 #include "kbc/types.h"
 
+
 /* The event bus is a fixed table, not a queue: the SSE writer has its own. */
 
 /* search.h gives the searcher no way to learn the document embeddings, so
@@ -75,7 +76,7 @@ kbc_status kbc_searcher_set_vecstore(kbc_searcher *s, const kbc_vecstore *vs,
 #define KBC_APP_CFG_FIELDS 8u
 #define KBC_APP_VEC_FILE "vectors.bin"
 /* search.c's `since:` value grammar, which validates the atom there and is
- * applied here; see the CONTRACT GAP note there for the header line the
+ * applied here; see the note there for the header line the
  * orchestrator should add. */
 kbc_status kbc_since_value_ns(const char *value, int64_t *ns, kbc_err *err);
 /* The link graph's write, and the per-source view it takes. Defined next to
@@ -91,6 +92,7 @@ typedef struct {
 static void app_edge_srcs_free(app_edge_src *v, size_t n);
 static kbc_status store_write_links(kbc_app *app, app_edge_src *v, size_t nsrc,
                                     kbc_err *err);
+
 
 /* Links recorded per document. A document with more outbound links than this
  * is a generated page, not curation; the cap keeps one file from turning a
@@ -306,6 +308,13 @@ typedef struct {
   uint32_t content_hash;
   char **link_paths; /* KBC_OWN, corpus-relative */
   size_t n_links;
+  /* The document's declared facets, as parallel KBC_OWN arrays. They are
+   * carried out for the same reason the links are: the store write is one
+   * transaction per document, and it belongs with the rest of the document's
+   * row rather than inside the parse. */
+  char **meta_keys;   /* KBC_OWN */
+  char **meta_values; /* KBC_OWN */
+  size_t n_metas;
 } kbc_app_ingested;
 
 static void ingested_free(kbc_app_ingested *g) {
@@ -317,6 +326,15 @@ static void ingested_free(kbc_app_ingested *g) {
   free(g->link_paths);
   g->link_paths = NULL;
   g->n_links = 0;
+  for (size_t i = 0; i < g->n_metas; i++) {
+    free(g->meta_keys[i]);
+    free(g->meta_values[i]);
+  }
+  free(g->meta_keys);
+  free(g->meta_values);
+  g->meta_keys = NULL;
+  g->meta_values = NULL;
+  g->n_metas = 0;
 }
 
 static kbc_status read_bounded(const char *path, kbc_str *out, kbc_err *err) {
@@ -467,6 +485,37 @@ static kbc_status ingest_file(kbc_app *app, const char *corpus_name,
           goto fail;
         }
         out->n_links++;
+      }
+    }
+  }
+
+  /* The document's declared facets. They REPLACE whatever the previous
+   * ingest of this path recorded — a tag the author deleted from the file
+   * must stop matching on this pass, not live on as a row nothing cleans
+   * up. `kbc_parsed_metas` already expands a multi-valued key into one entry
+   * per element, so the store receives one row per value. */
+  {
+    const kbc_metas *metas = kbc_parsed_metas(p);
+    const size_t nm = metas->len;
+    if (nm > 0) {
+      out->meta_keys = calloc(nm, sizeof(*out->meta_keys));
+      out->meta_values = calloc(nm, sizeof(*out->meta_values));
+      if (out->meta_keys == NULL || out->meta_values == NULL) {
+        free(summary);
+        s = kbc_err_set(err, KBC_ERR_NOMEM, "%zu facets of %s/%s", nm,
+                        corpus_name, rel);
+        goto fail;
+      }
+      for (size_t i = 0; i < nm; i++) {
+        out->meta_keys[i] = dup_cstr(metas->items[i].key);
+        out->meta_values[i] = dup_cstr(metas->items[i].value);
+        if (out->meta_keys[i] == NULL || out->meta_values[i] == NULL) {
+          free(summary);
+          s = kbc_err_set(err, KBC_ERR_NOMEM, "facet copy for %s/%s",
+                          corpus_name, rel);
+          goto fail;
+        }
+        out->n_metas++;
       }
     }
   }
@@ -1143,7 +1192,13 @@ static kbc_status sweep_one_id(kbc_app *app, const kbc_corpus_cfg *cc,
   } else if (path_set_has(seen, probe->ptr)) {
     s = KBC_OK;
   } else {
-    kbc_status d = kbc_store_delete_artifact(app->store, id, err);
+    /* The graph rows leave with the document, exactly as they do on the
+     * single-file removal path (store_forget_path). Dropping only the
+     * artifact row would leave its edges behind: an edge to a document that
+     * is not indexed any more is an in-degree nothing can attach to. */
+    kbc_status d = kbc_store_forget_document(app->store, cc->name, prev.path,
+                                             err);
+    if (d == KBC_OK) d = kbc_store_delete_artifact(app->store, id, err);
     if (kbc_failed(d)) {
       /* One stuck row must not cost the whole rescan: the row stays
        * visible and the next reindex tries again. */
@@ -1303,6 +1358,22 @@ static kbc_status reindex_locked(kbc_app *app, kbc_err *err) {
       row->title = g.title;
       g.title = NULL;
     }
+    /* The facets, replaced per document, right here rather than in the
+     * deferred link write: a facet names the document itself, so unlike a
+     * link it has no dependency on any other document having been ingested
+     * first. Every changed document reaches this call, including one that
+     * declares no facets at all — an empty list is what deletes the facets a
+     * previous version of the file used to carry. */
+    s = kbc_store_replace_metas(app->store, cc->name, row->path,
+                                (const char *const *)g.meta_keys,
+                                (const char *const *)g.meta_values, g.n_metas,
+                                err);
+    if (kbc_failed(s)) {
+      app_edge_srcs_free(edge_srcs, n_edge_srcs);
+      manifest_free(&m);
+      ingested_free(&g);
+      return s;
+    }
     /* EVERY changed document joins the write, links or not: a document that
      * lost its last link has to reach replace_edges with an empty target list,
      * which is what deletes the edges it used to have. */
@@ -1334,6 +1405,24 @@ static kbc_status reindex_locked(kbc_app *app, kbc_err *err) {
    * agree on the same document set. */
   size_t n_removed = 0;
   if (kbc_failed(s = sweep_orphans(app, &m, &n_removed, err))) {
+    manifest_free(&m);
+    return s;
+  }
+
+  /* THE DRAIN, and it runs over EVERY row the walk saw, not only the changed
+   * ones: a document whose links were written before its target existed has
+   * left a pending row, and only a lookup at the target can turn that into an
+   * edge. Running it for the whole document set is what makes a reindex
+   * order-independent — whichever document was visited first, the pass ends
+   * with the same graph. It is one indexed lookup per document (the
+   * (corpus, dst_path) index), and it is after the sweep so a source the
+   * walk did not see has already lost its pending rows and cannot
+   * contribute an edge. */
+  for (size_t i = 0; i < m.len && !kbc_failed(s); i++) {
+    const kbc_corpus_cfg *cc = &app->cfg->corpora[m.items[i].corpus_index];
+    s = kbc_store_drain_pending(app->store, cc->name, m.items[i].path, err);
+  }
+  if (kbc_failed(s)) {
     manifest_free(&m);
     return s;
   }
@@ -1693,15 +1782,16 @@ static kbc_status store_forget_path(kbc_app *app, const char *corpus,
   if (kbc_failed(kbc_store_get_artifact_by_path(app->store, qa, corpus, rel_path,
                                                 &prev, &local))) {
     kbc_arena_free(qa);
-    /* Not a row, but the edges it left are still ours to drop: a document
-     * that was re-ingested without its store row is not a document. */
-    return kbc_store_delete_edges(app->store, corpus, rel_path, err);
+    /* Not a row, but the graph rows it left are still ours to drop: a
+     * document that was re-ingested without its store row is not a
+     * document. */
+    return kbc_store_forget_document(app->store, corpus, rel_path, err);
   }
-  /* The edges leaving a document go with it. Backlinks INTO it are kept: a
-   * document that is unlinked today may be linked again the moment it is
-   * re-ingested, and dropping them would make every other document's
-   * in-degree depend on the order files happened to be scanned in. */
-  s = kbc_store_delete_edges(app->store, corpus, rel_path, err);
+  /* The graph rows go with the document, outbound AND inbound, and the
+   * inbound edges are demoted to pending links rather than dropped: the
+   * links other documents wrote are still true, and this one may come back.
+   * Pending links pointing at it are left alone for the same reason. */
+  s = kbc_store_forget_document(app->store, corpus, rel_path, err);
   if (kbc_failed(s)) {
     kbc_arena_free(qa);
     return s;
@@ -1734,11 +1824,15 @@ static kbc_status store_write_links(kbc_app *app, app_edge_src *v, size_t nsrc,
   for (size_t i = 0; i < nsrc; i++) total += v[i].n;
   /* total == 0 is NOT a no-op: every source in this batch has lost its last
    * link, and the write that deletes those edges is exactly the point. Only
-   * the batch RESOLVE needs targets, so that is what is skipped. */
+   * the batch RESOLVE needs targets, so that is what is skipped. The pending
+   * delete is here for the same reason: a document that has stopped naming a
+   * target must stop being the reason to look for it. */
   if (total == 0) {
     for (size_t i = 0; i < nsrc; i++) {
       kbc_status s = kbc_store_replace_edges(app->store, v[i].corpus, v[i].src,
                                              NULL, 0, err);
+      if (kbc_failed(s)) return s;
+      s = kbc_store_delete_pending(app->store, v[i].corpus, v[i].src, err);
       if (kbc_failed(s)) return s;
     }
     KBC_LOGI("graph: %zu documents, 0 of 0 link targets recorded", nsrc);
@@ -1775,39 +1869,59 @@ static kbc_status store_write_links(kbc_app *app, app_edge_src *v, size_t nsrc,
   }
 
   const char **kept = calloc(total, sizeof(*kept));
-  if (kept == NULL) {
+  /* One pending slot per raw target, filled in the same pass: a target that
+   * did not resolve is not an edge, but it IS a link the corpus states, and
+   * dropping it is what made the graph depend on visit order. */
+  const char **pending = calloc(total, sizeof(*pending));
+  if (kept == NULL || pending == NULL) {
+    free(kept);
+    free(pending);
     free(arts);
     kbc_arena_free(ea);
     return kbc_err_set(err, KBC_ERR_NOMEM, "%zu resolved links", total);
   }
   at = 0;
   size_t recorded = 0;
+  size_t n_pending = 0;
   s = KBC_OK;
   for (size_t i = 0; i < nsrc && s == KBC_OK; i++) {
     size_t nk = 0;
+    size_t np = 0;
     for (size_t j = 0; j < v[i].n; j++) {
       /* The resolved path is the artifact's own, not the link's spelling:
        * `../x/y.md` and `x/y.md` are one edge, and the primary key says so. */
-      if (arts[at + j] != NULL) kept[nk++] = arts[at + j]->path;
+      if (arts[at + j] != NULL) {
+        kept[nk++] = arts[at + j]->path;
+      } else {
+        pending[np++] = v[i].dst[j];
+      }
     }
     s = kbc_store_replace_edges(app->store, v[i].corpus, v[i].src, kept, nk,
                                 err);
+    if (s == KBC_OK)
+      s = kbc_store_delete_pending(app->store, v[i].corpus, v[i].src, err);
+    if (s == KBC_OK && np > 0)
+      s = kbc_store_add_pending_links(app->store, v[i].corpus, v[i].src,
+                                      pending, np, err);
     recorded += nk;
+    n_pending += np;
     at += v[i].n;
   }
   free(kept);
+  free(pending);
   free(arts);
   kbc_arena_free(ea);
   if (s == KBC_OK) {
-    /* Three numbers, and they are not the same number: the parser found
+    /* Four numbers, and they are not the same number: the parser found
      * `total` link targets, `recorded` of them resolved to an indexed
-     * document, and the graph holds `edges` rows — fewer than `recorded`
+     * document, `n_pending` name a target that is not one yet and wait for
+     * it, and the graph holds `edges` rows — fewer than `recorded`
      * because a source linking one document twice has one edge. Only the last
      * is the table itself. */
     const int64_t edges = kbc_store_edge_count(app->store, v[0].corpus, NULL);
-    KBC_LOGI("graph: %zu documents, %zu of %zu link targets resolved, %lld "
-             "edges in the graph",
-             nsrc, recorded, total, (long long)edges);
+    KBC_LOGI("graph: %zu documents, %zu of %zu link targets resolved, %zu "
+             "awaiting their target, %lld edges in the graph",
+             nsrc, recorded, total, n_pending, (long long)edges);
   }
   return s;
 }
@@ -2052,10 +2166,22 @@ static kbc_status reindex_one(kbc_app *app, const char *corpus,
     s = index_touch_one(app, cc, rel_path, true, err);
     goto done;
   }
+  /* The facets, replaced for this document alone — the same replace the full
+   * pass does, so a watched edit that removes a tag drops the match without
+   * waiting for a full scan. */
+  s = kbc_store_replace_metas(app->store, corpus, rel_path,
+                              (const char *const *)g.meta_keys,
+                              (const char *const *)g.meta_values, g.n_metas,
+                              err);
+  if (kbc_failed(s)) {
+    ingested_free(&g);
+    return s;
+  }
   /* The single-document path writes its own edges here: the rest of the
    * corpus is already in the store, so a target that is a document resolves
-   * now. A target that is not yet indexed records no edge, and the next full
-   * scan — which every watcher event is followed by — records it. */
+   * now. A target that is not yet indexed records no edge but DOES record a
+   * pending link, and the drain below is what picks it up when the target
+   * arrives — the watcher's single-file event, not a full scan. */
   if (g.n_links > 0) {
     app_edge_src one;
     one.corpus = corpus;
@@ -2065,7 +2191,12 @@ static kbc_status reindex_one(kbc_app *app, const char *corpus,
     s = store_write_links(app, &one, 1, err);
   } else {
     s = kbc_store_delete_edges(app->store, corpus, rel_path, err);
+    if (s == KBC_OK)
+      s = kbc_store_delete_pending(app->store, corpus, rel_path, err);
   }
+  /* This document is the TARGET of whatever was waiting for it. */
+  if (s == KBC_OK)
+    s = kbc_store_drain_pending(app->store, corpus, rel_path, err);
   if (kbc_failed(s)) {
     ingested_free(&g);
     return s;
@@ -2339,6 +2470,426 @@ static kbc_status graph_in_degrees(kbc_app *app, const char *corpus,
   return KBC_OK;
 }
 
+/* ------------------------------------------------------- facet overlay --- */
+
+/* A sorted, unique set of corpus-relative paths. Sorted because every set
+ * operation below is a merge and because the index walk tests membership
+ * once per document; unique because the (corpus, key, value) index can hand
+ * back the same path once per value it carries, and a duplicate in the
+ * membership set would be a duplicate search hit. */
+typedef struct {
+  char **items; /* KBC_OWN */
+  size_t len, cap;
+} app_pathset;
+
+static void pset_free(app_pathset *s) {
+  if (s == NULL) return;
+  for (size_t i = 0; i < s->len; i++) free(s->items[i]);
+  free(s->items);
+  s->items = NULL;
+  s->len = 0;
+  s->cap = 0;
+}
+
+static int cmp_path(const void *a, const void *b) {
+  return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+static void pset_normalise(app_pathset *s) {
+  if (s->len < 2) return;
+  qsort(s->items, s->len, sizeof(*s->items), cmp_path);
+  size_t w = 1;
+  for (size_t i = 1; i < s->len; i++) {
+    if (strcmp(s->items[w - 1], s->items[i]) == 0) {
+      free(s->items[i]);
+      continue;
+    }
+    s->items[w++] = s->items[i];
+  }
+  s->len = w;
+}
+
+static bool pset_has(const app_pathset *s, const char *p) {
+  size_t lo = 0;
+  size_t hi = s->len;
+  while (lo < hi) {
+    const size_t mid = lo + (hi - lo) / 2;
+    if (strcmp(s->items[mid], p) < 0) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo < s->len && strcmp(s->items[lo], p) == 0;
+}
+
+static kbc_status pset_merge(const app_pathset *a, const app_pathset *b,
+                             bool keep_only_both, app_pathset *out,
+                             kbc_err *err) {
+  /* NULL means the empty set: "the first positive literal" is a merge with
+   * nothing, and spelling that as a compound literal keeps the merge itself
+   * free of special cases. */
+  static const app_pathset EMPTY = {NULL, 0, 0};
+  if (a == NULL) a = &EMPTY;
+  if (b == NULL) b = &EMPTY;
+  memset(out, 0, sizeof(*out));
+  const size_t cap = keep_only_both ? (a->len < b->len ? a->len : b->len)
+                                    : a->len + b->len;
+  if (cap == 0) return KBC_OK;
+  out->items = calloc(cap, sizeof(*out->items));
+  if (out->items == NULL)
+    return kbc_err_set(err, KBC_ERR_NOMEM, "facet overlay: %zu paths", cap);
+  out->cap = cap;
+  size_t i = 0;
+  size_t j = 0;
+  while (i < a->len || (!keep_only_both && j < b->len)) {
+    int c;
+    const char *pick;
+    if (j >= b->len) {
+      pick = a->items[i++];
+    } else if (i >= a->len) {
+      pick = b->items[j++];
+    } else {
+      c = strcmp(a->items[i], b->items[j]);
+      pick = c <= 0 ? a->items[i++] : b->items[j++];
+      if (keep_only_both && c != 0) continue;
+      if (c == 0 && !keep_only_both) j++; /* a duplicate, already taken */
+    }
+    out->items[out->len++] = strdup(pick);
+    if (out->items[out->len - 1] == NULL) {
+      pset_free(out);
+      return kbc_err_set(err, KBC_ERR_NOMEM, "facet overlay: path copy");
+    }
+  }
+  return KBC_OK;
+}
+
+/* The documents carrying (key, value) in `corpus`, as a set. ONE indexed
+ * query; an empty answer is an empty set, which is a conjunct that matches
+ * nothing rather than a conjunct that matches everything. */
+static kbc_status pset_from_store(kbc_store *store, const char *corpus,
+                                  const char *key, const char *value,
+                                  app_pathset *out, kbc_err *err) {
+  memset(out, 0, sizeof(*out));
+  char **paths = NULL;
+  size_t n = 0;
+  kbc_status s = kbc_store_docs_with_meta(store, corpus, key, value, &paths,
+                                          &n, err);
+  if (kbc_failed(s)) return s;
+  out->items = paths;
+  out->len = n;
+  out->cap = n;
+  pset_normalise(out);
+  return KBC_OK;
+}
+
+/* docs_query.rs:434 is_index_page — the basename is `index.html`, compared
+ * case-insensitively. kb-c indexes Markdown as well as HTML, so `index.md` is
+ * the same page here. A document may also DECLARE itself an index with a
+ * truthy `kb-index` meta, which is the kb-c spelling of the category the
+ * original reads from `kb_category`; that half is a store query, and the
+ * basename half needs no store at all, so the two are applied where they can
+ * be: the declaration in the conjunct's set, the basename in the index walk
+ * (path_is_index). A non-truthy value never un-declares one: the flag says
+ * "this is an index", not "this is not". */
+static bool path_is_index(const char *path) {
+  const char *base = strrchr(path, '/');
+  base = base != NULL ? base + 1 : path;
+  return strcasecmp(base, "index.html") == 0 ||
+         strcasecmp(base, "index.md") == 0;
+}
+
+static kbc_status index_page_set(kbc_store *store, const char *corpus,
+                                 app_pathset *out, kbc_err *err) {
+  memset(out, 0, sizeof(*out));
+  static const char *const TRUTHY[] = {"true", "1", "yes", ""};
+  app_pathset acc;
+  memset(&acc, 0, sizeof(acc));
+  for (size_t i = 0; i < sizeof(TRUTHY) / sizeof(TRUTHY[0]); i++) {
+    app_pathset part;
+    kbc_status s = pset_from_store(store, corpus, "index", TRUTHY[i], &part,
+                                   err);
+    if (kbc_failed(s)) {
+      pset_free(&acc);
+      return s;
+    }
+    app_pathset merged;
+    s = pset_merge(&acc, &part, false, &merged, err);
+    pset_free(&acc);
+    pset_free(&part);
+    if (kbc_failed(s)) return s;
+    acc = merged;
+  }
+  *out = acc;
+  return KBC_OK;
+}
+/* One DNF conjunct, over one corpus, as the two sets the original's
+ * matches_conjunct applies: `pos` is what the positive literals admit and
+ * `neg` is what the negated ones drop.
+ *
+ * `pos` is NOT a fold over the atoms in the order they were typed. Inside one
+ * conjunct the original ANDs the PREDICATES and compares like with like:
+ * every tag literal is one any-of test (query.rs:286), every cap literal is
+ * its own test (query.rs:297), and a document has to pass all of them. So the
+ * tags union together, the caps intersect, and the two then intersect — which
+ * is why `cap:code tag:rust` is a narrower query than `cap:code` and not a
+ * wider one.
+ *
+ * An EMPTY `pos` means the conjunct constrains nothing, and the caller reads
+ * that as "every document" — the original's default `DocsQuery`, and the
+ * reason `NOT tag:x` on its own excludes rather than includes. */
+static kbc_status conjunct_set(kbc_store *store, const char *corpus,
+                               const kbc_facet_atom *atoms, size_t start,
+                               size_t end, app_pathset *pos_out,
+                               app_pathset *neg_out, bool *constrained,
+                               bool *index_only, kbc_err *err) {
+  memset(pos_out, 0, sizeof(*pos_out));
+  memset(neg_out, 0, sizeof(*neg_out));
+  *constrained = false;
+  *index_only = false;
+  app_pathset tags;
+  app_pathset caps;
+  memset(&tags, 0, sizeof(tags));
+  memset(&caps, 0, sizeof(caps));
+  bool have_tags = false;
+  bool have_caps = false;
+  bool want_index = false;
+  bool drop_index = false;
+  kbc_status s = KBC_OK;
+  for (size_t i = start; s == KBC_OK && i < end; i++) {
+    const kbc_facet_atom *at = &atoms[i];
+    if (at->key == KBC_FACET_INDEX) {
+      if (strcmp(at->value, "index_only") == 0) {
+        want_index = true;
+      } else {
+        drop_index = true;
+      }
+      continue;
+    }
+    const bool is_tag = at->key == KBC_FACET_TAG;
+    const char *key = is_tag ? "tags" : "caps";
+    app_pathset part;
+    s = pset_from_store(store, corpus, key, at->value, &part, err);
+    if (kbc_failed(s)) break;
+    /* A negated literal is an EXCLUSION (query.rs:290 exclude_tags,
+     * query.rs:302 exclude_caps): it drops the documents carrying the value
+     * and never widens the conjunct, so it never makes it constrained. */
+    if (at->negated) {
+      app_pathset next;
+      s = pset_merge(neg_out, &part, false, &next, err);
+      pset_free(&part);
+      if (kbc_failed(s)) break;
+      pset_free(neg_out);
+      *neg_out = next;
+      continue;
+    }
+    app_pathset *acc = is_tag ? &tags : &caps;
+    const bool have = is_tag ? have_tags : have_caps;
+    /* tags union (any-of), caps intersect (all-of). */
+    const bool combine = have && !is_tag;
+    app_pathset next;
+    s = pset_merge(acc, &part, combine, &next, err);
+    pset_free(&part);
+    if (kbc_failed(s)) break;
+    pset_free(acc);
+    *acc = next;
+    if (is_tag) {
+      have_tags = true;
+    } else {
+      have_caps = true;
+    }
+  }
+  if (s == KBC_OK && want_index) {
+    app_pathset ipages;
+    s = index_page_set(store, corpus, &ipages, err);
+    if (s == KBC_OK) {
+      app_pathset next;
+      s = pset_merge(have_tags ? &tags : &ipages, have_caps ? &caps : &ipages,
+                     have_tags || have_caps, &next, err);
+      pset_free(&ipages);
+      if (s == KBC_OK) {
+        pset_free(&tags);
+        pset_free(&caps);
+        tags = next;
+        have_tags = true;
+      }
+    }
+  }
+  if (s == KBC_OK && drop_index) {
+    app_pathset ipages;
+    s = index_page_set(store, corpus, &ipages, err);
+    if (s == KBC_OK) {
+      app_pathset next;
+      s = pset_merge(neg_out, &ipages, false, &next, err);
+      pset_free(&ipages);
+      if (s == KBC_OK) {
+        pset_free(neg_out);
+        *neg_out = next;
+      }
+    }
+  }
+  if (s == KBC_OK && have_tags && have_caps) {
+    app_pathset next;
+    s = pset_merge(&tags, &caps, true, &next, err);
+    pset_free(&tags);
+    pset_free(&caps);
+    if (s == KBC_OK) tags = next;
+  }
+  if (kbc_failed(s)) {
+    pset_free(&tags);
+    pset_free(&caps);
+    return s;
+  }
+  /* Only the tags accumulator survives when there were no caps; `caps` is
+   * empty in that case and merging it would intersect everything away. */
+  *constrained = have_tags || have_caps || want_index;
+  *index_only = want_index;
+  if (have_tags) {
+    *pos_out = tags;
+    pset_free(&caps);
+  } else if (have_caps) {
+    *pos_out = caps;
+    pset_free(&tags);
+  } else {
+    pset_free(&tags);
+    pset_free(&caps);
+  }
+  return KBC_OK;
+}
+
+/* The whole overlay, resolved once per query. Returns the index doc ids the
+ * facets admit, ascending; an empty result means the filter admits nothing,
+ * and the caller must answer zero rows.
+ *
+ * The walk at the end is where the boolean structure is applied, because that
+ * is the only place that sees a document: for each document the evaluator
+ * asks, per conjunct, "does this path satisfy it" — in the set, and not in
+ * the exclusion set — and a document is admitted when ANY conjunct says yes.
+ * That is query.rs:246 verbatim. */
+static kbc_status app_facets(void *ctx, const char *corpus,
+                             const kbc_facets *facets, uint32_t **ids_out,
+                             size_t *n_out, kbc_err *err) {
+  kbc_app *app = ctx;
+  *ids_out = NULL;
+  *n_out = 0;
+  if (app == NULL || facets == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "facet overlay: null argument");
+
+  kbc_strlist corpora;
+  kbc_strlist_init(&corpora);
+  kbc_status s = KBC_OK;
+  if (corpus != NULL) {
+    s = kbc_strlist_push(&corpora, corpus);
+  } else {
+    /* No corpus filter: the facets are evaluated in every corpus, because a
+     * membership set is doc ids and a doc id names exactly one corpus. */
+    s = kbc_store_list_corpora(app->store, &corpora, err);
+  }
+  if (kbc_failed(s)) {
+    kbc_strlist_free(&corpora);
+    return s;
+  }
+
+  const size_t nc = corpora.len;
+  const size_t nj = facets->n_conj;
+  /* One positive set, one exclusion set and one "does this conjunct constrain
+   * anything at all" flag per (corpus, conjunct). The flag is what separates
+   * "this conjunct names no facet, so it matches every document" from "this
+   * conjunct names a tag nobody carries, so it matches none" — the whole
+   * difference between an OR branch that is wide and one that is empty. */
+  app_pathset *pos = calloc(nc * nj > 0 ? nc * nj : 1, sizeof(*pos));
+  app_pathset *neg = calloc(nc * nj > 0 ? nc * nj : 1, sizeof(*neg));
+  bool *constrained = calloc(nc * nj > 0 ? nc * nj : 1, sizeof(*constrained));
+  bool *index_only = calloc(nc * nj > 0 ? nc * nj : 1, sizeof(*index_only));
+  if (pos == NULL || neg == NULL || constrained == NULL || index_only == NULL) {
+    free(index_only);
+    free(constrained);
+    free(pos);
+    free(neg);
+    kbc_strlist_free(&corpora);
+    return kbc_err_set(err, KBC_ERR_NOMEM, "facet overlay: %zu x %zu", nc, nj);
+  }
+  for (size_t c = 0; s == KBC_OK && c < nc; c++) {
+    for (size_t j = 0; s == KBC_OK && j < nj; j++) {
+      s = conjunct_set(app->store, corpora.items[c], facets->atoms,
+                       facets->conj[j], facets->conj[j + 1], &pos[c * nj + j],
+                       &neg[c * nj + j], &constrained[c * nj + j],
+                       &index_only[c * nj + j], err);
+    }
+  }
+  if (kbc_failed(s)) {
+    for (size_t i = 0; i < nc * nj; i++) {
+      pset_free(&pos[i]);
+      pset_free(&neg[i]);
+    }
+    free(pos);
+    free(neg);
+    free(constrained);
+    free(index_only);
+    kbc_strlist_free(&corpora);
+    return s;
+  }
+
+  /* The store answers in paths; the searcher speaks in doc ids. One walk of
+   * the index's doc table turns the paths into ids, in ascending order
+   * because the walk is ascending — which is what the searcher's binary
+   * search over the membership set needs. This is the same shape as
+   * graph_in_degrees above: the store cannot name a doc id, so the join
+   * starts on the index side. */
+  const uint32_t n_docs = kbc_index_doc_count(app->index);
+  uint32_t *ids = calloc(n_docs > 0 ? n_docs : 1, sizeof(*ids));
+  if (ids == NULL) {
+    for (size_t i = 0; i < nc * nj; i++) {
+      pset_free(&pos[i]);
+      pset_free(&neg[i]);
+    }
+    free(pos);
+    free(neg);
+    free(constrained);
+    free(index_only);
+    kbc_strlist_free(&corpora);
+    return kbc_err_set(err, KBC_ERR_NOMEM, "facet overlay: %u documents",
+                       (unsigned)n_docs);
+  }
+  size_t kept = 0;
+  for (uint32_t d = 0; d < n_docs; d++) {
+    const kbc_doc_meta *m = kbc_index_doc(app->index, d);
+    if (m == NULL || m->corpus == NULL || m->path == NULL) continue;
+    /* Each set belongs to ONE corpus: a path alone is not a document, and two
+     * corpora may carry the same relative path. */
+    for (size_t c = 0; c < nc; c++) {
+      if (strcmp(corpora.items[c], m->corpus) != 0) continue;
+      for (size_t j = 0; j < nj; j++) {
+        const app_pathset *p = &pos[c * nj + j];
+        if (constrained[c * nj + j] && !pset_has(p, m->path) &&
+            !(index_only[c * nj + j] && path_is_index(m->path)))
+          continue;
+        if (pset_has(&neg[c * nj + j], m->path)) continue;
+        ids[kept++] = d;
+        break;
+      }
+      break;
+    }
+  }
+  for (size_t i = 0; i < nc * nj; i++) {
+    pset_free(&pos[i]);
+    pset_free(&neg[i]);
+  }
+  free(pos);
+  free(neg);
+  free(constrained);
+  free(index_only);
+  kbc_strlist_free(&corpora);
+  if (kept == 0) {
+    free(ids);
+    KBC_LOGD("search: no document carries the requested facets");
+    return KBC_OK;
+  }
+  *ids_out = ids;
+  *n_out = kept;
+  return KBC_OK;
+}
+
 
 kbc_status kbc_app_search(kbc_app *app, kbc_arena *a, const kbc_query *q,
                           kbc_search_result *out, kbc_err *err) {
@@ -2401,6 +2952,14 @@ kbc_status kbc_app_search(kbc_app *app, kbc_arena *a, const kbc_query *q,
    * semantic query degrades to an empty result. app->vec is BORROWED for the
    * search, and the read lock held here is what keeps it alive. */
   (void)kbc_searcher_set_vecstore(s, app->vec, &local);
+
+  /* The metadata overlay. The facets live in the store, so the searcher
+   * cannot evaluate them and app is the only layer that can: it holds both
+   * the store (which answers in corpus-relative paths) and the index (whose
+   * doc ids the searcher filters on). Same contract-gap shape as the
+   * vecstore setter above, and the same read lock keeping app->index stable
+   * for the duration. */
+  (void)kbc_searcher_set_facet_fn(s, app_facets, app, &local);
 
   /* The effective query: the caller's, plus the graph the store knows about.
    * The weight comes from the config, read once per search, and 0.0 means the

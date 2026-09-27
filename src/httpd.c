@@ -1577,9 +1577,18 @@ static void worker_drain_zombies(kbc_worker *w) {
   w->zomb_len = 0;
 }
 
+/* all_conns is ONE array shared by every worker, and ptr_push grows it with
+ * realloc. Growing it unlocked let two workers accept at the same instant,
+ * both realloc the same block, and one silently discard the other's pointer:
+ * the loser's buffer was freed while conns were still being written into it,
+ * which is the "double free or corruption (!prev)" the load test hit at high
+ * connection counts. The lock is the same conns_mu the close path and the SSE
+ * fan-out already hold, so the array has exactly one writer discipline. */
 static bool httpd_track(kbc_httpd *h, conn *c) {
+  pthread_mutex_lock(&h->conns_mu);
   bool ok = ptr_push(&h->all_conns, &h->all_len, &h->all_cap,
                      KBC_HTTP_MAX_CONNECTIONS, c);
+  pthread_mutex_unlock(&h->conns_mu);
   if (ok) atomic_fetch_add(&h->conns, 1);
   return ok;
 }

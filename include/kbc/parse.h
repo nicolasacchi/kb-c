@@ -10,6 +10,7 @@
 
 #include "kbc/kbc.h"
 #include "kbc/mem.h"
+#include "kbc/meta.h"
 #include "kbc/types.h"
 
 #ifdef __cplusplus
@@ -30,8 +31,13 @@ const char *kbc_parsed_title(const kbc_parsed *p);
 /* Outbound links found in the source, in document order, each already
  * resolved to a corpus-relative path. KBC_ARENA.
  *
- * Markdown `[text](target)` and HTML `<a href="target">` are both read. A
- * target is resolved against the document's own directory, so `../x/y.md`
+ * Markdown `[text](target)`, HTML `<a href="target">` and Obsidian
+ * `[[target]]` / `[[target|alias]]` are all read, and all three resolve through
+ * ONE normaliser, so `[[y.md#part]]` and `[y](y.md#part)` produce the identical
+ * `y.md`. For a bare `[[target]]` the link's `text` is the target; an alias is
+ * display text only and never a second identity. `![[embed]]` is an image, not
+ * a link, and a construct inside a fenced code block is not a link at all.
+ * A target is resolved against the document's own directory, so `../x/y.md`
  * becomes `x/y.md`; `..` may not escape the corpus root, and a target that
  * escapes is DROPPED rather than clamped — a link out of the corpus is not a
  * link to anything kb-c indexes. Absolute URLs, mailto:, tel: and anchors
@@ -51,6 +57,14 @@ typedef struct {
 
 /* May be empty; never NULL. A document with no links yields len == 0. */
 const kbc_links *kbc_parsed_links(const kbc_parsed *p);
+
+/* Filterable metadata declared by the document's own markup, e.g.
+ * `<meta name="kb-tags" content="search, index">`. Only kb-* metas are
+ * collected, the key is lowercased, and a comma-separated content attribute
+ * yields ONE ENTRY PER ELEMENT, so the overlay can match a single value.
+ * Markdown front matter in a leading --- fenced block is read the same way.
+ * May be empty; never NULL. */
+const kbc_metas *kbc_parsed_metas(const kbc_parsed *p);
 bool kbc_parsed_has_anchor(const kbc_parsed *p, const char *id);
 
 /* ------------------------------------------------------------ tokenizer -- */

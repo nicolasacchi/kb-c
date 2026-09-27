@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -539,10 +540,10 @@ typedef struct {
   kbc_httpd *h;
 } server;
 
-/* Sends `raw` verbatim and reads the whole reply. The daemon answers a refused
- * request with Connection: close, so read-to-EOF is bounded. */
-static bool raw_exchange(server *s, const char *raw, size_t n, int *status,
-                         char *reply, size_t cap) {
+/* The connect-and-read half, keyed by PORT rather than by `server`, so a
+ * per-thread caller can drive it without sharing a mutable fixture. */
+static bool raw_exchange_port(int port, const char *raw, size_t n, int *status,
+                              char *reply, size_t cap) {
   *status = 0;
   reply[0] = '\0';
   int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -550,7 +551,7 @@ static bool raw_exchange(server *s, const char *raw, size_t n, int *status,
   struct sockaddr_in a;
   memset(&a, 0, sizeof a);
   a.sin_family = AF_INET;
-  a.sin_port = htons((uint16_t)s->port);
+  a.sin_port = htons((uint16_t)port);
   a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
     close(fd);
@@ -577,6 +578,13 @@ static bool raw_exchange(server *s, const char *raw, size_t n, int *status,
   if (strncmp(reply, "HTTP/1.1 ", 9) != 0) return false;
   *status = atoi(reply + 9);
   return true;
+}
+
+/* Sends `raw` verbatim and reads the whole reply. The daemon answers a refused
+ * request with Connection: close, so read-to-EOF is bounded. */
+static bool raw_exchange(server *s, const char *raw, size_t n, int *status,
+                         char *reply, size_t cap) {
+  return raw_exchange_port(s->port, raw, n, status, reply, cap);
 }
 
 static void srv_start(server *s, fixture *f) {
@@ -1290,6 +1298,130 @@ KBC_TEST(a_bad_rate_limit_threshold_refuses_to_start) {
   fx_teardown(&f);
 }
 
+/* ------------------------------------- concurrent accepts (regression) ------
+ *
+ * The daemon keeps ONE array of live connections shared by every worker, and
+ * worker_accept appends to it. Growing that array used to happen WITHOUT the
+ * mutex the close path and the SSE fan-out take, so two workers accepting at
+ * the same moment both realloc'd the same block: one buffer was freed while
+ * connections were still being written into it, and the daemon died with
+ * glibc's "double free or corruption (!prev)". It only showed up at high
+ * connection counts, which is why no test that opened a handful of sockets
+ * ever saw it.
+ *
+ * The test therefore does the one thing the bug needed: it makes MANY
+ * connections arrive at once, from many threads, against a MULTI-worker
+ * daemon (one worker cannot race itself), and it keeps going long enough for
+ * the array to be reallocated repeatedly rather than once. The array starts
+ * at 8 and doubles, so the connection count here crosses several growths.
+ *
+ * It is a real race, so a passing run is not proof the old code always
+ * failed — it is proof the shape is exercised. Under the sanitizer lanes it
+ * IS proof: ASan aborts on the losing realloc's double free, and TSan reports
+ * the unsynchronised write to all_conns. Both are deterministic about the
+ * BUG being present; neither can be made deterministic about a fix not being
+ * needed, which is why this hammers rather than asserts a count. What is
+ * asserted is the invariant a user can see: every connection that was
+ * accepted got a well-formed answer, and the daemon is still serving after
+ * the storm. */
+
+#define CONC_CONNS 40   /* connections per thread, opened back to back */
+#define CONC_THREADS 32 /* connectors released at the same instant */
+#define CONC_ROUNDS 4   /* waves, so the table is reallocated repeatedly */
+
+typedef struct {
+  int port;
+  int rounds;
+  pthread_barrier_t *start;
+  int answered;
+  int bad_reply;
+} conc_arg;
+
+static void *conc_connector(void *p) {
+  conc_arg *a = (conc_arg *)p;
+ /* All threads connect at the same instant, which is what puts the workers
+ * in worker_accept together. */
+  pthread_barrier_wait(a->start);
+  static const char req[] = "GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n";
+  char reply[8192];
+  for (int i = 0; i < a->rounds; i++) {
+    int status = 0;
+    if (!raw_exchange_port(a->port, req, strlen(req), &status, reply,
+                           sizeof reply)) {
+      a->bad_reply++;
+      continue;
+    }
+    if (status != 200) a->bad_reply++;
+    a->answered++;
+  }
+  return NULL;
+}
+
+KBC_TEST(concurrent_connects_do_not_corrupt_the_conn_table) {
+  fixture f;
+  fx_setup(&f, NULL);
+  free(f.cfg->bind_addr);
+  f.cfg->bind_addr = strdup("127.0.0.1");
+  f.cfg->port = 0;
+  /* More than one worker is the point: the race is between workers, and a
+   * single-worker daemon cannot take it. */
+  f.cfg->http_workers = 4;
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_httpd *h = kbc_httpd_start(f.app, f.cfg, &err);
+  if (h == NULL) {
+    fprintf(stderr, "  httpd_start: %s\n", err.msg);
+    kbc_test_fail(__FILE__, __LINE__, "httpd_start: %s", err.msg);
+    fx_teardown(&f);
+    return;
+  }
+  int port = kbc_httpd_port(h);
+  KBC_CHECK_MSG(port > 0, "no listening port");
+
+  /* Several waves, not one: the table starts at 8 entries and doubles, and the
+   * race is on the GROWTH, so a single small burst may never reallocate while
+   * two workers are inside it. Each wave re-grows a table the previous one
+   * left large, which is the state the load test that found the bug was in. */
+  for (int round = 0; round < CONC_ROUNDS; round++) {
+    pthread_barrier_t start;
+    KBC_CHECK(pthread_barrier_init(&start, NULL, (unsigned)CONC_THREADS) == 0);
+    pthread_t th[CONC_THREADS];
+    conc_arg args[CONC_THREADS];
+    for (int i = 0; i < CONC_THREADS; i++) {
+      memset(&args[i], 0, sizeof args[i]);
+      args[i].port = port;
+      args[i].rounds = CONC_CONNS;
+      args[i].start = &start;
+      KBC_CHECK(pthread_create(&th[i], NULL, conc_connector, &args[i]) == 0);
+    }
+    int answered = 0, bad = 0;
+    for (int i = 0; i < CONC_THREADS; i++) {
+      (void)pthread_join(th[i], NULL);
+      answered += args[i].answered;
+      bad += args[i].bad_reply;
+    }
+    (void)pthread_barrier_destroy(&start);
+    KBC_CHECK_MSG(bad == 0, "round %d: %d of %d connections got no 200", round,
+                  bad, CONC_THREADS * CONC_CONNS);
+    KBC_CHECK_MSG(answered == CONC_THREADS * CONC_CONNS,
+                  "round %d: only %d of %d connections completed", round,
+                  answered, CONC_THREADS * CONC_CONNS);
+  }
+
+  /* The daemon survived the storm and still answers: a corrupted connection
+   * table shows up here as a dead or wedged listener, not as a bad count. */
+  char reply[8192];
+  int status = 0;
+  static const char health[] = "GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n";
+  KBC_CHECK(raw_exchange_port(port, health, strlen(health), &status, reply,
+                             sizeof reply));
+  KBC_CHECK_MSG(status == 200, "the daemon did not survive the storm: %d",
+                status);
+
+  kbc_httpd_stop(h);
+  fx_teardown(&f);
+}
+
 
 /* ------------------------------------------------------------------- main -- */
 
@@ -1323,6 +1455,8 @@ int main(void) {
       {"rate_limit_caps_one_connection", rate_limit_caps_one_connection},
       {"a_bad_rate_limit_threshold_refuses_to_start",
        a_bad_rate_limit_threshold_refuses_to_start},
+      {"concurrent_connects_do_not_corrupt_the_conn_table",
+       concurrent_connects_do_not_corrupt_the_conn_table},
       {NULL, NULL},
   };
   return kbc_test_run("httpd", cases);

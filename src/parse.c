@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "kbc/log.h"
+
 #include "kbc/parse.h"
 
 /* ------------------------------------------------------------- charset -- */
@@ -231,6 +233,7 @@ struct kbc_parsed {
   size_t anchors_len;
   size_t anchors_cap;
   const char *title;  /* KBC_ARENA */
+  kbc_metas metas;    /* KBC_ARENA; kb-* metadata, document order */
 };
 
 typedef struct {
@@ -272,6 +275,10 @@ typedef struct {
 
 const kbc_links *kbc_parsed_links(const kbc_parsed *p) {
   return p == NULL ? NULL : &p->links;
+}
+
+const kbc_metas *kbc_parsed_metas(const kbc_parsed *p) {
+  return p == NULL ? NULL : &p->metas;
 }
 
 static kbc_status p_flush(parser *p);
@@ -547,6 +554,67 @@ static size_t md_link(const char *s, size_t n, size_t i, bool *image,
   *tgt_off = ts;
   *tgt_len = te - ts;
   return t + 1;
+}
+/* `[[target]]` and `[[target|alias]]` — the Obsidian wikilink forms the kb
+ * corpus is written in. Resolution is link_resolve, the SAME normaliser the
+ * markdown and href forms use: a wikilink normalised differently from a
+ * markdown link would give the graph two incompatible notions of identity.
+ * What link_resolve drops matches links.rs normalize_target (links.rs:186,
+ * trim -> drop '#fragment' -> strip leading '/' -> fold '\\'), and it adds
+ * the corpus-local segment walk on top.
+ *
+ * Returns the byte just past the closing "]]", or 0 when this is not a
+ * wikilink: a '[' with no "[[", a construct that does not close on this line,
+ * and `[[]]` / `[[|x]]`, which name no target. Those fall through to the
+ * ordinary byte path, so the prose keeps the brackets exactly as written.
+ *
+ * `*image` is `![...]]` (an embed): not a link, as `![alt](src)` is not one
+ * either — the caller still consumes the display text, so the prose stays
+ * byte-identical with and without the syntax. */
+static size_t wikilink(const char *s, size_t n, size_t i, bool *image,
+                       size_t *tgt_off, size_t *tgt_len, size_t *text_off,
+                       size_t *text_len) {
+  if (i + 1 >= n || s[i + 1] != '[') return 0;
+  *image = i > 0 && s[i - 1] == '!';
+
+  size_t j = i + 2;
+  while (j < n && s[j] != '\n' &&
+         !(s[j] == ']' && j + 1 < n && s[j + 1] == ']')) {
+    j++;
+  }
+  if (j + 1 >= n || s[j] != ']' || s[j + 1] != ']') return 0;
+
+  size_t ts = i + 2, te = j;
+  size_t pipe = SIZE_MAX;
+  for (size_t k = ts; k < te; k++) {
+    if (s[k] == '|') {
+      pipe = k;
+      break;
+    }
+  }
+  while (ts < te && is_space((unsigned char)s[ts])) ts++;
+  size_t tend = (pipe != SIZE_MAX) ? pipe : te;
+  while (tend > ts && is_space((unsigned char)s[tend - 1])) tend--;
+  if (ts >= tend) return 0; /* `[[]]` and `[[   ]]` name no target */
+
+  /* A bare `[[target]]` has no alias, and the display text IS the target —
+   * comrak builds the no-pipe form's label from its url, and links.rs:90
+   * collapses an equal label to `None` (links.rs:78 parse_wikilinks). An
+   * alias is display text only: it never reaches link_resolve, so it cannot
+   * mint a second identity for the same document. */
+  *tgt_off = ts;
+  *tgt_len = tend - ts;
+  *text_off = ts;
+  *text_len = tend - ts;
+  if (pipe != SIZE_MAX) {
+    size_t xs = pipe + 1, xe = te;
+    while (xs < xe && is_space((unsigned char)s[xs])) xs++;
+    while (xe > xs && is_space((unsigned char)s[xe - 1])) xe--;
+    if (xs >= xe) return 0; /* `[[|x]]` names no target either */
+    *text_off = xs;
+    *text_len = xe - xs;
+  }
+  return j + 2;
 }
 
 /* Feeds a byte range through exactly the path the main loop takes for one
@@ -1136,6 +1204,288 @@ static bool looks_like_html(const char *s, size_t len) {
   return false;
 }
 
+/* -------------------------------------------------------------- metas --- */
+
+/* The filterable metadata a document declares about itself. This runs as a
+ * SEPARATE pass over the source, after the block/anchor scan has finished,
+ * and it appends to p->out->metas and nothing else: a `<meta>` or a front
+ * matter block contributes no block text and no link, so extraction cannot
+ * move a byte of what the index tokenizes. */
+
+/* A document is hostile input, so the number of metas one file may declare is
+ * bounded. Past the bound the extras are dropped with a log line rather than
+ * silently, because a filter that matches a subset of what the document said
+ * is a filter that lies. */
+#define PARSE_MAX_METAS 256
+/* The value of one meta. Generous for a tag, and it is the same order as the
+ * path cap, but it keeps a single <meta content="..."> from claiming a
+ * 16 MiB document's worth of arena. */
+#define PARSE_MAX_META_VALUE 1024
+
+/* `tags` and `caps` are multi-valued: a comma-separated content is ONE ENTRY
+ * PER ELEMENT (meta.h), so the overlay can match a single value and a
+ * document declaring two tags is two rows in the store, not one row that has
+ * to be split again at query time. */
+static bool meta_multi_valued(const char *key) {
+  return strcmp(key, KBC_META_TAGS) == 0 || strcmp(key, KBC_META_CAPS) == 0;
+}
+
+/* Appends one already-lower-cased key with `value`, splitting a multi-valued
+ * key on commas. Returns KBC_ERR_NOMEM on failure.
+ *
+ * A SCALAR key always contributes exactly one entry, even an empty one:
+ * `<meta name="kb-index">` is a declaration whose value IS the empty string,
+ * and a flag that is only recorded when it carries text is a flag that can
+ * never be set the way the markup spells it. A multi-valued key contributes
+ * one entry per NON-EMPTY element, because an empty element of a list is not
+ * a value. */
+static kbc_status meta_push(kbc_arena *a, kbc_metas *out, const char *key,
+                            const char *value, size_t vlen) {
+  if (vlen > PARSE_MAX_META_VALUE) vlen = PARSE_MAX_META_VALUE;
+  const bool multi = meta_multi_valued(key);
+  size_t i = 0;
+  while (i <= vlen) {
+    size_t start = i;
+    while (start < vlen && is_space((unsigned char)value[start])) start++;
+    size_t end = multi ? start : vlen;
+    if (multi) {
+      while (end < vlen && value[end] != ',') end++;
+    }
+    size_t stop = end;
+    while (stop > start && is_space((unsigned char)value[stop - 1])) stop--;
+    if (stop > start || !multi) {
+      if (out->len >= PARSE_MAX_METAS) {
+        KBC_LOGW("parse: more than %d kb-* metas; the rest are dropped",
+                 PARSE_MAX_METAS);
+        return KBC_OK;
+      }
+      if (out->len == out->cap) {
+        const size_t ncap = out->cap == 0 ? 8 : out->cap * 2;
+        kbc_meta *grown =
+            (kbc_meta *)kbc_arena_calloc(a, ncap, sizeof(*grown));
+        if (grown == NULL) return KBC_ERR_NOMEM;
+        if (out->items != NULL && out->cap > 0)
+          memcpy(grown, out->items, out->cap * sizeof(*grown));
+        out->items = grown;
+        out->cap = ncap;
+      }
+      char *k = kbc_arena_strndup(a, key, strlen(key));
+      char *v = kbc_arena_strndup(a, value + start, stop - start);
+      if (k == NULL || v == NULL) return KBC_ERR_NOMEM;
+      out->items[out->len].key = k;
+      out->items[out->len].value = v;
+      out->len++;
+    }
+    if (!multi || end >= vlen) break;
+    i = end + 1;
+  }
+  return KBC_OK;
+}
+
+/* A YAML-ish scalar, minus the quotes and brackets a front matter list wears
+ * around its elements. Returns the value with its length; `*skip` is set past
+ * the scalar so a bracketed list can be walked. */
+static void fm_scalar(const char *s, size_t n, size_t *i, const char **out,
+                      size_t *out_len) {
+  size_t start = *i;
+  while (start < n && is_space((unsigned char)s[start])) start++;
+  char quote = 0;
+  if (start < n && (s[start] == '"' || s[start] == '\'')) {
+    quote = s[start];
+    start++;
+    const size_t e = start;
+    size_t j = start;
+    while (j < n && s[j] != quote) j++;
+    *out = s + start;
+    *out_len = j > e ? j - e : 0;
+    *i = j < n ? j + 1 : n;
+    return;
+  }
+  size_t end = start;
+  while (end < n && s[end] != '\n' && s[end] != '#') end++;
+  while (end > start && is_space((unsigned char)s[end - 1])) end--;
+  *out = s + start;
+  *out_len = end - start;
+  *i = end;
+}
+
+/* Markdown front matter: a `---` fence on the FIRST line, closed by a `---`
+ * or `...` line. Only `kb-*` keys are read, exactly as for the HTML form, so
+ * a `title:` or a `date:` in a document's front matter stays a document and
+ * does not become a filterable facet. */
+static kbc_status front_matter(kbc_arena *a, const char *s, size_t n,
+                               kbc_metas *out) {
+  size_t i = 0;
+  while (i < n && s[i] != '\n') i++; /* the opening line */
+  size_t body = i < n ? i + 1 : n;
+  /* A file that opens with `---` and never closes it is not front matter; a
+ * horizontal rule at the top of a document is more common than a truncated
+ * fence, and guessing would read the whole document as metadata. */
+  size_t p = body;
+  size_t end = 0;
+  bool closed = false;
+  while (p <= n) {
+    const size_t ls = p;
+    size_t le = ls;
+    while (le < n && s[le] != '\n') le++;
+    size_t t = ls;
+    while (t < le && is_space((unsigned char)s[t])) t++;
+    size_t u = le;
+    while (u > t && is_space((unsigned char)s[u - 1])) u--;
+    if (u - t == 3 && s[t] == '-' && s[t + 1] == '-' && s[t + 2] == '-') {
+      end = ls;
+      closed = true;
+      break;
+    }
+    if (u - t == 3 && s[t] == '.' && s[t + 1] == '.' && s[t + 2] == '.') {
+      end = ls;
+      closed = true;
+      break;
+    }
+    if (le >= n) break;
+    p = le + 1;
+  }
+  if (!closed) return KBC_OK;
+
+  /* The key the previous `- item` lines belong to; a block list is how
+ * `kb-tags:\n  - rust\n  - c` is written, and dropping it would silently
+ * lose every tag in that form. */
+  char *list_key = NULL;
+  i = body;
+  kbc_status st = KBC_OK;
+  while (st == KBC_OK && i < end) {
+    const size_t ls = i;
+    size_t le = ls;
+    while (le < end && s[le] != '\n') le++;
+    i = le + 1;
+    size_t t = ls;
+    while (t < le && is_space((unsigned char)s[t])) t++;
+    if (t >= le || s[t] == '#') continue;
+    if (s[t] == '-' && t + 1 < le && is_space((unsigned char)s[t + 1])) {
+      if (list_key == NULL) continue;
+      const char *v = NULL;
+      size_t vlen = 0;
+      size_t j = t + 1;
+      fm_scalar(s, le, &j, &v, &vlen);
+      st = meta_push(a, out, list_key, v, vlen);
+      continue;
+    }
+    size_t colon = t;
+    while (colon < le && s[colon] != ':') colon++;
+    if (colon >= le) continue; /* not a key: value line, so not metadata */
+    size_t kend = colon;
+    while (kend > t && is_space((unsigned char)s[kend - 1])) kend--;
+    if (kend - t < 4 || !ci_prefix(s, le, t, "kb-")) {
+      list_key = NULL;
+      continue;
+    }
+    char *key = kbc_arena_strndup(a, s + t + 3, kend - t - 3);
+    if (key == NULL) return KBC_ERR_NOMEM;
+    for (char *k = key; *k != '\0'; k++) *k = lower(*k);
+    const char *v = NULL;
+    size_t vlen = 0;
+    size_t j = colon + 1;
+    fm_scalar(s, le, &j, &v, &vlen);
+    /* `kb-tags: [a, b]` — the bracket is part of the scalar, so it is peeled
+     * here and the elements split below exactly as the HTML form's. */
+    if (vlen >= 2 && v[0] == '[' && v[vlen - 1] == ']') {
+      v++;
+      vlen -= 2;
+    }
+    st = meta_push(a, out, key, v, vlen);
+    list_key = vlen == 0 ? key : NULL;
+  }
+  return st;
+}
+
+/* One `<meta>` element's attributes. Only `name` and `content` are read, and
+ * only a `name` that starts with `kb-` produces a facet: the value is the
+ * trimmed content, or the empty string for a valueless element — which is
+ * still an entry, because `<meta name="kb-index">` is a declaration. */
+static kbc_status html_meta(kbc_arena *a, const char *s, size_t n,
+                            size_t *i, kbc_metas *out) {
+  size_t p = *i + 5; /* past "<meta" */
+  const char *name = NULL;
+  size_t name_len = 0;
+  const char *content = NULL;
+  size_t content_len = 0;
+  while (p < n) {
+    while (p < n && is_space((unsigned char)s[p])) p++;
+    if (p < n && s[p] == '>') {
+      p++;
+      break;
+    }
+    if (p < n && s[p] == '/') {
+      p++;
+      continue;
+    }
+    const size_t as = p;
+    while (p < n && !is_space((unsigned char)s[p]) && s[p] != '=' &&
+           s[p] != '>')
+      p++;
+    const size_t alen = p - as;
+    if (alen == 0) {
+      p++;
+      continue;
+    }
+    while (p < n && is_space((unsigned char)s[p])) p++;
+    const char *val = NULL;
+    size_t vlen = 0;
+    if (p < n && s[p] == '=') {
+      p++;
+      while (p < n && is_space((unsigned char)s[p])) p++;
+      if (p < n && (s[p] == '"' || s[p] == '\'')) {
+        const char q = s[p++];
+        val = s + p;
+        while (p < n && s[p] != q) p++;
+        vlen = (size_t)(s + p - val);
+        if (p < n) p++;
+      } else {
+        val = s + p;
+        while (p < n && !is_space((unsigned char)s[p]) && s[p] != '>') p++;
+        vlen = (size_t)(s + p - val);
+      }
+    }
+    if (ci_prefix(s, n, as, "name") && alen == 4) {
+      name = val;
+      name_len = vlen;
+    } else if (ci_prefix(s, n, as, "content") && alen == 7) {
+      content = val;
+      content_len = vlen;
+    }
+  }
+  /* The LAST byte consumed, not the first unconsumed one: the caller's loop
+   * advances by one itself, so handing it the position after the element
+   * steps over the `<` of the next `<meta>`. `p` is never <= *i: the loop
+   * above starts at *i + 5. */
+  *i = p - 1;
+  if (name == NULL || name_len < 4 || !ci_prefix(name, name_len, 0, "kb-")) {
+    return KBC_OK;
+  }
+  char *key = kbc_arena_strndup(a, name + 3, name_len - 3);
+  if (key == NULL) return KBC_ERR_NOMEM;
+  for (char *k = key; *k != '\0'; k++) *k = lower(*k);
+  if (key[0] == '\0') return KBC_OK;
+  return meta_push(a, out, key, content != NULL ? content : "", content_len);
+}
+
+static kbc_status extract_metas(kbc_arena *a, const char *s, size_t n,
+                                kbc_metas *out) {
+  kbc_status st = front_matter(a, s, n, out);
+  if (kbc_failed(st)) return st;
+  for (size_t i = 0; i + 5 < n; i++) {
+    if (s[i] != '<') continue;
+    /* "<metadata" and "<meta-" are not a meta element. */
+    const unsigned char after = (unsigned char)s[i + 5];
+    if (after != '>' && !is_space(after) && after != '/') continue;
+    if (!ci_prefix(s, n, i, "<meta")) continue;
+    st = html_meta(a, s, n, &i, out);
+    if (kbc_failed(st)) return st;
+    if (out->len >= PARSE_MAX_METAS) break;
+  }
+  return KBC_OK;
+}
+
 kbc_parsed *kbc_parse(kbc_arena *a, const char *text, size_t len,
                       const char *rel_path, kbc_err *err) {
   if (a == NULL) {
@@ -1190,6 +1540,25 @@ kbc_parsed *kbc_parse(kbc_arena *a, const char *text, size_t len,
        * ordinary append path and the whole construct is consumed, so the
        * block's prose is byte-identical to the same document without link
        * syntax — only the links vector learns about it. */
+      /* A wikilink is tried first: `[[x]]` is not markdown-link grammar, so
+       * md_link would decline it anyway, but trying it here keeps the two
+       * syntaxes on the same code path (consume, feed the display text,
+       * record one link) rather than on two. */
+      bool wimage = false;
+      size_t wtoff = 0, wtlen = 0, wgoff = 0, wglen = 0;
+      const size_t wend = wikilink(text, len, pos, &wimage, &wgoff, &wglen,
+                                   &wtoff, &wtlen);
+      if (wend > 0) {
+        if (!wimage) {
+          size_t idx = SIZE_MAX;
+          st = push_link(&p, text + wgoff, wglen, text + wtoff, wtlen, &idx);
+          if (kbc_failed(st)) goto fail;
+        }
+        st = feed_inline(&p, text, wtoff, wtoff + wtlen);
+        if (kbc_failed(st)) goto fail;
+        pos = wend;
+        continue;
+      }
       bool image = false;
       size_t toff = 0, tlen2 = 0, goff = 0, glen = 0;
       const size_t end =
@@ -1244,6 +1613,12 @@ kbc_parsed *kbc_parse(kbc_arena *a, const char *text, size_t len,
     pos++;
   }
   st = p_flush(&p);
+  if (kbc_failed(st)) goto fail;
+
+  /* After the block scan, and writing only p.out->metas: the metadata a
+   * document declares is read without touching a byte of what the index
+   * tokenizes, which is the invariant the link and block tests pin. */
+  st = extract_metas(a, text, len, &p.out->metas);
   if (kbc_failed(st)) goto fail;
 
   const char *title = p.title_h1 != NULL   ? p.title_h1

@@ -58,8 +58,25 @@
 #        KEEP_CORPUS=1 to leave the generated corpus on disk, COLD=0 to skip
 #        the page-cache eviction run, RUN_KBC_BENCH=1 to also run
 #        `kbc bench --corpus` (in-process, own tmpdir) at each size.
+#        PHASES (default "full") selects which phases run -- see below.
 # Output: per-size key=value on stdout, a summary table, progress on stderr,
 #         raw per-sample TSVs under $SANDBOX/samples.
+#
+# PHASES: the full ladder at both extremes does not fit one measurement window
+# on a shared host, so the expensive phases are selectable. The default is
+# "full", which is byte-for-byte the behaviour this script has always had, so
+# every published number stays reproducible with the same command.
+#   gen        generate the master corpus (and the queries-scale.txt beside it)
+#   ingest     `kbc reindex` into an empty data dir, timed, with peak RSS
+#   warm       start the daemon, then the warm latency sweeps (both query sets)
+#   cold       evict the index from page cache, restart, re-measure
+#   incr       one file change through the watcher, INCREMENTAL_REPS times
+# Names may be given in any order and combine: PHASES=gen,ingest,warm runs the
+# big rungs and stops short of the eviction sweep and the reindex probe.
+# Skipping a phase is recorded in the results file and shown as "-" in the
+# table, so a reduced run can never be mistaken for a full one.
+# Dependencies: warm, cold and incr all need an index, so they imply ingest;
+# asking for them without ingest is an error rather than a silent skip.
 #
 # The daemon: this script starts its own, from its own config, in its own data
 # dir, and kills only the pid it started. It refuses to run if its port is
@@ -84,6 +101,7 @@ COLD="${COLD:-1}"
 RUN_KBC_BENCH="${RUN_KBC_BENCH:-0}"
 KEEP_CORPUS="${KEEP_CORPUS:-0}"
 QUERY_FILE="${QUERY_FILE:-$ROOT/bench/queries.txt}"
+PHASES="${PHASES:-full}"
 MODE="keyword"
 URL="http://127.0.0.1:${PORT}"
 SAMPLES="$SANDBOX/samples"
@@ -91,6 +109,38 @@ RESULTS="$SANDBOX/results.env"
 
 log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 loadavg() { awk '{print $1}' /proc/loadavg; }
+
+# ------------------------------------------------------------ phase select
+# Resolved once, up front, from PHASES, so a reduced run is decided before
+# anything expensive happens and every phase site is a single lookup.
+PHASE_GEN=0; PHASE_INGEST=0; PHASE_WARM=0; PHASE_COLD=0; PHASE_INCR=0
+case ",${PHASES}," in
+  *,full,*)  PHASE_GEN=1; PHASE_INGEST=1; PHASE_WARM=1; PHASE_COLD=1; PHASE_INCR=1;;
+  *,none,*)  : ;;
+  *)
+    for p in ${PHASES//,/ }; do
+      case "$p" in
+        gen)        PHASE_GEN=1 ;;
+        ingest)     PHASE_INGEST=1 ;;
+        warm)       PHASE_WARM=1 ;;
+        cold)       PHASE_COLD=1 ;;
+        incr|incremental) PHASE_INCR=1 ;;
+        *) echo "ERROR unknown phase '${p}' in PHASES=${PHASES}; want a comma-separated subset of: gen,ingest,warm,cold,incr (or full|none)" >&2; exit 2 ;;
+      esac
+    done
+    ;;
+esac
+# A measurement phase is meaningless without an index, so requesting one is a
+# mistake worth naming rather than a rung that silently measures nothing.
+if [ "$PHASE_WARM$PHASE_COLD$PHASE_INCR" != "000" ] && [ "$PHASE_INGEST" = "0" ]; then
+  echo "ERROR PHASES=${PHASES} asks for warm/cold/incr without ingest; add ingest (or use 'full')" >&2
+  exit 2
+fi
+# COLD=0 predates PHASES and stays honoured: it is the published way to skip
+# the eviction sweep, and folding it in here means one check covers both.
+[ "$COLD" = "1" ] || PHASE_COLD=0
+
+PHASE_LIST="gen=$PHASE_GEN ingest=$PHASE_INGEST warm=$PHASE_WARM cold=$PHASE_COLD incr=$PHASE_INCR"
 
 # The two query sets. bench/queries.txt is the one every other number in this
 # repo was measured with, and it is run here too, unchanged, so the scale
@@ -114,7 +164,11 @@ cleanup() {
     ss -ltn 2>/dev/null | grep -q ":${PORT} " || break
     sleep 0.25
   done
-  if [ -n "${CORPUS_ROOT:-}" ] && [ "$KEEP_CORPUS" != "1" ]; then
+  # Only ever remove a corpus this run generated. A run with gen off is
+  # borrowing one -- including one a previous invocation left behind with
+  # KEEP_CORPUS=1 -- and deleting it would make that invocation unrepeatable.
+  # PHASE_GEN is unset if preflight bailed, which is the safe direction here.
+  if [ -n "${CORPUS_ROOT:-}" ] && [ "$KEEP_CORPUS" != "1" ] && [ "${PHASE_GEN:-0}" = "1" ]; then
     log "removing the generated corpus ${CORPUS_ROOT} (KEEP_CORPUS=1 to keep it)"
     rm -rf "$CORPUS_ROOT"
   fi
@@ -739,21 +793,41 @@ make_view() { # $1=view dir  $2=N
 jnum() { sed -n "s/.*\"$1\":\([0-9-]*\).*/\1/p"; }
 
 # ------------------------------------------------------------------ generate
-log "generating ${MAX_DOCS} documents into ${CORPUS_ROOT} (seed ${SEED}, word source ${WORD_SOURCE})"
-GEN_START=$(date +%s.%N)
-GEN_OUT=$(python3 "$SANDBOX/gen_corpus.py" "$CORPUS_ROOT" --docs "$MAX_DOCS" \
-            --seed "$SEED" --shard "$SHARD" --words "$WORD_SOURCE" \
-            --queries-out "$SANDBOX/queries-scale.txt")
-GEN_S=$(awk -v a="$GEN_START" -v b="$(date +%s.%N)" 'BEGIN{printf "%.2f", b-a}')
-GEN_BYTES=$(printf '%s\n' "$GEN_OUT" | sed -n 's/^BYTES=//p')
-GEN_VOCAB=$(printf '%s\n' "$GEN_OUT" | sed -n 's/^VOCAB=//p')
-log "generated ${MAX_DOCS} docs, ${GEN_BYTES} bytes, vocab ${GEN_VOCAB}, in ${GEN_S}s"
-echo "gen_docs=${MAX_DOCS} gen_bytes=${GEN_BYTES} gen_seconds=${GEN_S} gen_vocab=${GEN_VOCAB}" >> "$RESULTS"
+# A run with gen off reuses the corpus already at CORPUS_ROOT, which is what
+# lets a second invocation re-measure one large rung without paying for the
+# generator again. It is a real dependency, so it is checked, not assumed.
+if [ "$PHASE_GEN" = "1" ]; then
+  log "generating ${MAX_DOCS} documents into ${CORPUS_ROOT} (seed ${SEED}, word source ${WORD_SOURCE})"
+  GEN_START=$(date +%s.%N)
+  GEN_OUT=$(python3 "$SANDBOX/gen_corpus.py" "$CORPUS_ROOT" --docs "$MAX_DOCS" \
+              --seed "$SEED" --shard "$SHARD" --words "$WORD_SOURCE" \
+              --queries-out "$SANDBOX/queries-scale.txt")
+  GEN_S=$(awk -v a="$GEN_START" -v b="$(date +%s.%N)" 'BEGIN{printf "%.2f", b-a}')
+  GEN_BYTES=$(printf '%s\n' "$GEN_OUT" | sed -n 's/^BYTES=//p')
+  GEN_VOCAB=$(printf '%s\n' "$GEN_OUT" | sed -n 's/^VOCAB=//p')
+  log "generated ${MAX_DOCS} docs, ${GEN_BYTES} bytes, vocab ${GEN_VOCAB}, in ${GEN_S}s"
+else
+  [ -d "$CORPUS_ROOT" ] || { echo "ERROR PHASES has gen off but there is no corpus at ${CORPUS_ROOT}" >&2; exit 2; }
+  GEN_S="skipped"; GEN_BYTES=""; GEN_VOCAB=""
+  log "phases: gen off, reusing the corpus at ${CORPUS_ROOT}"
+fi
+echo "phases=${PHASE_LIST}" >> "$RESULTS"
+echo "gen_requested=${MAX_DOCS} gen_bytes=${GEN_BYTES} gen_seconds=${GEN_S} gen_vocab=${GEN_VOCAB}" >> "$RESULTS"
 echo "corpus_root=${CORPUS_ROOT}" >> "$RESULTS"
 echo "seed=${SEED}" >> "$RESULTS"
 echo "loadavg_at_start=$(loadavg)" >> "$RESULTS"
 echo "host_cores=$(nproc)" >> "$RESULTS"
 echo "mem_available_kb_at_start=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)" >> "$RESULTS"
+
+# With gen off, queries-scale.txt is not regenerated. The scale sweep is
+# defined by that file, so a run without it measures the repo's query set and
+# says so, rather than quietly swapping in a different one.
+if [ "$PHASE_GEN" = "0" ] && [ ! -r "$SANDBOX/queries-scale.txt" ]; then
+  HAVE_SCALE_QUERIES=0
+  log "phases: gen off and no queries-scale.txt -- the per-band scale sweep is off for this run"
+else
+  HAVE_SCALE_QUERIES=1
+fi
 
 # ------------------------------------------------------------------- the run
 {
@@ -763,6 +837,12 @@ echo "mem_available_kb_at_start=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
 } >> "$SANDBOX/table.txt"
 
 for N in $DOCS_LIST; do
+  # Nothing below this point measures anything without an index, and a rung
+  # with no index has no row worth printing. Say it and move on.
+  if [ "$PHASE_INGEST" != "1" ]; then
+    log "phases: ingest off -- no measurement at ${N}"
+    continue
+  fi
   log "=== ${N} documents ==="
   if [ "$N" = "$MAX_DOCS" ]; then
     CORPUS="$CORPUS_ROOT"
@@ -851,7 +931,11 @@ EOF
         | sed "s/^/${label}_/"
   }
   WARM_ENV=$(measure_set warm_q "$QUERY_FILE" "$REPS" 0)
-  WARM_SCALE_ENV=$(measure_set warm_scale "$SANDBOX/queries-scale.txt" "$REPS" 0)
+  if [ "$HAVE_SCALE_QUERIES" = "1" ]; then
+    WARM_SCALE_ENV=$(measure_set warm_scale "$SANDBOX/queries-scale.txt" "$REPS" 0)
+  else
+    WARM_SCALE_ENV=""
+  fi
   if ! printf '%s\n' "$WARM_ENV" | grep -q '^warm_q_P50_MS='; then
     log "ERROR the warm query client produced no percentiles; see ${SANDBOX}/q-${N}-warm_q.err"
     cat "$SANDBOX/q-${N}-warm_q.err" >&2
@@ -870,7 +954,7 @@ EOF
   # SQLite's own page cache is empty too. Without the restart only the index
   # would be cold and the hit-resolve half of the query would still be warm.
   COLD_P50=""; COLD_P99=""; EVICTED=0
-  if [ "$COLD" = "1" ]; then
+  if [ "$PHASE_COLD" = "1" ]; then
     stop_daemon
     EVICTED=$(python3 "$SANDBOX/evict.py" "$DATA/index" "$DATA/kb.db" \
                 "$DATA/kb.db-wal" 2>/dev/null | sed -n 's/^EVICTED_BYTES=//p')
@@ -896,7 +980,7 @@ EOF
   # the watcher reports as IN_MOVED_TO. A direct rewrite would edit the shared
   # inode and, in a hardlink view, the master corpus and every other view.
   INCR_US=""
-  if [ "$INCREMENTAL_REPS" -gt 0 ]; then
+  if [ "$PHASE_INCR" = "1" ] && [ "$INCREMENTAL_REPS" -gt 0 ]; then
     VICTIM=$(find "$CORPUS" -type f -name '*.md' | sort | head -1)
     for r in $(seq 1 "$INCREMENTAL_REPS"); do
       BEFORE_NS=$(kcurl -fsS -m 30 "$URL/api/stats" | jnum last_reindex_ns)
@@ -925,9 +1009,15 @@ EOF
       fi
     done
   fi
-  INCR_MS=$(printf '%s' "$INCR_US" | awk -F, '{
-    s=0; n=0; for (i=1;i<=NF;i++) { if ($i ~ /^[0-9]+$/) { s+=$i; n++ } }
-    if (n) printf "%.3f", s/n/1000; else printf "nan" }')
+  if [ "$PHASE_INCR" != "1" ] || [ "$INCREMENTAL_REPS" -le 0 ]; then
+    # "skipped", not "nan": nan reads like a measurement that failed, and a
+    # reduced run must not look like a broken full one.
+    INCR_MS="skipped"
+  else
+    INCR_MS=$(printf '%s' "$INCR_US" | awk -F, '{
+      s=0; n=0; for (i=1;i<=NF;i++) { if ($i ~ /^[0-9]+$/) { s+=$i; n++ } }
+      if (n) printf "%.3f", s/n/1000; else printf "nan" }')
+  fi
 
   RSS_FINAL=$(rss_kb "$DAEMON_PID")
   stop_daemon
@@ -947,6 +1037,7 @@ EOF
   RATIO=$(awk -v a="$INDEX_BYTES" -v b="$CORPUS_BYTES" 'BEGIN{printf "%.2f", b? a/b : 0}')
   {
     echo "N=$N"
+    echo "phases=${PHASE_LIST}"
     echo "corpus_files=$CORPUS_FILES"
     echo "corpus_bytes=$CORPUS_BYTES"
     echo "index_docs=$DOCS"
@@ -975,7 +1066,7 @@ EOF
     "$N" "$(awk -v b="$CORPUS_BYTES" 'BEGIN{printf "%.1f", b/1048576}')" \
     "$(awk -v b="$INDEX_BYTES" 'BEGIN{printf "%.1f", b/1048576}')" \
     "$RATIO" "$INGEST_S" "$((PEAK_KB / 1024))" "$((RSS_REST / 1024))" \
-    "$WARM_P50" "$WARM_P99" "${COLD_P50:-n/a}" "$INCR_MS" "$TERMS" \
+    "$WARM_P50" "$WARM_P99" "${COLD_P50:--}" "$INCR_MS" "$TERMS" \
     >> "$SANDBOX/table.txt"
   cat "$SANDBOX/table.txt" >&2
 
@@ -997,3 +1088,5 @@ log "NOTE: the ingest number is 'kbc reindex' into an empty data dir, which "
 log "      is the full-corpus cost. The incremental number is the daemon's "
 log "      own last_reindex_us for a single file change, so it excludes the "
 log "      watcher debounce that precedes it."
+log "phases run: ${PHASE_LIST}. A '-' in the table is a phase that was not"
+log "      selected for this run, not a measurement that failed."

@@ -78,18 +78,23 @@ kbc_status kbc_store_get_artifacts_by_path(kbc_store *s, kbc_arena *a,
  * out-degree when boosting (fusion.rs:214, fed from storage.edge_counts()), and
  * this table exists to compute that same number.
  *
- * CONVERGENCE — read this before trusting an in-degree. Edges are owned by the
- * SOURCE and are rewritten only when the SOURCE is re-ingested, never when a
- * target appears. A document ingested after a document that already links to it
- * therefore stays at in-degree 0 until its sources are re-ingested. This is
- * neither rare nor self-healing: `kbc daemon` does not reindex at startup, and a
- * full `kbc reindex` does NOT repair it either, because unchanged documents
- * contribute no edge writes. In practice the graph is complete only from a
- * from-scratch index, or after the linking sources are themselves touched.
- * kbc_config.graph_boost defaults to 0.0 — the graph is OFF — for exactly this
- * reason. Closing the gap properly needs a pending-links table drained at the
- * end of each ingest pass; that is PORT_PLAN stage 1, not a subtlety of this
- * function. */
+ * CONVERGENCE. Edges are owned by the SOURCE and are rewritten only when the
+ * SOURCE is re-ingested, so a document that arrives after a document linking to
+ * it would otherwise stay at in-degree 0 forever. They do not, because a target
+ * that did not exist at write time is recorded in `pending_links` (schema v3) and
+ * drained when the target arrives. A full reindex drains for EVERY document the
+ * walk saw, including unchanged ones, which is what makes the graph independent
+ * of the order documents were visited. `kbc_store_forget_document` demotes a
+ * removed document's inbound edges to pending rows rather than dropping them, so
+ * a document that comes back finds its backlinks. The property is asserted, not
+ * argued: tests/test_app.c::the_link_graph_does_not_depend_on_the_ingest_order
+ * ingests the same two-document corpus in both orders and requires an identical
+ * edge set and identical in-degrees.
+ *
+ * What is still true, and why the boost defaults to off: the graph is complete,
+ * but the boost's WEIGHT has never been benchmarked. graph_boost = 0.0 is the
+ * default because an unmeasured ranking weight should not change anyone's
+ * results; see DECISIONS.md ADR-004. */
 kbc_status kbc_store_replace_edges(kbc_store *s, const char *corpus,
                                    const char *src_path,
                                    const char *const *dst_paths, size_t n,
@@ -112,6 +117,58 @@ kbc_status kbc_store_edge_degrees_for(kbc_store *s, const char *corpus,
                                       const char *const *paths, size_t n,
                                       uint32_t *in_deg, kbc_err *err);
 int64_t kbc_store_edge_count(kbc_store *s, const char *corpus, kbc_err *err);
+
+/* ------------------------------------------------------- pending links -- */
+
+/* A link whose target did not exist when the source was ingested. This is what
+ * makes the graph order-independent: a document arriving after a document that
+ * links to it finds the link waiting instead of losing it.
+ *
+ * The drain is order-independent because of WHERE it is called, not what it
+ * does: a full reindex drains for EVERY document the walk saw, including
+ * unchanged ones, so an unchanged source still completes the graph. */
+kbc_status kbc_store_add_pending_links(kbc_store *s, const char *corpus,
+                                       const char *src_path,
+                                       const char *const *dst_paths, size_t n,
+                                       kbc_err *err);
+/* Materialises every pending link pointing at dst_path whose source is still a
+ * document, then deletes those rows. ONE transaction: an edge added with the
+ * row kept would be inserted forever, and a row deleted without its edge loses
+ * the link permanently. */
+kbc_status kbc_store_drain_pending(kbc_store *s, const char *corpus,
+                                   const char *dst_path, kbc_err *err);
+kbc_status kbc_store_delete_pending(kbc_store *s, const char *corpus,
+                                    const char *src_path, kbc_err *err);
+int64_t kbc_store_pending_count(kbc_store *s, kbc_err *err);
+/* Forgets a document entirely: drops the edges leaving it AND the pending rows
+ * leaving it, and DEMOTES its inbound edges to pending rows rather than
+ * dropping them, so a document that comes back finds its backlinks waiting.
+ * ONE transaction. Without the demotion, removing a document leaves a dangling
+ * edge pointing at something that is no longer indexed. */
+kbc_status kbc_store_forget_document(kbc_store *s, const char *corpus,
+                                      const char *path, kbc_err *err);
+
+
+/* --------------------------------------------------------- doc metadata -- */
+
+/* Filterable facets, replaced whole on every ingest so a value the document no
+ * longer declares stops matching immediately. The (corpus, key, value) index
+ * is what makes "every document with this tag" one query rather than a scan. */
+kbc_status kbc_store_replace_metas(kbc_store *s, const char *corpus,
+                                   const char *path,
+                                   const char *const *keys,
+                                   const char *const *values, size_t n,
+                                   kbc_err *err);
+kbc_status kbc_store_forget_metas(kbc_store *s, const char *corpus,
+                                  const char *path, kbc_err *err);
+/* Documents carrying (key, value), as KBC_OWN path strings the caller frees.
+ * `value == NULL` asks for the key with ANY value. ONE query. An empty result
+ * is a ZERO-LENGTH array — a filter that matches nothing must never look like
+ * a filter that was ignored. */
+kbc_status kbc_store_docs_with_meta(kbc_store *s, const char *corpus,
+                                    const char *key, const char *value,
+                                    char ***paths_out, size_t *n_out,
+                                    kbc_err *err);
 
 /* ---------------------------------------------------------------- chunks -- */
 
