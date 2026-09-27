@@ -76,15 +76,37 @@ retrieval *quality* (Recall@k, MRR, nDCG) and reports no timings.
 | | Rust `kb` | kb-c |
 |---|---|---|
 | full corpus, from empty | 252–262 s (1,594 docs) | 1.79 s / 1.83 s (1,114 docs) |
-| **one file changed** | full rebuild, same cost | **9–14 ms** at 1,114 documents |
+| **one file changed** | full rebuild, same cost | **9–14 ms** at 1,114 documents; **1.19 s median at 20,000** |
 | largest single file (2.4 MB) | — | 75.6 ms |
 
 The single-file row is the one that matters for a daemon: a file save used to
-re-parse and re-index the whole corpus, and now costs what the file costs, and
-the cost is proportional to the file rather than the corpus. The 9–14 ms figure
-is the end-to-end proof — an in-place update to a live index, with the store
-row committed first, that survives a restart of the daemon and reads back
-identical.
+re-parse and re-index the whole corpus, and now updates the index in place. The
+9–14 ms figure at 1,114 documents is the end-to-end proof — an in-place update to
+a live index, with the store row committed first, that survives a restart of
+the daemon and reads back identical.
+
+**And the cost is NOT proportional to the file.** That was a claim in an earlier
+revision of this document and the scale ladder disproved it. Measured across
+three sizes, a single-file save costs:
+
+| documents | index size | save (median) | per MB of INDEX | per MB of CORPUS |
+|---|---|---|---|---|
+| 1,000 | 1.5 MB | 251 ms | 167 ms | 127 ms |
+| 5,000 | 6.5 MB | 500 ms | 77 ms | 50 ms |
+| 20,000 | 23.5 MB | 1.19 s | 186 ms | 110 ms |
+
+It tracks INDEX SIZE, not corpus size and not file size: the daemon rewrites
+the index arena and fsyncs it on every save, so the cost is a function of how
+much index there is to rewrite. It is also violently variable — the three raw
+samples at 20,000 were 1.19 s, 0.98 s and 10.95 s — so the MEDIAN is the number
+to quote, not the mean, and a save at 20,000 documents can take ten seconds.
+
+A user-visible consequence: the incremental reindex makes a save cheap on a
+small corpus and progressively less cheap as the corpus grows, which is the
+opposite of the property it was built for. The fix is not a different algorithm
+— the in-place update is doing its job — it is not rewriting and fsyncing the
+whole index per save. That is unbuilt and is the most valuable thing left in
+this project.
 
 **An earlier number for this row was 10.3 ms, and a later measurement of the
 same thing was 355 ms at 1,000 documents. The 355 ms is not a regression.** It
@@ -329,34 +351,82 @@ lane.
 ## The scale ladder
 
 `bench/bench-scale.sh` is a byte-reproducible generator (`--seed 20260926`): the
-same seed gives the same bytes. It is **proven to generate 100,000 documents /
-199.4 MB**; the ingest was actually run at 1,000 and 5,000.
+same seed gives the same bytes, and the regeneration was verified against the run
+it reproduces. The ladder was measured at three rungs; the fourth is covered in
+"what was not measured".
 
-| | 1,000 docs | 5,000 docs |
-|---|---|---|
-| corpus | 2.0 MB | 10.1 MB |
-| index on disk | 1.5 MB | 6.5 MB |
-| ingest | 6.6 s | 61.7 s |
-| RSS at rest | 9 MB | 16 MB |
-| p50 | 0.483 ms | 0.594 ms |
-| p99 | 3.37 ms | 3.42 ms |
-| cold p50 | 0.62 ms | 0.44 ms |
+| | 1,000 | 5,000 | 20,000 |
+|---|---|---|---|
+| corpus | 2.0 MB | 10.1 MB | 39.9 MB |
+| index on disk | 1.5 MB | 6.5 MB | 23.5 MB |
+| index/corpus | 0.75 | 0.64 | 0.59 |
+| ingest | 8.3 s | 61.3 s | 213.7 s |
+| ingest per document | 8.3 ms | 12.3 ms | 10.7 ms |
+| RSS at rest | 9 MB | 16 MB | 36 MB |
+| — file-backed (mmap of the index) | 5.6 MB | 9.6 MB | 19.7 MB |
+| — anonymous (heap) | 3.5 MB | 6.6 MB | 16.0 MB |
+| warm p50 | 0.340 ms | 0.462 ms | 0.495 ms |
+| warm p99 | 0.524 ms | 0.794 ms | 1.108 ms |
+| cold p50 | 0.574 ms | 0.415 ms | 0.446 ms |
+| cold p99 | 1.323 ms | 0.529 ms | 15.994 ms |
+| single-file save (median) | 251 ms | 500 ms | 1.19 s |
+| terms | 6,835 | 13,387 | 19,828 |
 
-The index/corpus ratio **falls** from 0.75 to 0.64 as the corpus grows — more
-term sharing, not more index. And evicting the index from the page cache costs
-nothing measurable at these sizes.
+**The knee is not below 20,000 documents.** Both candidates for one dissolve on
+measurement:
 
-**The knee was not located.** Ingest cost per document rises steeply from 1,000
-to 5,000 (6.6 ms → 12.3 ms per document) and that trend was not followed far
-enough to say where it turns over. Two points are a line, not a curve. The
-100,000-document corpus exists and is byte-reproducible, but no number in this
-document comes from ingesting it.
+- *The falling index/corpus ratio* (0.75 → 0.64 → 0.59) is fixed per-index
+  overhead being amortised over more documents, not a per-document cost drifting
+  down. The term count is nearly flat against a 25,893-word vocabulary, so the
+  ratio is heading for an asymptote near the postings-to-corpus ratio. 0.59 is a
+  lower bound on that asymptote, not a turning point.
+- *The rising warm p50* (0.340 → 0.495 ms) is the load client's own round-trip
+  floor, not the index. At 20,000 documents a 56-posting query answers in 0.402 ms
+  and a 7,445-posting query in 0.609 ms.
+
+**What actually rises with scale is p99** (0.524 → 0.794 → 1.108 ms), which
+tracks index size: the working set stops fitting in cache. First
+size-sensitive thing measured is p99, not p50.
+
+**A cold p99 penalty appears only at 20,000** (15.99 ms cold against 1.108 ms
+warm) and is a first-touch fault cost, not a per-query one — cold p50 is 0.446 ms,
+indistinguishable from warm. Only the first few queries after a restart pay.
+
+**Per-query cost by posting-list length, df read out of the index file** (not
+inferred from the generator, and not from the API, whose `candidates` field caps
+at 200): at 20,000 documents the tail query `baz` has df 56 and answers in
+0.402 ms; the head query `kb` has df 7,445 and answers in 0.609 ms. Across the
+whole index, postings per term run min 1, p50 4, p90 72, p99 876, max 17,129 of
+20,000. A **133x span in posting-list length costs 1.5x in p50** — the bounded
+top-k is doing its job, and that is why p50 is nearly flat across the ladder.
+
+**RSS is dominated by the index itself.** From 5,000 documents up, the
+file-backed half of RSS tracks the index size within 1 MB, and the anonymous
+half grows more slowly. At 20,000 documents the index is 23.5 MB against 36 MB
+resident, of which 20 MB IS the index.
+
+**Ingest is linear with a large constant**, ~10.7 ms per document, flat to within
+13% from 5,000 to 20,000. Nothing degrades per document across 20x more
+documents.
 
 ## What was still not measured
 
 - **Rust at scale.** The Rust daemon was never run at the 5,000-document scale
   ladder, so the ladder is kb-c alone.
-- **A 100,000-document ingest.** The generator is proven; the ingest is not.
+- **A 100,000-document ingest.** Attempted. The corpus generated (100,000
+  documents, 209 MB, 24 s) and the store phase completed (100,000 artifacts and
+  2,045,462 chunks in a 590 MB database — 20.45 chunks per document, linear
+  against the 20,000-document rung). The INDEX build did not finish: it spent
+  2h19m of wall clock, of which 1m32s was CPU, blocked in the block layer
+  (`blk_mq_get_tag`, `folio_wait_bit_common`, state D) pulling 979 MB off a
+  shared RAID at 0.2-0.4 MB/s. System-wide iowait was 5-19% and other tenants
+  were getting I/O through, so it is this device's request queue, not a global
+  stall. That 2h19m measures shared storage under contention, not kb-c, and is
+  deliberately NOT reported as an ingest number or extrapolated. The 20,000
+  rung was re-ingested an hour later into a different sandbox and produced a
+  BYTE-IDENTICAL index (24,674,872 bytes, 19,828 terms) in 195.6 s against the
+  ladder's 213.7 s, which is the reproducibility check: the smaller rungs are
+  sound and only the 100k wall clock is unusable.
 - **The 20,000-row cliff** where brute-force cosine stops beating IVF-PQ.
 - **Cold page cache** for query latency; all query figures are warm.
 - **kb-c startup, cold** (no index on disk).

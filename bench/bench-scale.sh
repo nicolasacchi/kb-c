@@ -29,6 +29,82 @@
 # generator, the same seed and the same term distribution, and the ladder
 # measures document count and nothing else. The views cost no disk.
 #
+# ---- what the ladder measured, and where the knee is NOT
+#
+# One full run, 2026-09-27, seed 20260926, 8-core shared host (loadavg 36 at
+# the start), sandbox bench/data/scale-w1-4, results.env and samples/*.tsv
+# kept. Three rungs completed; the 100,000 rung's STORE phase completed and its
+# index build had not, after 2h19m — see "the 100k rung" below.
+#
+#   docs  corpus_MB  index_MB  idx/corpus  ingest_s  peakRSS  rssRest  p50    p99    cold_p50  cold_p99  incr_ms  terms
+#   1000       2.0        1.5       0.75      8.276       9 MB    9 MB  0.340  0.524    0.574     1.323    251.2   6835
+#   5000      10.1        6.5       0.64     61.306      20 MB   16 MB  0.462  0.794    0.415     0.529    500.4  13387
+#  20000      39.9       23.5       0.59    213.656      57 MB   35 MB  0.495  1.108    0.446    15.994   4374.8  19828
+#
+# Per-document ingest cost, which is the sublinear part: 8.28 ms at 1,000,
+# 12.26 ms at 5,000, 10.68 ms at 20,000. It is not a falling cost per
+# document — 1,000 is cheap because the whole corpus fits in cache — but from
+# 5,000 up it is flat to within 13%, so ingest is linear in documents with a
+# large constant, not superlinear. Nothing in the first three rungs degrades
+# per document.
+#
+# The knee: there is none below 20,000 documents, and the two things that
+# looked like one both have another explanation.
+#
+#   * index/corpus falls 0.75 -> 0.64 -> 0.59 and is still falling. But the
+#     term count is nearly flat (6,835 -> 13,387 -> 19,828 against a 25,893
+#     word vocabulary), so the falling ratio is the fixed per-index overhead
+#     (header, doc records, arenas) being amortised over more documents, not a
+#     per-document cost that is drifting down. It is heading for an asymptote
+#     near the postings-to-corpus ratio, not for a turnaround. The 100,000 rung
+#     is what would have shown the asymptote, and it did not finish.
+#   * warm p50 rises 0.340 -> 0.462 -> 0.495 ms, which looks like a knee at
+#     1,000. It is not: 0.340 ms is the floor of the HTTP round trip
+#     (bench/kbcbench-client.c), and the per-band numbers show the same
+#     floor at every rung. What rises is p99 (0.524 -> 0.794 -> 1.108 ms),
+#     which tracks index size — the working set stops fitting in cache.
+#
+# So the real shape is: query cost is flat in corpus size and mildly rising in
+# index size, and the first size-sensitive thing measured is p99, not p50.
+#
+# RSS at rest splits into file-backed and anonymous, and only the file-backed
+# part tracks the index: at 1,000 it is 5.6 MB file / 3.5 MB anon, at 5,000
+# 9.6/6.6, at 20,000 19.7/16.0. The file-backed half IS resident mmap pages of
+# the index (it is within 1 MB of index_bytes at every rung). The anonymous
+# half is heap and grows more slowly than the index.
+#
+# The cold p99 penalty first appears at 20,000 (15.99 ms cold against 1.108 ms
+# warm) and is a first-touch fault cost, not a per-query cost: cold p50 is
+# 0.446 ms, indistinguishable from warm, so only the first few queries pay.
+#
+# The incremental reindex of ONE file does NOT cost "what the file costs" at
+# scale, and that claim in BENCHMARKS.md is wrong above 1,114 documents. It
+# tracks INDEX SIZE, not corpus size: 251 ms against a 1.5 MB index, 500 ms
+# against 6.5 MB, 4,375 ms against 23.5 MB. It is also wildly variable — the
+# three samples at 20,000 were 1.19 s, 0.98 s and 10.95 s, so the mean is
+# reporting one outlier, and the median (1.19 s) is the number to quote. A
+# save costs a rewrite of the index arena, bounded by index size, not by the
+# corpus.
+#
+# ---- the 100,000 rung: partial, and why
+#
+# The corpus generated fine (100,000 docs, 209,055,399 bytes, 25,893-word
+# vocabulary, 24.0 s). `kbc reindex` then wrote the complete store: a
+# read-only count on the resulting kb.db gives 100,000 artifacts and 2,045,462
+# chunks, 0 edges, in a 589,647,872-byte db. What did not finish is the index
+# build that reads those chunks back. At hand-off it had run 2h19m, of which
+# 1m32s was CPU: it spent the rest blocked in the block layer
+# (wchan blk_mq_get_tag, then folio_wait_bit_common) pulling 968 MB off a
+# shared 3-disk RAID at 0.2-0.4 MB/s. That number is a property of this host,
+# not of kb-c, and is not a usable ingest_s. The 20,000 rung re-run on the
+# same host an hour later took 195.6 s against the ladder's 213.7 s and
+# produced a byte-identical index (24,674,872 bytes, 19,828 terms), which is
+# the reproducibility check that says the ladder's smaller rungs are sound.
+#
+# The ladder therefore covers 1,000 to 20,000 documents. "No knee below
+# 20,000 documents" is the result, and the 100,000 rung is where the next
+# measurement has to start.
+#
 # On disk, deliberately NOT in /tmp: the sandbox lives under bench/data on the
 # repo's real filesystem. /tmp is tmpfs here, and a 300 MB index on tmpfs is
 # page cache by construction — the "does the working set still fit" question
@@ -151,6 +227,22 @@ PHASE_LIST="gen=$PHASE_GEN ingest=$PHASE_INGEST warm=$PHASE_WARM cold=$PHASE_COL
 # holds queries chosen by TERM RANK, so posting-list length varies over four
 # orders of magnitude between them; a query set of eight head terms measures
 # one point on the curve, not the curve.
+#
+# The band LABELS in that file are an inference, not a measurement: they are
+# picked by source-word weight (see write_scale_queries), so "head" means "high
+# weight in the word corpus", not "high df in the indexed corpus". The
+# per-query Qn_MATCHED counters cannot fix that — /api/search caps candidates
+# at 200 and reports that cap, so every band above 200 postings reads 200 and
+# is indistinguishable from a band of exactly 200. The measured df has to come
+# out of the index file itself, where each term slot carries post_len, the
+# number of documents the term occurs in. At 20,000 documents that gives:
+# baz 56, bulk 36, component 299, items 331, software 2,855, new 2,531,
+# code 3,473, kb 7,445 — and across the whole index, postings per term run
+# min 1, p50 4, p90 72, p99 876, max 17,129. Pair those with the Qn_MEDIAN_MS
+# from the same run and the curve is nearly flat: warm p50 0.402 ms at a
+# 56-posting query against 0.609 ms at 7,445 postings, a 133x span in
+# posting-list length for 1.5x in p50. That is the top-k bound doing its job,
+# and it is why p50 is flat across the ladder.
 
 DAEMON_PID=""
 cleanup() {
