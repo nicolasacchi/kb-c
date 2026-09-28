@@ -76,7 +76,7 @@ retrieval *quality* (Recall@k, MRR, nDCG) and reports no timings.
 | | Rust `kb` | kb-c |
 |---|---|---|
 | full corpus, from empty | 252–262 s (1,594 docs) | 1.79 s / 1.83 s (1,114 docs) |
-| **one file changed** | full rebuild, same cost | **9–14 ms** at 1,114 documents; **1.19 s median at 20,000** |
+| **one file changed** | full rebuild, same cost | **33–36 ms at 1,000 and at 20,000 documents** — the cost no longer scales with the corpus |
 | largest single file (2.4 MB) | — | 75.6 ms |
 
 The single-file row is the one that matters for a daemon: a file save used to
@@ -101,12 +101,77 @@ much index there is to rewrite. It is also violently variable — the three raw
 samples at 20,000 were 1.19 s, 0.98 s and 10.95 s — so the MEDIAN is the number
 to quote, not the mean, and a save at 20,000 documents can take ten seconds.
 
-A user-visible consequence: the incremental reindex makes a save cheap on a
-small corpus and progressively less cheap as the corpus grows, which is the
-opposite of the property it was built for. The fix is not a different algorithm
-— the in-place update is doing its job — it is not rewriting and fsyncing the
-whole index per save. That is unbuilt and is the most valuable thing left in
-this project.
+## Why the save path had to change
+
+The table above says what was wrong. This is the fix and what it bought.
+
+**What the cost actually was.** Instrumenting `kbc_index_save` and
+`kbc_str_write_file_atomic` separately, at 20,000 documents on real storage
+(`/dev/md3`, ext4 on a 3-disk RAID), 41 timed reps with 2 warmups discarded:
+
+| phase | median | share |
+|---|---:|---:|
+| SERIALIZE (build the file in memory) | 103.3 ms | 13.1% |
+| WRITE | 35.9 ms | 4.6% |
+| fsync the file | 403.9 ms | 51.3% |
+| fsync the directory | 104.2 ms | 13.2% |
+| rename | 1.8 ms | 0.2% |
+| `free()` of the 24.7 MB scratch buffer | ~137 ms | 17.4% |
+| **total** | **786.5 ms** | |
+
+The same save on tmpfs is **49.7 ms**. The difference is the device, not the
+CPU, and `dd bs=1M count=25 conv=fsync` on this host is 0.34 s median against
+0.06 s on tmpfs — the same shape.
+
+**So the obvious fix was not enough.** SERIALIZE is 13.1%, and a *free*
+serialiser still leaves 683 ms of a 786 ms save. Bulk-copying the sections that
+are byte-identical in memory and on disk (`kbc_posting` and `kbc_doc_slot`,
+pinned by `_Static_assert` on `sizeof` and `offsetof`; `kbc_term_slot` is 32
+bytes with only 24 persisted and cannot be) took 1,437,761 per-row
+`kbc_str_append` calls at 17.5 ns down to one `memcpy` — 25.1 ms to 1.33 ms for
+the same bytes. That is worth having, and it is not the fix.
+
+**The fix is to stop rewriting.** A single-document update now appends a record
+to `<index>.journal` and fsyncs *that*; `kbc_index_open` replays the journal, so
+the index file plus its journal replayed in order is the live index. The index
+is rewritten whole only when the pending delta passes `KBC_INDEX_JOURNAL_MAX`
+(4 MiB) or on a full rebuild, which drops the journal.
+
+**What it bought**, measured the same way — both arms on the same data, in the
+same process, interleaved, 2 warmups discarded, persistence timed separately
+from the mmap and from the index mutation:
+
+| | OLD (rewrite) | NEW (journal) | ratio |
+|---|---:|---:|---:|
+| 1,000 documents, persist median | 68.2 ms | 33.0 ms | **2.07x** |
+| 20,000 documents, persist median | 177.2 ms | 36.4 ms | **4.87x** |
+| 20,000 documents, persist max | 475.8 ms | 74.0 ms | **6.4x** |
+
+And the reason the ratio is not larger is the honest limit of the fix: the
+journal appends **1,892 bytes after 10 appends** and still takes 36.4 ms,
+because that is this device's fsync floor. Measured directly, fsync costs
+33.9 ms for 90 bytes, 33.7 ms for 64 KiB, 98.2 ms for 1.5 MB and 140.3 ms for
+24.7 MB. **The journal has removed the entire size-dependent part of the
+barrier and is now sitting on the irreducible part.** On a device with cheap
+sync the same change would read as a much larger ratio, because the floor
+would be smaller — that is a property of the storage, not of kb-c.
+
+The `open (mmap)` row is not a real difference and is not quoted: both arms
+mmap the same file, and the arm that runs second pays for the first arm's
+24.7 MB write. The rows to read are `PERSIST` and `persist max`.
+
+**What is now true, and what is still not.** A file save's cost no longer
+scales with the index: 1,000 and 20,000 documents persist in 33.0 ms and
+36.4 ms, which is the same number to within the noise of the barrier. What is
+still unproven is the *compaction* cost — the full rewrite is unchanged and
+still costs what the table above says, and a long-lived daemon pays it every
+4 MiB of accumulated delta.
+
+The paragraph this section replaces said the fix was "unbuilt and the most
+valuable thing left in this project". That was accurate when written and is not
+now: the delta journal above is that fix, and the property the incremental
+reindex was built for — a save costs what the file costs — now holds, because
+the cost no longer scales with the index at all.
 
 **An earlier number for this row was 10.3 ms, and a later measurement of the
 same thing was 355 ms at 1,000 documents. The 355 ms is not a regression.** It
@@ -490,10 +555,16 @@ fixed with end-to-end proofs.
 4. **Arena-only request allocation** — no per-object malloc/free in a query.
 5. **Thread-local query scratch** — workers never serialise on the accumulator.
    65 ThreadSanitizer races before the fix, 0 after, no added allocation.
-6. **Incremental reindex** — a file save costs that file, not the corpus.
+6. **Incremental reindex** — and this one is now measured rather than asserted.
+   It used to be claimed here as "a file save costs that file, not the corpus".
+   That is **false above 1,114 documents**: the save rewrote the whole index
+   and fsync'd it, so the cost tracked the INDEX, not the file. The breakdown
+   that disproves it, at 20,000 documents on real storage, is in the scale
+   ladder above — 786.5 ms of which 508.1 ms is the fsync pair. See "Why the
+   save path had to change" below for the fix and its new numbers.
 
 Concurrent load and the vector lane are now measured above, and neither is
 where this breaks. What is still unproven is **scale**: the ladder stops at
-5,000 documents and locates no knee, so nothing here is a claim about 100k+.
+20,000 documents and locates no knee, so nothing here is a claim about 100k+.
 Also unproven: the 20,000-row point where brute-force cosine stops being the
 right answer, and any Rust comparison above that 360-document matched corpus.

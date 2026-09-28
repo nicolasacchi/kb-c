@@ -180,7 +180,7 @@ states.
 
 ### 2.4 Decisions the build made that the design did not
 
-Five of them, recorded here because each changed a contract this document
+Ten of them, recorded here because each changed a contract this document
 originally stated:
 
 1. **The artifact id is derived from `(corpus, path)` only** — FNV-1a over
@@ -224,6 +224,46 @@ originally stated:
    suite nor the python client ever saw it. One mutex around the growth is the
    whole fix; the rule it establishes is recorded in DECISIONS.md ADR-006. All
    three have end-to-end proofs.
+6. **Five more, found by a review pass over the three largest files plus
+   repeated runs of the suite.** They are recorded because each one is a
+   contract this document stated wrongly, and because two of them had no test
+   and no symptom anyone would have looked for:
+
+   - **A dangling symlink in a corpus made the entire reindex fail.**
+     `walk_dir` stats each entry with `fstatat(..., 0)`, which *follows* the
+     link, so a broken one fails with `ENOENT`; the code correctly treats that
+     as "vanished, not an error" and continues. But `readdir` signals
+     end-of-directory by returning `NULL` and leaving `errno` **unchanged**,
+     and the loop cleared `errno` only once, before it started — so the
+     `ENOENT` that `fstatat` left behind was read afterwards as a failure of
+     the walk itself. `kbc reindex` returned `readdir <path>: No such file or
+     directory` and indexed nothing. This is not exotic: a documents folder
+     with one broken link in it could not be indexed at all. Clearing `errno`
+     immediately before every `readdir` is the whole fix, and
+     `a_dangling_symlink_does_not_fail_the_reindex` is deterministic rather
+     than a race.
+   - **`fork()` before `fflush`.** `embed.c`'s `spawn` forked without flushing
+     stdio, and the child's fd 1 is about to become the sidecar's *protocol*
+     pipe. Any flush in the child — a libc exit path, a sanitizer runtime, a
+     library warning — injected the daemon's own buffered output into the
+     reply stream. It surfaced as the TSan lane failing, with the test suite's
+     own `== embed ==` banner arriving as a sidecar reply.
+   - **The two index writers shared one temp file.** Both built
+     `<index>.build`, and the atomic write names its temp after the *process*,
+     so both opened the same file with `O_TRUNC` and wrote from offset zero.
+     The promoted index was a splice `kbc_index_open` rejects, and the daemon
+     refused to start until an operator deleted it.
+   - **The full rebuild ran outside the write lock**, so it could promote a
+     stale snapshot over a newer single-file update, with every status
+     endpoint reporting success. Fixed with a `reindex_mu` held across the
+     whole pass and across the single-file path's store *and* index writes —
+     the store half was initially still outside it, and a `UNIQUE(doc_id, ord)`
+     violation is what exposed that.
+   - **An SSE connection was published to the cross-thread event fan-out one
+     line before the frame ring it writes into existed**, so a publisher
+     landing in that window computed `% 0` and dereferenced `NULL`. The
+     connection entered the shared array at accept time, and `c->sse` is the
+     only thing that makes it visible.
 
 ---
 
@@ -287,13 +327,24 @@ it did — each is a later stage, not a stage-0 unit:
 
 ### Stage 1 — storage completeness — MOSTLY PLANNED
 
-One unit's substance has landed since this was written, and it is the one the
-acceptance gate cares about most: **the incremental in-place index update**.
+Two units' substance have landed since this was written, and they are the ones
+the acceptance gate cares about most: **the incremental in-place index update**
+and, after it, **the delta journal that makes it cheap**.
 `app.c` re-indexes a single file rather than rebuilding the corpus
-(`reindex_one`), at 9–14 ms for a 1,114-document corpus, with the store row
-committed before the index so a reader never sees an index naming an
-uncommitted document. That work also produced the first two defects in §2.4.5
-and their fixes.
+(`reindex_one`), with the store row committed before the index so a reader
+never sees an index naming an uncommitted document. That work also produced
+the first two defects in §2.4.5 and their fixes.
+
+The in-place update alone did not deliver the property this stage is for. A
+single-file save still rewrote the whole index and fsynced it, so its cost
+tracked the INDEX: 251 ms / 500 ms / 1.19 s at 1,000 / 5,000 / 20,000
+documents. Measurement then showed the barrier was 64.6% of that and the
+serializer only 13.1%, so a cheaper serializer could recover at most the 13% it
+was responsible for. The fix was a delta journal — a single-document update
+appends a record and fsyncs that, and `kbc_index_open` replays it — which puts
+the save at **33 ms at 1,000 documents and 36 ms at 20,000**, this host's
+fsync floor. The cost no longer scales with the corpus. `BENCHMARKS.md` has the
+breakdown and the before/after.
 
 Unit 1 has since landed **in part**: the schema is now at **v4**, adding
 `edges` (v2), `pending_links` (v3) and `doc_metas` (v4) to the v1 tables. Those
@@ -525,7 +576,7 @@ this host, and it covers the head-to-head latency comparison, a matched-corpus
 concurrency A/B against Rust, a kb-c concurrency ladder measured with a load
 client (`bench/kbcbench-client.c`) that is cheap enough not to be the
 bottleneck, the vector lane against the production sidecar, and a scale ladder
-that stops at 5,000 documents and **locates no knee**. `bench/` holds the
+that stops at 20,000 documents and **locates no knee**. `bench/` holds the
 harnesses (`bench-kbc.sh`, `bench-rust.sh`, `bench-rust-concurrency.sh`,
 `bench-scale.sh`, `bench-vector.sh`) and `kbc bench` is the in-process one.
 
@@ -735,9 +786,11 @@ narrowing recorded in `INVENTORY.md`:
   overlap. The rows are stored and listed correctly; the windowing is stage 1.
 - There is no add-to-open on a frozen index, so a single changed file is
   re-indexed by rebuilding the corpus — but the *result* is then updated in
-  place (`reindex_one`), which measures 9–14 ms at 1,114 documents rather than
-  a full ingest. There is still no batch drain: N files touched in one debounce
-  window means N single-file updates rather than one transaction (R11).
+  place (`reindex_one`) and persisted through the delta journal, so a save
+  costs what the file costs: 33 ms at 1,000 documents and 36 ms at 20,000,
+  flat, because both numbers are this host's fsync floor rather than a kb-c
+  cost. There is still no batch drain: N files touched in one debounce window
+  means N single-file updates rather than one transaction (R11).
 - Within one DNF conjunct, `tag:` atoms are ANY-OF, so `tag:a AND tag:b` means
   "has a **or** has b". This is inherited from the original, which ANDs
   predicates rather than literals, and it is a genuine trap for a user. See
@@ -847,6 +900,6 @@ softened, Zig is the first alternative to re-evaluate.
 | R8 | The `kb-code-*` subtree is 240,255 LOC of Rust that nobody maintains after the port lands. | Silent bit-rot in a subsystem kb-c does not replace. | Explicitly not this project's problem, and said so rather than left implicit. |
 | R9 | Performance work is done before correctness work, because the performance claim is the reason the port exists. | A fast, wrong index ships. | The stage order in §3 puts storage completeness, grammar and HTTP parity ahead of measurement (stage 6), and the measurement stage found two severe correctness defects in the ingest path (§2.4.5) — which is the argument for the order, made by the order itself. |
 | R10 | The debounce and batching constants are tuned for the Rust daemon's latency. | kb-c either re-indexes too eagerly or too slowly. | P3-style treatment: `watcher_debounce_ms` (250 ms today, configurable) and the batch constants are in one place and listed in stage 1's gate, and are revisited once kb-c has a corpus to tune against. There is no 60 s reconcile in the tree yet — stage 1's unit 2 adds it, and the constant arrives with it. |
-| R11 | A watcher event re-indexes **that one file** in place (`reindex_one`), because the frozen index has no add-to-open operation. | Ingestion cost is a function of change size rather than corpus size, which is the point, but there is still no batch drain: N files touched in a debounce window means N single-file updates rather than one transaction. | Deliberate and measured: 9–14 ms for a 1,114-document corpus, proportional to the file rather than the corpus. The remaining work is stage 1's batch drain (≤32 docs / ≤8 MiB). Until it lands, many small changes in one window cost more than they should — a known weakness, not a surprise. |
+| R11 | A watcher event re-indexes **that one file** in place (`reindex_one`), because the frozen index has no add-to-open operation. | Ingestion cost is a function of change size rather than corpus size, which is the point, but there is still no batch drain: N files touched in a debounce window means N single-file updates rather than one transaction. | Deliberate and measured, and the measurement corrected the design twice: the in-place update alone did NOT make the cost proportional to the file, because the save rewrote and fsynced the whole index (251 ms / 500 ms / 1.19 s at 1,000 / 5,000 / 20,000 documents). A delta journal fixed that, and a save is now 33 ms at 1,000 documents and 36 ms at 20,000 — flat, because both are the storage's fsync floor. The remaining work is stage 1's batch drain (≤32 docs / ≤8 MiB), which is now a throughput improvement rather than a correctness one. The remaining work is stage 1's batch drain (≤32 docs / ≤8 MiB). Until it lands, many small changes in one window cost more than they should — a known weakness, not a surprise. |
 | R12 | The artifact id is a pure function of `(corpus, path)`, so a **rename** is a delete plus an insert, not an update. | A renamed file loses its id, its comment threads and its chunk history unless the move is observed. | Deliberate: the alternative mints a new id on every save, which is worse. The mitigation is stage 4's `mv` and the `moves` rename-race log, plus stage 1's reconcile delete pass, which is what makes an unobserved rename disappear rather than linger. Until both land, a rename orphans a row. |
 | R13 | A design document can describe a behaviour convincingly enough that nobody tests it. | Stage 0 shipped claiming a `sha256(rel_path)` id, 280-word chunk windows and plain JSON errors — and later drafts of this plan described an embedder wire protocol the real sidecar does not speak, and quoted a 10.3 ms incremental update that was never measured clean. | The test suite is the arbiter, and it earns that position: 11 suites, 339 cases, 24 defects found during the build, including two use-after-frees and a cross-thread data race (§2.4.4). A number that no run on the current code produced does not belong in this document, even as a placeholder. Any behaviour added to §3 without a test that fails when it is wrong is not done. |

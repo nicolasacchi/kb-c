@@ -56,8 +56,12 @@ Works today:
   `graph_boost` defaults to `0.0` and the weight is unmeasured. See
   `DECISIONS.md` ADR-004 for why, and ADR-006 for the concurrency rule the
   double-free fix established.
-- Incremental index update: a file save re-indexes that one file in place,
-  9–14 ms at 1,114 documents, and the update survives a restart.
+- Incremental index update: a file save re-indexes that one file in place and
+  persists through a delta journal, so the save costs what the file costs rather
+  than what the index weighs — 33 ms at 1,000 documents and 36 ms at 20,000,
+  which is this host's fsync floor rather than a kb-c cost. The update survives a
+  restart. `BENCHMARKS.md` has the measurement and the breakdown that forced the
+  change.
 - Errors are RFC 7807 `application/problem+json`. CORS is same-origin by
   default, with an exact allowlist in `KBC_CORS_ORIGINS` and no wildcard
   anywhere. Rate limiting is a per-connection fixed window, 120 req/s by
@@ -82,8 +86,13 @@ Not done:
   place where a `cap:` query can legitimately return a different answer.
 - No web UI. The Rust repo's two React/Vite SPAs, the Claude Code plugins and
   the Playwright e2e suite are out of scope for the C port.
-- The scale ladder stops at 5,000 documents and **locates no knee**. The
-  generator is proven at 100,000 documents; the ingest was not run there.
+- The scale ladder stops at 20,000 documents and **locates no knee**. Both
+  candidate knees dissolved on measurement, and the 20,000 rung re-ingested an
+  hour later into a different sandbox produced a byte-identical index. A
+  100,000-document attempt is recorded in `BENCHMARKS.md` as an attempt, not an
+  ingest figure: the corpus generated and the store phase completed, but the
+  index build blocked on shared storage, so its wall clock measures the disk
+  and not kb-c.
 - Large parts of the Rust surface are deliberately not ported. `INVENTORY.md`
   maps every crate and says what happened to it; `PORT_PLAN.md` is the phased
   plan. Read both before assuming a feature exists here.
