@@ -137,18 +137,24 @@ the index file plus its journal replayed in order is the live index. The index
 is rewritten whole only when the pending delta passes `KBC_INDEX_JOURNAL_MAX`
 (4 MiB) or on a full rebuild, which drops the journal.
 
-**What it bought**, measured the same way — both arms on the same data, in the
-same process, interleaved, 2 warmups discarded, persistence timed separately
-from the mmap and from the index mutation:
+**What it bought**, measured as a matched A/B — both arms on the same data, in
+the same process, interleaved, 2 warmups discarded, 10 samples each, persistence
+timed separately from the mmap and from the index mutation. The 5,000-document
+rung is the same corpus the ladder above uses (13,387 terms, reproduced):
 
-| | OLD (rewrite) | NEW (journal) | ratio |
-|---|---:|---:|---:|
-| 1,000 documents, persist median | 68.2 ms | 33.0 ms | **2.07x** |
-| 20,000 documents, persist median | 177.2 ms | 36.4 ms | **4.87x** |
-| 20,000 documents, persist max | 475.8 ms | 74.0 ms | **6.4x** |
+| | index size | OLD (rewrite) | NEW (journal) | ratio | journal bytes |
+|---|---:|---:|---:|---:|---:|
+| 1,000 documents | 1.5 MB | 65.8 ms | **30.6 ms** | 2.15x | 1,881 |
+| 5,000 documents | 6.5 MB | 110.5 ms | **33.3 ms** | 3.31x | 1,848 |
+| 20,000 documents | 23.5 MB | 208.4 ms | **36.3 ms** | 5.74x | 1,892 |
+| 20,000, worst sample | 23.5 MB | 358.3 ms | **70.7 ms** | 5.07x | — |
+
+**The number to read is the NEW column: 30.6, 33.3, 36.3 ms across a 20x range
+of corpus, and a journal that is the same ~1.9 KB at every rung.** The cost of
+saving one changed file no longer has a term in it for the size of the index.
 
 And the reason the ratio is not larger is the honest limit of the fix: the
-journal appends **1,892 bytes after 10 appends** and still takes 36.4 ms,
+journal appends **1,892 bytes after 10 appends** and still takes 36.3 ms,
 because that is this device's fsync floor. Measured directly, fsync costs
 33.9 ms for 90 bytes, 33.7 ms for 64 KiB, 98.2 ms for 1.5 MB and 140.3 ms for
 24.7 MB. **The journal has removed the entire size-dependent part of the
@@ -434,8 +440,17 @@ it reproduces. The ladder was measured at three rungs; the fourth is covered in
 | warm p99 | 0.524 ms | 0.794 ms | 1.108 ms |
 | cold p50 | 0.574 ms | 0.415 ms | 0.446 ms |
 | cold p99 | 1.323 ms | 0.529 ms | 15.994 ms |
-| single-file save (median) | 251 ms | 500 ms | 1.19 s |
+| single-file save (median) | 30.6 ms | 33.3 ms | 36.3 ms † |
 | terms | 6,835 | 13,387 | 19,828 |
+
+† This row is the only one in the ladder re-measured after the delta journal
+landed, and it was taken on a much quieter host than the rest of the table
+(load average 3 against 38–59), so it is not comparable to the rows above it in
+absolute terms — only to itself across the three rungs, which is the point.
+The pre-journal figures for the same operation, measured in the same run as
+these, are 65.8 / 110.5 / 208.4 ms; the full matched A/B is in "Why the save
+path had to change" below. What the row shows is that the three rungs are now
+within 6 ms of each other across a 20x range of corpus.
 
 **The knee is not below 20,000 documents.** Both candidates for one dissolve on
 measurement:
