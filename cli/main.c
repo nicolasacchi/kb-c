@@ -33,6 +33,8 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <sqlite3.h>
+#include <sys/wait.h>
 
 #include "kbc/app.h"
 #include "kbc/config.h"
@@ -51,7 +53,42 @@
 #define EXIT_USER 1
 #define EXIT_DAEMON 2
 
+/* A corpus name is the Rust's KbName: 1..64 bytes of [a-z0-9_-]. Filesystem-
+ * safe and subdomain-safe, and the reason a corpus name can never be a path
+ * segment that escapes, nor a tar option once the argv carries `--`. */
+#define KBC_MAX_KB_NAME 64u
+
+/* EXIT CODES ARE THIS BINARY'S OWN, and every verb — `backup` and `restore`
+ * included — uses the same three. The Rust CLI splits them the other way
+ * (0 success, 1 any failure, 2 a usage error), and this port deliberately does
+ * NOT reproduce that split:
+ *
+ *   - the Rust's 2 is clap's built-in default for a usage error, not a
+ *     designed contract, and the Rust's 1 is what `Termination` does with a
+ *     `Result::Err`. Nothing in the kb repo CHOOSES those numbers; they are
+ *     what falls out of clap plus the stdlib.
+ *   - reproducing them would make `kbc backup` exit 2 where `kbc search`
+ *     exits 1 for the very same class of mistake — a user error — in the SAME
+ *     binary. An operator (or script) branching on the exit status would have
+ *     to know which verb it ran. That inconsistency inside one program is a
+ *     worse defect than diverging from a default nobody reads.
+ *   - kb-c is a new port with no installed callers to break.
+ *
+ * So: 1 = user error / usage, 2 = daemon or IO failure, 0 = success. Classify
+ * through the shared helpers — die_user, die_io, fail_status — and never with
+ * a per-verb code: a variable holding the code for one verb, written at run
+ * time and read by a shared helper, is mutable global state (AGENTS.md rule 5)
+ * and it is how the split came back in the first place. */
+
+/* A copy buffer is a working set, not a cache: 64 KiB is the page size the
+ * kernel reads anyway, and a bigger one only buys faults. */
+#define COPY_BUF_BYTES 65536u
+/* Only `tar -tzf` wants tar's stdout, and only to look for one member name in
+ * it. A listing past this cap is not a tarball these verbs wrote. */
+#define TAR_LIST_MAX (8u * 1024u * 1024u)
+
 /* The routes this client speaks; they must match KBC_ROUTES in src/httpd.c. */
+
 #define R_SEARCH "/api/search"
 #define R_ARTIFACTS "/api/artifacts"
 #define R_REINDEX "/api/reindex"
@@ -135,7 +172,33 @@ static int die_user(const char *fmt, ...) {
   va_end(ap);
   json_error(buf);
   say_err("%s", buf);
-  exit(EXIT_USER);
+  exit(EXIT_USER); /* unconditional: see the exit-code contract above */
+}
+
+/* A printed line, with the operator-supplied parts escaped. The repo's one
+ * escaping helper is kbc_json_escape; it covers every byte below 0x20 —
+ * ESC included, so a corpus name cannot drive the operator's terminal or forge
+ * a second line of output. */
+static void put_shown(kbc_str *s, const char *v) {
+  if (kbc_failed(kbc_json_escape(s, v, strlen(v)))) {
+    die_user("%s", "out of memory escaping a value for output");
+  }
+}
+
+/* Appends into a line being built. Every failure here is OOM-or-nothing, and a
+ * truncated line is worse than a dead process, so this exits rather than
+ * casting the status away. */
+static void line_puts(kbc_str *s, const char *v) {
+  if (kbc_failed(kbc_str_puts(s, v))) {
+    die_user("%s", "out of memory building an output line");
+  }
+}
+
+/* One stdout line, newline included, buffer released. */
+static void emit_line(kbc_str *s) {
+  fwrite(s->ptr, 1, s->len, stdout);
+  fputc('\n', stdout);
+  kbc_str_free(s);
 }
 
 static int die_io(const char *fmt, ...)
@@ -1239,6 +1302,7 @@ typedef struct {
   const char *id;
   const char *query;
   long port;
+  const char *out;
   size_t limit;
   size_t queries;
   size_t repeats;
@@ -1250,6 +1314,8 @@ typedef struct {
   bool has_kb;
   bool has_mode;
   bool source;
+  bool all;
+  bool force;
   bool foreground;
   const char *positional[4];
   int npos;
@@ -1269,8 +1335,26 @@ static size_t parse_bounded(const char *s, const char *flag, size_t lo,
 static void parse_verb(const flag_def *defs, int argc, char **argv, int start,
                        opts *o) {
   memset(o, 0, sizeof *o);
+  bool end_of_options = false; /* set by `--`; see below */
   for (int k = start; k < argc; k++) {
     const char *s = argv[k];
+    /* `--` ends option parsing: everything after it is a positional, whatever
+     * it looks like. A corpus name may legitimately begin with `-` (`-notes`
+     * is a valid KbName), and without this there would be no way to NAME one
+     * on the command line at all. Standard POSIX, and the only place a
+     * leading-dash value can be passed unambiguously. */
+    if (end_of_options) {
+      if (o->npos < (int)(sizeof o->positional / sizeof o->positional[0])) {
+        o->positional[o->npos++] = s;
+      } else {
+        die_user("unexpected argument %s", s);
+      }
+      continue;
+    }
+    if (strcmp(s, "--") == 0) {
+      end_of_options = true;
+      continue;
+    }
     if (s[0] != '-' || s[1] == '\0') {
       if (o->npos < (int)(sizeof o->positional / sizeof o->positional[0])) {
         o->positional[o->npos++] = s;
@@ -1343,6 +1427,12 @@ static void parse_verb(const flag_def *defs, int argc, char **argv, int start,
       o->has_port = true;
     } else if (strcmp(s, "--source") == 0) {
       o->source = true;
+    } else if (strcmp(s, "--out") == 0) {
+      o->out = value;
+    } else if (strcmp(s, "--all") == 0) {
+      o->all = true;
+    } else if (strcmp(s, "--force") == 0) {
+      o->force = true;
     } else if (strcmp(s, "--foreground") == 0) {
       o->foreground = true;
     }
@@ -1376,6 +1466,12 @@ static const flag_def FLAGS_BENCH[] = { { "--queries", true },
                                         { "--repeat", true },
                                         { "--corpus", true },
                                         { NULL, false } };
+static const flag_def FLAGS_BACKUP[] = { { "--out", true },
+                                         { "--all", false },
+                                         { NULL, false } };
+static const flag_def FLAGS_RESTORE[] = { { "--kb", true },
+                                           { "--force", false },
+                                           { NULL, false } };
 
 static int cmd_search(int argc, char **argv, int start) {
   opts o;
@@ -2380,6 +2476,1035 @@ static int cmd_daemon(int argc, char **argv, int start) {
   return EXIT_OK;
 }
 
+/* --------------------------------------------------------------- backup ----
+ *
+ * `kbc backup <kb> [--out PATH] [--all]` and `kbc restore <tarball> --kb NAME
+ * [--force]`, ported from kb-cli/src/commands/{backup,restore}.rs.
+ *
+ * WHY VACUUM INTO AND NOT A FILE COPY. Tar-ing the live `index.db` while the
+ * daemon writes captures a torn, half-applied transaction. `VACUUM INTO` reads
+ * a transactionally-consistent view under WAL and writes a fresh, standalone,
+ * defragmented database — no `-wal`/`-shm` sidecars to reconcile, and it needs
+ * no cooperation from the running daemon.
+ *
+ * THE DESTINATION IS A BOUND PARAMETER, not a formatted literal. The Rust
+ * builds `"VACUUM INTO '<dest>'"` by doubling apostrophes (backup.rs:40) and
+ * justifies it with "VACUUM INTO predates bound parameters on some sqlite
+ * builds". kb-c links sqlite 3.27+, where the argument is an ordinary
+ * expression that takes a bound parameter, and rule 9 says all SQL goes
+ * through bound parameters. The formatting is dropped deliberately: a corpus
+ * name or state path is operator input, and a string-formatted path into SQL
+ * is the injection surface the escaping was only papering over.
+ *
+ * THE TARBALL LAYOUT — the archive root is the corpus name, and inside it:
+ *
+ *     <kb>/index.db      the sqlite snapshot (VACUUM INTO)
+ *     <kb>/lance/        the vector store, when the daemon has one
+ *     <kb>/.review/      per-artifact review JSON, when present
+ *     slates/            the DAEMON-WIDE sibling, when the daemon has one
+ *
+ * `slates/` rides ALONGSIDE `<kb>/` and not inside it, because a slate keys on
+ * a PROJECT and is daemon-wide state. `restore` puts it back at the same level
+ * (the archive extracts into the kb-state PARENT, which IS the state dir).
+ */
+
+/* The Rust's KbName::new: 1..64 bytes of [a-z0-9_-]. A corpus name is a
+ * filesystem path segment AND a tar member name AND a daemon name, so it is
+ * validated once here rather than trusted at each use. */
+static bool kb_name_ok(const char *kb) {
+  size_t n = strlen(kb);
+  if (n == 0 || n > KBC_MAX_KB_NAME) {
+    return false;
+  }
+  for (size_t i = 0; i < n; i++) {
+    char c = kb[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' ||
+          c == '-')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/* An operator-supplied path, bounded. Refused over KBC_MAX_PATH_LEN rather
+ * than truncated: a truncated path is a DIFFERENT path, and silently writing
+ * the backup somewhere the operator did not name is worse than refusing. The
+ * offending value is ESCAPED into the message — a path carrying a newline
+ * would otherwise forge a second line of stderr. */
+static char *bounded_path(const char *what, const char *p) {
+  if (strlen(p) >= KBC_MAX_PATH_LEN) {
+    kbc_str line;
+    kbc_str_init(&line);
+    put_shown(&line, what);
+    put_shown(&line, ": ");
+    put_shown(&line, p);
+    line_puts(&line, " is longer than 4096 bytes");
+    char buf[KBC_ERR_MSG_MAX];
+    size_t n = line.len < sizeof buf - 1u ? line.len : sizeof buf - 1u;
+    memcpy(buf, line.ptr, n);
+    buf[n] = '\0';
+    kbc_str_free(&line);
+    die_user("%s", buf);
+  }
+  return xstrdup(p);
+}
+
+
+static char *join2(const char *a, const char *b) {
+  char *j = path_join(a, b);
+  if (strlen(j) >= KBC_MAX_PATH_LEN) {
+    die_user("path %s is longer than %u bytes", j, KBC_MAX_PATH_LEN);
+  }
+  return j;
+}
+
+/* There is deliberately no per-verb error function here. Every failure in
+ * these two verbs goes through die_user, die_io or fail_status, so the exit
+ * class is decided in ONE place and cannot drift between verbs — see the
+ * exit-code contract at the top of this file. */
+
+/* `YYYYMMDD-HHMMSS` in UTC — the Rust's chrono stamp. Seconds, not finer: the
+ * shape is what makes `<kb>-<stamp>.tar.gz` recognisable, and two backups of
+ * the same corpus in the same second are the same file by design. */
+static char *utc_stamp(void) {
+  time_t now = time(NULL);
+  struct tm tm;
+  if (now == (time_t)-1 || gmtime_r(&now, &tm) == NULL) {
+    die_io("utc_stamp: %s", strerror(errno));
+  }
+  char buf[32];
+  if (strftime(buf, sizeof buf, "%Y%m%d-%H%M%S", &tm) == 0) {
+    die_io("utc_stamp: the clock produced no timestamp");
+  }
+  return xstrdup(buf);
+}
+
+/* Copies one regular file, byte for byte, creating the destination. Callers
+ * pass paths they have already bounded; nothing here is operator text. */
+static kbc_status copy_file(const char *src, const char *dst, kbc_err *err) {
+  int in = open(src, O_RDONLY);
+  if (in < 0) {
+    return kbc_err_set(err, KBC_ERR_IO, "open %s: %s", src, strerror(errno));
+  }
+  int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (out < 0) {
+    int e = errno;
+    (void)close(in);
+    return kbc_err_set(err, KBC_ERR_IO, "create %s: %s", dst, strerror(e));
+  }
+  kbc_status st = KBC_OK;
+  char *buf = malloc(COPY_BUF_BYTES);
+  if (buf == NULL) {
+    (void)close(out);
+    (void)close(in);
+    return kbc_err_set(err, KBC_ERR_NOMEM, "out of memory copying %s", src);
+  }
+  for (;;) {
+    ssize_t n = read(in, buf, COPY_BUF_BYTES);
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      st = kbc_err_set(err, KBC_ERR_IO, "read %s: %s", src, strerror(errno));
+      break;
+    }
+    if (n == 0) {
+      break;
+    }
+    ssize_t at = 0;
+    while (at < n) {
+      ssize_t w = write(out, buf + at, (size_t)(n - at));
+      if (w < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        st = kbc_err_set(err, KBC_ERR_IO, "write %s: %s", dst,
+                         strerror(errno));
+        goto done;
+      }
+      at += w;
+    }
+  }
+done:
+  free(buf);
+  if (st == KBC_OK && fsync(out) != 0) {
+    st = kbc_err_set(err, KBC_ERR_IO, "fsync %s: %s", dst, strerror(errno));
+  }
+  if (close(out) != 0 && st == KBC_OK) {
+    st = kbc_err_set(err, KBC_ERR_IO, "close %s: %s", dst, strerror(errno));
+  }
+  if (close(in) != 0 && st == KBC_OK) {
+    st = kbc_err_set(err, KBC_ERR_IO, "close %s: %s", src, strerror(errno));
+  }
+  return st;
+}
+
+/* Removes a file or a whole tree. Used for the staging dir and for --force's
+ * wipe, so it must not follow a symlink out of the tree it was pointed at:
+ * lstat decides, and a symlink is unlinked rather than descended into. */
+static kbc_status rm_rf(const char *path, kbc_err *err) {
+  struct stat sb;
+  if (lstat(path, &sb) != 0) {
+    if (errno == ENOENT) {
+      return KBC_OK;
+    }
+    return kbc_err_set(err, KBC_ERR_IO, "stat %s: %s", path, strerror(errno));
+  }
+  if (!S_ISDIR(sb.st_mode)) {
+    if (unlink(path) != 0 && errno != ENOENT) {
+      return kbc_err_set(err, KBC_ERR_IO, "unlink %s: %s", path,
+                         strerror(errno));
+    }
+    return KBC_OK;
+  }
+  DIR *d = opendir(path);
+  if (d == NULL) {
+    return kbc_err_set(err, KBC_ERR_IO, "opendir %s: %s", path,
+                       strerror(errno));
+  }
+  kbc_status st = KBC_OK;
+  struct dirent *de;
+  errno = 0;
+  while (st == KBC_OK && (de = readdir(d)) != NULL) {
+    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+      continue;
+    }
+    char *child = join2(path, de->d_name);
+    st = rm_rf(child, err);
+    free(child);
+    errno = 0;
+  }
+  if (st == KBC_OK && closedir(d) != 0) {
+    st = kbc_err_set(err, KBC_ERR_IO, "closedir %s: %s", path,
+                     strerror(errno));
+  } else if (st != KBC_OK) {
+    (void)closedir(d);
+  }
+  if (st == KBC_OK && rmdir(path) != 0 && errno != ENOENT) {
+    st = kbc_err_set(err, KBC_ERR_IO, "rmdir %s: %s", path, strerror(errno));
+  }
+  return st;
+}
+
+/* Recursive copy, the Rust's copy_dir. Depth-bounded because a state tree can
+ * be deep and the process stack is not: a corpus that somehow produced a
+ * thousand nested directories must fail loudly, not smash the stack. */
+#define COPY_MAX_DEPTH 64u
+
+static kbc_status copy_dir(const char *src, const char *dst, unsigned depth,
+                           kbc_err *err) {
+  if (depth > COPY_MAX_DEPTH) {
+    return kbc_err_set(err, KBC_ERR_IO, "%s nests deeper than %u levels", src,
+                       COPY_MAX_DEPTH);
+  }
+  if (kbc_failed(kbc_mkdir_p(dst, err))) {
+    return err->status;
+  }
+  DIR *d = opendir(src);
+  if (d == NULL) {
+    return kbc_err_set(err, KBC_ERR_IO, "opendir %s: %s", src, strerror(errno));
+  }
+  kbc_status st = KBC_OK;
+  struct dirent *de;
+  errno = 0;
+  while (st == KBC_OK && (de = readdir(d)) != NULL) {
+    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+      continue;
+    }
+    char *s = join2(src, de->d_name);
+    char *t = join2(dst, de->d_name);
+    struct stat sb;
+    if (lstat(s, &sb) != 0) {
+      st = kbc_err_set(err, KBC_ERR_IO, "stat %s: %s", s, strerror(errno));
+    } else if (S_ISDIR(sb.st_mode)) {
+      st = copy_dir(s, t, depth + 1u, err);
+    } else if (S_ISREG(sb.st_mode)) {
+      st = copy_file(s, t, err);
+    }
+    /* Anything else — a socket, a fifo, a symlink — is SKIPPED, matching the
+     * Rust's WalkDir, which yields symlinks as entries and copies neither. */
+    free(s);
+    free(t);
+    errno = 0;
+  }
+  if (st == KBC_OK && closedir(d) != 0) {
+    st = kbc_err_set(err, KBC_ERR_IO, "closedir %s: %s", src, strerror(errno));
+  } else if (st != KBC_OK) {
+    (void)closedir(d);
+  }
+  return st;
+}
+
+/* `true` when `path` is a directory with no entries. The Rust's
+ * `read_dir(&kb_state)?.next().is_some()`, inverted: an EXISTING BUT EMPTY
+ * state dir is a legitimate restore target and must not need --force. */
+static bool dir_is_empty(const char *path) {
+  DIR *d = opendir(path);
+  if (d == NULL) {
+    return true;
+  }
+  bool empty = true;
+  struct dirent *de;
+  while ((de = readdir(d)) != NULL) {
+    if (strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0) {
+      empty = false;
+      break;
+    }
+  }
+  (void)closedir(d);
+  return empty;
+}
+
+/* An execvp argv, built without ever casting away const.
+ *
+ * execvp takes `char *const argv[]`, and -Wcast-qual rightly refuses to make
+ * one out of a `const char *`. A cast would also misdescribe the contract:
+ * these slots are read by the child, never written. So the builder strdups
+ * each argument, owns it, and the whole vector is freed in one call. */
+typedef struct {
+  char **v;
+  size_t n;
+  size_t cap;
+} argv_vec;
+
+static void argv_free(argv_vec *a) {
+  for (size_t i = 0; i < a->n; i++) {
+    free(a->v[i]);
+  }
+  free(a->v);
+  a->v = NULL;
+  a->n = 0;
+  a->cap = 0;
+}
+
+/* Always NULL-terminates, so `a.v` is directly usable as the execvp argv. An
+ * allocation failure here is fatal by design: there is no argv to run without
+ * it, and a half-built one would be worse than none. The callers push a
+ * compile-time-fixed number of arguments (7 or 8), so this vector never grows
+ * without bound and the doubling cannot overflow. */
+static void argv_push(argv_vec *a, const char *arg) {
+  if (a->n + 2u > a->cap) {
+    size_t cap = a->cap == 0 ? 8u : a->cap * 2u;
+    char **grown = realloc(a->v, cap * sizeof *grown);
+    if (grown == NULL) {
+      argv_free(a);
+      die_io("out of memory building a `tar` command line");
+    }
+    a->v = grown;
+    a->cap = cap;
+  }
+  char *copy = strdup(arg);
+  if (copy == NULL) {
+    argv_free(a);
+    die_io("out of memory building a `tar` command line");
+  }
+  a->v[a->n++] = copy;
+  a->v[a->n] = NULL;
+}
+
+/* Runs `argv[0]` with `argv`, no shell, and returns its exit status; -1 when
+ * it could not be spawned at all. Nothing here is ever formatted into a
+ * command string: a corpus name is operator input and a path is too, and a
+ * shell would make both an injection surface (rule 9). tar is an EXTERNAL
+ * process in the original too, and it must stay one — this verb never shells
+ * out to `kbc` itself. */
+static int run_argv(char *const argv[], kbc_str *out) {
+  int fds[2] = {-1, -1};
+  if (out != NULL && pipe(fds) != 0) {
+    say_err("pipe: %s", strerror(errno));
+    return -1;
+  }
+  pid_t pid = fork();
+  if (pid < 0) {
+    if (out != NULL) {
+      (void)close(fds[0]);
+      (void)close(fds[1]);
+    }
+    say_err("fork: %s", strerror(errno));
+    return -1;
+  }
+  if (pid == 0) {
+    if (out != NULL) {
+      (void)close(fds[0]);
+      if (dup2(fds[1], STDOUT_FILENO) < 0) {
+        _exit(127);
+      }
+      (void)close(fds[1]);
+    }
+    execvp(argv[0], argv);
+    _exit(127);
+  }
+  if (out != NULL) {
+    (void)close(fds[1]);
+    char buf[COPY_BUF_BYTES];
+    for (;;) {
+      ssize_t n = read(fds[0], buf, sizeof buf);
+      if (n < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        break;
+      }
+      if (n == 0) {
+        break;
+      }
+      if (out->len + (size_t)n > TAR_LIST_MAX) {
+        say_err("`%s` wrote more than %u bytes of listing", argv[0],
+                TAR_LIST_MAX);
+        (void)close(fds[0]);
+        (void)waitpid(pid, NULL, 0);
+        return -1;
+      }
+      if (kbc_failed(kbc_str_append(out, buf, (size_t)n))) {
+        say_err("out of memory reading `%s` output", argv[0]);
+        (void)close(fds[0]);
+        (void)waitpid(pid, NULL, 0);
+        return -1;
+      }
+    }
+    (void)close(fds[0]);
+  }
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0) {
+    if (errno != EINTR) {
+      say_err("waitpid: %s", strerror(errno));
+      return -1;
+    }
+  }
+  if (WIFEXITED(status)) {
+    return WEXITSTATUS(status);
+  }
+  if (WIFSIGNALED(status)) {
+    say_err("`%s` was killed by signal %d", argv[0], WTERMSIG(status));
+  }
+  return -1;
+}
+
+/* tar's exit code, or a message naming the spawn failure. The Rust reports
+ * "tar invocation failed (is `tar` installed?)" for a spawn error, which is the
+ * common case and the one the hint is for. */
+static int run_tar(char *const argv[], kbc_str *out) {
+  int rc = run_argv(argv, out);
+  if (rc == 127) {
+    say_err("tar invocation failed (is `tar` installed?)");
+  }
+  return rc;
+}
+
+/* A transactionally-consistent copy of the sqlite database at `src` to `dest`
+ * via VACUUM INTO.
+ *
+ * Opened READ-ONLY, unlike the Rust's Connection::open: that one carries
+ * SQLITE_OPEN_CREATE, so a mistyped source path silently CREATES an empty
+ * database and the backup "succeeds" with nothing in it. Read-only fails
+ * loudly instead. VACUUM INTO works on a read-only connection — it only
+ * writes the destination.
+ *
+ * `dest` must not already exist: sqlite refuses to overwrite, and refusing is
+ * what keeps a re-run from quietly swapping one snapshot for another. */
+static kbc_status vacuum_into(const char *src, const char *dest, kbc_err *err) {
+  sqlite3 *db = NULL;
+  int rc = sqlite3_open_v2(src, &db, SQLITE_OPEN_READONLY, NULL);
+  if (rc != SQLITE_OK) {
+    kbc_status st = kbc_err_set(err, KBC_ERR_IO, "open %s: %s", src,
+                                db != NULL ? sqlite3_errmsg(db) : "no sqlite");
+    if (db != NULL) {
+      (void)sqlite3_close(db);
+    }
+    return st;
+  }
+  sqlite3_stmt *q = NULL;
+  rc = sqlite3_prepare_v2(db, "VACUUM INTO ?1", -1, &q, NULL);
+  if (rc != SQLITE_OK) {
+    kbc_status st = kbc_err_set(err, KBC_ERR_SQL, "prepare VACUUM INTO: %s",
+                                sqlite3_errmsg(db));
+    (void)sqlite3_close(db);
+    return st;
+  }
+  rc = sqlite3_bind_text(q, 1, dest, -1, SQLITE_TRANSIENT);
+  if (rc != SQLITE_OK) {
+    kbc_status st = kbc_err_set(err, KBC_ERR_SQL, "bind VACUUM INTO dest: %s",
+                                sqlite3_errmsg(db));
+    (void)sqlite3_finalize(q);
+    (void)sqlite3_close(db);
+    return st;
+  }
+  rc = sqlite3_step(q);
+  kbc_status st = KBC_OK;
+  if (rc != SQLITE_DONE) {
+    st = kbc_err_set(err, KBC_ERR_SQL, "VACUUM INTO %s: %s", dest,
+                     sqlite3_errmsg(db));
+  }
+  (void)sqlite3_finalize(q);
+  (void)sqlite3_close(db);
+  return st;
+}
+
+/* `true` when the archive carries the daemon-wide `slates/` member. Pre-SL2
+ * tarballs do not, and asking tar to extract a member that is not there is an
+ * error — so the LISTING is the gate, not a swallowed extraction failure. */
+static bool archive_has_slates(const char *tarball) {
+  argv_vec a = {NULL, 0, 0};
+  argv_push(&a, "tar");
+  argv_push(&a, "-tzf");
+  argv_push(&a, tarball);
+  kbc_str listing;
+  kbc_str_init(&listing);
+  int rc = run_tar(a.v, &listing);
+  argv_free(&a);
+  if (rc != 0) {
+    kbc_str_free(&listing);
+    die_io("tar -tzf %s failed with exit code %d", tarball, rc);
+  }
+  bool found = false;
+  for (size_t i = 0; i < listing.len && !found; i++) {
+    size_t start = i;
+    while (i < listing.len && listing.ptr[i] != '\n') {
+      i++;
+    }
+    size_t n = i - start;
+    if (n > 0 && listing.ptr[i - 1] == '/') {
+      n--;
+    }
+    if (n >= 6u && memcmp(listing.ptr + start, "slates", 6u) == 0 &&
+        (n == 6u || listing.ptr[start + 6u] == '/')) {
+      found = true;
+    }
+  }
+  kbc_str_free(&listing);
+  return found;
+}
+
+/* Packs `staging` with tar, by member name.
+ *
+ * The `--` BEFORE THE MEMBER LIST is not decoration. tar reads a leading `-`
+ * as an option, and a corpus name may legitimately start with one (`-notes`
+ * is a legal KbName). The Rust CLI omits it (commands/backup.rs:408) while
+ * its own daemon writer emits it (backup.rs:318); the CLI is the bug, and an
+ * operator-supplied corpus name must never be read as a tar option. */
+static int tar_tree(const char *staging, const char *out, const char *kb,
+                    bool include_slates) {
+  argv_vec a = {NULL, 0, 0};
+  argv_push(&a, "tar");
+  argv_push(&a, "-czf");
+  argv_push(&a, out);
+  argv_push(&a, "-C");
+  argv_push(&a, staging);
+  argv_push(&a, "--");
+  argv_push(&a, kb);
+  if (include_slates) {
+    argv_push(&a, "slates");
+  }
+  int rc = run_tar(a.v, NULL);
+  argv_free(&a);
+  return rc;
+}
+
+/* Extracts ONE member (`kb` or `slates`) of `tarball` into `dest`. The `--`
+ * applies here for the same reason it does in tar_tree. */
+static int tar_extract(const char *tarball, const char *dest,
+                       const char *member) {
+  argv_vec a = {NULL, 0, 0};
+  argv_push(&a, "tar");
+  argv_push(&a, "-xzf");
+  argv_push(&a, tarball);
+  argv_push(&a, "-C");
+  argv_push(&a, dest);
+  argv_push(&a, "--");
+  argv_push(&a, member);
+  int rc = run_tar(a.v, NULL);
+  argv_free(&a);
+  return rc;
+}
+
+/* `<data_dir>/exports/` — where the default tarball name and the staging dir
+ * live. The Rust's `<state>/exports/`; kb-c's per-daemon state directory IS
+ * `data_dir`, so this is the same level. */
+static char *exports_dir(const kbc_config *cfg) {
+  return join2(cfg->data_dir, "exports");
+}
+
+/* Builds the consistent snapshot tree at `staging/<kb>/` and tars it.
+ *
+ * A FAILED BACKUP LEAVES NOTHING BEHIND: the caller removes the staging tree on
+ * both the success and the error path, and a tar that exits non-zero has its
+ * partial output file removed here. A half-written tarball that looks like a
+ * backup is the one artefact worse than no backup at all. */
+static kbc_status stage_and_tar(const kbc_config *cfg, const char *kb,
+                                const char *staging, const char *out,
+                                kbc_err *err) {
+  char *staged_kb = join2(staging, kb);
+  char *staged_db = join2(staged_kb, "index.db");
+  char *staged_lance = join2(staged_kb, "lance");
+  char *staged_review = join2(staged_kb, ".review");
+  char *staged_slates = join2(staging, "slates");
+  char *src_lance = join2(cfg->data_dir, "lance");
+  char *src_review = join2(cfg->data_dir, ".review");
+  char *src_slates = join2(cfg->data_dir, "slates");
+
+  kbc_status st = kbc_mkdir_p(staged_kb, err);
+  /* 1. sqlite — transactionally consistent even while the daemon writes. */
+  if (st == KBC_OK) {
+    st = vacuum_into(cfg->db_path, staged_db, err);
+  }
+  /* 2. lance — the vector store, copied verbatim when the daemon has one. */
+  if (st == KBC_OK && kbc_path_exists(src_lance)) {
+    st = copy_dir(src_lance, staged_lance, 0u, err);
+  }
+  /* 3. review — each review JSON file lands via atomic rename, so every file
+   *    is already internally consistent and a plain copy is enough. */
+  if (st == KBC_OK && kbc_path_exists(src_review)) {
+    st = copy_dir(src_review, staged_review, 0u, err);
+  }
+  /* 3b. slates — the daemon-wide clause. See the layout comment. */
+  bool include_slates = st == KBC_OK && kbc_path_exists(src_slates);
+  if (include_slates) {
+    st = copy_dir(src_slates, staged_slates, 0u, err);
+  }
+  if (st == KBC_OK) {
+    int rc = tar_tree(staging, out, kb, include_slates);
+    if (rc != 0) {
+      (void)unlink(out); /* the partial tarball, gone before anyone sees it */
+      st = kbc_err_set(err, KBC_ERR_IO, "tar exited %d", rc);
+    }
+  }
+  free(staged_kb);
+  free(staged_db);
+  free(staged_lance);
+  free(staged_review);
+  free(staged_slates);
+  free(src_lance);
+  free(src_review);
+  free(src_slates);
+  return st;
+}
+
+/* `true` when `kb` is a corpus this daemon is configured to index.
+ *
+ * kb-c's corpus REGISTRY is the config's [[corpus]] list, not a row in the
+ * store: `kbc add` writes kb.toml, and the store's `sources` table stays empty
+ * on a real deployment. So this asks the config, and the store-existence check
+ * above is what covers "configured but never indexed".
+ *
+ * Checking the config rather than the store matters for the SNAPSHOT too: the
+ * tarball is the whole volume, so backing up a corpus that does not exist
+ * would produce a perfectly valid tarball of somebody else's data under a name
+ * that was never indexed — a mistake the operator would only discover when the
+ * restore did not contain what they expected. */
+static bool corpus_is_configured(const kbc_config *cfg, const char *kb) {
+  return kbc_config_corpus(cfg, kb) != NULL;
+}
+
+/* One corpus's snapshot. `out_arg` NULL means the default export name. */
+
+static kbc_status snapshot_one(const kbc_config *cfg, const char *kb,
+                               const char *out_arg, kbc_err *err) {
+  /* Two questions, in this order, because they have different remedies.
+   *
+   * Is the corpus CONFIGURED? kb-c keeps one sqlite volume per daemon, not
+   * one directory per corpus the way the Rust does, so "the state dir exists"
+   * is the wrong question: the volume exists as soon as ANY corpus has been
+   * indexed. The config's [[corpus]] list is the registry, and it is what the
+   * snapshot is NAMED after.
+   *
+   * Does the volume EXIST? sqlite's Connection::open CREATES a missing file,
+   * so a state dir that was never indexed would otherwise be snapshotted as a
+   * brand-new empty database. Refusing first is what stops a backup from
+   * inventing the thing it backs up. */
+  if (!corpus_is_configured(cfg, kb)) {
+    return kbc_err_set(err, KBC_ERR_NOTFOUND,
+                       "kb %s is not a configured corpus; run "
+                       "`kbc add <dir> --kb %s` first",
+                       kb, kb);
+  }
+  if (!kbc_path_exists(cfg->db_path)) {
+    return kbc_err_set(err, KBC_ERR_NOTFOUND,
+                       "kb %s has no state at %s; index something first", kb,
+                       cfg->db_path);
+  }
+  char *exports = exports_dir(cfg);
+  kbc_status st = kbc_mkdir_p(exports, err);
+  char *out = NULL;
+  char *staging = NULL;
+  if (st == KBC_OK) {
+    char *stamp = utc_stamp();
+    if (out_arg != NULL) {
+      char *expanded = expand_tilde(out_arg);
+      out = bounded_path("--out", expanded);
+      free(expanded);
+    } else {
+      char name[KBC_MAX_KB_NAME + 32u];
+      (void)snprintf(name, sizeof name, "%s-%s.tar.gz", kb, stamp);
+      out = join2(exports, name);
+    }
+    char *dir = dir_of(out);
+    st = kbc_mkdir_p(dir, err);
+    free(dir);
+    /* `.staging-<kb>-<pid>-<stamp>`: the pid keeps two concurrent backups of
+     * the same corpus in the same second off each other's staging tree. */
+    char sname[KBC_MAX_KB_NAME + 64u];
+    (void)snprintf(sname, sizeof sname, ".staging-%s-%ld-%s", kb,
+                   (long)getpid(), stamp);
+    staging = join2(exports, sname);
+    free(stamp);
+  }
+  /* Stage a consistent snapshot under exports/, tar it, then clean up the
+   * staging dir unconditionally — success or error. */
+  if (st == KBC_OK) {
+    st = stage_and_tar(cfg, kb, staging, out, err);
+  }
+  if (staging != NULL) {
+    /* The cleanup runs whether the snapshot succeeded or not, and a cleanup
+     * that itself fails is reported ONLY when there is no earlier, more
+     * useful failure to report: the operator needs the snapshot's reason. */
+    kbc_err local;
+    kbc_err_reset(&local);
+    kbc_status cs = rm_rf(staging, &local);
+    if (st == KBC_OK && kbc_failed(cs)) {
+      st = local.status;
+      (void)kbc_err_set(err, st, "removing the staging dir %s: %s", staging,
+                        local.msg);
+    }
+  }
+  if (st != KBC_OK) {
+    free(exports);
+    free(out);
+    free(staging);
+    return st;
+  }
+  free(exports);
+  free(staging);
+  if (g_json) {
+    kbc_str line;
+    kbc_str_init(&line);
+    line_puts(&line, "{\"ok\":true,\"kb\":");
+    put_shown(&line, kb);
+    line_puts(&line, ",\"tarball\":");
+    put_shown(&line, out);
+    line_puts(&line, "}");
+    emit_line(&line);
+  } else {
+    kbc_str line;
+    kbc_str_init(&line);
+    line_puts(&line, "backup: ");
+    put_shown(&line, cfg->data_dir);
+    line_puts(&line, " -> ");
+    put_shown(&line, out);
+    emit_line(&line);
+  }
+  free(out);
+  return KBC_OK;
+}
+
+
+/* `--all` — one tarball per corpus this daemon knows, each at the default
+ * export path. The corpus LIST comes from `GET /api/kbs`, but every snapshot
+ * is this machine's own state dir, so a remote daemon is refused before the
+ * list: listing one host's corpora and tarring another's state would file this
+ * machine's data under the remote's names. Loopback only, which is the same
+ * bound the config's own bind guard uses.
+ *
+ * EVERY listed corpus is attempted, including after a failure: a partial sweep
+ * that stopped at the first error would leave the operator guessing which
+ * corpora are covered. Failures are collected and named together at the end —
+ * a later success does not cancel an earlier failure, and reporting success
+ * when any corpus failed is the one outcome the command must never produce. */
+static int backup_all(const kbc_config *cfg) {
+  const char *base = resolve_base_url();
+  kbc_url u;
+  kbc_err e;
+  kbc_err_reset(&e);
+  if (!url_parse(base, &u, &e)) {
+    die_user("backup --all: %s", e.msg);
+  }
+  bool loopback = strcmp(u.host, "127.0.0.1") == 0 ||
+                  strcmp(u.host, "localhost") == 0 || strcmp(u.host, "::1") == 0;
+  if (!loopback) {
+    char *host = u.host;
+    die_user("backup --all: refusing daemon %s — the corpus list would come "
+             "from another host while the snapshot is this machine's state",
+             host);
+  }
+  url_free(&u);
+
+  int status = 0;
+  kbc_str resp;
+  kbc_err_reset(&e);
+  if (kbc_failed(http_call("GET", "/api/kbs", NULL, 0, &status, &resp, &e))) {
+    /* call_failed, like every other verb: a transport failure is the daemon
+     * class (exit 2), a 401 is the user class — the same split `kbc status`
+     * makes, which is the whole point of using the shared helper. */
+    call_failed(e.status, &e, "backup --all: listing corpora");
+  }
+  if (status < 200 || status >= 300) {
+    kbc_str_free(&resp);
+    die_io("backup --all: HTTP %d listing corpora", status);
+  }
+  kbc_json *root = NULL;
+  kbc_arena *a = resp_arena(&resp, &root, "backup --all");
+  const kbc_json *kbs = kbc_json_get(root, "kbs");
+  if (kbs == NULL || !kbc_json_is(kbs, KBC_JSON_ARR)) {
+    kbc_arena_free(a);
+    kbc_str_free(&resp);
+    die_io("backup --all: the daemon's answer carried no corpus list");
+  }
+  size_t n = kbc_json_len(kbs);
+  if (n == 0) {
+    kbc_arena_free(a);
+    kbc_str_free(&resp);
+    die_user("backup --all: the daemon lists no corpora; nothing to back up");
+  }
+  kbc_str failed_names;
+  kbc_str_init(&failed_names);
+  size_t nfailed = 0;
+  int worst = EXIT_USER;
+  for (size_t i = 0; i < n; i++) {
+    const kbc_json *row = kbc_json_at(kbs, i);
+    const char *name =
+        kbc_json_is(row, KBC_JSON_OBJ) ? kbc_json_str(row, "name", NULL) : NULL;
+    /* A row with no usable name is a FAILURE, not a skip: dropping it would
+     * silently leave that corpus out of the backup set and still report
+     * success. */
+    if (name == NULL || !kb_name_ok(name)) {
+      say_err("backup: kb FAILED: the daemon listed a row with no usable name");
+      if (nfailed++ > 0) {
+        (void)kbc_str_putc(&failed_names, ',');
+      }
+      (void)kbc_str_puts(&failed_names, "(unnamed)");
+      worst = EXIT_DAEMON; /* the daemon's own answer is what is wrong */
+      continue;
+    }
+    kbc_err local;
+    kbc_err_reset(&local);
+    if (kbc_failed(snapshot_one(cfg, name, NULL, &local))) {
+      /* Built and escaped rather than passed to say_err as a format: `name`
+       * came off the wire, and a corpus name is operator input even when it
+       * arrived by HTTP. */
+      kbc_str why;
+      kbc_str_init(&why);
+      line_puts(&why, "backup: kb ");
+      put_shown(&why, name);
+      line_puts(&why, " FAILED: ");
+      put_shown(&why, local.msg[0] != '\0' ? local.msg
+                                          : kbc_status_str(local.status));
+      emit_line(&why);
+      if (nfailed++ > 0) {
+        (void)kbc_str_putc(&failed_names, ',');
+      }
+      (void)kbc_str_puts(&failed_names, name);
+      /* The aggregate keeps the WORST class seen: a sweep that hit a daemon
+       * or filesystem failure must not report the same code as one that only
+       * found corpora the user has not set up — the same rule fail_status
+       * applies to a single failure, applied to the sweep. */
+      if (local.status != KBC_ERR_INVALID && local.status != KBC_ERR_NOTFOUND &&
+          local.status != KBC_ERR_PARSE) {
+        worst = EXIT_DAEMON;
+      }
+    }
+  }
+  kbc_arena_free(a);
+  kbc_str_free(&resp);
+  if (nfailed > 0) {
+    /* Sized for the worst case of two 64-bit counts, so -Wformat-truncation
+     * can see the write fits: this line is never truncated, and a truncated
+     * one would name the wrong number of corpora. */
+    char counts[96];
+    (void)snprintf(counts, sizeof counts, "backup: %zu of %zu corpora failed: ",
+                   nfailed, n);
+    kbc_str line;
+    kbc_str_init(&line);
+    line_puts(&line, counts);
+    put_shown(&line, failed_names.ptr);
+    emit_line(&line);
+    kbc_str_free(&failed_names);
+    return worst;
+  }
+  kbc_str_free(&failed_names);
+  return EXIT_OK;
+}
+
+static int cmd_backup(int argc, char **argv, int start) {
+  /* No exit code is set up here: every failure below reaches exit() through
+   * die_user, die_io or fail_status, which is how every other verb does it. */
+  opts o;
+  parse_verb(FLAGS_BACKUP, argc, argv, start, &o);
+  if (o.all && o.out != NULL) {
+    die_user("--out is not valid with --all (one path cannot hold every "
+             "tarball)");
+  }
+  if (o.all && o.npos > 0) {
+    die_user("--all takes no corpus name");
+  }
+  kbc_config *cfg = load_config();
+  if (o.all) {
+    return backup_all(cfg);
+  }
+  const char *kb = positional(&o, 0, "backup <kb>");
+  if (!kb_name_ok(kb)) {
+    die_user("invalid kb %s: a corpus name must be 1-%u bytes of [a-z0-9_-]",
+             kb, KBC_MAX_KB_NAME);
+  }
+  /* The --out bound is enforced where the path is produced, in snapshot_one;
+   * checking it here too would be a second rule to keep in step. */
+  kbc_err e;
+  kbc_err_reset(&e);
+  kbc_status s = snapshot_one(cfg, kb, o.out, &e);
+  if (kbc_failed(s)) {
+    /* fail_status, not a verb-specific reporter: a corpus the user has not
+     * configured is a user error (1); a filesystem or daemon failure is 2. */
+    fail_status(s, &e, kb, NULL);
+  }
+  return EXIT_OK;
+}
+
+/* The Rust's `kb restore <tarball> --kb <name> [--force]`. The daemon for this
+ * kb must be stopped first: it holds index.db open.
+ *
+ * NO VERSION CHECK HERE, and that is deliberate. The Rust does not check in
+ * restore either — a too-new tarball restores "successfully" here and is
+ * REFUSED at the next kbc_store_open, by refuse_if_volume_ahead, which runs
+ * BEFORE migrations and would otherwise have to undo them. Adding a check in
+ * restore would silently move the failure to a different command, and would
+ * reject a tarball this binary might still be able to read after a downgrade. */
+static int cmd_restore(int argc, char **argv, int start) {
+  opts o;
+  parse_verb(FLAGS_RESTORE, argc, argv, start, &o);
+  const char *tarball_arg = positional(&o, 0, "restore <tarball>");
+  if (!o.has_kb) {
+    die_user("restore needs --kb <name>");
+  }
+  if (!kb_name_ok(o.kb)) {
+    die_user("invalid kb %s: a corpus name must be 1-%u bytes of [a-z0-9_-]",
+             o.kb, KBC_MAX_KB_NAME);
+  }
+  char *expanded = expand_tilde(tarball_arg);
+  char *tarball = bounded_path("tarball", expanded);
+  free(expanded);
+  if (!kbc_path_exists(tarball)) {
+    /* A tarball the user named and that is not there is a user error, the
+     * same class `kbc get`'s missing artifact is. */
+    die_user("restore: tarball %s not found", tarball);
+  }
+
+  kbc_config *cfg = load_config();
+  /* The tarball root is `<kb>/…`, so extracting into the state dir recreates
+   * `<state>/<kb>/` — the parent IS the state dir. */
+  char *kb_state = join2(cfg->data_dir, o.kb);
+  if (kbc_path_exists(kb_state) && !dir_is_empty(kb_state) && !o.force) {
+    kbc_str line;
+    kbc_str_init(&line);
+    line_puts(&line, "restore: kb ");
+    put_shown(&line, o.kb);
+    line_puts(&line, " already has state at ");
+    put_shown(&line, kb_state);
+    line_puts(&line,
+              " - refusing to overwrite. Stop the daemon for this kb, then "
+              "pass --force to replace it.");
+    emit_line(&line);
+    free(kb_state);
+    free(tarball);
+    return EXIT_USER;
+  }
+  if (o.force && kbc_path_exists(kb_state)) {
+    kbc_err e;
+    kbc_err_reset(&e);
+    if (kbc_failed(rm_rf(kb_state, &e))) {
+      fail_status(e.status, &e, "restore: clearing existing state", NULL);
+    }
+  }
+  if (kbc_failed(kbc_mkdir_p(cfg->data_dir, NULL))) {
+    die_io("restore: %s is not a usable state directory", cfg->data_dir);
+  }
+
+  /* The kb's own tree, always. Named explicitly rather than extracting the
+   * whole archive, so the slates member below is a SEPARATE, guarded
+   * decision. */
+  int rc = tar_extract(tarball, cfg->data_dir, o.kb);
+  if (rc != 0) {
+    free(kb_state);
+    free(tarball);
+    die_io("restore: tar exited %d extracting %s/", rc, o.kb);
+  }
+
+  /* SLATES — never clobbers. --force is scoped to "replace THIS kb's state",
+   * and slates are daemon-wide: honouring --force here would destroy every
+   * other project's live coordination board on a one-kb restore. An existing
+   * slates/ is left alone and the skip is printed with its remedy. */
+  char *slates_dir = join2(cfg->data_dir, "slates");
+  if (archive_has_slates(tarball)) {
+    if (kbc_path_exists(slates_dir)) {
+      kbc_str line;
+      kbc_str_init(&line);
+      line_puts(&line, "restore: SKIPPING the tarball's daemon-wide slates/ - ");
+      put_shown(&line, slates_dir);
+      line_puts(&line, " already exists. Slates are not per-kb, so --force "
+                       "(which replaces only kb ");
+      put_shown(&line, o.kb);
+      line_puts(&line, ") does not cover them; move that directory aside and "
+                       "re-run to restore them.");
+      emit_line(&line);
+    } else {
+      int src = tar_extract(tarball, cfg->data_dir, "slates");
+      if (src != 0) {
+        free(slates_dir);
+        free(kb_state);
+        free(tarball);
+        die_io("restore: tar exited %d extracting slates/", src);
+      }
+      kbc_str line;
+      kbc_str_init(&line);
+      line_puts(&line, "restore: slates/ -> ");
+      put_shown(&line, slates_dir);
+      emit_line(&line);
+    }
+  }
+
+  /* Validate: the archive must have produced this kb's index.db. Catches a
+ * wrong tarball, or a --kb that does not match the archive's root dir. */
+  char *index_db = join2(kb_state, "index.db");
+  if (!kbc_path_exists(index_db)) {
+    kbc_str line;
+    kbc_str_init(&line);
+    line_puts(&line, "restore produced no index.db at ");
+    put_shown(&line, kb_state);
+    line_puts(&line, " - wrong tarball, or its root dir doesn't match --kb ");
+    put_shown(&line, o.kb);
+    line_puts(&line, "?");
+    emit_line(&line);
+    free(index_db);
+    free(slates_dir);
+    free(kb_state);
+    free(tarball);
+    return EXIT_USER;
+  }
+
+  if (g_json) {
+    kbc_str line;
+    kbc_str_init(&line);
+    line_puts(&line, "{\"ok\":true,\"kb\":");
+    put_shown(&line, o.kb);
+    line_puts(&line, ",\"tarball\":");
+    put_shown(&line, tarball);
+    line_puts(&line, ",\"state\":");
+    put_shown(&line, kb_state);
+    line_puts(&line, "}");
+    emit_line(&line);
+  } else {
+    kbc_str line;
+    kbc_str_init(&line);
+    line_puts(&line, "restore: ");
+    put_shown(&line, tarball);
+    line_puts(&line, " -> ");
+    put_shown(&line, kb_state);
+    emit_line(&line);
+  }
+  free(index_db);
+  free(slates_dir);
+  free(kb_state);
+  free(tarball);
+  return EXIT_OK;
+}
+
 /* ------------------------------------------------------------------ help --- */
 
 static void usage(FILE *out) {
@@ -2400,6 +3525,9 @@ static void usage(FILE *out) {
           "  list [--kb NAME] [--limit N]\n"
           "  status\n"
           "  bench [--queries N] [--repeat N] [--corpus DIR]\n"
+          "  backup <kb> [--out PATH]\n"
+          "  backup --all            (one tarball per corpus; no --out)\n"
+          "  restore <tarball> --kb NAME [--force]\n"
           "  config show\n"
           "  token generate\n"
           "  version\n");
@@ -2497,6 +3625,10 @@ int main(int argc, char **argv) {
     rc = cmd_bench(argc, argv, start);
   } else if (strcmp(verb, "daemon") == 0) {
     rc = cmd_daemon(argc, argv, start);
+  } else if (strcmp(verb, "backup") == 0) {
+    rc = cmd_backup(argc, argv, start);
+  } else if (strcmp(verb, "restore") == 0) {
+    rc = cmd_restore(argc, argv, start);
   } else if (strcmp(verb, "version") == 0) {
     rc = cmd_version();
   } else if (strcmp(verb, "help") == 0) {

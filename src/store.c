@@ -2566,7 +2566,8 @@ kbc_status kbc_store_record_error(kbc_store *s, const kbc_error_row *row,
     const kbc_status prepared = prepare(
         err, s,
         "UPDATE errors SET retry_count = retry_count + 1, message = ?1,"
-        " created_at = ?2 WHERE corpus = ?3 AND path = ?4 AND dismissed = 0;",
+        " created_at = ?2, content_hash = ?5"
+        " WHERE corpus = ?3 AND path = ?4 AND dismissed = 0;",
         &q);
     if (prepared != KBC_OK) {
       st = prepared;
@@ -2575,6 +2576,11 @@ kbc_status kbc_store_record_error(kbc_store *s, const kbc_error_row *row,
       if (st == KBC_OK) st = bind_i64(err, s, q, 2, row->created_at);
       if (st == KBC_OK) st = bind_text(err, s, q, 3, row->corpus);
       if (st == KBC_OK) st = bind_text(err, s, q, 4, row->path);
+      /* The stored hash moves with the counter, so the row keeps describing the
+       * bytes it is counting failures OF. A NULL records as SQL NULL, so a
+       * caller recording without a hash clears the stale one rather than
+       * leaving it to answer a question nobody asked again. */
+      if (st == KBC_OK) st = bind_text(err, s, q, 5, row->content_hash);
       if (st == KBC_OK) {
         const int step = sqlite3_step(q);
         if (step != SQLITE_DONE)
@@ -2628,30 +2634,61 @@ kbc_status kbc_store_record_error(kbc_store *s, const kbc_error_row *row,
   return st;
 }
 
-/* The quarantine gate. 0 for a path with no open error, which is what a
- * document that has never failed must read as. A DISMISSED row is not
- * counted: clearing an error is what gives a document a fresh budget of
- * attempts (Rust's un-quarantine route, sqlite.rs:413). */
+/* The quarantine gate, keyed by (corpus, path) and — when the caller names the
+ * content — by the hash of the bytes about to be embedded.
+ *
+ * The two modes answer DIFFERENT questions and conflating them is the bug the
+ * hash exists to prevent:
+ *
+ *   content_hash != NULL — "is this still the document that failed?". A row
+ *     whose stored hash differs reads as 0, because it belongs to different
+ *     bytes. Editing a document is how an operator fixes one that failed, so
+ *     the edited document must get a fresh embedding budget; the original
+ *     spells this retry_count_for_path_hash (kb-core/src/indexer.rs:2439).
+ *
+ *   content_hash == NULL — "how bad is it?". The raw count for the path, which
+ *     is what an operator's Errors view and a diagnostic want, and what a
+ *     caller with no bytes in hand can still ask.
+ *
+ * 0 for a path with no open error, which is what a document that has never
+ * failed must read as. A DISMISSED row is not counted: clearing an error is
+ * what gives a document a fresh budget of attempts (Rust's un-quarantine route,
+ * sqlite.rs:413). */
 kbc_status kbc_store_retry_count_for_path(kbc_store *s, const char *corpus,
-                                          const char *path, int64_t *out,
-                                          kbc_err *err) {
+                                          const char *path,
+                                          const char *content_hash,
+                                          int64_t *out, kbc_err *err) {
   if (s == NULL || out == NULL)
     return kbc_err_set(err, KBC_ERR_INVALID,
                        "retry_count_for_path: null argument");
   kbc_status st = require_text(err, "error corpus", corpus, 255);
   if (st == KBC_OK)
     st = require_text(err, "error path", path, KBC_MAX_PATH_LEN);
+  if (st == KBC_OK && content_hash != NULL)
+    st = require_text(err, "error content hash", content_hash,
+                      KBC_MAX_CONTENT_HASH_LEN);
   if (st != KBC_OK) return st;
+
+  /* Two statement texts rather than one with a bound-and-ignored clause, so
+   * neither mode can quietly read the other's rows. `content_hash = ?3` also
+   * excludes a row recorded with NO hash: a row that never claimed to be about
+   * these bytes is not evidence about them, and counting it would re-gate an
+   * edited document on the strength of somebody else's failure. */
+  const char *sql =
+      content_hash != NULL
+          ? "SELECT IFNULL((SELECT retry_count FROM errors WHERE corpus = ?1"
+            " AND path = ?2 AND dismissed = 0 AND content_hash = ?3"
+            " LIMIT 1), 0);"
+          : "SELECT IFNULL((SELECT retry_count FROM errors WHERE corpus = ?1"
+            " AND path = ?2 AND dismissed = 0 LIMIT 1), 0);";
 
   lock(s);
   sqlite3_stmt *q = NULL;
-  st = prepare(err, s,
-               "SELECT IFNULL((SELECT retry_count FROM errors"
-               " WHERE corpus = ?1 AND path = ?2 AND dismissed = 0"
-               " LIMIT 1), 0);",
-               &q);
+  st = prepare(err, s, sql, &q);
   if (st == KBC_OK) st = bind_text(err, s, q, 1, corpus);
   if (st == KBC_OK) st = bind_text(err, s, q, 2, path);
+  if (st == KBC_OK && content_hash != NULL)
+    st = bind_text(err, s, q, 3, content_hash);
   if (st != KBC_OK) {
     (void)finalize(err, s, q, st);
     unlock(s);

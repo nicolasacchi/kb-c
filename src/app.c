@@ -56,6 +56,7 @@
 #include <unistd.h>
 
 #include "kbc/app.h"
+#include "kbc/chunk.h"
 #include "kbc/json.h"
 #include "kbc/log.h"
 #include "kbc/mem.h"
@@ -282,6 +283,297 @@ static kbc_status join_rel(kbc_str *out, const char *prefix, const char *leaf) {
   return KBC_OK;
 }
 
+/* ------------------------------------------------------------- chunker --- */
+
+/* Unit 6: the passage chunker (chunk.rs:40-84), ported whole.
+ *
+ * A document is split into overlapping WORD windows so that each one is small
+ * enough to embed in full. The models truncate at 512 tokens, so a single
+ * whole-body vector only "sees" the first few hundred words of a long
+ * artifact. It REPLACES the one-row-per-parsed-block chunking, which sized a
+ * chunk by markdown shape: a document that is one long paragraph produced one
+ * 10,000-word chunk, and the vector lane saw the first 400 words of it and
+ * nothing else.
+ *
+ * It is a LEAF: three strings and two window sizes in, a chunk list out. No
+ * clock, no map iteration, no I/O (chunk.rs:12-14). That is what makes a
+ * re-index of an unchanged file produce byte-identical chunks, and it is why
+ * it is testable at all — a chunker that read the clock could not be.
+ *
+ * The unit is a whitespace-delimited WORD, not a byte and not a character
+ * (chunk.rs:62, `body.split_whitespace()`), and a chunk's text is its window's
+ * words joined by a SINGLE ASCII space (chunk.rs:73), so a newline inside a
+ * window becomes a space. Chunk 0 is not a window at all: it is the title and
+ * the document's heading list, a short high-signal passage that lifts short
+ * queries and keeps a body-less artifact representable (chunk.rs:50-59). It
+ * is emitted only when that pair is not empty after trimming.
+ */
+
+/* include/kbc/chunk.h owns the window sizes, the two structs and the leaf's
+ * signature. They are NOT redeclared here: a second copy of a public contract
+ * is a second thing that can drift, and the test that used to mirror them
+ * caught that drift with a sizeof assertion — which fires on layout rather
+ * than on behaviour, the wrong failure for the wrong reason. KBC_CHUNK_WORDS,
+ * KBC_CHUNK_OVERLAP_WORDS and KBC_MAX_CHUNKS_PER_DOC are the header's, and
+ * kbc_chunk_document below is this file's definition of the header's
+ * declaration, so the two cannot disagree about the signature. */
+
+/* Rust's str::split_whitespace and str::trim work on the Unicode whitespace
+ * set. The difference is unreachable here: parse.c collapses every run of
+ * whitespace inside a block to a single space before anything sees it, so the
+ * only byte that can separate two words is one of these. */
+static bool chunk_space(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' ||
+         c == '\v';
+}
+
+/* Trims [*b, *e) in place to the span between the first and last byte that is
+ * not whitespace. Rust trims each part and then the CONCATENATION
+ * (chunk.rs:51-52), so "T" + "\n" + "" is "T" and not "T\n". */
+static void chunk_trim(const char *s, size_t *b, size_t *e) {
+  while (*b < *e && chunk_space(s[*b])) (*b)++;
+  while (*e > *b && chunk_space(s[*e - 1])) (*e)--;
+}
+
+/* Appends one chunk, or counts it and drops it when the list is already at
+ * `cap`. The dropped ones still land in `total`: the cap hides rows, it does
+ * not unmake the document. */
+static kbc_status chunk_push(kbc_arena *a, kbc_chunks *out, size_t cap,
+                             const char *text, size_t len, kbc_err *err) {
+  if (out->len >= cap) {
+    out->total++;
+    return KBC_OK;
+  }
+  if (out->len == out->cap) {
+    size_t want = out->cap ? out->cap * 2u : 8u;
+    if (want > cap) {
+      want = cap;
+    }
+    if (want <= out->cap) {
+      return kbc_err_set(err, KBC_ERR_INTERNAL,
+                         "chunk list is stuck at %zu of a %zu cap", out->cap,
+                         cap);
+    }
+    kbc_chunk *grown = kbc_arena_calloc(a, want, sizeof(*grown));
+    if (grown == NULL) {
+      return kbc_err_set(err, KBC_ERR_NOMEM, "chunk list of %zu", want);
+    }
+    if (out->items != NULL && out->len > 0) {
+      memcpy(grown, out->items, out->len * sizeof(*grown));
+    }
+    out->items = grown;
+    out->cap = want;
+  }
+  kbc_chunk *slot = &out->items[out->len];
+  slot->idx = (uint32_t)out->len;
+  slot->text = kbc_arena_strndup(a, text, len);
+  if (slot->text == NULL) {
+    return kbc_err_set(err, KBC_ERR_NOMEM, "chunk %u of %zu bytes", slot->idx,
+                       len);
+  }
+  slot->text_len = len;
+  out->len++;
+  out->total++;
+  return KBC_OK;
+}
+
+kbc_status kbc_chunk_document(kbc_arena *a, const char *title,
+                                  const char *headings, const char *body,
+                                  size_t body_len, size_t chunk_words,
+                                  size_t overlap_words, size_t cap,
+                                  kbc_chunks *out, kbc_err *err) {
+  if (a == NULL || out == NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "chunk_document: arena and out are both required");
+  }
+  memset(out, 0, sizeof(*out));
+  const char *t = title != NULL ? title : "";
+  const char *h = headings != NULL ? headings : "";
+
+  /* Chunk 0. */
+  {
+    size_t tb = 0, te = strlen(t);
+    size_t hb = 0, he = strlen(h);
+    chunk_trim(t, &tb, &te);
+    chunk_trim(h, &hb, &he);
+    kbc_str head;
+    kbc_str_init(&head);
+    kbc_status s = kbc_str_append(&head, t + tb, te - tb);
+    if (s == KBC_OK) {
+      s = kbc_str_putc(&head, '\n');
+    }
+    if (s == KBC_OK) {
+      s = kbc_str_append(&head, h + hb, he - hb);
+    }
+    size_t b = 0, e = s == KBC_OK ? head.len : 0;
+    if (s == KBC_OK) {
+      chunk_trim(head.ptr, &b, &e);
+    }
+    if (s == KBC_OK && e > b) {
+      s = chunk_push(a, out, cap, head.ptr + b, e - b, err);
+    }
+    kbc_str_free(&head);
+    if (kbc_failed(s)) {
+      return s;
+    }
+  }
+
+  if (body == NULL || body_len == 0) {
+    return KBC_OK;
+  }
+  /* How many words the body holds, counted first: a window ends at
+   * min(start + window, nwords) and the walk stops when a window reaches the
+   * last word (chunk.rs:69-80), so the count is the loop's stopping rule and
+   * not a convenience. */
+  size_t nwords = 0;
+  for (size_t i = 0; i < body_len;) {
+    while (i < body_len && chunk_space(body[i])) {
+      i++;
+    }
+    if (i >= body_len) {
+      break;
+    }
+    nwords++;
+    while (i < body_len && !chunk_space(body[i])) {
+      i++;
+    }
+  }
+  if (nwords == 0) {
+    return KBC_OK;
+  }
+
+  /* window.max(1) and step = window.saturating_sub(overlap).max(1)
+   * (chunk.rs:66-67). The step guard is load-bearing: an overlap >= window
+   * would make the step zero and the walk would never advance. */
+  const size_t window = chunk_words > 0 ? chunk_words : 1u;
+  const size_t step = window > overlap_words ? window - overlap_words : 1u;
+  size_t wi = 0;  /* word index of the current window's first word */
+  size_t pos = 0; /* its byte offset in `body` */
+  for (;;) {
+    const size_t end = window >= nwords - wi ? nwords : wi + window;
+    size_t resume = 0;
+    bool have_resume = false;
+    size_t seen = 0;
+    kbc_str text;
+    kbc_str_init(&text);
+    kbc_status s = KBC_OK;
+    size_t p = pos;
+    size_t idx = wi;
+    while (idx < end && s == KBC_OK) {
+      while (p < body_len && chunk_space(body[p])) {
+        p++;
+      }
+      const size_t ws = p;
+      while (p < body_len && !chunk_space(body[p])) {
+        p++;
+      }
+      /* The next window starts `step` words in, so remember where that word
+       * begins and the walk never rescans from the top of the body. */
+      if (idx - wi == step) {
+        resume = ws;
+        have_resume = true;
+      }
+      if (seen > 0) {
+        s = kbc_str_putc(&text, ' ');
+      }
+      if (s == KBC_OK) {
+        s = kbc_str_append(&text, body + ws, p - ws);
+      }
+      seen++;
+      idx++;
+    }
+    if (s == KBC_OK) {
+      s = chunk_push(a, out, cap, text.ptr, text.len, err);
+    }
+    kbc_str_free(&text);
+    if (kbc_failed(s)) {
+      return s;
+    }
+    if (end == nwords) {
+      break;
+    }
+    if (!have_resume) {
+      resume = p; /* step == window: the next window starts where this ended */
+    }
+    wi += step;
+    pos = resume;
+  }
+  return KBC_OK;
+}
+
+/* The document's chunk rows: the window list, projected onto the store's
+ * (doc_id, ord, text) shape. `*total_out` is the count before the cap, which
+ * is the number a log line has to report. */
+static kbc_status document_chunks(kbc_arena *a, const kbc_parsed *p,
+                                  const char *doc_id, kbc_chunk_in **out,
+                                  size_t *n_out, size_t *total_out,
+                                  kbc_err *err) {
+  const kbc_blocks *b = kbc_parsed_blocks(p);
+  kbc_str headings;
+  kbc_str_init(&headings);
+  kbc_str body;
+  kbc_str_init(&body);
+  /* The heading list, in document order, one per line (parser.rs:538 joins
+   * heading lines with "\n"). The body is every block's text, headings
+   * included — the same "all visible text" the original chunks. */
+  for (size_t i = 0; i < b->len; i++) {
+    if (b->items[i].heading_level > 0) {
+      if (headings.len > 0 &&
+          kbc_failed(kbc_str_putc(&headings, '\n'))) {
+        kbc_str_free(&headings);
+        kbc_str_free(&body);
+        return kbc_err_set(err, KBC_ERR_NOMEM, "heading list");
+      }
+      if (kbc_failed(kbc_str_append(&headings, b->items[i].text,
+                                    b->items[i].text_len))) {
+        kbc_str_free(&headings);
+        kbc_str_free(&body);
+        return kbc_err_set(err, KBC_ERR_NOMEM, "heading list");
+      }
+    }
+    if (body.len > 0 && kbc_failed(kbc_str_putc(&body, '\n'))) {
+      kbc_str_free(&headings);
+      kbc_str_free(&body);
+      return kbc_err_set(err, KBC_ERR_NOMEM, "chunk body");
+    }
+    if (kbc_failed(kbc_str_append(&body, b->items[i].text,
+                                  b->items[i].text_len))) {
+      kbc_str_free(&headings);
+      kbc_str_free(&body);
+      return kbc_err_set(err, KBC_ERR_NOMEM, "chunk body");
+    }
+  }
+
+  kbc_chunks list;
+  kbc_status s = kbc_chunk_document(a, kbc_parsed_title(p), headings.ptr,
+                                        body.ptr, body.len, KBC_CHUNK_WORDS,
+                                        KBC_CHUNK_OVERLAP_WORDS,
+                                        KBC_MAX_CHUNKS_PER_DOC, &list, err);
+  kbc_str_free(&headings);
+  kbc_str_free(&body);
+  if (kbc_failed(s)) {
+    return s;
+  }
+
+  kbc_chunk_in *rows = NULL;
+  if (list.len > 0) {
+    rows = calloc(list.len, sizeof(*rows));
+    if (rows == NULL) {
+      return kbc_err_set(err, KBC_ERR_NOMEM, "%zu chunk rows", list.len);
+    }
+    for (size_t i = 0; i < list.len; i++) {
+      rows[i].doc_id = doc_id;
+      rows[i].ord = list.items[i].idx;
+      rows[i].text = list.items[i].text;
+      rows[i].text_len = list.items[i].text_len;
+    }
+  }
+  *out = rows;
+  *n_out = list.len;
+  *total_out = list.total;
+  return KBC_OK;
+}
+
 /* --------------------------------------------------------------- summary */
 
 /* First non-heading block, whitespace-collapsed and truncated. KBC_OWN; never
@@ -461,24 +753,28 @@ static kbc_status ingest_file(kbc_app *app, const char *corpus_name,
   }
 
   /* Chunks are what a comment anchors to; a doc without them is uncommentable,
-   * so they are part of the same transaction, not a later backfill. */
+   * so they are part of the same transaction, not a later backfill.
+   *
+   * They are WORD WINDOWS, not parsed blocks (see the chunker): a block is a
+   * markdown shape, and a document that is one long paragraph would be a
+   * single 10,000-word chunk that the embedder truncates away. The invariant
+   * this buys is that every window of the body is embedded in full, so a
+   * passage in the last thousand words is as findable as one in the first. */
   kbc_chunk_in *chunks = NULL;
-  if (blocks->len > 0) {
-    chunks = (kbc_chunk_in *)calloc(blocks->len, sizeof(*chunks));
-    if (!chunks) {
-      free(summary);
-      s = kbc_err_set(err, KBC_ERR_NOMEM, "%zu chunks for %s", blocks->len,
-                      full.ptr);
-      goto fail;
-    }
-    for (size_t i = 0; i < blocks->len; i++) {
-      chunks[i].doc_id = art.id;
-      chunks[i].ord = (uint32_t)i;
-      chunks[i].text = blocks->items[i].text;
-      chunks[i].text_len = blocks->items[i].text_len;
-    }
+  size_t n_chunks = 0, total_chunks = 0;
+  s = document_chunks(fa, p, art.id, &chunks, &n_chunks, &total_chunks, err);
+  if (kbc_failed(s)) {
+    free(summary);
+    goto fail;
   }
-  s = kbc_store_replace_chunks(app->store, chunks, blocks->len, err);
+  if (total_chunks > n_chunks) {
+    /* The cap dropped rows. It is logged with the ORIGINAL count, because a
+    * log that says "512 chunks" for a document that produced 5,000 is a log
+    * that hides the truncation it exists to surface. */
+    KBC_LOGW("%s/%s: %zu chunks, only the first %u stored", corpus_name, rel,
+             total_chunks, (unsigned)KBC_MAX_CHUNKS_PER_DOC);
+  }
+  s = kbc_store_replace_chunks(app->store, chunks, n_chunks, err);
   free(chunks);
   if (kbc_failed(s)) {
     free(summary);
@@ -765,9 +1061,14 @@ static kbc_status walk_dir(kbc_app *app, const kbc_corpus_cfg *cc,
 
 /* Embeds one text. KBC_ARENA copy on success, NULL when the sidecar is
  * unusable. A dead sidecar degrades the search lane; it is never a reason to
- * fail a reindex. */
+ * fail a reindex.
+ *
+ * `why`, when not NULL, receives the sidecar's own message on failure. It is
+ * what the quarantine counter records, so the Errors tab names the actual
+ * refusal rather than a generic one; the query lane passes NULL because a
+ * failed QUERY embed belongs to no document and must not be counted. */
 static float *embed_one(kbc_app *app, kbc_arena *a, const char *text,
-                        size_t *dim_out) {
+                        size_t *dim_out, kbc_err *why) {
   *dim_out = 0;
   if (!app->embed || !kbc_embedder_healthy(app->embed)) {
     return NULL;
@@ -781,10 +1082,220 @@ static float *embed_one(kbc_app *app, kbc_arena *a, const char *text,
                                     kbc_embedder_dim(app->embed), &out, &local);
   if (kbc_failed(s) || !out) {
     KBC_LOGW("embedder: %s, vector lane degraded", local.msg);
+    if (why != NULL) {
+      *why = local;
+    }
     return NULL;
   }
   *dim_out = kbc_embedder_dim(app->embed);
   return *dim_out ? out : NULL;
+}
+
+/* --------------------------------------------------------- quarantine --- */
+
+/* QUARANTINE_THRESHOLD (indexer.rs:39): a document whose embedding has failed
+ * this many times stops being embedded. It does NOT stop being indexed — the
+ * embedding column is nullable by design, so a gated document keeps its rows
+ * and stays keyword-searchable, which is the whole point: an operator can
+ * still find and read the document that is too big for the model. */
+#define APP_QUARANTINE_THRESHOLD 3
+
+/* Buffer for the "fnv1a32-" + 8 hex digits the helper writes. Sized here
+ * rather than taken from the store's private ceiling: this is a local
+ * formatting buffer, and the store still validates what arrives. */
+#define APP_CONTENT_HASH_MAX 32u
+
+/* The content hash the gate and the recorder agree on, as the STRING the
+ * store's `content_hash` column holds.
+ *
+ * The hash is `kbc_fnv1a32` over the file's BYTES — the same function, over
+ * the same input, that fills `kbc_artifact.content_hash` above, so "the same
+ * document by content" means one thing everywhere in this file. Not a security
+ * hash and not trying to be: its only job is to answer "are these the same
+ * bytes as the ones that failed", and a collision merely lets a document keep
+ * a budget it did not earn.
+ *
+ * BYTES, not the searchable text and not the mtime: a whitespace-only edit
+ * leaves the indexed text identical while being exactly the kind of change an
+ * operator makes when they are trying to fix an oversized document. Hashing
+ * anything derived from the parse would let that edit look like no edit at
+ * all and keep the document in quarantine forever. */
+static void content_hash_str(const char *bytes, size_t len, char *out,
+                             size_t out_cap) {
+  snprintf(out, out_cap, "fnv1a32-%08" PRIx32, kbc_fnv1a32(bytes, len));
+}
+
+/* Whether these bytes are over their embed budget. The gate's ONLY input is
+ * the errors.retry_count the store keeps for the path, which is why
+ * kbc_store_record_error counts rather than duplicating: a store that
+ * inserted a fresh row per failure would reset the count to zero on every
+ * pass and gate nothing, forever.
+ *
+ * The count is asked for by (path, content_hash), not by path alone. That is
+ * the whole point of the parameter: editing a document is how an operator
+ * fixes one that failed, so a document whose bytes moved is a different
+ * document and its failure count is not this one's. Passing NULL here instead
+ * would ask the store a different question — "how bad is it", the operator's
+ * question, not the gate's — and would keep a fixed document in quarantine
+ * until somebody cleared the error by hand.
+ *
+ * A store read that FAILS is not a gate: it is a broken database, and
+ * answering "not quarantined" there is the safe direction — we would embed a
+ * document we should have skipped, which costs one sidecar round trip. The
+ * converse would silently drop the vector lane for a document that had never
+ * failed. That is a judgement call, not a proof, and it is the reason this
+ * branch logs rather than returning silently. */
+static bool embed_gated(kbc_app *app, const char *corpus, const char *rel_path,
+                        const char *content_hash) {
+  int64_t retries = 0;
+  kbc_err local;
+  kbc_err_reset(&local);
+  if (kbc_failed(kbc_store_retry_count_for_path(app->store, corpus, rel_path,
+                                                content_hash, &retries,
+                                                &local))) {
+    KBC_LOGW("quarantine gate for %s/%s: %s; embedding anyway", corpus,
+             rel_path, local.msg);
+    return false;
+  }
+  if (retries < (int64_t)APP_QUARANTINE_THRESHOLD) {
+    return false;
+  }
+  /* indexer.rs:2453 logs the same thing. It is a WARNING and not a debug line
+   * because a document silently losing its vector is exactly the sort of
+   * degradation an operator has to be able to see in a log. */
+  KBC_LOGW("%s/%s: %lld embed failures, skipping the embed (still indexed, "
+           "still keyword-searchable)",
+           corpus, rel_path, (long long)retries);
+  return true;
+}
+
+/* Records one embed failure for a path, durably.
+ *
+ * The id is minted here, not in the store, because the store's contract says
+ * the CALLER names the row (store.h: "e-" + 6 base32) and the natural stable
+ * name for this failure is (corpus, path, attempt): two failures of the same
+ * path are two different rows as far as the id is concerned even though
+ * record_error collapses them into one row with a higher count.
+ *
+ * `content_hash` rides along because that is what makes the count
+ * hash-scoped in the original (retry_count_for_path_hash): an edit produces a
+ * new hash and a fresh budget. It is the SAME value embed_gated is handed on
+ * the next pass, computed by the same helper over the same bytes — a recorder
+ * and a gate that disagreed about the hash would make every future lookup
+ * answer "a different document" and nothing would ever be gated again.
+ *
+ * A failure to RECORD is logged and not propagated: the document is already
+ * indexed without a vector, which is the state the gate exists to make
+ * permanent, and failing the whole reindex over a bookkeeping row would trade
+ * a degraded search lane for a failed one. */
+static void record_embed_failure(kbc_app *app, const char *corpus,
+                                 const char *rel_path, const char *content_hash,
+                                 const char *msg) {
+  char id[KBC_MAX_ID_LEN + 1];
+  uint32_t h = kbc_fnv1a32(corpus, strlen(corpus));
+  h ^= kbc_fnv1a32(rel_path, strlen(rel_path));
+  h ^= (uint32_t)(kbc_now_ns() & 0xFFFFFFFFu);
+  static const char hex[] = "0123456789abcdefghjkmnpqrstvwxyz";
+  id[0] = 'e';
+  id[1] = '-';
+  for (unsigned i = 0; i < 6u; i++) {
+    id[2u + i] = hex[h & 31u];
+    h >>= 5;
+  }
+  id[8] = '\0';
+
+  kbc_error_row row;
+  memset(&row, 0, sizeof row);
+  row.id = id;
+  row.kind = "embed";
+  row.corpus = corpus;
+  row.path = rel_path;
+  row.message = msg;
+  /* The hash of the bytes THIS failure is about, not a placeholder: the gate
+   * looks the row up by it on the next pass, so NULL here would make every
+   * future hash lookup answer "a different document" and gate nothing. */
+  row.content_hash = content_hash;
+  row.retry_count = 0; /* record_error owns the counter; this is the first. */
+  row.created_at = kbc_now_ns() / 1000000000LL;
+  row.dismissed = false;
+
+  kbc_err local;
+  kbc_err_reset(&local);
+  if (kbc_failed(kbc_store_record_error(app->store, &row, &local))) {
+    KBC_LOGW("embed failure for %s/%s not recorded: %s", corpus, rel_path,
+             local.msg);
+  }
+}
+
+/* Embeds a document's text UNLESS the path is over its embed budget, and
+ * records the failure when the sidecar refuses one.
+ *
+ * THE INVARIANT, and the reason this is one function rather than a check at
+ * each call site: a gated pass must NOT clear the error row. The obvious
+ * "successful index clears this path's open errors" step — which the original
+ * does, indexer.rs:2958-2968 — is exactly wrong here, because the gate reads
+ * that row on the NEXT pass. Clearing it un-gates the document, the next pass
+ * takes a real embed attempt, the embed fails, the row comes back at count 1,
+ * and three passes later the document is gated again: a document that fails
+ * forever oscillates in and out of quarantine and is embedded forever, which
+ * is the failure the gate was built for (the 2026-08-21 ci-host OOM loop,
+ * indexer.rs:6800-6810). A gated pass proves NOTHING about whether the failure
+ * condition is gone — the embed was never attempted — so it must leave the
+ * row alone. The only ways out are an operator clearing the error or a content
+ * change, and both are deliberate acts.
+ *
+ * `*out` is NULL for every reason the vector is absent: no embedder, a gated
+ * path, or a sidecar that refused. The caller indexes either way; the
+ * embedding column is nullable and a document without one is still a
+ * document.
+ *
+ * LOCKING. Neither lock is taken here. The store has its own mutex, taken and
+ * released inside each kbc_store_* call; the embedder has its own. The caller
+ * holds reindex_mu (the OUTER lock) and is not holding app->lock — both call
+ * `raw`/`raw_len` are the document's BYTES, not the searchable text, and they
+ * exist only so the gate can name the content: a caller that could not say
+ * what the document is could not ask "is this still the one that failed?".
+ *
+ * LOCKING. Neither lock is taken here. The store has its own mutex, taken and
+ * released inside each kbc_store_* call; the embedder has its own. The caller
+ * holds reindex_mu (the OUTER lock) and is not holding app->lock — both call
+ * sites embed before the write lock, exactly as they did before this gate
+ * existed. So the new path adds no edge to the lock order and cannot deadlock
+ * against it. */
+static float *embed_document(kbc_app *app, kbc_arena *a, const char *corpus,
+                             const char *rel_path, const char *raw,
+                             size_t raw_len, const char *text,
+                             size_t *dim_out) {
+  *dim_out = 0;
+  if (app->embed == NULL) {
+    return NULL;
+  }
+  /* Computed once, used by BOTH the gate and the recorder. Two hash values
+   * would be two different documents as far as the store is concerned, and the
+   * count would never be found again. */
+  char hash[APP_CONTENT_HASH_MAX];
+  content_hash_str(raw, raw_len, hash, sizeof hash);
+  if (embed_gated(app, corpus, rel_path, hash)) {
+    return NULL;
+  }
+  /* Health is sampled BEFORE the call, not after: kbc_embedder_embed marks
+   * the sidecar unhealthy on a sidecar-reported error, so asking afterwards
+   * would find it dead and conclude the failure belonged to nobody. The
+   * question is "did a REACHABLE sidecar refuse this document", and only the
+   * reading from before the call answers it. */
+  const bool reachable = kbc_embedder_healthy(app->embed);
+  kbc_err why;
+  kbc_err_reset(&why);
+  float *v = embed_one(app, a, text, dim_out, &why);
+  if (v == NULL && reachable) {
+    /* Reachable going in and no vector coming out is a refusal, not a missing
+     * embedder: that is the failure the counter is for. A sidecar that was
+     * already dead is not this document's fault and is not counted — every
+     * document in the corpus would pay for one broken process. */
+    record_embed_failure(app, corpus, rel_path, hash,
+                         why.msg[0] != '\0' ? why.msg : "embed failed");
+  }
+  return v;
 }
 
 /* Splits the configured `[embedder] command` into an argv. The sidecar is not
@@ -1052,7 +1563,13 @@ static kbc_status build_index(kbc_app *app, kbc_app_manifest *m,
     /* Embedded before the store decision: at this point nobody may know the
      * dimension yet, and a store sized for the wrong one is worse than none. */
     size_t dim = 0;
-    float *v = embed_one(app, fa, text.ptr, &dim);
+    /* Through the gate: a document over its embed budget keeps its keyword
+     * row and loses only its vector. Taken while reindex_mu is held and
+     * BEFORE the rwlock, exactly as the ungated embed was. */
+    /* `raw` is the document's bytes — the file's, or the stored source of an
+     * unchanged file, which is the same bytes by definition of unchanged. */
+    float *v = embed_document(app, fa, cc->name, row->path, raw.ptr, raw.len,
+                              text.ptr, &dim);
     if (v != NULL && vec == NULL && !vec_tried && dim > 0 && m->len > 0) {
       vec_tried = true;
       kbc_err local;
@@ -2258,7 +2775,8 @@ static kbc_status index_touch_one(kbc_app *app, const kbc_corpus_cfg *cc,
     }
     /* Embedded before the write lock, because the embedder is a subprocess
      * round trip and the lock is the one thing searches queue behind. */
-    v = embed_one(app, fa, text.ptr, &dim);
+    v = embed_document(app, fa, cc->name, rel_path, raw.ptr, raw.len, text.ptr,
+                       &dim);
   }
 
   index_lock(app);
@@ -3301,7 +3819,7 @@ kbc_status kbc_app_search(kbc_app *app, kbc_arena *a, const kbc_query *q,
      * make, and the embedder serializes its own pipe internally. */
     ea = kbc_arena_new(16u * 1024u);
     if (ea) {
-      vec = embed_one(app, ea, q->q, &vec_len);
+      vec = embed_one(app, ea, q->q, &vec_len, NULL);
     }
   }
 

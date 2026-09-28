@@ -2140,7 +2140,7 @@ KBC_TEST(a_repeated_failure_counts_retries_instead_of_duplicating_the_row) {
   KBC_CHECK_OK(kbc_store_record_error(s, &row, &err));
 
   int64_t retries = -1;
-  KBC_CHECK_OK(kbc_store_retry_count_for_path(s, "kb", "bad.md", &retries,
+  KBC_CHECK_OK(kbc_store_retry_count_for_path(s, "kb", "bad.md", NULL, &retries,
                                               &err));
   KBC_CHECK_EQ_INT(retries, 0); /* a first failure starts the count at zero */
 
@@ -2148,7 +2148,7 @@ KBC_TEST(a_repeated_failure_counts_retries_instead_of_duplicating_the_row) {
   row.message = "unclosed fence at line 9";
   row.created_at = 2000;
   KBC_CHECK_OK(kbc_store_record_error(s, &row, &err));
-  KBC_CHECK_OK(kbc_store_retry_count_for_path(s, "kb", "bad.md", &retries,
+  KBC_CHECK_OK(kbc_store_retry_count_for_path(s, "kb", "bad.md", NULL, &retries,
                                               &err));
   KBC_CHECK_EQ_INT(retries, 1);
 
@@ -2165,7 +2165,7 @@ KBC_TEST(a_repeated_failure_counts_retries_instead_of_duplicating_the_row) {
 
   row.id = "e-cccccc";
   KBC_CHECK_OK(kbc_store_record_error(s, &row, &err));
-  KBC_CHECK_OK(kbc_store_retry_count_for_path(s, "kb", "bad.md", &retries,
+  KBC_CHECK_OK(kbc_store_retry_count_for_path(s, "kb", "bad.md", NULL, &retries,
                                               &err));
   KBC_CHECK_EQ_INT(retries, 2);
 
@@ -2175,14 +2175,14 @@ KBC_TEST(a_repeated_failure_counts_retries_instead_of_duplicating_the_row) {
   row.path = "worse.md";
   row.created_at = 3000; /* its own clock, so "newest first" is decidable */
   KBC_CHECK_OK(kbc_store_record_error(s, &row, &err));
-  KBC_CHECK_OK(kbc_store_retry_count_for_path(s, "kb", "worse.md", &retries,
+  KBC_CHECK_OK(kbc_store_retry_count_for_path(s, "kb", "worse.md", NULL, &retries,
                                               &err));
   KBC_CHECK_EQ_INT(retries, 0);
   row.id = "e-eeeeee";
   row.path = "bad.md";
   row.corpus = "other";
   KBC_CHECK_OK(kbc_store_record_error(s, &row, &err));
-  KBC_CHECK_OK(kbc_store_retry_count_for_path(s, "other", "bad.md", &retries,
+  KBC_CHECK_OK(kbc_store_retry_count_for_path(s, "other", "bad.md", NULL, &retries,
                                               &err));
   KBC_CHECK_EQ_INT(retries, 0);
   rows = NULL;
@@ -2192,13 +2192,14 @@ KBC_TEST(a_repeated_failure_counts_retries_instead_of_duplicating_the_row) {
 
   /* A path nobody ever failed on reads as zero, not as an error. */
   KBC_CHECK_OK(
-      kbc_store_retry_count_for_path(s, "kb", "fine.md", &retries, &err));
+      kbc_store_retry_count_for_path(s, "kb", "fine.md", NULL, &retries,
+                                              &err));
   KBC_CHECK_EQ_INT(retries, 0);
 
   /* Clearing hands the document a fresh budget, and the dismissed row stays
    * on disk: the history of a failure is what an operator reads. */
   KBC_CHECK_OK(kbc_store_clear_error(s, "kb", "bad.md", &err));
-  KBC_CHECK_OK(kbc_store_retry_count_for_path(s, "kb", "bad.md", &retries,
+  KBC_CHECK_OK(kbc_store_retry_count_for_path(s, "kb", "bad.md", NULL, &retries,
                                               &err));
   KBC_CHECK_EQ_INT(retries, 0);
   rows = NULL;
@@ -2619,7 +2620,7 @@ KBC_TEST(stage1_writes_reject_empty_and_oversized_values) {
   KBC_CHECK_ERR(kbc_store_pin_memory(s, "0123456789abc", 1, &err),
                 KBC_ERR_INVALID);
   KBC_CHECK_ERR(kbc_store_pin_memory(s, NULL, 1, &err), KBC_ERR_INVALID);
-  KBC_CHECK_ERR(kbc_store_retry_count_for_path(s, "kb", "", NULL, &err),
+  KBC_CHECK_ERR(kbc_store_retry_count_for_path(s, "kb", "", NULL, NULL, &err),
                 KBC_ERR_INVALID);
 
   kbc_arena_free(a);

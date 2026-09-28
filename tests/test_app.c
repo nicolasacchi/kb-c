@@ -12,6 +12,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <sqlite3.h>
@@ -23,6 +24,7 @@
 #include <unistd.h>
 
 #include "kbc/app.h"
+#include "kbc/chunk.h"
 #include "kbc/mem.h"
 #include "kbc/store.h"
 #include "kbc_test.h"
@@ -60,6 +62,9 @@ typedef struct {
   char corpus_b[KBC_TEST_PATH_MAX];
   kbc_config *cfg;
   kbc_app *app;
+  /* The fake sidecar and its request log, used by the quarantine cases. */
+  char sidecar[KBC_TEST_PATH_MAX];
+  char log[KBC_TEST_PATH_MAX];
 } fixture;
 
 static void join(char *out, size_t cap, const char *dir, const char *name) {
@@ -3075,6 +3080,821 @@ KBC_TEST(delete_by_path_refuses_a_bad_target_and_forgives_an_absent_one) {
   fx_teardown(&f);
 }
 
+/* ------------------------------------------------------------- chunker --- */
+
+/* include/kbc/chunk.h is the contract: the window sizes, both structs and the
+ * leaf's signature. Nothing is redeclared or re-asserted here, which is the
+ * point. The mirror this replaces checked `sizeof(kbc_chunk) == 24`, so a
+ * header that grew a field would have failed the build on a LAYOUT mismatch
+ * while every behavioural assertion about the chunker still passed — a test
+ * that fires on the wrong thing. Reading the same declaration the production
+ * code compiles against cannot drift from it at all. */
+
+/* chunk.rs's own defaults (chunk.rs:19, :23). Spelled here so a test that
+ * forgets an argument says DEFAULT instead of quietly using a literal — a
+ * value, not a declaration, so naming it here says nothing the header does
+ * not. */
+#define CHUNK_DEFAULT_WORDS KBC_CHUNK_WORDS
+#define CHUNK_DEFAULT_OVERLAP KBC_CHUNK_OVERLAP_WORDS
+
+/* "w0 w1 ... w<n-1>", chunk.rs's test word generator (:101-106). */
+static char *chunk_words(size_t n) {
+  kbc_str s;
+  kbc_str_init(&s);
+  for (size_t i = 0; i < n; i++) {
+    if (i > 0) {
+      (void)kbc_str_putc(&s, ' ');
+    }
+    (void)kbc_str_printf(&s, "w%zu", i);
+  }
+  char *out = strdup(s.ptr != NULL ? s.ptr : "");
+  kbc_str_free(&s);
+  return out;
+}
+
+/* Runs the leaf with the default window sizes. `cap` is APP_MAX_CHUNKS_PER_DOC
+ * at every call site but one, so it is a parameter. */
+static bool chunk_default(kbc_arena *a, const char *title, const char *headings,
+                          const char *body, size_t cap, kbc_chunks *out) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_status s =
+      kbc_chunk_document(a, title, headings, body, strlen(body),
+                             CHUNK_DEFAULT_WORDS, CHUNK_DEFAULT_OVERLAP, cap,
+                             out, &err);
+  if (s != KBC_OK) {
+    fprintf(stderr, "  chunk_document: %s\n", err.msg);
+  }
+  return s == KBC_OK;
+}
+
+/* The words of one chunk, so an overlap can be compared as two spans of words
+ * rather than as substrings — a substring comparison would pass on a window
+ * that merely contained the other one's text. */
+static size_t chunk_word_at(const char *text, size_t i, char *out,
+                            size_t out_cap) {
+  const char *p = text;
+  size_t seen = 0;
+  while (*p != '\0') {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+      p++;
+    }
+    if (*p == '\0') {
+      break;
+    }
+    const char *w = p;
+    while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') {
+      p++;
+    }
+    if (seen == i) {
+      const size_t n = (size_t)(p - w);
+      if (n + 1u > out_cap) {
+        return n; /* too long to compare; the length itself is the signal */
+      }
+      memcpy(out, w, n);
+      out[n] = '\0';
+      return n;
+    }
+    seen++;
+  }
+  return 0;
+}
+
+static size_t chunk_word_count(const char *text) {
+  size_t n = 0;
+  const char *p = text;
+  while (*p != '\0') {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+      p++;
+    }
+    if (*p == '\0') {
+      break;
+    }
+    n++;
+    while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') {
+      p++;
+    }
+  }
+  return n;
+}
+
+/* chunk.rs:109 chunk_zero_is_title_plus_headings. A document with a title and
+ * headings but NO body is one chunk, and it carries both. */
+KBC_TEST(chunk_zero_is_title_plus_headings) {
+  kbc_arena *a = kbc_arena_new(4096);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) return;
+  kbc_chunks c;
+  KBC_CHECK(chunk_default(a, "My Title", "Heading One Heading Two", "",
+                          KBC_MAX_CHUNKS_PER_DOC, &c));
+  KBC_CHECK_EQ_INT(c.len, 1);
+  if (c.len == 1) {
+    KBC_CHECK_EQ_INT(c.items[0].idx, 0);
+    KBC_CHECK_MSG(strstr(c.items[0].text, "My Title") != NULL,
+                  "chunk 0 lost the title: \"%s\"", c.items[0].text);
+    KBC_CHECK_MSG(strstr(c.items[0].text, "Heading One") != NULL,
+                  "chunk 0 lost the headings: \"%s\"", c.items[0].text);
+  }
+  kbc_arena_free(a);
+}
+
+/* chunk.rs:118 short_body_is_a_single_window. 50 words fit inside one 280-word
+ * window, so there is no second body chunk and no trailing empty one. */
+KBC_TEST(short_body_is_a_single_window) {
+  kbc_arena *a = kbc_arena_new(65536);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) return;
+  char *body = chunk_words(50);
+  KBC_CHECK_NOT_NULL(body);
+  kbc_chunks c;
+  KBC_CHECK(chunk_default(a, "T", "", body, KBC_MAX_CHUNKS_PER_DOC, &c));
+  /* chunk 0 (title) + one body window. */
+  KBC_CHECK_EQ_INT(c.len, 2);
+  if (c.len == 2) {
+    KBC_CHECK_EQ_INT(c.items[1].idx, 1);
+    KBC_CHECK_EQ_INT(chunk_word_count(c.items[1].text), 50);
+  }
+  free(body);
+  kbc_arena_free(a);
+}
+
+/* chunk.rs:127 long_body_splits_into_overlapping_windows. 600 words, window
+ * 280, overlap 60 => step 220 and windows [0,280) [220,500) [440,600). The
+ * adjacency of the windows is the property: the last 60 words of one ARE the
+ * first 60 of the next, which is what a passage straddling a boundary relies
+ * on. */
+KBC_TEST(long_body_splits_into_overlapping_windows) {
+  kbc_arena *a = kbc_arena_new(256u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) return;
+  char *body = chunk_words(600);
+  KBC_CHECK_NOT_NULL(body);
+  kbc_chunks c;
+  KBC_CHECK(chunk_default(a, "T", "", body, KBC_MAX_CHUNKS_PER_DOC, &c));
+  KBC_CHECK_EQ_INT(c.len, 4); /* chunk 0 + three body windows */
+  if (c.len == 4) {
+    /* Body windows live at items[1..3]; items[0] is chunk 0 (the title), which
+     * is not a window and takes no part in the overlap. */
+    for (size_t w = 1; w + 1u < c.len; w++) {
+      for (size_t k = 0; k < 60u; k++) {
+        char lhs[64] = "", rhs[64] = "";
+        /* last 60 words of window w == first 60 of window w+1 */
+        (void)chunk_word_at(c.items[w].text,
+                            chunk_word_count(c.items[w].text) - 60u + k, lhs,
+                            sizeof lhs);
+        (void)chunk_word_at(c.items[w + 1u].text, k, rhs, sizeof rhs);
+        KBC_CHECK_MSG(strcmp(lhs, rhs) == 0,
+                      "windows %zu and %zu do not overlap by 60 at %zu: "
+                      "\"%s\" vs \"%s\"",
+                      w, w + 1u, k, lhs, rhs);
+      }
+    }
+  }
+  free(body);
+  kbc_arena_free(a);
+}
+
+/* chunk.rs:148 last_window_is_not_duplicated. Exactly one window's worth of
+ * words ends the body, and the walk stops there instead of emitting the empty
+ * window that would follow. */
+KBC_TEST(last_window_is_not_duplicated) {
+  kbc_arena *a = kbc_arena_new(256u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) return;
+  char *body = chunk_words(280);
+  KBC_CHECK_NOT_NULL(body);
+  kbc_chunks c;
+  KBC_CHECK(chunk_default(a, "T", "", body, KBC_MAX_CHUNKS_PER_DOC, &c));
+  KBC_CHECK_EQ_INT(c.len, 2); /* title + 1 body window */
+  if (c.len >= 2) {
+    KBC_CHECK_MSG(chunk_word_count(c.items[c.len - 1].text) > 0,
+                  "the last chunk is empty: the walk ran one step too far");
+  }
+  free(body);
+  kbc_arena_free(a);
+}
+
+/* chunk.rs:155 empty_document_yields_no_chunks. Whitespace is not a word and
+ * is not a title, so a document with nothing in it produces nothing — an
+ * empty chunk row would be a comment anchor pointing at nothing. */
+KBC_TEST(empty_document_yields_no_chunks) {
+  kbc_arena *a = kbc_arena_new(4096);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) return;
+  kbc_chunks c;
+  KBC_CHECK(chunk_default(a, "", "", "", KBC_MAX_CHUNKS_PER_DOC, &c));
+  KBC_CHECK_EQ_INT(c.len, 0);
+  KBC_CHECK(chunk_default(a, "   ", "  ", "  \n ", KBC_MAX_CHUNKS_PER_DOC, &c));
+  KBC_CHECK_EQ_INT(c.len, 0);
+  kbc_arena_free(a);
+}
+
+/* chunk.rs:160 body_only_still_chunks. No title and no headings: chunk 0 is
+ * not emitted (there is nothing to put in it) and the body's first window
+ * takes index 0 instead of being pushed down. */
+KBC_TEST(body_only_still_chunks) {
+  kbc_arena *a = kbc_arena_new(4096);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) return;
+  char *body = chunk_words(10);
+  KBC_CHECK_NOT_NULL(body);
+  kbc_chunks c;
+  KBC_CHECK(chunk_default(a, "", "", body, KBC_MAX_CHUNKS_PER_DOC, &c));
+  KBC_CHECK_EQ_INT(c.len, 1);
+  if (c.len == 1) {
+    KBC_CHECK_EQ_INT(c.items[0].idx, 0);
+ }
+  free(body);
+  kbc_arena_free(a);
+}
+
+/* chunk.rs:167 is_deterministic. A re-index of an unchanged file has to
+ * produce byte-identical chunks, because the stored vectors are compared
+ * against them to decide what may be reused; a chunker that iterated a hash
+ * map or read the clock would re-embed the whole corpus on every pass. */
+KBC_TEST(chunking_is_deterministic) {
+  kbc_arena *a = kbc_arena_new(256u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) return;
+  char *body = chunk_words(1000);
+  KBC_CHECK_NOT_NULL(body);
+  kbc_chunks x, y;
+  KBC_CHECK(chunk_default(a, "T", "H", body, KBC_MAX_CHUNKS_PER_DOC, &x));
+  KBC_CHECK(chunk_default(a, "T", "H", body, KBC_MAX_CHUNKS_PER_DOC, &y));
+  KBC_CHECK_EQ_INT(x.len, y.len);
+  for (size_t i = 0; i < x.len && i < y.len; i++) {
+    KBC_CHECK_MSG(x.items[i].text_len == y.items[i].text_len &&
+                      memcmp(x.items[i].text, y.items[i].text,
+                             x.items[i].text_len) == 0,
+                  "chunk %zu differs between two runs of the same input", i);
+  }
+  free(body);
+  kbc_arena_free(a);
+}
+
+/* chunk.rs:174 degenerate_overlap_still_terminates. An overlap LARGER than the
+ * window makes window - overlap negative, so a naive step would be 0 or wrap
+ * and the walk would never advance. The guard forces a step of at least one
+ * word, so the case that used to hang now returns. */
+KBC_TEST(degenerate_overlap_still_terminates) {
+  kbc_arena *a = kbc_arena_new(65536);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) return;
+  char *body = chunk_words(100);
+  KBC_CHECK_NOT_NULL(body);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_chunks c;
+  KBC_CHECK_OK(kbc_chunk_document(a, "", "", body, strlen(body), 10u, 50u,
+                                      KBC_MAX_CHUNKS_PER_DOC, &c, &err));
+  KBC_CHECK_MSG(c.len > 0, "a degenerate overlap produced no chunks at all");
+  /* Every word of the body is still covered exactly once as a window start,
+ * which is what "always advance" means observably. */
+  KBC_CHECK_EQ_INT(c.total, c.len);
+  for (size_t i = 0; i < c.len; i++) {
+    KBC_CHECK_EQ_INT(c.items[i].idx, i);
+ }
+  free(body);
+  kbc_arena_free(a);
+}
+
+/* indexer.rs:3576 cap_chunks_to_truncates_to_the_first_n_and_reports_the_
+ * original_total. The cap keeps the FIRST chunks, so chunk 0 — the
+ * title/headings passage — survives; and `total` reports the count BEFORE the
+ * truncation, because a caller that logged the kept count would report a
+ * document that produced 5,000 chunks as having produced 512. */
+KBC_TEST(the_chunk_cap_keeps_the_first_n_and_reports_the_original_total) {
+  kbc_arena *a = kbc_arena_new(256u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) return;
+  /* 900 words at the default window is 1 + 4 windows, so a cap of 3 truncates
+ * without needing a 16 MiB document. */
+  char *body = chunk_words(900);
+  KBC_CHECK_NOT_NULL(body);
+  kbc_chunks c;
+  KBC_CHECK(chunk_default(a, "T", "H", body, 3u, &c));
+  KBC_CHECK_EQ_INT(c.len, 3);
+  KBC_CHECK_EQ_INT(c.total, 5);
+  if (c.len == 3) {
+    KBC_CHECK_MSG(strstr(c.items[0].text, "T") == c.items[0].text,
+                  "the cap dropped chunk 0: the title passage must survive");
+    for (size_t i = 0; i < c.len; i++) {
+      KBC_CHECK_EQ_INT(c.items[i].idx, i);
+    }
+  }
+  free(body);
+  kbc_arena_free(a);
+}
+
+/* The end-to-end half, through the daemon's own entry point. The chunk rows
+ * are what a comment anchors to and what the vector lane covers, so a
+ * document whose body is one long paragraph must be stored as OVERLAPPING
+ * WINDOWS rather than as the single oversized block it used to be — and the
+ * keyword lane must still answer for a term that occurs only in the last
+ * window, which is the whole reason the windows overlap. */
+KBC_TEST(a_long_document_is_stored_as_overlapping_windows_and_stays_findable) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  /* 600 words => windows [0,280) [220,500) [440,600). "quokkazinc" sits at
+   * word 500, which is in the LAST window only; "aardvarkium" at word 250 is
+   * in the 220-280 overlap and therefore in two windows at once. */
+  kbc_str doc;
+  kbc_str_init(&doc);
+  (void)kbc_str_puts(&doc, "# Long Ledger\n\n");
+ for (size_t i = 0; i < 600u; i++) {
+    if (i > 0) {
+      (void)kbc_str_putc(&doc, ' ');
+    }
+    if (i == 250u) {
+      (void)kbc_str_puts(&doc, "aardvarkium");
+    } else if (i == 500u) {
+      (void)kbc_str_puts(&doc, "quokkazinc");
+    } else {
+      (void)kbc_str_printf(&doc, "w%zu", i);
+    }
+  }
+  (void)kbc_str_putc(&doc, '\n');
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, "long.md");
+  kbc_test_write_file(p, doc.ptr);
+  kbc_str_free(&doc);
+
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  /* The stored rows are the windows, not the one block the old chunker wrote.
+   * Read through a second connection so the count cannot be confused with the
+   * three short fixture documents. */
+  kbc_arena *ida = kbc_arena_new(4096);
+  KBC_CHECK_NOT_NULL(ida);
+  const char *id = ida != NULL ? id_of_path(f.cfg, CORPUS_A, "long.md", ida)
+                               : NULL;
+  KBC_CHECK_NOT_NULL(id);
+
+  if (id != NULL) {
+    kbc_store *s = kbc_store_open(f.cfg, &err);
+    KBC_CHECK_NOT_NULL(s);
+    if (s != NULL) {
+      kbc_arena *ca = kbc_arena_new(256u * 1024u);
+      KBC_CHECK_NOT_NULL(ca);
+      if (ca != NULL) {
+        kbc_block *rows = kbc_arena_calloc(ca, 16u, sizeof(*rows));
+        KBC_CHECK_NOT_NULL(rows);
+        size_t n = 0;
+        kbc_err_reset(&err);
+        KBC_CHECK_OK(
+            kbc_store_list_chunks(s, ca, id, rows, &n, &err));
+        /* chunk 0 (title+heading) + three body windows. */
+        KBC_CHECK_EQ_INT(n, 4);
+        if (n == 4) {
+          KBC_CHECK_MSG(strstr(rows[0].text, "Long Ledger") != NULL,
+                        "chunk 0 is not the title passage: \"%s\"", rows[0].text);
+          /* The last window carries the term that is in no earlier window. */
+          KBC_CHECK_MSG(strstr(rows[3].text, "quokkazinc") != NULL,
+                        "the final window does not reach word 500");
+          KBC_CHECK_MSG(strstr(rows[1].text, "quokkazinc") == NULL,
+                        "word 500 leaked into the first window");
+          /* The overlap term is in two windows — that is the overlap — and
+           * the search still returns the document ONCE. */
+          KBC_CHECK_MSG(strstr(rows[1].text, "aardvarkium") != NULL,
+                        "word 250 missing from window [0,280)");
+          KBC_CHECK_MSG(strstr(rows[2].text, "aardvarkium") != NULL,
+                        "word 250 missing from the overlap window [220,500)");
+        }
+        kbc_arena_free(ca);
+      }
+      kbc_store_close(s);
+    }
+  }
+
+  /* And the keyword lane answers for a term that lives in the last window and
+   * in the overlap, once each. */
+  char path[64], title[64], idbuf[32];
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "quokkazinc", CORPUS_A, path,
+                                  sizeof path, title, sizeof title, idbuf,
+                                  sizeof idbuf, NULL),
+                   1);
+  KBC_CHECK_EQ_STR(path, "long.md");
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "aardvarkium", CORPUS_A, path,
+                                  sizeof path, title, sizeof title, idbuf,
+                                  sizeof idbuf, NULL),
+                   1);
+  KBC_CHECK_EQ_STR(path, "long.md");
+
+  kbc_arena_free(ida);
+  fx_teardown(&f);
+}
+
+/* ---------------------------------------------------------- quarantine --- */
+
+/* A sidecar that records every request it is asked to embed and answers with
+ * a fixed vector, so "was this document re-embedded?" is observable from
+ * outside the process. The log is the whole point: the alternative — reading
+ * the vector store back — cannot tell a document that was re-embedded with
+ * the same value from one that was not touched. */
+static void make_counting_sidecar(const char *path, const char *log_path,
+                                  bool fail) {
+  kbc_str s;
+  kbc_str_init(&s);
+  (void)kbc_str_printf(&s, "#!/bin/sh\nLOG=%s\n", log_path);
+  (void)kbc_str_puts(&s,
+                     "while IFS= read -r line; do\n"
+       "  printf '%s\\n' \"$line\" >> \"$LOG\"\n"
+       "  case \"$line\" in\n"
+    "  *health*) printf '%s\\n' '{\"ok\":true,\"dim\":3,\"model\":\"fake\"}' ;;\n");
+  if (fail) {
+    /* A sidecar-reported error is a failed REQUEST, not a dead pipe. */
+    (void)kbc_str_puts(&s,
+                       "  *embed*) printf '%s\\n' '{\"kind\":\"error\","
+                       "\"msg\":\"simulated OOM\"}' ;;\n");
+  } else {
+    (void)kbc_str_puts(&s,
+                       "  *embed*) printf '%s\\n' '{\"ok\":true,\"dim\":3,"
+                       "\"vectors\":[[1,0,0]]}' ;;\n");
+  }
+  (void)kbc_str_puts(&s, "  esac\ndone\n");
+  kbc_test_write_file(path, s.ptr);
+  kbc_str_free(&s);
+  KBC_CHECK_MSG(chmod(path, 0755) == 0, "chmod %s: %s", path, strerror(errno));
+}
+
+static size_t count_log_lines(const char *log_path) {
+  char *text = kbc_test_read_file(log_path);
+  if (text == NULL) {
+    return 0;
+  }
+  size_t n = 0;
+  for (const char *p = text; *p != '\0'; p++) {
+    if (*p == '\n') {
+      n++;
+    }
+  }
+  free(text);
+  return n;
+}
+
+/* The store's own view of a path's failure count.
+ *
+ * `content_hash` NULL is the "how bad is it" question and returns the raw
+ * count. Passing a hash asks the gate's question instead — "is this still the
+ * document that failed" — and is how a test tells an edited document's fresh
+ * budget from an unchanged one's exhausted one. */
+static int64_t retry_count_hashed(const kbc_config *cfg, const char *corpus,
+                                  const char *path, const char *content_hash) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = kbc_store_open(cfg, &err);
+  if (s == NULL) return -1;
+  int64_t n = -1;
+  (void)kbc_store_retry_count_for_path(s, corpus, path, content_hash, &n, &err);
+  kbc_store_close(s);
+  return n;
+}
+
+static int64_t retry_count(const kbc_config *cfg, const char *corpus,
+                           const char *path) {
+  return retry_count_hashed(cfg, corpus, path, NULL);
+}
+
+/* The content hash of some text, in the form app.c writes it into the
+ * errors.content_hash column. Mirrored deliberately: a test that seeded the
+ * gate with a hash the gate will never be asked about would prove nothing. */
+static void hash_of(const char *text, char *out, size_t cap) {
+  snprintf(out, cap, "fnv1a32-%08" PRIx32, kbc_fnv1a32(text, strlen(text)));
+}
+
+/* Records one embed failure for `path` against `content_hash`, the way the
+ * daemon does — the same field, so the gate can find the row again. */
+static kbc_status seed_failure(const kbc_config *cfg, const char *path,
+                                const char *content_hash, int i) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = kbc_store_open(cfg, &err);
+  if (s == NULL) return false;
+  char id[24];
+  snprintf(id, sizeof id, "e-seed%02d", i);
+  char msg[64];
+  snprintf(msg, sizeof msg, "simulated OOM #%d", i);
+  kbc_error_row row;
+  memset(&row, 0, sizeof row);
+  row.id = id;
+  row.kind = "embed";
+  row.corpus = CORPUS_A;
+  row.path = path;
+  row.message = msg;
+  row.content_hash = content_hash;
+  row.created_at = 1756000000 + i;
+  const kbc_status st = kbc_store_record_error(s, &row, &err);
+  kbc_store_close(s);
+  return st;
+}
+
+/* A corpus of ONE document with a fake sidecar wired in, so what the sidecar
+ * was asked to embed names exactly one file. */
+static void fx_setup_quarantine(fixture *f, bool sidecar_fails) {
+  memset(f, 0, sizeof(*f));
+  kbc_test_tmpdir(f->root, sizeof f->root);
+  join(f->data, sizeof f->data, f->root, "data");
+  join(f->corpus_a, sizeof f->corpus_a, f->root, CORPUS_A);
+  kbc_test_mkdir_p(f->corpus_a);
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f->corpus_a, "a.md");
+  kbc_test_write_file(p, DOC_A);
+  join(f->sidecar, sizeof f->sidecar, f->root, "sidecar.sh");
+  join(f->log, sizeof f->log, f->root, "sidecar.log");
+  make_counting_sidecar(f->sidecar, f->log, sidecar_fails);
+
+  f->cfg = make_cfg(f->data, f->corpus_a, NULL);
+  KBC_CHECK_NOT_NULL(f->cfg);
+  if (f->cfg == NULL) return;
+  free(f->cfg->embedder_cmd);
+  f->cfg->embedder_cmd = strdup(f->sidecar);
+  kbc_err err;
+  kbc_err_reset(&err);
+  f->app = kbc_app_open(f->cfg, &err);
+  if (f->app == NULL) fprintf(stderr, "  app_open: %s\n", err.msg);
+  KBC_CHECK_NOT_NULL(f->app);
+}
+
+/* A genuine embed failure is recorded for the path, durably. Without the
+ * record the gate has no input and a document that fails forever is embedded
+ * forever — which is the failure the gate exists to stop. */
+KBC_TEST(a_failed_embed_is_recorded_against_the_document) {
+  fixture f;
+  fx_setup_quarantine(&f, true);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  /* The reindex still SUCCEEDS: a broken sidecar degrades the vector lane, it
+   * is never a reason to fail an ingest. */
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  /* record_error INSERTS the first row of a path at retry_count 0 and only
+   * bumps it on later calls (store.c:2591-2595), so one failure reads 0. The
+   * row is the durable artefact, so it is read back through the public listing
+   * rather than inferred from the count. */
+  KBC_CHECK_EQ_INT(retry_count(f.cfg, CORPUS_A, "a.md"), 0);
+  {
+    kbc_arena *ea = kbc_arena_new(8192);
+    KBC_CHECK_NOT_NULL(ea);
+    if (ea != NULL) {
+      kbc_store *s = kbc_store_open(f.cfg, &err);
+      KBC_CHECK_NOT_NULL(s);
+      if (s != NULL) {
+        kbc_error_row *rows = NULL;
+        size_t n = 0;
+        kbc_err_reset(&err);
+        KBC_CHECK_OK(
+            kbc_store_list_errors(s, ea, CORPUS_A, true, 10u, &rows, &n, &err));
+        KBC_CHECK_EQ_INT(n, 1);
+        if (n == 1) {
+          /* The sidecar's OWN message, so the Errors tab names the actual
+           * refusal instead of a generic "embed failed". */
+          KBC_CHECK_EQ_STR(rows[0].kind, "embed");
+          KBC_CHECK_EQ_STR(rows[0].path, "a.md");
+          KBC_CHECK_MSG(strstr(rows[0].message, "simulated OOM") != NULL,
+                        "the recorded message lost the sidecar's own: \"%s\"",
+                        rows[0].message);
+          /* The content hash, and it is THIS document's: the quarantine gate
+           * looks the row up by (path, content_hash) on the next pass, so a
+           * NULL here — or any other string — would make every future lookup
+           * answer "a different document" and nothing would ever be gated.
+           * Compared by VALUE: a hash of the wrong bytes fails the gate
+           * exactly the way a missing one does, so shape is not the test. */
+          char want[32];
+          hash_of(DOC_A, want, sizeof want);
+          KBC_CHECK_MSG(rows[0].content_hash != NULL &&
+                            strcmp(rows[0].content_hash, want) == 0,
+                        "the recorded content hash is not this document's: "
+                        "got \"%s\", want \"%s\"",
+                        rows[0].content_hash ? rows[0].content_hash : "(null)",
+                        want);
+        }
+        kbc_store_close(s);
+      }
+      kbc_arena_free(ea);
+    }
+  }
+
+  /* And the document is indexed and searchable regardless — the embedding
+ * column is nullable by design, so a document without a vector is still a
+ * document. */
+  char path[64], title[64], id[32];
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "accruals", NULL, path, sizeof path,
+                                  title, sizeof title, id, sizeof id, NULL),
+                   1);
+  KBC_CHECK_EQ_STR(path, "a.md");
+
+  fx_teardown(&f);
+}
+
+/* THE quarantine gate. Past the threshold the document stops being embedded
+ * and KEEPS being indexed, and the error row that gated it SURVIVES the pass
+ * that skipped the embed.
+ *
+ * The row surviving is the load-bearing half. The obvious "a successful
+ * index clears this path's open errors" step un-gates the document on the
+ * next pass, the next pass takes a real embed attempt, it fails, the row
+ * returns at count 1, and a document that fails forever oscillates in and out
+ * of quarantine — embedded forever, which is the loop the gate was built to
+ * stop. So the count must still read at the threshold after a gated pass. */
+KBC_TEST(a_quarantined_document_stays_indexed_and_keeps_its_error_row) {
+  fixture f;
+  fx_setup_quarantine(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  /* The gate is seeded, not waited for: driving three real failures would
+   * need three reindexes and would assert the sidecar's behaviour as much as
+   * the gate's. record_error's first call for a path INSERTS at retry_count 0
+   * and later calls bump it, so the count reaches the threshold on the
+   * threshold+1'th call (indexer.rs:6812-6821).
+   *
+   * Seeded against a.md's OWN content hash, which is the point of change 1: a
+   * row recorded against different bytes is not evidence about these, so
+   * seeding NULL here would leave the document ungated and every assertion
+   * below would pass for the wrong reason. */
+  char hash_a[32];
+  hash_of(DOC_A, hash_a, sizeof hash_a);
+  for (int i = 0; i <= 3; i++) {
+    KBC_CHECK_OK(seed_failure(f.cfg, "a.md", hash_a, i));
+  }
+  /* Precondition: the gate's own comparison, asked the gate's way. If this is
+   * wrong, every assertion below is measuring the wrong state. */
+  KBC_CHECK_EQ_INT(retry_count_hashed(f.cfg, CORPUS_A, "a.md", hash_a), 3);
+  /* And the row is invisible to any other content — that asymmetry is what
+   * gives an edited document a fresh budget. */
+  char other[32];
+  hash_of(DOC_B, other, sizeof other);
+  KBC_CHECK_EQ_INT(retry_count_hashed(f.cfg, CORPUS_A, "a.md", other), 0);
+
+  /* Clear the log so what follows is this pass's sidecar traffic and nothing
+   * else. */
+  kbc_test_write_file(f.log, "");
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  KBC_CHECK_MSG(count_log_lines(f.log) == 0,
+                "the gated document was still sent to the sidecar: %zu "
+                "requests",
+                count_log_lines(f.log));
+
+  /* Still keyword-searchable: the embedding column is nullable by design, so
+   * losing the vector costs semantic recall, not existence. */
+  char path[64], title[64], id[32];
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "accruals", NULL, path, sizeof path,
+                                  title, sizeof title, id, sizeof id, NULL),
+                   1);
+  KBC_CHECK_EQ_STR(path, "a.md");
+
+  /* And the row that gated it is untouched: same count, still open. A gated
+   * pass proves nothing about whether the failure condition is gone, because
+   * the embed was never attempted. */
+  KBC_CHECK_EQ_INT(retry_count(f.cfg, CORPUS_A, "a.md"), 3);
+
+  /* An operator clearing the error is the way OUT: the next pass embeds again.
+   * Without this the gate would be a one-way door, and "stays gated until an
+   * operator acts" would be indistinguishable from "stays gated forever". */
+  kbc_store *clr = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(clr);
+  if (clr != NULL) {
+    kbc_err_reset(&err);
+    KBC_CHECK_OK(kbc_store_clear_error(clr, CORPUS_A, "a.md", &err));
+    kbc_store_close(clr);
+  }
+  kbc_test_write_file(f.log, "");
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  KBC_CHECK_MSG(count_log_lines(f.log) > 0,
+                "clearing the error did not restore embedding: the document "
+                "can never leave quarantine");
+
+  fx_teardown(&f);
+}
+
+/* Does the sidecar log mention this word? The log is the only externally
+ * visible record of WHICH document was embedded; a line count alone cannot
+ * say which file was skipped, which is the whole question here. */
+static bool log_mentions(const char *log_path, const char *word) {
+  char *text = kbc_test_read_file(log_path);
+  if (text == NULL) {
+    return false;
+  }
+  const bool found = strstr(text, word) != NULL;
+  free(text);
+  return found;
+}
+
+/* The gate is keyed by (path, content_hash), not by path. Editing a document
+ * is how an operator fixes one that failed, so a document whose bytes moved is
+ * a DIFFERENT document and gets a fresh embedding budget — the original's
+ * retry_count_for_path_hash (indexer.rs:2439). Keyed by path alone, a document
+ * that fails, is edited to fix the failure and re-indexed never leaves
+ * quarantine, and the only remedy is an operator clearing the error by hand.
+ *
+ * Both halves are asserted, because either alone proves nothing:
+ *
+ *   EDITED    — a.md's bytes change, and the next pass embeds it again.
+ *   UNCHANGED — b.md's bytes do not, and it stays gated on that SAME pass. If
+ *               the gate had stopped working, a.md would come back and so
+ *               would b.md; if it had kept working as before, a.md would stay
+ *               silent. Only a content-keyed gate gives one and not the other.
+ *
+ * The failures are SEEDED against each document's own real hash rather than
+ * driven through a failing sidecar: a sidecar that refuses is marked unhealthy
+ * after its first refusal, so a broken sidecar yields one recorded failure and
+ * then stops being asked — it cannot walk a counter up to a threshold. That the
+ * daemon RECORDS the hash the gate will ASK about is a separate claim, proved
+ * where a real failure exists: a_failed_embed_is_recorded_against_the_document
+ * reads the recorded hash back off the row. */
+KBC_TEST(an_edited_document_leaves_quarantine_and_an_unchanged_one_does_not) {
+  fixture f;
+  fx_setup_quarantine(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  /* A second document, so "the edited one came back" cannot be confused with
+   * "embedding resumed for everything". Distinct vocabulary is what says which
+   * document a given sidecar request was about. */
+  char bp[KBC_TEST_PATH_MAX];
+  join(bp, sizeof bp, f.corpus_a, "b.md");
+  kbc_test_write_file(bp, DOC_B);
+
+  kbc_err err;
+  kbc_err_reset(&err);
+  char hash_a[32], hash_b[32];
+  hash_of(DOC_A, hash_a, sizeof hash_a);
+  hash_of(DOC_B, hash_b, sizeof hash_b);
+  KBC_CHECK_MSG(strcmp(hash_a, hash_b) != 0,
+                "the two documents hashed alike, so this test cannot tell "
+                "them apart");
+  /* record_error inserts a path's first row at count 0 and bumps thereafter,
+   * so threshold+1 records put the count AT the threshold. */
+  for (int i = 0; i <= 3; i++) {
+    KBC_CHECK_OK(seed_failure(f.cfg, "a.md", hash_a, i));
+    KBC_CHECK_OK(seed_failure(f.cfg, "b.md", hash_b, 100 + i));
+  }
+  KBC_CHECK_EQ_INT(retry_count_hashed(f.cfg, CORPUS_A, "a.md", hash_a), 3);
+  KBC_CHECK_EQ_INT(retry_count_hashed(f.cfg, CORPUS_A, "b.md", hash_b), 3);
+
+  /* Gated: neither document reaches the sidecar at all. */
+  kbc_test_write_file(f.log, "");
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  KBC_CHECK_MSG(count_log_lines(f.log) == 0,
+                "an over-budget document was still embedded: %zu requests",
+                count_log_lines(f.log));
+
+  /* a.md is EDITED, so its bytes — and therefore its hash — move. */
+  const char *a_fixed =
+      "# Alpha Ledger\n\nThe ledger reconciles accruals in one short "
+      "passage.\n";
+  char ap[KBC_TEST_PATH_MAX];
+  join(ap, sizeof ap, f.corpus_a, "a.md");
+  kbc_test_write_file(ap, a_fixed);
+  char hash_fixed[32];
+  hash_of(a_fixed, hash_fixed, sizeof hash_fixed);
+  KBC_CHECK_MSG(strcmp(hash_fixed, hash_a) != 0,
+                "the edited bytes hashed to the old content's hash, so this "
+                "test cannot tell the two versions apart");
+
+  kbc_test_write_file(f.log, "");
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  KBC_CHECK_MSG(log_mentions(f.log, "accruals"),
+                "the EDITED document stayed in quarantine: an operator's fix "
+                "did not restore it, so the gate is keyed by path alone");
+  KBC_CHECK_MSG(!log_mentions(f.log, "quixotic"),
+                "the UNCHANGED document left quarantine on a pass that edited "
+                "a different file: the gate is not keyed by content at all");
+
+  /* The old failure record survives and still describes the OLD bytes: a fresh
+   * budget is a different question asked of a different document, not the
+   * failure history being deleted. The raw count still reads 3, so an operator
+   * looking at the Errors tab sees what actually happened to that file. */
+  KBC_CHECK_EQ_INT(retry_count_hashed(f.cfg, CORPUS_A, "a.md", hash_a), 3);
+  KBC_CHECK_EQ_INT(retry_count_hashed(f.cfg, CORPUS_A, "a.md", hash_fixed), 0);
+  KBC_CHECK_EQ_INT(retry_count(f.cfg, CORPUS_A, "a.md"), 3);
+
+  /* Still keyword-searchable: losing the vector costs semantic recall, not
+   * existence. */
+  char path[64], title[64], id[32];
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "accruals", NULL, path, sizeof path,
+                                  title, sizeof title, id, sizeof id, NULL),
+                   1);
+  KBC_CHECK_EQ_STR(path, "a.md");
+
+  fx_teardown(&f);
+}
+
+
 int main(void) {
   static const kbc_test_case cases[] = {
       {"ingest_indexes_every_document", ingest_indexes_every_document},
@@ -3152,6 +3972,26 @@ int main(void) {
      delete_by_path_takes_the_document_and_announces_it},
     {"delete_by_path_refuses_a_bad_target_and_forgives_an_absent_one",
      delete_by_path_refuses_a_bad_target_and_forgives_an_absent_one},
+      {"chunk_zero_is_title_plus_headings", chunk_zero_is_title_plus_headings},
+      {"short_body_is_a_single_window", short_body_is_a_single_window},
+      {"long_body_splits_into_overlapping_windows",
+       long_body_splits_into_overlapping_windows},
+      {"last_window_is_not_duplicated", last_window_is_not_duplicated},
+      {"empty_document_yields_no_chunks", empty_document_yields_no_chunks},
+      {"body_only_still_chunks", body_only_still_chunks},
+      {"chunking_is_deterministic", chunking_is_deterministic},
+      {"degenerate_overlap_still_terminates",
+       degenerate_overlap_still_terminates},
+      {"the_chunk_cap_keeps_the_first_n_and_reports_the_original_total",
+       the_chunk_cap_keeps_the_first_n_and_reports_the_original_total},
+      {"a_long_document_is_stored_as_overlapping_windows_and_stays_findable",
+       a_long_document_is_stored_as_overlapping_windows_and_stays_findable},
+      {"a_failed_embed_is_recorded_against_the_document",
+       a_failed_embed_is_recorded_against_the_document},
+      {"a_quarantined_document_stays_indexed_and_keeps_its_error_row",
+       a_quarantined_document_stays_indexed_and_keeps_its_error_row},
+      {"an_edited_document_leaves_quarantine_and_an_unchanged_one_does_not",
+       an_edited_document_leaves_quarantine_and_an_unchanged_one_does_not},
       {NULL, NULL},
   };
   return kbc_test_run("app", cases);

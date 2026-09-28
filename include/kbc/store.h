@@ -272,11 +272,18 @@ kbc_status kbc_store_list_index_runs(kbc_store *s, kbc_arena *a,
 
 /* ----------------------------------------------------------------- errors -- */
 
-/* One row per ingest failure. `content_hash` clears the row when the file's
- * content changes, and `retry_count` is what the quarantine gate reads: a
- * document whose retries reach QUARANTINE_THRESHOLD stops being embedded and
- * stays keyword-searchable. `dismissed` is 0/1, and the "open errors" query is
- * a partial index over exactly `dismissed = 0`. */
+/* One row per ingest failure, keyed by (corpus, path). `retry_count` is what
+ * the quarantine gate reads: a document whose retries reach
+ * QUARANTINE_THRESHOLD stops being embedded and stays keyword-searchable.
+ * `dismissed` is 0/1, and the "open errors" query is a partial index over
+ * exactly `dismissed = 0`.
+ *
+ * `content_hash` is the hash of the file's bytes at the time of the failure,
+ * and it is the reason an EDITED document gets a fresh embedding budget: the
+ * gate is keyed by (path, content_hash), not by path alone, because editing a
+ * document is how an operator fixes one that failed. The original names this
+ * `retry_count_for_path_hash`; the C port keeps the hash because the
+ * behaviour is the behaviour. */
 typedef struct {
   const char *id;      /* ARENA, "e-" + 6 base32 */
   const char *kind;    /* ARENA: parse | io | sqlite | lance | embed */
@@ -289,15 +296,26 @@ typedef struct {
   bool dismissed;
 } kbc_error_row;
 
-/* Records a failure. Keyed by (corpus, path) in the Rust original's caller,
- * so a second failure for the same path increments `retry_count` rather than
- * inserting a duplicate row. */
+/* Records a failure, keyed by (corpus, path): a second failure for the same
+ * path increments `retry_count` rather than inserting a duplicate row. */
 kbc_status kbc_store_record_error(kbc_store *s, const kbc_error_row *row,
                                   kbc_err *err);
-/* The quarantine gate. Returns 0 when there is no row for the path. */
+/* The quarantine gate. Returns 0 when there is no row for the path, and a
+ * count of 0 when the row was recorded against DIFFERENT content — an edited
+ * document is a fresh attempt, not a continuing failure. `content_hash` is the
+ * hash of the bytes about to be embedded; pass NULL to read the count for the
+ * path alone, which is the "how bad is it" question rather than the "is this
+ * document still the one that failed" question.
+ *
+ * The original's name for this is `retry_count_for_path_hash`
+ * (kb-core/src/indexer.rs:2439) and the hash is load-bearing: without it a
+ * document that fails, is edited to fix the failure, and is re-indexed never
+ * leaves quarantine, and an operator's only remedy is to clear the error by
+ * hand. */
 kbc_status kbc_store_retry_count_for_path(kbc_store *s, const char *corpus,
-                                          const char *path, int64_t *out,
-                                          kbc_err *err);
+                                          const char *path,
+                                          const char *content_hash,
+                                          int64_t *out, kbc_err *err);
 kbc_status kbc_store_clear_error(kbc_store *s, const char *corpus,
                                  const char *path, kbc_err *err);
 kbc_status kbc_store_list_errors(kbc_store *s, kbc_arena *a, const char *corpus,
