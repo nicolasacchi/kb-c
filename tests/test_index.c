@@ -2107,6 +2107,104 @@ KBC_TEST(a_checkpoint_does_not_rewrite_the_index_file) {
   kbc_test_rmrf(dir);
 }
 
+/* THE property the journal exists for, stated as bytes rather than as
+ * milliseconds: the record one changed document produces is the same size
+ * whether the index holds eight documents or eight hundred.
+ *
+ * This is the claim BENCHMARKS.md used to make and measurement disproved — "a
+ * file save costs what the file costs" — because the save rewrote and fsynced
+ * the whole index, so 1,000 and 20,000 documents cost 251 ms and 1.19 s. A
+ * timing assertion could not guard that here: it would be a flaky test on a
+ * shared machine, and a flaky test guards nothing. The byte count is
+ * deterministic, and it is the thing the barrier actually pushes, so this
+ * fails the moment a checkpoint starts scaling with the index again. */
+KBC_TEST(a_checkpoint_writes_the_same_bytes_for_the_same_document) {
+  enum { SMALL = 8, LARGE = 800 };
+  char dir[KBC_TEST_PATH_MAX];
+  char small[KBC_TEST_PATH_MAX + 32], large[KBC_TEST_PATH_MAX + 32];
+  char js[KBC_TEST_PATH_MAX + 64], jl[KBC_TEST_PATH_MAX + 64];
+  kbc_arena *a = kbc_arena_new(8u << 20);
+  kbc_err err;
+  static inc_doc ms[SMALL], ml[LARGE];
+  size_t ls = 0, ll = 0;
+  char *bs = NULL, *bl = NULL;
+  int i;
+
+  memset(&err, 0, sizeof err);
+  memset(ms, 0, sizeof ms);
+  memset(ml, 0, sizeof ml);
+  kbc_test_tmpdir(dir, sizeof dir);
+  (void)snprintf(small, sizeof small, "%s/small.idx", dir);
+  (void)snprintf(large, sizeof large, "%s/large.idx", dir);
+  jr_path(js, sizeof js, dir, "small.idx.journal");
+  jr_path(jl, sizeof jl, dir, "large.idx.journal");
+
+  /* The same two documents sit at the front of both corpora, so the mutated
+   * one is the same document, with the same path and the same replacement
+   * text, in both indexes. Everything the record carries is therefore
+   * identical and only the index size differs. */
+  /* Static storage, not a block-scoped array: inc_doc holds the path POINTER,
+   * and a `char p[64]` inside the loop body would be out of scope — and ASan
+   * says so loudly — by the time the index is built from these. */
+  static char sp[SMALL][64], lp[LARGE][64];
+  for (i = 0; i < SMALL; i++) {
+    (void)snprintf(sp[i], sizeof sp[i], "s%04d.md", i);
+    ms[i].path = sp[i];
+    ms[i].body = (i % 2) ? "alpha beta gamma" : "delta epsilon zeta";
+  }
+  for (i = 0; i < LARGE; i++) {
+    (void)snprintf(lp[i], sizeof lp[i], "l%04d.md", i);
+    ml[i].path = lp[i];
+    ml[i].body = (i % 2) ? "alpha beta gamma" : "delta epsilon zeta";
+  }
+
+  struct {
+    const char *idx, *jrnl;
+    inc_doc *m;
+    size_t n;
+  } arms[2] = {{small, js, ms, SMALL}, {large, jl, ml, LARGE}};
+
+  for (int arm = 0; arm < 2; arm++) {
+    kbc_index *ix = jr_sealed(arms[arm].idx, arms[arm].m, arms[arm].n, a, &err);
+    if (ix == NULL) {
+      kbc_arena_free(a);
+      kbc_test_rmrf(dir);
+      return;
+    }
+    kbc_index_free(ix);
+    kbc_err_reset(&err);
+    ix = kbc_index_open(arms[arm].idx, &err);
+    KBC_CHECK_NOT_NULL(ix);
+    if (ix == NULL) {
+      kbc_arena_free(a);
+      kbc_test_rmrf(dir);
+      return;
+    }
+    size_t n = arms[arm].n;
+    inc_apply(ix, arms[arm].m, &n, arms[arm].m[0].path, "omega kappa lambda",
+              a, &err);
+    KBC_CHECK_OK(kbc_index_checkpoint(ix, arms[arm].idx, &err));
+    kbc_index_free(ix);
+  }
+
+  bs = read_bytes(js, &ls);
+  bl = read_bytes(jl, &ll);
+  KBC_CHECK_MSG(bs != NULL && bl != NULL && ls > 0,
+                "a checkpoint wrote no journal for %zu and %zu documents",
+                (size_t)SMALL, (size_t)LARGE);
+  if (bs != NULL && bl != NULL && ls > 0) {
+    KBC_CHECK_MSG(ls == ll,
+                  "the same one-document change costs %zu bytes of journal in "
+                  "a %d-document index and %zu in a %d-document one: the "
+                  "checkpoint is scaling with the index again",
+                  ls, (int)SMALL, ll, (int)LARGE);
+  }
+  free(bs);
+  free(bl);
+  kbc_arena_free(a);
+  kbc_test_rmrf(dir);
+}
+
 /* The real invariant, at the scale that matters: MANY checkpointed mutations,
  * each one followed by a reopen that has to reproduce the live index, and the
  * end state has to be the state of a full rebuild of the same corpus. */
@@ -2549,6 +2647,8 @@ int main(void) {
        a_checkpointed_mutation_replays_on_open},
       {"a_checkpoint_does_not_rewrite_the_index_file",
        a_checkpoint_does_not_rewrite_the_index_file},
+      {"a_checkpoint_writes_the_same_bytes_for_the_same_document",
+       a_checkpoint_writes_the_same_bytes_for_the_same_document},
       {"many_checkpointed_mutations_equal_a_full_rebuild",
        many_checkpointed_mutations_equal_a_full_rebuild},
       {"pending_bytes_grows_after_a_mutation_and_drains_at_a_checkpoint",
