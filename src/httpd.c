@@ -1434,24 +1434,30 @@ static void httpd_on_event(void *user, const char *type, const char *json) {
   if (kbc_failed(sse_frame_build(&f, type, json, id))) goto done;
 
   /* Fan out. conns_mu keeps a conn from being freed under our feet; c->mu
-   * keeps the queue consistent. The frame is copied because the worker frees
-   * it once written. */
+   * keeps the queue consistent AND carries the publication of c->sse. The
+   * flag is therefore READ under the lock sse_attach writes it with, so a
+   * publisher can never see it set on a conn whose ring does not exist yet —
+   * see sse_attach. The frame is copied because the worker frees it once
+   * written. */
   pthread_mutex_lock(&h->conns_mu);
   for (size_t i = 0; i < h->all_len; i++) {
     conn *c = h->all_conns[i];
-    if (!c->sse || c->closed) continue;
-    char *copy = malloc(f.len + 1);
-    if (copy == NULL) continue;
-    memcpy(copy, f.ptr, f.len);
-    copy[f.len] = '\0';
+    if (c->closed) continue; /* written under conns_mu, which is held here */
     pthread_mutex_lock(&c->mu);
-    sse_push_locked(c, copy, f.len);
+    if (c->sse) {
+      char *copy = malloc(f.len + 1);
+      if (copy != NULL) {
+        memcpy(copy, f.ptr, f.len);
+        copy[f.len] = '\0';
+        sse_push_locked(c, copy, f.len);
+        uint64_t one = 1;
+        /* EAGAIN here only means the counter is already non-zero, i.e. the
+         * worker has a wake-up pending anyway. */
+        ssize_t ignored = write(c->event_fd, &one, sizeof one);
+        (void)ignored;
+      }
+    }
     pthread_mutex_unlock(&c->mu);
-    uint64_t one = 1;
-    /* EAGAIN here only means the counter is already non-zero, i.e. the worker
-     * has a wake-up pending anyway. */
-    ssize_t ignored = write(c->event_fd, &one, sizeof one);
-    (void)ignored;
   }
   pthread_mutex_unlock(&h->conns_mu);
 
@@ -1726,6 +1732,19 @@ static int set_cloexec_nonblock(int fd);
 
 /* ------------------------------------------------------------ read path --- */
 static void sse_attach(conn *c, const char *last_event_id) {
+  /* c->sse is the ONLY thing that makes this connection visible to the event
+   * fan-out: httpd_track appended it to h->all_conns at accept time, and
+   * httpd_on_event walks that array looking for exactly this flag. So every
+   * field the fan-out reaches for once it has seen the flag — c->q, c->qcap,
+   * c->event_fd — must be BUILT before the flag is published, and the flag is
+   * published under c->mu, the lock the fan-out reads it with. The old order
+   * set c->sse first and allocated after it, so a publisher landing in that
+   * window took the SSE branch with q == NULL and qcap == 0: sse_push_locked
+   * then computed `% c->qcap` and dereferenced the NULL ring, and the daemon
+   * died of SIGFPE on a thread that had done nothing wrong. */
+  c->qcap = KBC_SSE_QUEUE_CAP;
+  c->q = calloc(c->qcap, sizeof *c->q);
+  if (c->q == NULL) c->qcap = 0;
 
   /* EFD_NONBLOCK|EFD_CLOEXEC are GNU extensions; the portable equivalent is
    * a plain eventfd plus the same two fcntls used for accepted sockets. */
@@ -1734,10 +1753,12 @@ static void sse_attach(conn *c, const char *last_event_id) {
     close(c->event_fd);
     c->event_fd = -1;
   }
-  c->sse = true;
-  c->qcap = KBC_SSE_QUEUE_CAP;
-  c->q = calloc(c->qcap, sizeof *c->q);
   if (c->q == NULL || c->event_fd < 0) {
+    /* Nothing is published, so the fan-out skips this conn and conn_destroy
+     * walks zero ring entries instead of 64 NULL frames. c->q is released
+     * here so a ring that was allocated and then abandoned does not leak. */
+    free(c->q);
+    c->q = NULL;
     c->close_after = true;
     return;
   }
@@ -1756,6 +1777,12 @@ static void sse_attach(conn *c, const char *last_event_id) {
     return;
   }
   c->last_write_ns = kbc_now_ns();
+  /* The publication point: the ring exists, the wake fd is armed and this
+   * worker owns the sweep, so from here the conn is a live stream — and only
+   * a publisher holding c->mu can see that it is one. */
+  pthread_mutex_lock(&c->mu);
+  c->sse = true;
+  pthread_mutex_unlock(&c->mu);
   if (last_event_id != NULL && last_event_id[0] != '\0') {
     char *end = NULL;
     errno = 0;
@@ -2024,19 +2051,36 @@ static void conn_on_wake(conn *c) {
 /* Keepalive tick for every stream this worker owns. */
 static void worker_service_sse(kbc_worker *w) {
   int64_t now = kbc_now_ns();
-  for (size_t i = 0; i < w->sse_len; i++) {
+  size_t i = 0;
+  while (i < w->sse_len) {
     conn *c = w->sse[i];
-    if (c->closed) continue;
+    if (c->closed) {
+      i++;
+      continue;
+    }
+    size_t len_before = w->sse_len;
     sse_pump(c);
     if (now - c->last_write_ns >= KBC_SSE_KEEPALIVE_NS) {
       (void)kbc_str_puts(&c->out, ":keepalive\n\n");
       c->last_write_ns = now;
     }
+    bool dead = false;
     if (c->out.len > c->out_off && conn_flush(c) == FLUSH_ERROR) {
       conn_close(w->h, c);
-      continue;
+      dead = true;
     }
-    conn_arm(c);
+    if (!dead) conn_arm(c);
+    /* worker_sse_del is reached only from conn_destroy, and conn_close
+     * DEFERS that to worker_drain_zombies, which worker_main runs after this
+     * sweep — so w->sse[] cannot shrink underneath this loop today, and a
+     * plain i++ would be equivalent. The index advances only when the array
+     * did not shrink, which is what keeps the sweep correct if that deferral
+     * ever changes: worker_sse_del does not compact, it moves the LAST entry
+     * into the vacated slot, so an unconditional increment would step over
+     * the conn moved into it and the shortened length would end the tick
+     * early. The `while` condition is what terminates the sweep once every
+     * entry is gone. */
+    if (w->sse_len == len_before) i++;
   }
 }
 
@@ -2289,12 +2333,39 @@ kbc_httpd *kbc_httpd_start(kbc_app *app, const kbc_config *cfg, kbc_err *err) {
   h->cfg = cfg;
   h->workers = (int)want;
   h->port = cfg->port;
+  h->wake_rd = -1;
+  h->wake_wr = -1;
+  /* Everything kbc_httpd_stop tears down is made valid HERE, ahead of the
+   * first failure path: the two mutexes it destroys, the two atomics it
+   * stores to, and the CORS list it frees. calloc hands back zeros, and a
+   * zero is not an initialised mutex. */
+  atomic_init(&h->conns, 0);
+  atomic_init(&h->stopping, false);
+  kbc_strlist_init(&h->cors);
+  pthread_mutex_init(&h->conns_mu, NULL);
+  pthread_mutex_init(&h->ring_mu, NULL);
+
   h->bind_addr = strdup(cfg->bind_addr != NULL ? cfg->bind_addr : "127.0.0.1");
   h->listen_fd = calloc(want, sizeof *h->listen_fd);
   h->w = calloc(want, sizeof *h->w);
   h->threads = calloc(want, sizeof *h->threads);
-  h->wake_rd = -1;
-  h->wake_wr = -1;
+  if (h->bind_addr == NULL || h->listen_fd == NULL || h->w == NULL ||
+      h->threads == NULL) {
+    (void)kbc_err_set(err, KBC_ERR_NOMEM, "kbc_httpd_start: worker arrays");
+    kbc_httpd_stop(h);
+    return NULL;
+  }
+  /* kbc_httpd_stop closes every listen_fd and every worker epfd that reads
+   * >= 0, and calloc leaves those slots at 0 — which is a VALID descriptor.
+   * A failure before this sweep therefore made stop close the CALLER's
+   * descriptor 0, its stdin, once per worker. The sweep sits directly after
+   * the allocations it covers, so every path below hands stop a fully-formed
+   * object. */
+  for (size_t i = 0; i < want; i++) {
+    h->listen_fd[i] = -1;
+    h->w[i].epfd = -1;
+    h->w[i].lfd = -1;
+  }
 
   /* The two knobs that have no home in kbc_config. They are read ONCE here,
    * into httpd-owned memory, and never again: a worker must not call getenv
@@ -2302,7 +2373,6 @@ kbc_httpd *kbc_httpd_start(kbc_app *app, const kbc_config *cfg, kbc_err *err) {
    * for the life of the daemon. The config fields they should become are in
    * the port report; until the header owns them, the environment is the
    * honest place for them. */
-  kbc_strlist_init(&h->cors);
   h->rate_limit = KBC_RATE_LIMIT_DEFAULT;
   const char *origins = getenv("KBC_CORS_ORIGINS");
   if (origins != NULL) {
@@ -2354,17 +2424,6 @@ kbc_httpd *kbc_httpd_start(kbc_app *app, const kbc_config *cfg, kbc_err *err) {
     }
     h->rate_limit = v;
   }
-  if (h->bind_addr == NULL || h->listen_fd == NULL || h->w == NULL ||
-      h->threads == NULL) {
-    (void)kbc_err_set(err, KBC_ERR_NOMEM, "kbc_httpd_start: worker arrays");
-    kbc_httpd_stop(h);
-    return NULL;
-  }
-  for (size_t i = 0; i < want; i++) {
-    h->listen_fd[i] = -1;
-    h->w[i].epfd = -1;
-    h->w[i].lfd = -1;
-  }
   /* The wake pipe is the only cross-thread wake-up a worker needs: one read end
    * is registered in every epoll set. */
   int fds[2];
@@ -2377,11 +2436,7 @@ kbc_httpd *kbc_httpd_start(kbc_app *app, const kbc_config *cfg, kbc_err *err) {
   h->wake_wr = fds[1];
   (void)set_cloexec_nonblock(h->wake_rd);
   (void)set_cloexec_nonblock(h->wake_wr);
-  atomic_init(&h->conns, 0);
-  atomic_init(&h->stopping, false);
   h->started_ns = kbc_now_ns();
-  pthread_mutex_init(&h->conns_mu, NULL);
-  pthread_mutex_init(&h->ring_mu, NULL);
 
   /* One listening socket per worker. Port 0 would hand a DIFFERENT port to
    * each SO_REUSEPORT socket, so the first one picks the port for the rest. */

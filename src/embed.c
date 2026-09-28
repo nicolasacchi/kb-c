@@ -256,6 +256,15 @@ static kbc_status spawn(kbc_embedder *e, kbc_err *err) {
     return kbc_err_set(err, KBC_ERR_IO, "pipe2 for sidecar stdout: %s",
                        strerror(saved));
   }
+  /* The child inherits this process's UNFLUSHED stdio buffers. The protocol
+   * pipe is about to become its fd 1, so if anything in the child flushes —
+   * a libc exit path, a sanitizer runtime, a library warning — every pending
+   * byte the daemon had buffered is injected into the sidecar's reply stream
+   * and the protocol desynchronises on text that has nothing to do with the
+   * sidecar. It is not hypothetical: the test suite's own `== embed ==` banner
+   * reached kbc_embedder_embed as the reply of a sidecar that never started.
+   * POSIX requires the flush here; it costs nothing on the spawn path. */
+  fflush(NULL);
   pid_t pid = fork();
   if (pid < 0) {
     int saved = errno;

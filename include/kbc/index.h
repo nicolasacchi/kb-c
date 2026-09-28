@@ -58,10 +58,68 @@ kbc_status kbc_index_end_build(kbc_index *ix, kbc_err *err);
  * that kbc_index_open would reject. */
 kbc_status kbc_index_save(const kbc_index *ix, const char *path, kbc_err *err);
 
-/* Opens a saved index read-only. Returns KBC_ERR_PARSE (message names the
- * expected/actual format) on a magic or version mismatch, so an index written
- * by an older build is a clear error, not a crash. */
+/* Opens a saved index read-only, replaying the delta journal beside it if one
+ * is there (see "delta persistence" below), so the returned index reflects
+ * every acknowledged checkpoint and not merely the last full rewrite.
+ *
+ * Returns KBC_ERR_PARSE (message names the expected/actual format) on a magic
+ * or version mismatch, so an index written by an older build is a clear error,
+ * not a crash. */
 kbc_index *kbc_index_open(const char *path, kbc_err *err);
+
+/* --------------------------------------------------- delta persistence -- */
+
+/* WHY THIS EXISTS. A single-document update used to call kbc_index_save, which
+ * rewrites the whole index and fsyncs it. Measured on this host at 20,000
+ * documents: a 24.7 MB rewrite whose cost is 508 ms of fsync (64.6% of a
+ * 786 ms save), 36 ms of write and only 103 ms of serialisation. So the cost of
+ * saving one changed file tracked the size of the INDEX, not the size of the
+ * file — 1.19 s median, 10.95 s worst. Making the serialiser cheaper could
+ * recover at most the 13% it was responsible for. The fix is to stop rewriting:
+ * a delta journal makes the bytes the durability barrier must push three orders
+ * of magnitude smaller.
+ *
+ * A checkpoint is therefore: append the pending mutations to a journal beside
+ * the index, and fsync THAT. kbc_index_open replays the journal, so an index
+ * opened from disk is the state the daemon last checkpointed.
+ *
+ * Invariant: the index file, plus its journal replayed in order, equals the
+ * live index at every point. Every doc_id in a journal record is therefore the
+ * id the document had when the record was written, and replay MUST apply
+ * records strictly in order and MUST NOT re-journal them.
+ */
+
+/* The journal is rewritten whole once the pending delta would exceed this, so
+ * it cannot grow without bound. Four MiB is roughly the point at which a
+ * rewrite is cheaper than continuing to append. */
+#define KBC_INDEX_JOURNAL_MAX (4u * 1024u * 1024u)
+
+/* Persists every mutation made since the last checkpoint, in one place.
+ *
+ * Appends to `<path>.journal` and fsyncs it when the pending delta is small,
+ * and otherwise writes the whole index with kbc_index_save and discards the
+ * journal. Either way, after this returns KBC_OK a crash loses nothing: the
+ * next kbc_index_open replays the journal over the index file.
+ *
+ * A torn tail — a record only partly on disk when the process died — is
+ * discarded on open rather than treated as corruption, because a delta that
+ * was never acknowledged is a delta that never happened.
+ *
+ * WRITER-ONLY and single-threaded, like the mutation functions it follows and
+ * like kbc_index_save. On an index with no file behind it (one built in this
+ * process) this is exactly kbc_index_save. */
+kbc_status kbc_index_checkpoint(const kbc_index *ix, const char *path,
+                                kbc_err *err);
+
+/* Bytes of delta a checkpoint would append right now — zero when a full
+ * rewrite is already unavoidable, and after a checkpoint. Observability for
+ * the compaction decision, not a knob: nothing may be tuned through it. */
+size_t kbc_index_pending_bytes(const kbc_index *ix);
+
+/* Discards the journal beside `path`. A full rebuild that rewrote the index
+ * from the corpus calls this, because that index already contains everything
+ * the journal described. KBC_OK when there was no journal to discard. */
+kbc_status kbc_index_drop_journal(const char *path, kbc_err *err);
 
 /* --------------------------------------------------------- updating ---- */
 
@@ -122,7 +180,12 @@ kbc_status kbc_index_bm25(const kbc_index *ix, const kbc_tokens *query,
                           kbc_err *err);
 
 /* Terms in the index whose prefix matches `prefix` (a trailing `*` in a user
- * query is stripped before this is called). ARENA copies, sorted. */
+ * query is stripped before this is called). Sorted.
+ *
+ * The entries are KBC_OWN heap copies, NOT arena copies: free the list with
+ * kbc_strlist_free. `a` is validated non-NULL but the strings do not live in
+ * it, so resetting that arena does not invalidate `out` — and skipping the
+ * free leaks. */
 kbc_status kbc_index_expand_prefix(const kbc_index *ix, kbc_arena *a,
                                    const char *prefix, kbc_strlist *out,
                                    kbc_err *err);

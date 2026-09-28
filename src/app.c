@@ -7,11 +7,17 @@
  *
  * Locking shape (explicit, never re-entered):
  *
- *   pthread_rwlock_t lock guards EXACTLY {index, vec}.
- *   Public entry points take it; the `_locked` internals do not. The search
- *   resolve callback runs with the read lock already held, so it must never
- *   take it again — a rwlock is not recursive and that would be a hard
- *   self-deadlock.
+ *   pthread_mutex_t reindex_mu is the OUTER lock of the two. It is taken at
+ *   the outermost reindex entry point only — kbc_app_reindex via
+ *   reindex_locked, and kbc_app_reindex_file/_remove via reindex_one — and
+ *   held across everything that writes, store rows and index alike. It is not
+ *   recursive: reindex_pass, reindex_one_locked and index_touch_one all
+ *   ASSUME it is held and must never take it.
+ *
+ *   pthread_rwlock_t lock guards EXACTLY {index, vec}, and is taken under
+ *   reindex_mu and only there. The search resolve callback runs with the read
+ *   lock already held, so it must never take it again — a rwlock is not
+ *   recursive and that would be a hard self-deadlock.
  *
  * Everything else in kbc_app is either immutable after open (config, store,
  * embedder) or carries its own internal lock (store, embedder, watcher, and
@@ -134,6 +140,22 @@ struct kbc_app {
   kbc_watcher *watch;
   char *vec_path; /* KBC_OWN */
 
+  /* NOT the rwlock, and not a second view of it. The two indexers — the full
+   * rebuild and the single-file path — run on different threads (an httpd
+   * worker and the watcher) and each writes BOTH the store rows and the index,
+   * and the rwlock covers neither of those for long: reindex_pass takes it
+   * only for the final swap, and index_touch_one only around the mutation. A
+   * rwlock separates threads that take it; it cannot exclude one that is not.
+   * So the exclusion is a mutex of its own, and it is taken at the outermost
+   * reindex entry point — which is also why the lock order is always
+   * reindex_mu then lock, and never the reverse. */
+  pthread_mutex_t reindex_mu;
+  /* Names the build file uniquely per writer. kbc_str_write_file_atomic opens
+   * "<path>.tmp.<pid>", so two writers in one process that agreed on ONE
+   * <path>.build would open the same temp file with O_TRUNC and write over
+   * each other from offset 0. reindex_mu already keeps the writers apart;
+   * this is the second line, for a caller that forgets it. */
+  _Atomic uint64_t build_seq;
   pthread_rwlock_t lock;
   pthread_mutex_t bus_lock;
   kbc_app_sub subs[KBC_APP_MAX_SUBS];
@@ -575,8 +597,22 @@ static kbc_status walk_dir(kbc_app *app, const kbc_corpus_cfg *cc,
   }
 
   struct dirent *ent;
-  errno = 0;
-  while ((ent = readdir(d)) != NULL) {
+  /* errno is cleared immediately before EVERY readdir, never once before the
+   * loop. readdir signals end-of-directory by returning NULL and leaving errno
+   * UNCHANGED, so whatever the last syscall in the previous iteration left
+   * behind is what the check after the loop reads. The body below calls
+   * fstatat, which sets errno=ENOENT for exactly the case its own comment calls
+   * harmless — a file that vanished between readdir and fstatat — and recurses
+   * into walk_dir, which calls opendir. Any of those made an ordinary,
+   * successful walk report "readdir <path>: No such file or directory" and
+   * fail the reindex. It reproduced about one run in three under a corpus
+   * being rewritten underneath the walk. */
+  for (;;) {
+    errno = 0;
+    ent = readdir(d);
+    if (ent == NULL) {
+      break;
+    }
     if (ent->d_name[0] == '.') {
       continue; /* "." ".." and every dotfile */
     }
@@ -1071,26 +1107,75 @@ fail:
   return s;
 }
 
-/* Renames `<path>.build` over `path`. Used after kbc_index_save has already
- * fsync'd the build file, so the promotion itself is the atomic step and a
- * failure before it leaves the previous generation intact. */
-static kbc_status promote_file(const char *path, kbc_err *err) {
-  kbc_str tmp;
-  kbc_str_init(&tmp);
-  kbc_status s = kbc_str_printf(&tmp, "%s.build", path);
-  if (kbc_failed(s)) {
-    kbc_str_free(&tmp);
-    return kbc_err_set(err, KBC_ERR_NOMEM, "temp path for %s", path);
+/* Publishes one writer's work. `full` is the whole-rebuild path: a build file
+ * of THIS writer's own, renamed over the live index. Otherwise it is a
+ * single-document update, and it does NOT rewrite anything — it appends the
+ * delta to the journal beside the index and fsyncs that, which is the entire
+ * point: the bytes the durability barrier has to push then scale with the
+ * document that changed rather than with the size of the index.
+ *
+ * The build name carries a sequence number, not just ".build". Both writers
+ * run in one process, and kbc_str_write_file_atomic opens "<path>.tmp.<pid>"
+ * — a per-PROCESS name. A shared build name therefore meant the same temp
+ * file opened with O_TRUNC by both, each writing an index from offset 0, and
+ * the promoted file was a byte-level splice of two of them: kbc_index_open
+ * rejected it and the daemon refused to start until an operator deleted the
+ * index. reindex_mu is what actually keeps the writers apart; the sequence
+ * number means a writer that forgets it still cannot corrupt the other. */
+static kbc_status index_publish(kbc_app *app, const kbc_index *ix, bool full,
+                                kbc_err *err) {
+  if (!full) {
+    /* kbc_index_checkpoint decides for itself between appending and rewriting
+     * whole, so this stays correct when the delta outgrows the journal. Both
+     * are still atomic: it writes through kbc_str_write_file_atomic, which is
+     * temp file + fsync + rename, and reindex_mu already excludes the other
+     * writer for the whole call. */
+    return kbc_index_checkpoint(ix, app->cfg->index_path, err);
   }
-  if (rename(tmp.ptr, path) != 0) {
-    int saved = errno;
-    (void)unlink(tmp.ptr);
-    s = kbc_err_set(err, KBC_ERR_IO, "rename %s to %s: %s", tmp.ptr, path,
-                    strerror(saved));
-    kbc_str_free(&tmp);
+  const uint64_t seq =
+      atomic_fetch_add_explicit(&app->build_seq, 1u, memory_order_relaxed);
+  kbc_str build;
+  kbc_str_init(&build);
+  kbc_status s =
+      kbc_str_printf(&build, "%s.build.%" PRIu64, app->cfg->index_path, seq);
+  if (kbc_failed(s)) {
+    kbc_str_free(&build);
+    return kbc_err_set(err, KBC_ERR_NOMEM, "build path for %s",
+                       app->cfg->index_path);
+  }
+  s = kbc_index_save(ix, build.ptr, err);
+  if (kbc_failed(s)) {
+    /* A build file that never reached the live name is litter, and these
+     * names are per-writer, so nothing would ever reuse or overwrite it. */
+    (void)unlink(build.ptr);
+    kbc_str_free(&build);
     return s;
   }
-  kbc_str_free(&tmp);
+  /* The journal goes BEFORE the rename, and the order is the point. The
+   * invariant is "index file plus journal replayed in order equals the live
+   * index", and a rebuild's index already contains everything the journal
+   * describes, so a surviving journal is a stale one. Rename first and a crash
+   * in between leaves that stale journal to be replayed over a fresh index —
+   * documents resurrected, ids renumbered against records that never
+   * described them, an index that is actively wrong. Drop first and a crash
+   * in between leaves the previous index with its last few deltas missing,
+   * which the next walk of the corpus repairs, because the corpus on disk is
+   * the authority. Wrong-but-recoverable beats corrupt. */
+  s = kbc_index_drop_journal(app->cfg->index_path, err);
+  if (kbc_failed(s)) {
+    (void)unlink(build.ptr);
+    kbc_str_free(&build);
+    return s;
+  }
+  if (rename(build.ptr, app->cfg->index_path) != 0) {
+    int saved = errno;
+    (void)unlink(build.ptr);
+    s = kbc_err_set(err, KBC_ERR_IO, "rename %s over %s: %s", build.ptr,
+                    app->cfg->index_path, strerror(saved));
+    kbc_str_free(&build);
+    return s;
+  }
+  kbc_str_free(&build);
   return KBC_OK;
 }
 
@@ -1299,8 +1384,12 @@ static kbc_status sweep_orphans(kbc_app *app, const kbc_app_manifest *m,
 
 /* Walk -> ingest -> build -> save -> promote -> swap. On any failure before
  * the swap the old index keeps serving: the daemon never publishes a
- * half-built index, and the store keeps the rows it already committed. */
-static kbc_status reindex_locked(kbc_app *app, kbc_err *err) {
+ * half-built index, and the store keeps the rows it already committed.
+ *
+ * `_pass`, not `_locked`: it takes no lock of its own. The lock that makes
+ * this safe against the other writer is reindex_mu, and it is taken by the
+ * wrapper below for the WHOLE pass. */
+static kbc_status reindex_pass(kbc_app *app, kbc_err *err) {
   const int64_t t0 = kbc_now_ns();
 
   kbc_app_manifest m;
@@ -1390,10 +1479,6 @@ static kbc_status reindex_locked(kbc_app *app, kbc_err *err) {
   if (!kbc_failed(s = store_write_links(app, edge_srcs, n_edge_srcs, err))) {
     /* nothing */
   }
-  for (size_t i = 0; i < n_edge_srcs; i++) {
-    for (size_t j = 0; j < edge_srcs[i].n; j++) free(edge_srcs[i].dst[j]);
-    free(edge_srcs[i].dst);
-  }
   app_edge_srcs_free(edge_srcs, n_edge_srcs);
   if (kbc_failed(s)) {
     manifest_free(&m);
@@ -1435,16 +1520,7 @@ static kbc_status reindex_locked(kbc_app *app, kbc_err *err) {
     return s;
   }
 
-  kbc_str build_path;
-  kbc_str_init(&build_path);
-  s = kbc_str_printf(&build_path, "%s.build", app->cfg->index_path);
-  if (!kbc_failed(s)) {
-    s = kbc_index_save(ix, build_path.ptr, err);
-  }
-  if (!kbc_failed(s)) {
-    s = promote_file(app->cfg->index_path, err);
-  }
-  kbc_str_free(&build_path);
+  s = index_publish(app, ix, true, err);
   if (kbc_failed(s)) {
     manifest_free(&m);
     kbc_index_free(ix);
@@ -1503,6 +1579,34 @@ static kbc_status reindex_locked(kbc_app *app, kbc_err *err) {
            docs, terms, n_changed, n_unchanged, n_skipped, n_removed, embedded,
            (t1 - t0) / 1000);
   return KBC_OK;
+}
+
+/* The full rebuild, serialised against the single-file path.
+ *
+ * The rwlock cannot do this job. reindex_pass takes it only for the final
+ * swap, which is after the publish has already renamed a file, so for the
+ * whole of the walk, the ingest and the build the live index is unguarded — and
+ * index_touch_one, which is what the watcher calls, does exactly that
+ * concurrently. A rwlock separates threads that take it; it cannot exclude a
+ * thread that is not.
+ *
+ * Holding reindex_mu across the WHOLE pass is also the invariant behind
+ * "a rebuild never installs a snapshot older than one already promoted": the
+ * walk reads the corpus, so a single-file update that commits and promotes
+ * while the walk is running would otherwise be overwritten by a build that
+ * started before it, never saw the newer revision, and installs its older one
+ * as app->index — with the store at the newer revision and every status
+ * endpoint reporting success.
+ *
+ * The lock is taken HERE, once, rather than inside the pass: reindex_pass has
+ * seven early returns, and a lock taken in the body is a lock each of them
+ * has to remember. reindex_one_locked is the only other caller of the pass and
+ * it holds the same mutex; neither may take it twice. */
+static kbc_status reindex_locked(kbc_app *app, kbc_err *err) {
+  pthread_mutex_lock(&app->reindex_mu);
+  kbc_status s = reindex_pass(app, err);
+  pthread_mutex_unlock(&app->reindex_mu);
+  return s;
 }
 
 /* ------------------------------------------------------------------ open */
@@ -1613,7 +1717,14 @@ kbc_app *kbc_app_open(const kbc_config *cfg, kbc_err *err) {
     (void)kbc_err_set(err, KBC_ERR_INTERNAL, "pthread_rwlock_init failed");
     return NULL;
   }
+  if (pthread_mutex_init(&app->reindex_mu, NULL) != 0) {
+    pthread_rwlock_destroy(&app->lock);
+    free(app);
+    (void)kbc_err_set(err, KBC_ERR_INTERNAL, "pthread_mutex_init failed");
+    return NULL;
+  }
   if (pthread_mutex_init(&app->bus_lock, NULL) != 0) {
+    pthread_mutex_destroy(&app->reindex_mu);
     pthread_rwlock_destroy(&app->lock);
     free(app);
     (void)kbc_err_set(err, KBC_ERR_INTERNAL, "pthread_mutex_init failed");
@@ -1733,6 +1844,7 @@ void kbc_app_close(kbc_app *app) {
   kbc_config_free(app->cfg);
   pthread_mutex_destroy(&app->bus_lock);
   pthread_rwlock_destroy(&app->lock);
+  pthread_mutex_destroy(&app->reindex_mu);
   free(app);
 }
 
@@ -1801,6 +1913,24 @@ static kbc_status store_forget_path(kbc_app *app, const char *corpus,
   return s;
 }
 
+/* The one place that frees a link batch. `dst` and its entries are KBC_OWN,
+ * transferred here from the parse, and BOTH callers abort part-way through a
+ * pass — reindex_pass on an unreadable document or a rejected facet,
+ * reindex_one on a store write. A free loop at the call site is a loop some
+ * abort path skips, and both of these did: a full rebuild that died on its
+ * Nth document leaked every link array the first N-1 had handed over. */
+static void app_edge_srcs_free(app_edge_src *v, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    for (size_t j = 0; j < v[i].n; j++) {
+      free(v[i].dst[j]);
+    }
+    free(v[i].dst);
+    v[i].dst = NULL;
+    v[i].n = 0;
+  }
+  free(v);
+}
+
 /* The link graph, kept in step with the documents.
  *
  * Every re-ingest REPLACES the edges leaving that path, and a removal drops
@@ -1813,11 +1943,6 @@ static kbc_status store_forget_path(kbc_app *app, const char *corpus,
  *
  * The targets of every source are resolved against the store in ONE batch;
  * each source's own replace is then a single transaction. */
-static void app_edge_srcs_free(app_edge_src *v, size_t n) {
-  free(v);
-  (void)n;
-}
-
 static kbc_status store_write_links(kbc_app *app, app_edge_src *v, size_t nsrc,
                                     kbc_err *err) {
   size_t total = 0;
@@ -1929,11 +2054,11 @@ static kbc_status store_write_links(kbc_app *app, app_edge_src *v, size_t nsrc,
 /* One document, in place: read it, tokenize it, rewrite only its postings.
  *
  * The mutation runs under the write lock — a reader must never see a
- * half-rewritten postings array — and the result is saved and promoted before
- * the lock is released, so a crash mid-update leaves the previous generation
- * on disk and the daemon comes back up on it. The store row is committed
- * before any of this (reindex_one), so app.h's invariant holds throughout: the
- * index never references a document the store has not committed.
+ * half-rewritten postings array — and the result is published before the lock
+ * is released, so a crash mid-update leaves the previous generation on disk
+ * and the daemon comes back up on it. The store row is committed before any of
+ * this (reindex_one), so app.h's invariant holds throughout: the index never
+ * references a document the store has not committed.
  *
  * `vanished` means the file is not on disk, which is a removal rather than an
  * update.
@@ -1942,6 +2067,18 @@ static kbc_status store_write_links(kbc_app *app, app_edge_src *v, size_t nsrc,
  * store and index are keyed on. The corpus root is joined once, into `full`,
  * and never prepended to the key.
  */
+
+/* The mutation window: the WRITE lock only.
+ *
+ * reindex_mu is deliberately NOT taken here. It is a plain, non-recursive
+ * mutex and reindex_one — the only caller — already holds it across the store
+ * writes that precede this, so taking it again would self-deadlock. Holding it
+ * at the reindex_one call site instead is what excludes this path from a full
+ * rebuild on BOTH halves: the store rows and the index. */
+static void index_lock(kbc_app *app) { pthread_rwlock_wrlock(&app->lock); }
+
+static void index_unlock(kbc_app *app) { pthread_rwlock_unlock(&app->lock); }
+
 static kbc_status index_touch_one(kbc_app *app, const kbc_corpus_cfg *cc,
                                   const char *rel_path, bool vanished,
                                   kbc_err *err) {
@@ -1998,14 +2135,14 @@ static kbc_status index_touch_one(kbc_app *app, const kbc_corpus_cfg *cc,
     v = embed_one(app, fa, text.ptr, &dim);
   }
 
-  pthread_rwlock_wrlock(&app->lock);
+  index_lock(app);
   doc_id = kbc_index_id_of(app->index, cc->name, rel_path);
   docs_before = kbc_index_doc_count(app->index);
   if (vanished) {
     if (doc_id != UINT32_MAX) {
       s = kbc_index_remove_doc(app->index, doc_id, err);
       if (kbc_failed(s)) {
-        pthread_rwlock_unlock(&app->lock);
+        index_unlock(app);
         goto out;
       }
       /* A removal renumbers every document above it, so the vector rows keyed
@@ -2025,7 +2162,7 @@ static kbc_status index_touch_one(kbc_app *app, const kbc_corpus_cfg *cc,
     s = kbc_index_update_doc(app->index, doc_id, cc->name, rel_path, title,
                              KBC_KIND_ARTIFACT, &toks, err);
     if (kbc_failed(s)) {
-      pthread_rwlock_unlock(&app->lock);
+      index_unlock(app);
       goto out;
     }
     /* A replace keeps every doc id, and an append uses one past the old end,
@@ -2048,18 +2185,9 @@ static kbc_status index_touch_one(kbc_app *app, const kbc_corpus_cfg *cc,
     }
   }
 
-  kbc_str build_path;
-  kbc_str_init(&build_path);
-  s = kbc_str_printf(&build_path, "%s.build", app->cfg->index_path);
-  if (!kbc_failed(s)) {
-    s = kbc_index_save(app->index, build_path.ptr, err);
-  }
-  if (!kbc_failed(s)) {
-    s = promote_file(app->cfg->index_path, err);
-  }
-  kbc_str_free(&build_path);
+  s = index_publish(app, app->index, false, err);
   if (kbc_failed(s)) {
-    pthread_rwlock_unlock(&app->lock);
+    index_unlock(app);
     goto out;
   }
   const int64_t docs = (int64_t)kbc_index_doc_count(app->index);
@@ -2073,7 +2201,7 @@ static kbc_status index_touch_one(kbc_app *app, const kbc_corpus_cfg *cc,
  * index last changed", which this is. */
   atomic_store_explicit(&app->st_last_us, (kbc_now_ns() - t0) / 1000,
                         memory_order_relaxed);
-  pthread_rwlock_unlock(&app->lock);
+  index_unlock(app);
 
   kbc_str payload;
   kbc_str_init(&payload);
@@ -2097,26 +2225,25 @@ out:
 /* Bring one path up to date, without touching any other. The filesystem is the
  * authority, exactly as it is for a full scan: a delete event for a file that
  * is still there re-ingests it rather than dropping it, and a save event for a
- * file that has since been deleted drops it. */
-static kbc_status reindex_one(kbc_app *app, const char *corpus,
-                              const char *rel_path, kbc_err *err) {
-  if (!app) {
-    return kbc_err_set(err, KBC_ERR_INVALID, "reindex: app is NULL");
-  }
-  if (!corpus || !rel_path || rel_path[0] == '\0') {
-    return kbc_err_set(err, KBC_ERR_INVALID,
-                       "reindex: corpus and path are both required");
-  }
-  if (strlen(rel_path) > (size_t)KBC_MAX_PATH_LEN) {
-    return kbc_err_set(err, KBC_ERR_INVALID, "%s/%s: path over the %u byte cap",
-                       corpus, rel_path, (unsigned)KBC_MAX_PATH_LEN);
-  }
-  /* A path from the watcher or a request body reaches the filesystem; '..' is
-   * refused before it does. */
-  if (strstr(rel_path, "..") != NULL) {
-    return kbc_err_set(err, KBC_ERR_INVALID, "%s/%s: '..' is not allowed",
-                       corpus, rel_path);
-  }
+ * file that has since been deleted drops it.
+ *
+ * Everything below `reindex_one_locked` runs holding reindex_mu, and the store
+ * writes are the reason it is taken at all: the full pass writes the same rows
+ * for the same documents — upsert_artifact, replace_chunks, replace_metas, the
+ * edges — and `chunks` is UNIQUE(doc_id, ord), so a rebuild ingesting a
+ * document while the single-file path ingests the same one produced
+ * "chunk <id>/0: duplicate ord" and a FAILED reindex. Serialising only the
+ * index, as this did, left the half that actually collides unprotected.
+ *
+ * The lock covers the whole body rather than the store phase and the index
+ * phase separately, because the two must not be separable: split, the store
+ * would hold the new revision while the index still held the old one, which
+ * is the half-applied state app.h exists to prevent. It is taken HERE, once,
+ * so every return in the body — including the error unwinds — releases it. The
+ * body calls the `_pass` form of the full rebuild and the index mutation
+ * assumes the mutex is held; NEITHER may take it again. */
+static kbc_status reindex_one_locked(kbc_app *app, const char *corpus,
+                                     const char *rel_path, kbc_err *err) {
   const kbc_corpus_cfg *cc = kbc_config_corpus(app->cfg, corpus);
   if (!cc) {
     return kbc_err_set(err, KBC_ERR_NOTFOUND, "corpus %s is not configured",
@@ -2125,7 +2252,7 @@ static kbc_status reindex_one(kbc_app *app, const char *corpus,
   /* No index to update in place (first start, before any reindex): a full scan
    * is not a fallback here, it is the only thing that can work. */
   if (app->index == NULL) {
-    return kbc_app_reindex(app, err);
+    return reindex_pass(app, err);
   }
 
   /* The filesystem is the authority. A path that is not there is a removal:
@@ -2139,9 +2266,21 @@ static kbc_status reindex_one(kbc_app *app, const char *corpus,
 
   if (vanished) {
     kbc_str_free(&full);
-    if (!kbc_failed(store_forget_path(app, corpus, rel_path, err))) {
-      s = index_touch_one(app, cc, rel_path, true, err);
+    /* `s` is assigned here or not at all. It used to be left holding the
+     * kbc_str_printf result from two lines up — which is KBC_OK, because
+     * `vanished` came from the stat, not the printf — so a store_forget_path
+     * failure fell through to `done` and was reported to the watcher as
+     * success: the artifact row and the graph rows stayed, the document
+     * stayed searchable, and nothing anywhere said it had failed. */
+    s = store_forget_path(app, corpus, rel_path, err);
+    if (kbc_failed(s)) {
+      /* Reported, not papered over. Nothing is half-applied here — the row is
+       * still in the store AND still in the index, so the state is the old
+       * consistent one — and `done`'s full-scan fallback is for the opposite
+       * case, the store row committed while the index was not. */
+      return s;
     }
+    s = index_touch_one(app, cc, rel_path, true, err);
     goto done;
   }
 
@@ -2214,10 +2353,43 @@ done:
     KBC_LOGW("reindex %s/%s: %s; falling back to a full scan", corpus, rel_path,
              err->msg);
     kbc_err_reset(err);
-    return kbc_app_reindex(app, err);
+    return reindex_pass(app, err);
    }
   return KBC_OK;
  }
+
+/* The validation, unlocked, and the body, locked. Argument checking touches
+ * nothing shared, so it stays outside the mutex; everything that writes —
+ * store rows and the index — is inside it, which is the invariant this file
+ * exists to keep: ONE writer of the store and of the index at a time, so the
+ * two indexers are excluded from each other on both halves rather than one.
+ *
+ * The lock is taken once, here, because reindex_one_locked returns from seven
+ * places and a lock taken in the body is a lock each of them has to remember. */
+static kbc_status reindex_one(kbc_app *app, const char *corpus,
+                              const char *rel_path, kbc_err *err) {
+  if (!app) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "reindex: app is NULL");
+  }
+  if (!corpus || !rel_path || rel_path[0] == '\0') {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "reindex: corpus and path are both required");
+  }
+  if (strlen(rel_path) > (size_t)KBC_MAX_PATH_LEN) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "%s/%s: path over the %u byte cap",
+                       corpus, rel_path, (unsigned)KBC_MAX_PATH_LEN);
+  }
+  /* A path from the watcher or a request body reaches the filesystem; '..' is
+   * refused before it does. */
+  if (strstr(rel_path, "..") != NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "%s/%s: '..' is not allowed",
+                       corpus, rel_path);
+  }
+  pthread_mutex_lock(&app->reindex_mu);
+  kbc_status s = reindex_one_locked(app, corpus, rel_path, err);
+  pthread_mutex_unlock(&app->reindex_mu);
+  return s;
+}
 
 kbc_status kbc_app_reindex_file(kbc_app *app, const char *corpus,
                                 const char *rel_path, kbc_err *err) {

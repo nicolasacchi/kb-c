@@ -1905,6 +1905,627 @@ KBC_TEST(a_large_corpus_saves_a_reopenable_stable_file) {
   kbc_test_rmrf(dir);
 }
 
+/* --------------------------------------------------- delta persistence --
+ * A checkpoint appends the mutations to <index>.journal instead of rewriting
+ * the index, so what has to hold is that the index file plus its journal,
+ * replayed in order, is the live index. Every test below is that sentence
+ * checked from a different side.
+ */
+
+/* Builds a corpus, saves it, and hands back a MAPPED index: an index with no
+ * file behind it is one kbc_index_checkpoint has to rewrite whole, and the
+ * journal path is only the interesting one. */
+static kbc_index *jr_sealed(const char *path, const inc_doc *m, size_t n,
+                            kbc_arena *a, kbc_err *err) {
+  kbc_index *ix = kbc_index_new();
+  uint32_t id = 0;
+  size_t i;
+  memset(err, 0, sizeof *err);
+  KBC_CHECK_OK(kbc_index_begin_build(ix, err));
+  for (i = 0; i < n; i++) {
+    KBC_CHECK_OK(add(ix, a, id, "kb", m[i].path, m[i].path, m[i].body, err));
+    id++;
+  }
+  KBC_CHECK_OK(kbc_index_end_build(ix, err));
+  KBC_CHECK_OK(kbc_index_save(ix, path, err));
+  kbc_index_free(ix);
+  kbc_err_reset(err);
+  ix = kbc_index_open(path, err);
+  KBC_CHECK_MSG(ix != NULL, "open %s: %s", path, err->msg);
+  return ix;
+}
+
+static void jr_path(char *buf, size_t cap, const char *dir, const char *name) {
+  int k = snprintf(buf, cap, "%s/%s", dir, name);
+  KBC_CHECK(k > 0 && (size_t)k < cap);
+}
+
+static void append_bytes(const char *path, const void *data, size_t len) {
+  FILE *f = fopen(path, "ab");
+  if (f == NULL) {
+    kbc_test_fail(__FILE__, __LINE__, "cannot append to %s", path);
+    kbc_test_failures++;
+    return;
+  }
+  (size_t)fwrite(data, 1, len, f);
+  (void)fclose(f);
+}
+
+/* One mutation, checkpointed, and the state it has to produce on the next
+ * open. A journal that lost an update or applied a removal twice fails here. */
+KBC_TEST(a_checkpointed_mutation_replays_on_open) {
+  char dir[KBC_TEST_PATH_MAX];
+  char path[KBC_TEST_PATH_MAX + 32], jrnl[KBC_TEST_PATH_MAX + 64];
+  kbc_arena *a = kbc_arena_new(1u << 20);
+  kbc_err err;
+  kbc_index *ix;
+  static inc_doc m[6]; /* four documents, and room for the two appended later */
+  size_t n = 4;
+  memset(&err, 0, sizeof err);
+  memset(m, 0, sizeof m);
+  kbc_test_tmpdir(dir, sizeof dir);
+  (void)snprintf(path, sizeof path, "%s/jr.idx", dir);
+  jr_path(jrnl, sizeof jrnl, dir, "jr.idx.journal");
+  m[0] = (inc_doc){"a.md", "alpha alpha beta"};
+  m[1] = (inc_doc){"b.md", "gamma delta delta"};
+  m[2] = (inc_doc){"c.md", "epsilon"};
+  m[3] = (inc_doc){"d.md", "zeta eta"};
+
+  ix = jr_sealed(path, m, n, a, &err);
+  if (ix == NULL) {
+    goto done;
+  }
+
+  /* A replace that drops a term the document used to have: if replay only ADDED
+   * the record's terms, "beta" would keep a posting for a.md forever and
+   * posting_count would come back one too high. */
+  inc_apply(ix, m, &n, "a.md", "alpha theta", a, &err);
+  KBC_CHECK_OK(kbc_index_checkpoint(ix, path, &err));
+  KBC_CHECK_MSG(kbc_path_exists(jrnl), "the checkpoint wrote no journal, so the "
+                                       "delta had to go somewhere else");
+  kbc_index_free(ix);
+
+  kbc_err_reset(&err);
+  ix = kbc_index_open(path, &err);
+  KBC_CHECK_MSG(ix != NULL, "reopen after the checkpoint: %s", err.msg);
+  if (ix == NULL) {
+    goto done;
+  }
+  inc_check(ix, m, n, "one checkpointed replace");
+  rt_check_meta(ix, m, n, "one checkpointed replace");
+
+  /* A removal, which renumbers everything above it — the record has to carry
+   * the id the document had when it was written, not the one it has now. */
+  {
+    uint32_t id = kbc_index_id_of(ix, "kb", "c.md");
+    KBC_CHECK(id != UINT32_MAX);
+    inc_retire(m, n, "c.md");
+    KBC_CHECK_OK(kbc_index_remove_doc(ix, id, &err));
+  }
+  /* An append after it, so the journal carries a removal AND two different
+   * kinds of update in one file, in the order they happened. */
+  inc_apply(ix, m, &n, "e.md", "mu nu xi", a, &err);
+  KBC_CHECK_OK(kbc_index_checkpoint(ix, path, &err));
+  kbc_index_free(ix);
+
+  kbc_err_reset(&err);
+  ix = kbc_index_open(path, &err);
+  KBC_CHECK_MSG(ix != NULL, "reopen after the removal: %s", err.msg);
+  if (ix == NULL) {
+    goto done;
+  }
+  inc_check(ix, m, n, "a removal and an append through the journal");
+  rt_check_meta(ix, m, n, "a removal and an append through the journal");
+
+  /* A SECOND checkpoint on the reopened index appends to the same journal
+   * rather than replacing it, so a torn read of either record is caught. */
+  inc_apply(ix, m, &n, "b.md", "gamma gamma gamma omega", a, &err);
+  KBC_CHECK_OK(kbc_index_checkpoint(ix, path, &err));
+  kbc_index_free(ix);
+  kbc_err_reset(&err);
+  ix = kbc_index_open(path, &err);
+  KBC_CHECK_MSG(ix != NULL, "reopen after the second checkpoint: %s", err.msg);
+  if (ix != NULL) {
+    inc_check(ix, m, n, "two checkpoints in one journal");
+    kbc_index_free(ix);
+  }
+
+done:
+  kbc_arena_free(a);
+  kbc_test_rmrf(dir);
+}
+
+/* The delta lives in the journal, not in a rewrite: take the journal away and
+ * the index file is exactly the state the last full save left, mutated or
+ * not. A checkpoint that quietly rewrote the file would fail this. */
+KBC_TEST(a_checkpoint_does_not_rewrite_the_index_file) {
+  char dir[KBC_TEST_PATH_MAX];
+  char path[KBC_TEST_PATH_MAX + 32], jrnl[KBC_TEST_PATH_MAX + 64];
+  char other[KBC_TEST_PATH_MAX + 32];
+  kbc_arena *a = kbc_arena_new(1u << 20);
+  kbc_err err;
+  kbc_index *ix;
+  char *before = NULL, *after = NULL;
+  size_t lb = 0, la = 0;
+  static inc_doc m[2];
+  memset(&err, 0, sizeof err);
+  memset(m, 0, sizeof m);
+  kbc_test_tmpdir(dir, sizeof dir);
+  (void)snprintf(path, sizeof path, "%s/nr.idx", dir);
+  (void)snprintf(other, sizeof other, "%s/nr-copy.idx", dir);
+  jr_path(jrnl, sizeof jrnl, dir, "nr.idx.journal");
+  m[0] = (inc_doc){"a.md", "alpha beta"};
+  m[1] = (inc_doc){"b.md", "gamma delta"};
+
+  ix = jr_sealed(path, m, 2, a, &err);
+  if (ix == NULL) {
+    kbc_arena_free(a);
+    kbc_test_rmrf(dir);
+    return;
+  }
+  /* A copy taken while the index is still unmutated is the file a checkpoint
+   * must NOT touch. */
+  KBC_CHECK_OK(kbc_index_save(ix, other, &err));
+  kbc_index_free(ix);
+  before = read_bytes(path, &lb);
+  after = read_bytes(other, &la);
+  KBC_CHECK_MSG(before != NULL && after != NULL && lb == la && lb > 0,
+                "the two copies of an unmutated index differ in size");
+  if (before != NULL && after != NULL && lb == la) {
+    KBC_CHECK_MSG(memcmp(before, after, lb) == 0,
+                  "two saves of the same index produced different files");
+  }
+  free(before);
+  free(after);
+
+  kbc_err_reset(&err);
+  ix = kbc_index_open(path, &err);
+  KBC_CHECK_NOT_NULL(ix);
+  if (ix != NULL) {
+    size_t n = 2;
+    static inc_doc model[2];
+    model[0] = m[0];
+    model[1] = m[1];
+    inc_apply(ix, model, &n, "a.md", "alpha alpha omega", a, &err);
+    KBC_CHECK_OK(kbc_index_checkpoint(ix, path, &err));
+    kbc_index_free(ix);
+    /* With the journal gone the file is the pre-mutation state again, so the
+     * delta really was in the journal and nowhere else. */
+    KBC_CHECK_OK(kbc_index_drop_journal(path, &err));
+    kbc_err_reset(&err);
+    ix = kbc_index_open(path, &err);
+    KBC_CHECK_MSG(ix != NULL, "open after dropping the journal: %s", err.msg);
+    if (ix != NULL) {
+      inc_check(ix, m, 2, "the index file, journal discarded");
+      kbc_index_free(ix);
+    }
+  }
+  /* Dropping a journal that is not there is not an error, and a caller that
+ * rebuilds the whole index has to be able to say so unconditionally. */
+  KBC_CHECK_OK(kbc_index_drop_journal(path, &err));
+  kbc_arena_free(a);
+  kbc_test_rmrf(dir);
+}
+
+/* The real invariant, at the scale that matters: MANY checkpointed mutations,
+ * each one followed by a reopen that has to reproduce the live index, and the
+ * end state has to be the state of a full rebuild of the same corpus. */
+KBC_TEST(many_checkpointed_mutations_equal_a_full_rebuild) {
+  char dir[KBC_TEST_PATH_MAX];
+  char path[KBC_TEST_PATH_MAX + 32];
+  kbc_arena *a = kbc_arena_new(1u << 20);
+  kbc_err err;
+  kbc_index *ix;
+  static inc_doc m[8];
+  size_t n = 4, step;
+  memset(&err, 0, sizeof err);
+  memset(m, 0, sizeof m);
+  kbc_test_tmpdir(dir, sizeof dir);
+  (void)snprintf(path, sizeof path, "%s/chain.idx", dir);
+  m[0] = (inc_doc){"a.md", "alpha alpha beta one two"};
+  m[1] = (inc_doc){"b.md", "beta gamma gamma three"};
+  m[2] = (inc_doc){"c.md", "gamma delta four five"};
+  m[3] = (inc_doc){"d.md", "delta epsilon six seven"};
+
+  ix = jr_sealed(path, m, n, a, &err);
+  if (ix == NULL) {
+    kbc_arena_free(a);
+    kbc_test_rmrf(dir);
+    return;
+  }
+
+  /* Twelve mutations, and after every second one the index is thrown away and
+   * rebuilt from the file — which means the state under test is the journal's
+   * doing, not the in-memory index's. */
+  {
+    static const char *const bodies[6] = {
+        "alpha zeta two",         "beta",           "mu nu xi kappa",
+        "gamma gamma gamma deep", "delta kappa lambda mu", "epsilon only"};
+    static const char *const paths[6] = {"a.md", "b.md", "e.md",
+                                          "c.md", "d.md",  "e.md"};
+    for (step = 0; step < 12; step++) {
+      const char *p = paths[step % 6];
+      const char *body = bodies[step % 6];
+      inc_apply(ix, m, &n, p, body, a, &err);
+      KBC_CHECK_OK(kbc_index_checkpoint(ix, path, &err));
+      KBC_CHECK_MSG(kbc_index_pending_bytes(ix) == 0,
+                    "step %zu: %zu bytes of delta are still pending after a "
+                    "checkpoint",
+                    step, kbc_index_pending_bytes(ix));
+      if (step % 2 == 1) {
+        kbc_index_free(ix);
+        kbc_err_reset(&err);
+        ix = kbc_index_open(path, &err);
+        KBC_CHECK_MSG(ix != NULL, "step %zu: reopen: %s", step, err.msg);
+        if (ix == NULL) {
+          break;
+        }
+        inc_check(ix, m, n, "a checkpointed mutation, reopened");
+      }
+    }
+  }
+  if (ix != NULL) {
+    inc_check(ix, m, n, "the whole checkpointed chain");
+    rt_check_meta(ix, m, n, "the whole checkpointed chain");
+    kbc_index_free(ix);
+  }
+  kbc_arena_free(a);
+  kbc_test_rmrf(dir);
+}
+
+/* The pending buffer is the compaction decision's only input, and a caller
+ * watching it has to see it grow and drain. */
+KBC_TEST(pending_bytes_grows_after_a_mutation_and_drains_at_a_checkpoint) {
+  char dir[KBC_TEST_PATH_MAX];
+  char path[KBC_TEST_PATH_MAX + 32];
+  kbc_arena *a = kbc_arena_new(1u << 20);
+  kbc_err err;
+  kbc_index *ix;
+  static inc_doc m[2];
+  size_t n = 2, quiet;
+  memset(&err, 0, sizeof err);
+  memset(m, 0, sizeof m);
+  kbc_test_tmpdir(dir, sizeof dir);
+  (void)snprintf(path, sizeof path, "%s/pend.idx", dir);
+  m[0] = (inc_doc){"a.md", "alpha beta"};
+  m[1] = (inc_doc){"b.md", "gamma delta"};
+
+  ix = jr_sealed(path, m, n, a, &err);
+  if (ix == NULL) {
+    kbc_arena_free(a);
+    kbc_test_rmrf(dir);
+    return;
+  }
+  /* Nothing has been mutated, so there is nothing to append. */
+  KBC_CHECK_EQ_INT(kbc_index_pending_bytes(ix), 0);
+  inc_apply(ix, m, &n, "a.md", "alpha alpha beta gamma delta epsilon", a, &err);
+  {
+    size_t grew = kbc_index_pending_bytes(ix);
+    KBC_CHECK_MSG(grew > 0, "a mutation left no pending delta at all");
+    /* A mutation that changes nothing observable still has to be recorded:
+     * this one only changes the title the caller passes, so its record is
+     * the same size class as the one above, and the buffer can only grow. */
+    KBC_CHECK_OK(kbc_index_checkpoint(ix, path, &err));
+    KBC_CHECK_EQ_INT(kbc_index_pending_bytes(ix), 0);
+    kbc_index_free(ix);
+    kbc_err_reset(&err);
+    ix = kbc_index_open(path, &err);
+    KBC_CHECK_NOT_NULL(ix);
+    if (ix != NULL) {
+      inc_check(ix, m, n, "after a drained checkpoint");
+    }
+  }
+  /* A removal is a record too. */
+  if (ix != NULL) {
+    uint32_t id = kbc_index_id_of(ix, "kb", "b.md");
+    KBC_CHECK(id != UINT32_MAX);
+    quiet = kbc_index_pending_bytes(ix);
+    KBC_CHECK_EQ_INT(quiet, 0);
+    inc_retire(m, n, "b.md");
+    KBC_CHECK_OK(kbc_index_remove_doc(ix, id, &err));
+    KBC_CHECK_MSG(kbc_index_pending_bytes(ix) > 0,
+                  "a removal left no pending delta at all");
+    KBC_CHECK_OK(kbc_index_checkpoint(ix, path, &err));
+    KBC_CHECK_EQ_INT(kbc_index_pending_bytes(ix), 0);
+    kbc_index_free(ix);
+    kbc_err_reset(&err);
+    ix = kbc_index_open(path, &err);
+    KBC_CHECK_NOT_NULL(ix);
+    if (ix != NULL) {
+      inc_check(ix, m, n, "after a checkpointed removal");
+    }
+  }
+  kbc_index_free(ix);
+  kbc_arena_free(a);
+  kbc_test_rmrf(dir);
+}
+
+/* A record only half on disk was never acknowledged, so it never happened:
+ * the tail is dropped and the index opens at the last state that WAS. */
+KBC_TEST(a_torn_journal_tail_is_discarded) {
+  char dir[KBC_TEST_PATH_MAX];
+  char path[KBC_TEST_PATH_MAX + 32], jrnl[KBC_TEST_PATH_MAX + 64];
+  kbc_arena *a = kbc_arena_new(1u << 20);
+  kbc_err err;
+  kbc_index *ix;
+  static inc_doc m[3];
+  size_t n = 3;
+  size_t jlen = 0, klen = 0;
+  char *jb = NULL, *kb2 = NULL;
+  memset(&err, 0, sizeof err);
+  memset(m, 0, sizeof m);
+  kbc_test_tmpdir(dir, sizeof dir);
+  (void)snprintf(path, sizeof path, "%s/torn.idx", dir);
+  jr_path(jrnl, sizeof jrnl, dir, "torn.idx.journal");
+  m[0] = (inc_doc){"a.md", "alpha alpha beta"};
+  m[1] = (inc_doc){"b.md", "gamma delta"};
+  m[2] = (inc_doc){"c.md", "epsilon"};
+
+  ix = jr_sealed(path, m, n, a, &err);
+  if (ix == NULL) {
+    goto done;
+  }
+  inc_apply(ix, m, &n, "a.md", "alpha theta", a, &err);
+  KBC_CHECK_OK(kbc_index_checkpoint(ix, path, &err));
+  kbc_index_free(ix);
+  jb = read_bytes(jrnl, &jlen);
+  KBC_CHECK(jb != NULL && jlen > 32);
+
+  /* Half a record header, then some more: a process that died mid-append
+   * leaves bytes, and a byte count that is not a record boundary. */
+  {
+    static const unsigned char junk[11] = {0x4b, 0x42, 0x4c, 0x31, 1, 0, 0,
+                                           0,    0,    0,    0};
+    append_bytes(jrnl, junk, sizeof junk);
+  }
+  kbc_err_reset(&err);
+  ix = kbc_index_open(path, &err);
+  KBC_CHECK_MSG(ix != NULL, "a torn tail is not corruption: %s", err.msg);
+  if (ix != NULL) {
+    inc_check(ix, m, n, "after a torn tail was discarded");
+    kbc_index_free(ix);
+  }
+  /* The tail is GONE, not just skipped: a journal that kept it would stop
+   * every future append behind the prefix the reader stops at. */
+  kb2 = read_bytes(jrnl, &klen);
+  KBC_CHECK_MSG(kb2 != NULL && klen == jlen,
+                "the journal is %zu bytes after the torn tail was discarded, it "
+                "was %zu before",
+                klen, jlen);
+  if (kb2 != NULL && klen == jlen && jb != NULL) {
+    KBC_CHECK_MSG(memcmp(jb, kb2, jlen) == 0,
+                  "the surviving journal is not the prefix it was");
+  }
+  /* And the journal that was truncated to still works: an append after it
+   * lands where the reader expects. */
+  kbc_err_reset(&err);
+  ix = kbc_index_open(path, &err);
+  KBC_CHECK_NOT_NULL(ix);
+  if (ix != NULL) {
+    inc_apply(ix, m, &n, "b.md", "gamma gamma eta", a, &err);
+    KBC_CHECK_OK(kbc_index_checkpoint(ix, path, &err));
+    kbc_index_free(ix);
+    kbc_err_reset(&err);
+    ix = kbc_index_open(path, &err);
+    KBC_CHECK_MSG(ix != NULL, "open after appending to a truncated journal: %s",
+                  err.msg);
+    if (ix != NULL) {
+      inc_check(ix, m, n, "an append onto a truncated journal");
+      kbc_index_free(ix);
+    }
+  }
+  free(jb);
+  free(kb2);
+
+done:
+  kbc_arena_free(a);
+  kbc_test_rmrf(dir);
+}
+
+/* A record that is the right length but the wrong BYTES is not a torn tail,
+ * it is a file somebody changed. Applying it anyway would put the index into
+ * a state no mutation ever produced, so the open has to fail loudly. */
+KBC_TEST(a_corrupt_journal_record_is_rejected_loudly) {
+  char dir[KBC_TEST_PATH_MAX];
+  char path[KBC_TEST_PATH_MAX + 32], jrnl[KBC_TEST_PATH_MAX + 64];
+  kbc_arena *a = kbc_arena_new(1u << 20);
+  kbc_err err;
+  kbc_index *ix;
+  static inc_doc m[2];
+  size_t n = 2, jlen = 0;
+  char *jb = NULL;
+  memset(&err, 0, sizeof err);
+  memset(m, 0, sizeof m);
+  kbc_test_tmpdir(dir, sizeof dir);
+  (void)snprintf(path, sizeof path, "%s/corrupt.idx", dir);
+  jr_path(jrnl, sizeof jrnl, dir, "corrupt.idx.journal");
+  m[0] = (inc_doc){"a.md", "alpha alpha beta"};
+  m[1] = (inc_doc){"b.md", "gamma delta"};
+
+  ix = jr_sealed(path, m, n, a, &err);
+  if (ix == NULL) {
+    goto done;
+  }
+  inc_apply(ix, m, &n, "a.md", "alpha theta", a, &err);
+  KBC_CHECK_OK(kbc_index_checkpoint(ix, path, &err));
+  kbc_index_free(ix);
+
+  /* One byte inside the first record's first TERM. Every length, count and
+   * terminator is untouched and the byte is still a legal term character, so
+   * nothing structural can see it: the record applies cleanly and leaves a
+   * posting for a term no document has. (Corrupting the corpus instead would
+   * prove nothing — kbc_index_update_doc rejects a record whose corpus is not
+   * the one at that id, so the mutation's own validation would catch it.)
+   * The checksum is the only thing standing here, which is the whole reason
+   * there is one. */
+  jb = read_bytes(jrnl, &jlen);
+  KBC_CHECK(jb != NULL && jlen > 80);
+  if (jb != NULL && jlen > 80) {
+    /* 32-byte header, three lengths, the three strings, the token and term
+     * counts, the first term's own header, then its bytes. Every offset here
+     * is derived from the lengths the record declares. */
+    const size_t cl = (size_t)((unsigned char)jb[32] |
+                               ((unsigned char)jb[33] << 8));
+    const size_t pl = (size_t)((unsigned char)jb[36] |
+                               ((unsigned char)jb[37] << 8));
+    const size_t tl = (size_t)((unsigned char)jb[40] |
+                               ((unsigned char)jb[41] << 8));
+    const size_t at = 32u + 12u + cl + pl + tl + 8u + 8u;
+    FILE *f;
+    KBC_CHECK_MSG(at < jlen && jb[at] >= 'a' && jb[at] <= 'z',
+                  "the first term is not at the offset the record describes "
+                  "(byte %d at %zu of %zu)",
+                  (int)jb[at], at, jlen);
+    jb[at] = (char)(jb[at] ^ 0x01); /* a real term, one letter different */
+    f = fopen(jrnl, "r+b");
+    KBC_CHECK(f != NULL);
+    if (f != NULL) {
+      KBC_CHECK_EQ_INT(fseek(f, (long)at, SEEK_SET), 0);
+      KBC_CHECK_EQ_INT(fwrite(jb + at, 1, 1, f), 1);
+      (void)fclose(f);
+    }
+    kbc_err_reset(&err);
+    ix = kbc_index_open(path, &err);
+    KBC_CHECK_MSG(ix == NULL, "a corrupt journal record was applied silently");
+    if (ix != NULL) {
+      kbc_index_free(ix);
+    } else {
+      /* Loudly: a status, and a message that names the file and what is wrong
+       * with it, so an operator can act instead of wondering. */
+      KBC_CHECK_ERR_MSG(err);
+      KBC_CHECK_MSG(strstr(err.msg, jrnl) != NULL,
+                    "the error does not name the journal: %s", err.msg);
+      KBC_CHECK_MSG(strstr(err.msg, "offset 0") != NULL,
+                    "the error does not say which record: %s", err.msg);
+    }
+  }
+  free(jb);
+
+done:
+  kbc_arena_free(a);
+  kbc_test_rmrf(dir);
+}
+
+/* The journal cannot grow for ever: past KBC_INDEX_JOURNAL_MAX a checkpoint
+ * rewrites the index whole and drops the journal, and the index that comes
+ * back is still right. */
+KBC_TEST(a_journal_past_its_limit_compacts_to_a_full_rewrite) {
+  char dir[KBC_TEST_PATH_MAX];
+  char path[KBC_TEST_PATH_MAX + 32], jrnl[KBC_TEST_PATH_MAX + 64];
+  kbc_arena *a = kbc_arena_new(1u << 24);
+  kbc_err err;
+  kbc_index *ix;
+  static char body[400000];
+  static char body2[sizeof(body) + 64u];
+  static inc_doc m[2];
+  size_t n = 2, jlen = 0, i, w;
+  char *jb = NULL;
+  size_t peak = 0, appends = 0; /* appends: checkpoints that really appended */
+  bool compacted = false;
+  memset(&err, 0, sizeof err);
+  memset(m, 0, sizeof m);
+  kbc_test_tmpdir(dir, sizeof dir);
+  (void)snprintf(path, sizeof path, "%s/big-jrnl.idx", dir);
+  jr_path(jrnl, sizeof jrnl, dir, "big-jrnl.idx.journal");
+
+  /* A body wide enough that a handful of its mutations is megabytes of
+   * delta: 20,000 distinct terms is a ~300 KB record, so fifteen of them are
+   * past the 4 MiB limit without the test taking an hour. */
+  w = 0;
+  for (i = 0; i < 20000; i++) {
+    w += (size_t)snprintf(body + w, sizeof body - w, "%s w%u",
+                          w ? "" : "alpha", (unsigned)(i + 1));
+  }
+  (void)snprintf(body2, sizeof body2, "%s w%u", body, 99999u);
+  m[0] = (inc_doc){"a.md", body};
+  m[1] = (inc_doc){"b.md", "gamma delta"};
+
+  ix = jr_sealed(path, m, n, a, &err);
+  if (ix == NULL) {
+    kbc_arena_free(a);
+    kbc_test_rmrf(dir);
+    return;
+  }
+  KBC_CHECK_EQ_INT(kbc_index_pending_bytes(ix), 0);
+  /* The second document is replaced with a body carrying 20,000 distinct
+   * terms over and over. Every fourth mutation is checkpointed, so the journal
+   * on disk GROWS as well as the pending buffer — and the limit has to be
+   * reached on the sum of the two, which is the whole reason the compaction
+   * decision is `journal_bytes + pending` and not `pending` alone. */
+  for (i = 0; i < 40 && !compacted; i++) {
+    kbc_tokens t;
+    tokens_zero(&t);
+    KBC_CHECK_OK(kbc_tokenize(a, body2, strlen(body2), &t, &err));
+    KBC_CHECK_OK(kbc_index_update_doc(ix, 1, "kb", "b.md", "b.md",
+                                      KBC_KIND_ARTIFACT, &t, &err));
+    m[1].body = body2;
+    peak = kbc_index_pending_bytes(ix);
+    if (i == 3) {
+      /* Four wide mutations really are megabytes of delta, so the limit below
+       * is reached by ACCUMULATION and not by one enormous record. */
+      KBC_CHECK_MSG(peak > ((size_t)1u << 20),
+                    "four wide mutations left only %zu bytes pending, so this "
+                    "test is not driving the limit at all",
+                    peak);
+    }
+    if (i % 4 == 3) {
+      KBC_CHECK_OK(kbc_index_checkpoint(ix, path, &err));
+      /* The journal vanishing IS the compaction: the deltas it held are in
+       * the index file now, and a journal left behind would apply them twice
+       * on the next open. */
+      if (!kbc_path_exists(jrnl)) {
+        compacted = true;
+        break;
+      }
+      appends++;
+    }
+  }
+  KBC_CHECK_MSG(compacted,
+                "after %zu wide mutations and %zu checkpoints the journal was "
+                "still being appended to, so the compaction never fired",
+                i, appends);
+  /* The journal was really being used first: a compaction that fired on the
+   * first checkpoint would pass every check below without ever having
+   * appended a second record. */
+  KBC_CHECK_MSG(appends >= 2,
+                "the journal was compacted after %zu appends, so the append "
+                "path is barely covered here",
+                appends);
+  KBC_CHECK_EQ_INT(kbc_index_pending_bytes(ix), 0);
+  KBC_CHECK_OK(kbc_index_checkpoint(ix, path, &err));
+  KBC_CHECK_MSG(!kbc_path_exists(jrnl),
+                "the compaction left a journal behind; the deltas it holds are "
+                "in the index file now and replaying them would apply them "
+                "twice");
+  kbc_index_free(ix);
+
+  kbc_err_reset(&err);
+  ix = kbc_index_open(path, &err);
+  KBC_CHECK_MSG(ix != NULL, "reopen after the compaction: %s", err.msg);
+  if (ix != NULL) {
+    inc_check(ix, m, n, "after a compaction to a full rewrite");
+    rt_check_meta(ix, m, n, "after a compaction to a full rewrite");
+    /* A checkpoint right after one is a no-op, and the file it would have
+     * rewritten is still a file this loader accepts. */
+    KBC_CHECK_OK(kbc_index_checkpoint(ix, path, &err));
+    kbc_index_free(ix);
+  }
+  kbc_err_reset(&err);
+  ix = kbc_index_open(path, &err);
+  KBC_CHECK_MSG(ix != NULL, "reopen after a no-op checkpoint: %s", err.msg);
+  if (ix != NULL) {
+    inc_check(ix, m, n, "after a no-op checkpoint");
+    kbc_index_free(ix);
+  }
+  jb = read_bytes(jrnl, &jlen);
+  KBC_CHECK_MSG(jb == NULL || jlen == 0,
+                "a journal reappeared after the compaction");
+  free(jb);
+  kbc_arena_free(a);
+  kbc_test_rmrf(dir);
+}
+
+
 
 /* ------------------------------------------------------------- main ------ */
 
@@ -1924,6 +2545,19 @@ int main(void) {
        every_mutation_saves_a_reopenable_stable_file},
       {"a_large_corpus_saves_a_reopenable_stable_file",
        a_large_corpus_saves_a_reopenable_stable_file},
+      {"a_checkpointed_mutation_replays_on_open",
+       a_checkpointed_mutation_replays_on_open},
+      {"a_checkpoint_does_not_rewrite_the_index_file",
+       a_checkpoint_does_not_rewrite_the_index_file},
+      {"many_checkpointed_mutations_equal_a_full_rebuild",
+       many_checkpointed_mutations_equal_a_full_rebuild},
+      {"pending_bytes_grows_after_a_mutation_and_drains_at_a_checkpoint",
+       pending_bytes_grows_after_a_mutation_and_drains_at_a_checkpoint},
+      {"a_torn_journal_tail_is_discarded", a_torn_journal_tail_is_discarded},
+      {"a_corrupt_journal_record_is_rejected_loudly",
+       a_corrupt_journal_record_is_rejected_loudly},
+      {"a_journal_past_its_limit_compacts_to_a_full_rewrite",
+       a_journal_past_its_limit_compacts_to_a_full_rewrite},
       {"bm25_score_matches_hand_computation", bm25_score_matches_hand_computation},
       {"bm25_returns_exactly_the_matching_docs",
        bm25_returns_exactly_the_matching_docs},

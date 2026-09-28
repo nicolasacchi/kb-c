@@ -8,12 +8,14 @@
  * where request-line, header-table and Content-Length rules actually run. */
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1422,6 +1424,294 @@ KBC_TEST(concurrent_connects_do_not_corrupt_the_conn_table) {
   fx_teardown(&f);
 }
 
+/* ------------------------------------------------- live SSE streams over TCP --
+ *
+ * An SSE stream never ends on its own, so it cannot be read the way the other
+ * exchanges in this file are: it is read with a deadline, and the client
+ * decides when to hang up. */
+
+typedef struct {
+  int fd;
+  char buf[16384];
+  size_t len;
+} sse_client;
+
+static bool sse_open(int port, sse_client *c) {
+  memset(c, 0, sizeof *c);
+  c->fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (c->fd < 0) return false;
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof a);
+  a.sin_family = AF_INET;
+  a.sin_port = htons((uint16_t)port);
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (connect(c->fd, (struct sockaddr *)&a, sizeof a) != 0) {
+    close(c->fd);
+    c->fd = -1;
+    return false;
+  }
+  static const char req[] = "GET /api/events HTTP/1.1\r\nHost: x\r\n\r\n";
+  size_t off = 0;
+  while (off < sizeof req - 1) {
+    ssize_t w = send(c->fd, req + off, sizeof req - 1 - off, MSG_NOSIGNAL);
+    if (w <= 0) {
+      close(c->fd);
+      c->fd = -1;
+      return false;
+    }
+    off += (size_t)w;
+  }
+  struct timeval tv;
+  tv.tv_sec = 2;
+  tv.tv_usec = 0;
+  (void)setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  return true;
+}
+
+/* Exactly one recv. True means "the stream is still open", whether or not it
+ * had anything to say: only EOF is a closed stream, a timeout is an idle
+ * one, and an idle stream is the normal case for /api/events. */
+static bool sse_poll(sse_client *c) {
+  if (c->fd < 0) return false;
+  if (c->len + 1 >= sizeof c->buf) return true;
+  ssize_t n = recv(c->fd, c->buf + c->len, sizeof c->buf - 1 - c->len, 0);
+  if (n > 0) {
+    c->len += (size_t)n;
+    c->buf[c->len] = '\0';
+    return true;
+  }
+  if (n == 0) return false;
+  if (errno == EINTR) return true;
+  return errno == EAGAIN || errno == EWOULDBLOCK;
+}
+
+static bool sse_saw(const sse_client *c, const char *needle) {
+  return strstr(c->buf, needle) != NULL;
+}
+
+static bool sse_wait(sse_client *c, const char *needle, int tries) {
+  for (int i = 0; i < tries; i++) {
+    if (sse_saw(c, needle)) return true;
+    if (!sse_poll(c)) return false;
+  }
+  return sse_saw(c, needle);
+}
+
+static void sse_hangup(sse_client *c) {
+  if (c->fd >= 0) {
+    close(c->fd);
+    c->fd = -1;
+  }
+}
+
+/* ------------------------------------------ SSE attach vs the event fan-out --
+ *
+ * httpd_track puts a connection in h->all_conns at ACCEPT time, and
+ * httpd_on_event walks that array on every published event looking for
+ * c->sse. sse_attach used to set c->sse first and build the frame ring after
+ * it, so a publisher landing in that window took the SSE branch of the
+ * fan-out on a connection whose ring was still q == NULL / qcap == 0:
+ * sse_push_locked computed `% c->qcap` and dereferenced the NULL ring, and
+ * the daemon died of SIGFPE on a thread that had done nothing wrong.
+ *
+ * What this test can and cannot prove, stated plainly: the interleaving is a
+ * C data race rather than a scheduling accident, and on a TSO target it is
+ * not reachable — the store that publishes c->sse cannot be observed before
+ * the store that fills c->q, and the compiler will not move a store across
+ * the calloc. So this does NOT fail on x86-64 when the fix is reverted;
+ * eight runs of a reverted build all pass. What it does is keep the shape
+ * exercised at volume — thousands of streams opened against threads that
+ * publish continuously (every reindex publishes index.updated) — and a
+ * fan-out that reached a half-built ring would take the whole test process
+ * down, which ctest reports. On a weak-ordering target it is the detector.
+ * Read a green run as "not disproven", not as proof. */
+
+#define RACE_STREAMS 8
+#define RACE_ROUNDS 200
+#define RACE_PUBLISHERS 2
+
+typedef struct {
+  int port;
+  int rounds;
+  pthread_barrier_t *start;
+  int opened;
+  int bad;
+} stream_arg;
+
+typedef struct {
+  int port;
+  int rounds;
+  pthread_barrier_t *start;
+  int published;
+  int bad;
+} publish_arg;
+
+static void *race_stream(void *p) {
+  stream_arg *a = (stream_arg *)p;
+  pthread_barrier_wait(a->start);
+  for (int i = 0; i < a->rounds; i++) {
+    sse_client c;
+    if (!sse_open(a->port, &c) || !sse_wait(&c, ":ok", 8)) {
+      a->bad++;
+    } else if (strncmp(c.buf, "HTTP/1.1 200", 12) == 0 &&
+               strstr(c.buf, "text/event-stream") != NULL) {
+      a->opened++;
+    } else {
+      a->bad++;
+    }
+    sse_hangup(&c);
+  }
+  return NULL;
+}
+
+static void *race_publisher(void *p) {
+  publish_arg *a = (publish_arg *)p;
+  static const char req[] = "POST /api/reindex HTTP/1.1\r\nHost: x\r\n\r\n";
+  char reply[8192];
+  pthread_barrier_wait(a->start);
+  for (int i = 0; i < a->rounds; i++) {
+    int status = 0;
+    bool ok = raw_exchange_port(a->port, req, sizeof req - 1, &status, reply,
+                                sizeof reply);
+    if (ok && status == 202) {
+      a->published++;
+    } else {
+      a->bad++;
+    }
+  }
+  return NULL;
+}
+
+KBC_TEST(sse_attach_racing_the_event_fan_out_keeps_the_daemon) {
+  fixture f;
+  fx_setup(&f, NULL);
+  free(f.cfg->bind_addr);
+  f.cfg->bind_addr = strdup("127.0.0.1");
+  f.cfg->port = 0;
+  /* The attach and the publish must be on DIFFERENT threads for the race to
+   * exist at all, and with SO_REUSEPORT the kernel only spreads them across
+   * workers when there is more than one. */
+  f.cfg->http_workers = 4;
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_httpd *h = kbc_httpd_start(f.app, f.cfg, &err);
+  if (h == NULL) {
+    fprintf(stderr, "  httpd_start: %s\n", err.msg);
+    kbc_test_fail(__FILE__, __LINE__, "httpd_start: %s", err.msg);
+    fx_teardown(&f);
+    return;
+  }
+  int port = kbc_httpd_port(h);
+  KBC_CHECK_MSG(port > 0, "no listening port");
+
+  pthread_barrier_t start;
+  KBC_CHECK(pthread_barrier_init(&start, NULL,
+                                 (unsigned)(RACE_STREAMS + RACE_PUBLISHERS)) ==
+            0);
+  pthread_t th[RACE_STREAMS + RACE_PUBLISHERS];
+  stream_arg sa[RACE_STREAMS];
+  publish_arg pa[RACE_PUBLISHERS];
+  for (int i = 0; i < RACE_STREAMS; i++) {
+    memset(&sa[i], 0, sizeof sa[i]);
+    sa[i].port = port;
+    sa[i].rounds = RACE_ROUNDS;
+    sa[i].start = &start;
+    KBC_CHECK(pthread_create(&th[i], NULL, race_stream, &sa[i]) == 0);
+  }
+  for (int i = 0; i < RACE_PUBLISHERS; i++) {
+    memset(&pa[i], 0, sizeof pa[i]);
+    pa[i].port = port;
+    pa[i].rounds = RACE_ROUNDS;
+    pa[i].start = &start;
+    KBC_CHECK(pthread_create(&th[RACE_STREAMS + i], NULL, race_publisher,
+                             &pa[i]) == 0);
+  }
+  int opened = 0, bad_stream = 0, published = 0, bad_publish = 0;
+  for (int i = 0; i < RACE_STREAMS; i++) {
+    (void)pthread_join(th[i], NULL);
+    opened += sa[i].opened;
+    bad_stream += sa[i].bad;
+  }
+  for (int i = 0; i < RACE_PUBLISHERS; i++) {
+    (void)pthread_join(th[RACE_STREAMS + i], NULL);
+    published += pa[i].published;
+    bad_publish += pa[i].bad;
+  }
+  (void)pthread_barrier_destroy(&start);
+
+  KBC_CHECK_MSG(bad_stream == 0, "%d of %d streams never got a well-formed SSE "
+                "head while the fan-out was publishing", bad_stream,
+                RACE_STREAMS * RACE_ROUNDS);
+  KBC_CHECK_MSG(opened == RACE_STREAMS * RACE_ROUNDS,
+                "only %d of %d streams completed", opened,
+                RACE_STREAMS * RACE_ROUNDS);
+  KBC_CHECK_MSG(bad_publish == 0, "%d of %d reindexes got no 202", bad_publish,
+                RACE_PUBLISHERS * RACE_ROUNDS);
+
+  /* The daemon survived the storm and still answers: a fan-out that touched a
+   * half-built ring shows up here as a dead listener, not as a bad count. */
+  char reply[8192];
+  int status = 0;
+  static const char health[] = "GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n";
+  KBC_CHECK(
+      raw_exchange_port(port, health, sizeof health - 1, &status, reply,
+                        sizeof reply));
+  KBC_CHECK_MSG(status == 200, "the daemon did not survive the storm: %d",
+                status);
+  KBC_CHECK_MSG(published > 0, "the storm published nothing, so it proved "
+                "nothing");
+
+  kbc_httpd_stop(h);
+  fx_teardown(&f);
+}
+
+/* ------------------------------------- a refused start must not close fd 0 --
+ *
+ * kbc_httpd is calloc'd, so an untouched listen_fd[] / w[i].epfd slot reads as
+ * 0 — a perfectly valid descriptor. kbc_httpd_stop closes everything that
+ * reads >= 0, so a failure path that runs BEFORE those slots are swept to -1
+ * tears the daemon down with the caller's descriptor 0 in them, and the
+ * caller loses its stdin once per configured worker. Three paths run before
+ * the sweep: the CORS allocation, the CORS list push, and an unparseable
+ * KBC_RATE_LIMIT_RPS. Only the last is reachable from a test — the other two
+ * need malloc to fail — so it is the one driven here, and the assertion is
+ * about the descriptor rather than about the error message. */
+
+KBC_TEST(a_refused_start_leaves_the_callers_descriptors_open) {
+  static const char *const bad[] = {"many", "12x", "99999999999999999999999"};
+  fixture f;
+  fx_setup(&f, NULL);
+  free(f.cfg->bind_addr);
+  f.cfg->bind_addr = strdup("127.0.0.1");
+  f.cfg->port = 0;
+  f.cfg->http_workers = 4; /* stop closes one descriptor per worker */
+
+  for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+    /* Install a known-good descriptor 0 first, so what is asserted below is
+     * this failure path and not whatever an earlier case left behind. */
+    int null = open("/dev/null", O_RDONLY);
+    KBC_CHECK_MSG(null >= 0, "cannot open /dev/null");
+    if (null < 0) break;
+    if (null != 0) {
+      bool moved = dup2(null, 0) == 0;
+      close(null);
+      KBC_CHECK_MSG(moved, "cannot install a guard on descriptor 0");
+    }
+    KBC_CHECK(setenv("KBC_RATE_LIMIT_RPS", bad[i], 1) == 0);
+    kbc_err err;
+    kbc_err_reset(&err);
+    kbc_httpd *h = kbc_httpd_start(f.app, f.cfg, &err);
+    KBC_CHECK_MSG(h == NULL, "KBC_RATE_LIMIT_RPS=\"%s\" was accepted", bad[i]);
+    if (h != NULL) kbc_httpd_stop(h);
+    KBC_CHECK_ERR_MSG(err);
+    KBC_CHECK_MSG(fcntl(0, F_GETFD) != -1,
+                  "a refused start (KBC_RATE_LIMIT_RPS=\"%s\") closed the "
+                  "caller's descriptor 0", bad[i]);
+  }
+  (void)unsetenv("KBC_RATE_LIMIT_RPS");
+  fx_teardown(&f);
+}
+
 
 /* ------------------------------------------------------------------- main -- */
 
@@ -1457,6 +1747,10 @@ int main(void) {
        a_bad_rate_limit_threshold_refuses_to_start},
       {"concurrent_connects_do_not_corrupt_the_conn_table",
        concurrent_connects_do_not_corrupt_the_conn_table},
+      {"sse_attach_racing_the_event_fan_out_keeps_the_daemon",
+       sse_attach_racing_the_event_fan_out_keeps_the_daemon},
+      {"a_refused_start_leaves_the_callers_descriptors_open",
+       a_refused_start_leaves_the_callers_descriptors_open},
       {NULL, NULL},
   };
   return kbc_test_run("httpd", cases);

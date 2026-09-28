@@ -579,7 +579,9 @@ KBC_TEST(embedder_child_death) {
   const char *texts[1] = {"alpha"};
   float *out = NULL;
   kbc_err_reset(&err);
-  KBC_CHECK_ERR(kbc_embedder_embed(e, a, texts, 1, 0, &out, &err), KBC_ERR_IO);
+  KBC_CHECK_MSG(kbc_embedder_embed(e, a, texts, 1, 0, &out, &err) == KBC_ERR_IO,
+                "a sidecar that cannot exec must report IO, got %s: %s",
+                kbc_status_str(err.status), err.msg);
   KBC_CHECK_ERR_MSG(err);
   KBC_CHECK_NULL(out);
   KBC_CHECK_MSG(!kbc_embedder_healthy(e),

@@ -9,7 +9,12 @@
  * while restoring its mtime: if the unchanged check regressed to a content
  * hash or a blind re-read, the tampered word would become findable.
  */
+#include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1947,6 +1952,689 @@ KBC_TEST(scope_is_still_refused) {
   fx_teardown(&f);
 }
 
+/* ==========================================================================
+ * Two writers of one index file.
+ *
+ * Every case above drives a single thread. The daemon does not: a full
+ * rebuild runs on the httpd worker that answered POST /api/reindex, the
+ * single-file path runs on the watcher thread, and both of them publish the
+ * index file. These cases run the two against each other, and the last one
+ * takes the store's write lock out from under a rebuild in progress.
+ * ======================================================================== */
+
+/* Enough documents that a full rebuild spends real time walking, ingesting
+ * and serialising an index — that is the window the two writers shared. */
+#define BULK_DOCS 120u
+#define RACE_ITERS 24u
+/* The other thread runs until the rebuilds stop, so this is a ceiling that
+ * only exists so a wedged run cannot fill the disk. */
+#define TOUCH_ITERS 20000u
+#define GROW_ITERS 2000u
+/* Enough documents, each with its own heap array of link targets, that a
+ * rebuild is still DEEP in its ingest loop when the store stops answering.
+ * The holder polls for the first two re-stored rows and then has to win
+ * sqlite's write lock, and both the polling and the lock acquisition take
+ * milliseconds; a corpus whose store phase was shorter than that would let
+ * the rebuild finish it first and the injection would prove nothing. */
+#define LINK_DOCS 400u
+#define LINK_LINKS 4u
+/* How many times the case re-runs the injection before declaring it broken. */
+#define ABORT_ATTEMPTS 5
+
+/* Written through a staging name and renamed over the target, so a reindex
+ * running on the other thread reads a whole revision or none of it — never
+ * the first half of one and the second half of the next. Touches no harness
+ * state, so it is safe to call from a worker thread. */
+static int write_file_atomic(const char *path, const char *content) {
+  char stage[KBC_TEST_PATH_MAX];
+  int n = snprintf(stage, sizeof stage, "%s.staging", path);
+  if (n <= 0 || (size_t)n >= sizeof stage) {
+    return -1;
+  }
+  FILE *fh = fopen(stage, "wb");
+  if (fh == NULL) {
+    return -1;
+  }
+  size_t len = strlen(content);
+  int rc = (fwrite(content, 1u, len, fh) == len) ? 0 : -1;
+  if (fclose(fh) != 0) {
+    rc = -1;
+  }
+  if (rc != 0) {
+    (void)unlink(stage);
+    return -1;
+  }
+  return rename(stage, path) == 0 ? 0 : -1;
+}
+
+static void write_bulk_doc(const char *dir, size_t i) {
+  char name[64], body[3072], path[KBC_TEST_PATH_MAX];
+  snprintf(name, sizeof name, "doc%04zu.md", i);
+  join(path, sizeof path, dir, name);
+  int len = snprintf(body, sizeof body, "# %s\n\nA ledger page.\n", name);
+  for (size_t k = 0; k < 40u; k++) {
+    len += snprintf(body + len, sizeof body - (size_t)len,
+                    "passage %04zu %02u reconciles the accrual ledger for the "
+                    "quarter\n",
+                    i, (unsigned)k);
+  }
+  kbc_test_write_file(path, body);
+}
+
+static void write_bulk_corpus(const char *dir) {
+  for (size_t i = 0; i < BULK_DOCS; i++) {
+    write_bulk_doc(dir, i);
+  }
+}
+
+/* What the corpus actually holds, counted from the directory rather than from
+ * what the test believes it wrote: the whole point of these cases is that the
+ * index must match the disk, and a count taken from the test's own
+ * bookkeeping could not tell the two apart. */
+static size_t count_indexable(const char *dir) {
+  DIR *d = opendir(dir);
+  if (d == NULL) {
+    return 0;
+  }
+  size_t n = 0;
+  struct dirent *e;
+  while ((e = readdir(d)) != NULL) {
+    if (e->d_name[0] == '.') {
+      continue;
+    }
+    size_t len = strlen(e->d_name);
+    if (len > 3u && strcmp(e->d_name + len - 3u, ".md") == 0) {
+      n++;
+    }
+  }
+  closedir(d);
+  return n;
+}
+
+/* What the two threads share. `bad` and `detail` are per-thread: a worker has
+ * no business touching the harness's failure counter. */
+typedef struct {
+  _Atomic int stop;
+  _Atomic uint32_t grown;
+} race_shared;
+
+typedef struct {
+  kbc_app *app;
+  const kbc_config *cfg;
+  const char *dir;
+  race_shared *shared;
+  unsigned iters;
+  /* Whether the other thread leaves the document SET alone. A rebuild's
+   * promoted index can only be compared with the directory mid-run when
+   * nothing is being added to it; when the other thread is creating
+   * documents, the two are legitimately a step apart until it catches up. */
+  bool count_stable;
+  /* What the live index held before this thread started adding to it. */
+  int64_t base_docs;
+  const char *bad;
+  char detail[256];
+} racer;
+
+static void race_fail(racer *r, const char *what, const char *detail) {
+  if (r->bad != NULL) {
+    return;
+  }
+  r->bad = what;
+  snprintf(r->detail, sizeof r->detail, "%s", detail != NULL ? detail : "");
+}
+
+/* A full rebuild, over and over, beside the other thread. It runs until its
+ * iteration count is spent and then says so, so the other thread is busy for
+ * the whole window rather than for the first few percent of it. After every
+ * rebuild this thread reads back the file the daemon would restart on. */
+static void *rebuild_loop(void *arg) {
+  racer *r = arg;
+  kbc_err err;
+  for (unsigned i = 0; i < r->iters; i++) {
+    kbc_err_reset(&err);
+    kbc_status s = kbc_app_reindex(r->app, &err);
+    if (kbc_failed(s)) {
+      race_fail(r, "kbc_app_reindex failed", err.msg);
+      continue;
+    }
+    kbc_err_reset(&err);
+    kbc_index *ix = kbc_index_open(r->cfg->index_path, &err);
+    if (ix == NULL) {
+      race_fail(r, "the promoted index does not open", err.msg);
+      continue;
+    }
+    uint32_t docs = kbc_index_doc_count(ix);
+    size_t on_disk = count_indexable(r->dir);
+    kbc_index_free(ix);
+    if (r->count_stable && (size_t)docs != on_disk) {
+      char msg[64];
+      snprintf(msg, sizeof msg, "%u documents promoted, %zu on disk", docs,
+               on_disk);
+      race_fail(r, "the promoted index is not a corpus state", msg);
+    }
+  }
+  atomic_store_explicit(&r->shared->stop, 1, memory_order_relaxed);
+  return NULL;
+}
+
+/* One document, rewritten and reindexed in place, over and over, for as long
+ * as the rebuilds run. The rewrite is what makes the two indexes genuinely
+ * DIFFERENT bytes: a single-file update of an unchanged document serialises to
+ * the same file as the rebuild, and two writers producing identical bytes
+ * leave no trace of the collision. */
+static void *touch_loop(void *arg) {
+  racer *r = arg;
+  const char *name = "doc0000.md";
+  char path[KBC_TEST_PATH_MAX];
+  join(path, sizeof path, r->dir, name);
+  kbc_err err;
+  for (unsigned i = 0; i < TOUCH_ITERS; i++) {
+    if (atomic_load_explicit(&r->shared->stop, memory_order_relaxed) != 0) {
+      break;
+    }
+    char body[256];
+    snprintf(body, sizeof body,
+             "# Revision\n\nThe ledger page was rewritten, revision %u.\n", i);
+    if (write_file_atomic(path, body) != 0) {
+      race_fail(r, "the revised document could not be written", path);
+      return NULL;
+    }
+    kbc_err_reset(&err);
+    kbc_status s = kbc_app_reindex_file(r->app, CORPUS_A, name, &err);
+    if (kbc_failed(s)) {
+      race_fail(r, "kbc_app_reindex_file failed", err.msg);
+      return NULL;
+    }
+  }
+  return NULL;
+}
+
+/* A document that did not exist when the walk started, created and indexed on
+ * its own, for as long as the rebuilds run.
+ *
+ * After every one it re-checks the invariant rather than only at the end: a
+ * rebuild that swept a document the store had already committed does not
+ * repair itself, because the watcher does not re-fire for a path it has
+ * already reported. So a loss is permanent, and the very next iteration sees
+ * it. Checking only the final state would instead be a bet on whether the
+ * LAST document happened to land inside the LAST rebuild's window. */
+static void *grow_loop(void *arg) {
+  racer *r = arg;
+  kbc_err err;
+  for (unsigned i = 0; i < GROW_ITERS; i++) {
+    if (atomic_load_explicit(&r->shared->stop, memory_order_relaxed) != 0) {
+      break;
+    }
+    char name[64], body[256], path[KBC_TEST_PATH_MAX];
+    snprintf(name, sizeof name, "extra%04u.md", i);
+    join(path, sizeof path, r->dir, name);
+    snprintf(body, sizeof body,
+             "# Extra %04u\n\nA page that arrived mid-pass.\n", i);
+    if (write_file_atomic(path, body) != 0) {
+      race_fail(r, "the new document could not be written", path);
+      return NULL;
+    }
+    kbc_err_reset(&err);
+    kbc_status s = kbc_app_reindex_file(r->app, CORPUS_A, name, &err);
+    if (kbc_failed(s)) {
+      race_fail(r, "kbc_app_reindex_file failed", err.msg);
+      return NULL;
+    }
+    atomic_fetch_add_explicit(&r->shared->grown, 1u, memory_order_relaxed);
+    /* Every document this thread has finished indexing is still in the live
+     * index. It is there because this thread put it there a moment ago, and a
+     * rebuild that dropped it again has lost it for good. */
+    kbc_app_stats st;
+    kbc_err serr;
+    kbc_err_reset(&serr);
+    if (kbc_failed(kbc_app_stats_get(r->app, &st, &serr))) {
+      race_fail(r, "kbc_app_stats_get failed", serr.msg);
+      return NULL;
+    }
+    uint32_t done =
+        atomic_load_explicit(&r->shared->grown, memory_order_relaxed);
+    const int64_t expect = r->base_docs + (int64_t)done;
+    if (st.index_docs != expect) {
+      char msg[96];
+      snprintf(msg, sizeof msg, "%lld documents indexed, %lld created and kept",
+               (long long)st.index_docs, (long long)expect);
+      race_fail(r, "a rebuild dropped a document the store had committed", msg);
+      return NULL;
+    }
+  }
+  return NULL;
+}
+
+/* A broken symlink is an ordinary thing to find in a documents folder, and it
+ * used to fail the ENTIRE reindex. walk_dir stats each entry with
+ * fstatat(..., 0), which FOLLOWS the link, so a dangling one fails with
+ * ENOENT; the code correctly treats that as "vanished, not an error" and
+ * carries on. But readdir signals end-of-directory by returning NULL and
+ * leaving errno UNCHANGED, and the loop cleared errno only once, before it
+ * started — so the ENOENT that fstatat left behind was read afterwards as a
+ * failure of the walk itself. The reindex returned "readdir <path>: No such
+ * file or directory" and indexed nothing at all.
+ *
+ * This is deterministic: the link is dangling on every run, so the stat that
+ * sets errno always fails, and it is the only entry in the directory, so
+ * nothing later in the loop body can overwrite errno before the loop ends. */
+KBC_TEST(a_dangling_symlink_does_not_fail_the_reindex) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char link[KBC_TEST_PATH_MAX];
+  join(link, sizeof link, f.corpus_a, "dangling.md");
+  KBC_CHECK_EQ_INT(symlink("/nonexistent/kb-c-no-such-target", link), 0);
+  /* Four entries on disk, and the walk must SEE all four: a walk that bailed
+   * out early would also have counted three, so the disk side is asserted to
+   * make the index count mean what it says. */
+  KBC_CHECK_EQ_INT(count_indexable(f.corpus_a), 4);
+
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_MSG(kbc_app_reindex(f.app, &err) == KBC_OK,
+                "one broken symlink failed the whole reindex: %s", err.msg);
+  kbc_app_stats st;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_stats_get(f.app, &st, &err));
+  /* Three, not four: the link resolves to nothing, so it is skipped rather
+ * than ingested and rather than taking the whole walk down with it. */
+  KBC_CHECK_EQ_INT(st.index_docs, 3);
+  fx_teardown(&f);
+}
+
+/* Defect one. Both writers promoted into `<index>.build`, and the atomic write
+ * underneath them names its temp file after the PROCESS, so the two opened
+ * the same file with O_TRUNC and wrote over each other from offset zero. The
+ * promoted index was a splice kbc_index_open rejects, and the daemon refused
+ * to start until an operator deleted it and reindexed — destroying the very
+ * guarantee the fsync-then-rename dance exists to provide. */
+KBC_TEST(a_full_reindex_and_a_single_file_update_never_splice_the_index) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  write_bulk_corpus(f.corpus_a);
+
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  const size_t want = count_indexable(f.corpus_a);
+  KBC_CHECK(want > BULK_DOCS);
+
+  race_shared sh;
+  atomic_init(&sh.stop, 0);
+  atomic_init(&sh.grown, 0u);
+  racer rebuild, touch;
+  memset(&rebuild, 0, sizeof rebuild);
+  memset(&touch, 0, sizeof touch);
+  rebuild.app = touch.app = f.app;
+  rebuild.cfg = touch.cfg = f.cfg;
+  rebuild.dir = touch.dir = f.corpus_a;
+  rebuild.shared = touch.shared = &sh;
+  rebuild.iters = RACE_ITERS;
+  /* The other thread rewrites a document in place, so the set on disk never
+   * moves: every promoted generation must match it exactly. */
+  rebuild.count_stable = true;
+
+  pthread_t rebuild_th, touch_th;
+  KBC_CHECK_EQ_INT(pthread_create(&rebuild_th, NULL, rebuild_loop, &rebuild),
+                   0);
+  KBC_CHECK_EQ_INT(pthread_create(&touch_th, NULL, touch_loop, &touch), 0);
+  KBC_CHECK_EQ_INT(pthread_join(rebuild_th, NULL), 0);
+  KBC_CHECK_EQ_INT(pthread_join(touch_th, NULL), 0);
+
+  KBC_CHECK_MSG(rebuild.bad == NULL, "full rebuild - %s: %s", rebuild.bad,
+                rebuild.detail);
+  KBC_CHECK_MSG(touch.bad == NULL, "single-file update - %s: %s", touch.bad,
+                touch.detail);
+
+  kbc_err_reset(&err);
+  kbc_index *ix = kbc_index_open(f.cfg->index_path, &err);
+  KBC_CHECK_MSG(ix != NULL, "the promoted index does not open: %s", err.msg);
+  if (ix != NULL) {
+    KBC_CHECK_EQ_INT(kbc_index_doc_count(ix), (long long)want);
+    kbc_index_free(ix);
+  }
+  kbc_app_stats st;
+  KBC_CHECK_OK(kbc_app_stats_get(f.app, &st, &err));
+  KBC_CHECK_EQ_INT(st.index_docs, (long long)want);
+  fx_teardown(&f);
+}
+
+/* Defect two, which is the same missing exclusion seen from the other side.
+ * The full rebuild took the write lock only for its final swap, so for the
+ * whole of the walk a single-file update could commit and promote a document
+ * the walk had not seen; the rebuild then swept that document's store row away
+ * and published an index without it. The watcher does not re-fire for a path
+ * it has already reported, so the divergence lasted until the next full scan,
+ * with every status endpoint reporting success. */
+KBC_TEST(a_full_reindex_never_drops_a_document_a_single_file_update_added) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  write_bulk_corpus(f.corpus_a);
+
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  race_shared sh;
+  atomic_init(&sh.stop, 0);
+  atomic_init(&sh.grown, 0u);
+  racer rebuild, grow;
+  memset(&rebuild, 0, sizeof rebuild);
+  memset(&grow, 0, sizeof grow);
+  rebuild.app = grow.app = f.app;
+  rebuild.cfg = grow.cfg = f.cfg;
+  rebuild.dir = grow.dir = f.corpus_a;
+  rebuild.shared = grow.shared = &sh;
+  rebuild.iters = RACE_ITERS;
+  /* The other thread is ADDING documents, so a promoted index is legitimately
+   * one document behind the directory until that thread catches up. The
+   * cross-check that the two are equal is made once, at quiescence, below. */
+  rebuild.base_docs = grow.base_docs =
+      (int64_t)count_indexable(f.corpus_a);
+
+  pthread_t rebuild_th, grow_th;
+  KBC_CHECK_EQ_INT(pthread_create(&rebuild_th, NULL, rebuild_loop, &rebuild),
+                   0);
+  KBC_CHECK_EQ_INT(pthread_create(&grow_th, NULL, grow_loop, &grow), 0);
+  KBC_CHECK_EQ_INT(pthread_join(rebuild_th, NULL), 0);
+  KBC_CHECK_EQ_INT(pthread_join(grow_th, NULL), 0);
+
+  KBC_CHECK_MSG(rebuild.bad == NULL, "full rebuild - %s: %s", rebuild.bad,
+                rebuild.detail);
+  KBC_CHECK_MSG(grow.bad == NULL, "single-file update - %s: %s", grow.bad,
+                grow.detail);
+
+  /* The live index against the directory: every document that exists is in
+   * it. A rebuild that ran with a single-file update inside it loses exactly
+   * one of these. */
+  const size_t on_disk = count_indexable(f.corpus_a);
+  const uint32_t grown = atomic_load_explicit(&sh.grown, memory_order_relaxed);
+  KBC_CHECK_EQ_INT(on_disk, (long long)(3u + BULK_DOCS + grown));
+  kbc_app_stats st;
+  KBC_CHECK_OK(kbc_app_stats_get(f.app, &st, &err));
+  KBC_CHECK_MSG(st.index_docs == (int64_t)on_disk,
+                "the live index holds %lld documents, the corpus has %zu",
+                (long long)st.index_docs, on_disk);
+  fx_teardown(&f);
+}
+
+/* A second connection to the app's own database. store.h is frozen and has no
+ * fault-injection seam, and the two cases below need a store write that
+ * fails — something a healthy filesystem never produces on demand. */
+typedef struct {
+  sqlite3 *db;
+} db_side;
+
+static bool db_side_open(db_side *side, const kbc_config *cfg) {
+  if (sqlite3_open_v2(cfg->db_path, &side->db,
+                      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                      NULL) != SQLITE_OK) {
+    fprintf(stderr, "  sqlite3_open %s: %s\n", cfg->db_path,
+            side->db != NULL ? sqlite3_errmsg(side->db) : "no handle");
+    return false;
+  }
+  return true;
+}
+
+static kbc_status db_side_exec(db_side *side, const char *sql) {
+  char *msg = NULL;
+  if (sqlite3_exec(side->db, sql, NULL, NULL, &msg) == SQLITE_OK) {
+    return KBC_OK;
+  }
+  kbc_status s = kbc_err_set(NULL, KBC_ERR_IO, "%s", msg != NULL ? msg : sql);
+  sqlite3_free(msg);
+  return s;
+}
+
+static void db_side_close(db_side *side) {
+  if (side->db != NULL) {
+    (void)sqlite3_close(side->db);
+    side->db = NULL;
+  }
+}
+
+/* Defect three. `s` was left holding the kbc_str_printf result from two lines
+ * earlier — which is KBC_OK, because `vanished` came from the stat and not the
+ * printf — so a store_forget_path failure fell through to the success path.
+ * The caller was told the removal worked, the artifact row and the graph rows
+ * stayed, the deleted document stayed searchable, and the watcher logged
+ * nothing at all. */
+KBC_TEST(a_removal_the_store_cannot_commit_is_reported_not_swallowed) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  char path[64], title[64], id[32];
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "verdigris", NULL, path, sizeof path,
+                                  title, sizeof title, id, sizeof id, NULL),
+                   1);
+  KBC_CHECK_EQ_STR(path, "c.md");
+
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, "c.md");
+  KBC_CHECK_MSG(unlink(p) == 0, "unlink %s: %s", p, strerror(errno));
+
+  /* forget_document demotes the inbound edges to pending links and deletes
+   * the outbound ones in one transaction, so a store without the graph table
+   * cannot drop the document at all. */
+  db_side side;
+  memset(&side, 0, sizeof side);
+  if (!db_side_open(&side, f.cfg)) {
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK_OK(db_side_exec(&side, "DROP TABLE edges;"));
+
+  kbc_err_reset(&err);
+  kbc_status s = kbc_app_reindex_file(f.app, CORPUS_A, "c.md", &err);
+  KBC_CHECK_MSG(kbc_failed(s),
+                "a removal the store refused reported KBC_OK (last error: %s)",
+                err.msg);
+  if (kbc_failed(s)) {
+    KBC_CHECK_ERR_MSG(err);
+  }
+  db_side_close(&side);
+
+  /* Nothing is half-applied: the row is in the store AND in the index, which
+   * is the state the daemon was in before the removal was asked for. The
+   * document stays searchable — loudly, with the failure on the record. */
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "verdigris", NULL, path, sizeof path,
+                                  title, sizeof title, id, sizeof id, NULL),
+                   1);
+  KBC_CHECK_EQ_STR(path, "c.md");
+  fx_teardown(&f);
+}
+
+/* Each carries its own heap array of link targets, which the ingest loop hands
+ * to the batch it is building. Only one document names the generation word,
+ * so a search for it names exactly one file. */
+static void write_link_doc(const char *dir, size_t i, const char *generation) {
+  char name[64], body[2048], path[KBC_TEST_PATH_MAX];
+  snprintf(name, sizeof name, "link%04zu.md", i);
+  join(path, sizeof path, dir, name);
+  int len = snprintf(body, sizeof body, "# %s\n\nThis page mentions %s.\n",
+                     name, i == 0u ? generation : "ledger");
+  for (size_t k = 0; k < LINK_LINKS; k++) {
+    len += snprintf(body + len, sizeof body - (size_t)len,
+                    "[target %zu](doc%04zu.md)\n", k, i);
+  }
+  kbc_test_write_file(path, body);
+}
+
+typedef struct {
+  db_side side;
+  long long cutoff_ns;
+  _Atomic int stop;
+  _Atomic int locked;
+} write_lock_holder;
+
+static void nap_us(long us) {
+  struct timespec ts;
+  ts.tv_sec = (time_t)(us / 1000000L);
+  ts.tv_nsec = (us % 1000000L) * 1000L;
+  (void)nanosleep(&ts, NULL);
+}
+
+/* Waits until a rebuild has re-stored two documents, then takes sqlite's
+ * write lock and holds it. The store's own writes then time out, which is the
+ * only way to reach the ingest loop's error unwind: the files on disk cannot
+ * make a store write fail on demand. */
+static void *hold_write_lock(void *arg) {
+  write_lock_holder *h = arg;
+  (void)db_side_exec(&h->side, "PRAGMA busy_timeout = 30000;");
+  sqlite3_stmt *q = NULL;
+  if (sqlite3_prepare_v2(h->side.db,
+                         "SELECT count(*) FROM artifacts WHERE mtime_ns > ?1;",
+                         -1, &q, NULL) != SQLITE_OK) {
+    return NULL;
+  }
+  for (;;) {
+    if (atomic_load_explicit(&h->stop, memory_order_relaxed) != 0) {
+      break;
+    }
+    int rc = sqlite3_reset(q);
+    if (rc == SQLITE_OK) {
+      rc = sqlite3_bind_int64(q, 1, h->cutoff_ns);
+    }
+    int n = -1;
+    if (rc == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) {
+      n = sqlite3_column_int(q, 0);
+    }
+    if (n >= 2) {
+      break;
+    }
+    nap_us(200);
+  }
+  sqlite3_finalize(q);
+  if (db_side_exec(&h->side, "BEGIN IMMEDIATE;") == KBC_OK) {
+    atomic_store_explicit(&h->locked, 1, memory_order_relaxed);
+    while (atomic_load_explicit(&h->stop, memory_order_relaxed) == 0) {
+      nap_ms(1);
+    }
+    (void)db_side_exec(&h->side, "ROLLBACK;");
+  }
+  return NULL;
+}
+
+/* Defect four. Both of the ingest loop's error returns freed the batch ARRAY
+ * and not the link-target arrays inside it, so a rebuild that died on its Nth
+ * document leaked every one the first N-1 had handed over. The observable
+ * half of the case is the unwind: the old generation keeps serving, nothing
+ * half-built is published, and the next reindex still runs — which is what
+ * proves the lock the pass now holds is released on that path. The leak
+ * itself is what the ASan/LSan lane is there to catch. */
+KBC_TEST(an_aborted_reindex_leaves_the_previous_generation_serving) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  for (size_t i = 0; i < LINK_DOCS; i++) {
+    write_link_doc(f.corpus_a, i, "quokka");
+  }
+
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  char path[64], title[64], id[32];
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "quokka", NULL, path, sizeof path,
+                                  title, sizeof title, id, sizeof id, NULL),
+                   1);
+
+  /* Each attempt writes a fresh generation, so the rebuild has a real store
+   * phase to be interrupted in, and asks a second connection to take sqlite's
+   * write lock as soon as the pass starts re-storing. Whether the holder wins
+   * that race is timing, so the case RETRIES rather than declaring itself
+   * broken: an attempt whose lock lands after the pass has finished its store
+   * writes proves nothing, and a test that failed on that would be a test of
+   * the machine's load. What it asserts is that the injection can be made to
+   * land — and that when it does, everything downstream is right. */
+  bool aborted = false;
+  int completed = 0; /* attempts that ran to the end and published */
+  kbc_status s = KBC_OK;
+  for (int attempt = 0; attempt < ABORT_ATTEMPTS && !aborted; attempt++) {
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    const long long cutoff =
+        (long long)now.tv_sec * 1000000000LL + (long long)now.tv_nsec;
+    for (size_t i = 0; i < LINK_DOCS; i++) {
+      write_link_doc(f.corpus_a, i, "wombat");
+    }
+
+    write_lock_holder h;
+    memset(&h, 0, sizeof h);
+    atomic_init(&h.stop, 0);
+    atomic_init(&h.locked, 0);
+    h.cutoff_ns = cutoff;
+    if (!db_side_open(&h.side, f.cfg)) {
+      fx_teardown(&f);
+      return;
+    }
+    pthread_t th;
+    KBC_CHECK_EQ_INT(pthread_create(&th, NULL, hold_write_lock, &h), 0);
+    kbc_err_reset(&err);
+    s = kbc_app_reindex(f.app, &err);
+    atomic_store_explicit(&h.stop, 1, memory_order_relaxed);
+    KBC_CHECK_EQ_INT(pthread_join(th, NULL), 0);
+    db_side_close(&h.side);
+    if (kbc_failed(s)) {
+      aborted = true;
+    } else {
+      completed++;
+    }
+  }
+
+  KBC_CHECK_MSG(aborted,
+                "a second connection never managed to take sqlite's write lock "
+                "during a rebuild's store phase in %d attempts, so this case "
+                "proved nothing",
+                ABORT_ATTEMPTS);
+  if (aborted) {
+    KBC_CHECK_ERR_MSG(err);
+    /* Nothing was published: the live index is still whatever the last
+     * attempt that COMPLETED installed, not a half-built one. Which
+     * generation that is depends on whether any attempt got that far. */
+    const char *live = completed > 0 ? "wombat" : "quokka";
+    const char *gone = completed > 0 ? "quokka" : "wombat";
+    KBC_CHECK_EQ_INT(
+        first_hit_path(f.app, live, NULL, path, sizeof path, title, sizeof title,
+                       id, sizeof id, NULL),
+        1);
+    KBC_CHECK_EQ_INT(
+        first_hit_path(f.app, gone, NULL, path, sizeof path, title, sizeof title,
+                       id, sizeof id, NULL),
+        0);
+  }
+
+  /* And the lock the pass held is free again — if the unwind had kept it,
+   * this call would never return. */
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "wombat", NULL, path, sizeof path,
+                                  title, sizeof title, id, sizeof id, NULL),
+                   1);
+  fx_teardown(&f);
+}
+
 int main(void) {
   static const kbc_test_case cases[] = {
       {"ingest_indexes_every_document", ingest_indexes_every_document},
@@ -2006,6 +2694,16 @@ int main(void) {
     {"a_tag_value_is_case_sensitive_as_it_is_in_the_original",
      a_tag_value_is_case_sensitive_as_it_is_in_the_original},
     {"scope_is_still_refused", scope_is_still_refused},
+    {"a_dangling_symlink_does_not_fail_the_reindex",
+     a_dangling_symlink_does_not_fail_the_reindex},
+    {"a_full_reindex_and_a_single_file_update_never_splice_the_index",
+     a_full_reindex_and_a_single_file_update_never_splice_the_index},
+    {"a_full_reindex_never_drops_a_document_a_single_file_update_added",
+     a_full_reindex_never_drops_a_document_a_single_file_update_added},
+    {"a_removal_the_store_cannot_commit_is_reported_not_swallowed",
+     a_removal_the_store_cannot_commit_is_reported_not_swallowed},
+    {"an_aborted_reindex_leaves_the_previous_generation_serving",
+     an_aborted_reindex_leaves_the_previous_generation_serving},
       {NULL, NULL},
   };
   return kbc_test_run("app", cases);
