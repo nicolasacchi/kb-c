@@ -10,9 +10,9 @@
  *
  * SQL discipline: every value that came from a file, an HTTP request or a
  * query string is bound, never formatted into a statement. The only strings
- * assembled here are the fixed filter clauses of the four variants in
- * kbc_store_list_artifact_ids, each a compile-time literal chosen by a
- * boolean — never user text.
+ * chosen rather than bound are the fixed filter clauses of the four variants
+ * in kbc_store_list_artifact_ids and the four in kbc_store_list_errors, each
+ * a compile-time literal picked by a boolean — never user text.
  */
 
 #include <stdio.h>
@@ -121,8 +121,134 @@ static const char *const SCHEMA_V4 =
     "CREATE INDEX IF NOT EXISTS doc_metas_kv"
     " ON doc_metas(corpus, key, value);";
 
- 
-#define SCHEMA_VERSION 4
+/* v5..v10 — the rest of the Rust original's per-kb schema that kb-c claims.
+ * The DDL is the Rust DDL (kb-core/migrations/), unchanged except for the one
+ * rename kb-c already makes: `source_slug` is `corpus` everywhere, because
+ * kb-c calls a source root a corpus. A Rust migration that only ALTERed a
+ * table is folded into the CREATE that introduces it — these tables have
+ * never existed in any kb-c schema, so there is nothing to ALTER — and the
+ * indexes are the FINAL upstream form, because an index is only useful if it
+ * matches the query it serves.
+ *
+ * v5 — sources, index runs, ingest errors (V0001). */
+static const char *const SCHEMA_V5 =
+    "CREATE TABLE IF NOT EXISTS sources ("
+    " slug TEXT PRIMARY KEY,"
+    " path TEXT NOT NULL UNIQUE,"
+    " added_at INTEGER NOT NULL,"
+    " paused INTEGER NOT NULL DEFAULT 0);"
+    "CREATE TABLE IF NOT EXISTS index_runs ("
+    " id TEXT PRIMARY KEY,"
+    " corpus TEXT NOT NULL REFERENCES sources(slug),"
+    " started_at INTEGER NOT NULL,"
+    " finished_at INTEGER,"
+    " ok_count INTEGER NOT NULL DEFAULT 0,"
+    " err_count INTEGER NOT NULL DEFAULT 0);"
+    "CREATE INDEX IF NOT EXISTS idx_runs_source ON index_runs(corpus);"
+    "CREATE INDEX IF NOT EXISTS idx_runs_started ON index_runs(started_at);"
+    "CREATE TABLE IF NOT EXISTS errors ("
+    " id TEXT PRIMARY KEY,"
+    " kind TEXT NOT NULL,"
+    " corpus TEXT NOT NULL,"
+    " path TEXT NOT NULL,"
+    " message TEXT NOT NULL,"
+    " content_hash TEXT,"
+    " retry_count INTEGER NOT NULL DEFAULT 0,"
+    " created_at INTEGER NOT NULL,"
+    " dismissed INTEGER NOT NULL DEFAULT 0);"
+    "CREATE INDEX IF NOT EXISTS idx_errors_source ON errors(corpus);"
+    "CREATE INDEX IF NOT EXISTS idx_errors_path ON errors(path);"
+    /* PARTIAL, and deliberately so: dismissed = 0 is the only predicate the
+     * open-errors surface ever asks for, so a full index would carry every
+     * resolved row forever to answer a query that never wants it. */
+    "CREATE INDEX IF NOT EXISTS idx_errors_open"
+    " ON errors(dismissed) WHERE dismissed = 0;";
+
+/* v6 — the reading/search/comment history (V0003 + V0007 + V0012 + V0014 +
+ * V0022 + V0034). One polymorphic table so a timeline is one ORDER BY rather
+ * than a UNION of three; the CHECK is what keeps "one of three kinds" an
+ * invariant of the table rather than of every caller.
+ *
+ * Both later indexes are PARTIAL for the same reason the errors one is: each
+ * exists for exactly one query, and restricting the index to the rows that
+ * query can match is what turns a full scan into a seek. */
+static const char *const SCHEMA_V6 =
+    "CREATE TABLE IF NOT EXISTS history ("
+    " id INTEGER PRIMARY KEY,"
+    " kind TEXT NOT NULL CHECK (kind IN ('open','search','comment')),"
+    " artifact_id TEXT,"
+    " query TEXT,"
+    " comment_id TEXT,"
+    " scroll_y INTEGER NOT NULL DEFAULT 0,"
+    " scroll_max INTEGER NOT NULL DEFAULT 0,"
+    " started_at INTEGER NOT NULL,"
+    " updated_at INTEGER NOT NULL,"
+    " scroll_y_max INTEGER NOT NULL DEFAULT 0,"
+    " active_ms INTEGER NOT NULL DEFAULT 0,"
+    " last_section TEXT,"
+    " source TEXT,"
+    " user TEXT NOT NULL DEFAULT '');"
+    "CREATE INDEX IF NOT EXISTS idx_history_started"
+    " ON history(started_at DESC);"
+    "CREATE INDEX IF NOT EXISTS idx_history_artifact_open"
+    " ON history(artifact_id, started_at DESC)"
+    " WHERE artifact_id IS NOT NULL AND kind = 'open';"
+    "CREATE INDEX IF NOT EXISTS idx_history_search"
+    " ON history(query, started_at DESC) WHERE kind = 'search';";
+
+/* v7 — the corkboard, the artifacts a user has anchored (V0005). */
+static const char *const SCHEMA_V7 =
+    "CREATE TABLE IF NOT EXISTS corkboard ("
+    " artifact_id TEXT PRIMARY KEY,"
+    " created_at INTEGER NOT NULL);"
+    "CREATE INDEX IF NOT EXISTS idx_corkboard_created"
+    " ON corkboard(created_at DESC);";
+
+/* v8 — pinned memories, which bypass the recall decay floor (V0006). Same
+ * shape as the corkboard and for the same reason. */
+static const char *const SCHEMA_V8 =
+    "CREATE TABLE IF NOT EXISTS pinned_memories ("
+    " artifact_id TEXT PRIMARY KEY,"
+    " pinned_at INTEGER NOT NULL);"
+    "CREATE INDEX IF NOT EXISTS idx_pinned_memories_at"
+    " ON pinned_memories(pinned_at DESC);";
+
+/* v9 — per-file exclusion, durable operator intent keyed by the
+ * source-relative path (V0023). */
+static const char *const SCHEMA_V9 =
+    "CREATE TABLE IF NOT EXISTS excluded_files ("
+    " path TEXT PRIMARY KEY,"
+    " excluded_at INTEGER NOT NULL,"
+    " note TEXT);";
+
+/* v10 — the stable first-indexed anchor per artifact (V0033). No index: the
+ * only query it serves is a primary-key probe, and it outlives the artifact
+ * (there is no foreign key, on purpose). */
+static const char *const SCHEMA_V10 =
+    "CREATE TABLE IF NOT EXISTS doc_first_seen ("
+    " artifact_id TEXT PRIMARY KEY,"
+    " first_indexed_unix INTEGER NOT NULL);";
+
+/* The ladder, in the shape refinery's Runner has it: an ordered list of
+ * (version, sql), applied FORWARD-ONLY, one transaction per version. Rust
+ * reads its binary epoch from the runner rather than from a second constant
+ * so the two can never drift (sibling.rs:79); BINARY_EPOCH is that read,
+ * and there is deliberately no SCHEMA_VERSION constant to fall out of step
+ * with the last entry. */
+typedef struct {
+  int version;
+  const char *sql;
+} kbc_migration;
+
+static const kbc_migration MIGRATIONS[] = {
+    {1, SCHEMA_V1},   {2, SCHEMA_V2},   {3, SCHEMA_V3},   {4, SCHEMA_V4},
+    {5, SCHEMA_V5},   {6, SCHEMA_V6},   {7, SCHEMA_V7},   {8, SCHEMA_V8},
+    {9, SCHEMA_V9},   {10, SCHEMA_V10},
+};
+
+#define MIGRATION_COUNT (sizeof(MIGRATIONS) / sizeof(MIGRATIONS[0]))
+#define BINARY_EPOCH MIGRATIONS[MIGRATION_COUNT - 1].version
+
 
 #define ARTIFACT_COLS                                                          \
   "id, corpus, path, title, kind, mtime_ns, size_bytes, content_hash, "     \
@@ -169,6 +295,9 @@ enum {
   " FROM artifacts WHERE corpus = ?1 AND path = ?2;"
 
 static kbc_status migrate_locked(kbc_store *s, kbc_err *err);
+static kbc_status volume_epoch(kbc_err *err, const kbc_store *s, int64_t *out);
+static kbc_status refuse_if_volume_ahead(kbc_err *err, const char *db_path,
+                                         int64_t volume);
 static kbc_status require_text(kbc_err *err, const char *what, const char *v,
                                size_t max);
 
@@ -380,12 +509,33 @@ kbc_store *kbc_store_open(const kbc_config *cfg, kbc_err *err) {
     return NULL;
   }
 
+  /* busy_timeout first, and alone: it is a connection setting, not a write to
+   * the file, and without it the guard's read below would fail outright on a
+   * volume another process is opening at the same moment. */
+  if (exec_plain(err, s, "PRAGMA busy_timeout = 5000;") != KBC_OK) {
+    kbc_store_close(s);
+    return NULL;
+  }
+
+  /* Before the pragmas that touch the file, before anything at all: a volume
+   * this binary cannot read must not be written to even by a journal-mode
+   * change. The read is a plain SELECT against a table name that is a literal
+   * here, so there is nothing user-influenced in it. */
+  int64_t volume = 0;
+  if (volume_epoch(err, s, &volume) != KBC_OK) {
+    kbc_store_close(s);
+    return NULL;
+  }
+  if (refuse_if_volume_ahead(err, cfg->db_path, volume) != KBC_OK) {
+    kbc_store_close(s);
+    return NULL;
+  }
+
   /* WAL: readers never block the writer. NORMAL: a crash may lose the last
    * transaction but never the database. */
   const char *const pragmas[] = {
       "PRAGMA journal_mode = WAL;", "PRAGMA synchronous = NORMAL;",
-      "PRAGMA foreign_keys = ON;",  "PRAGMA busy_timeout = 5000;",
-      "PRAGMA temp_store = MEMORY;",
+      "PRAGMA foreign_keys = ON;",  "PRAGMA temp_store = MEMORY;",
   };
   for (size_t i = 0; i < sizeof(pragmas) / sizeof(pragmas[0]); i++) {
     if (exec_plain(err, s, pragmas[i]) != KBC_OK) {
@@ -418,15 +568,63 @@ int kbc_store_schema_version(const kbc_store *s) {
 
 /* ---------------------------------------------------------- migrations --- */
 
-static kbc_status apply_v1(kbc_store *s, kbc_err *err) {
-  kbc_status st = exec_plain(err, s, SCHEMA_V1);
+/* The version a volume has reached, or 0 for a volume that has never been
+ * migrated — a brand-new file, or one whose bookkeeping table does not exist
+ * yet. That case is Rust's `None` (sibling.rs:95) and is never a refusal, so
+ * it is reported as 0 rather than as a state of its own. */
+static kbc_status volume_epoch(kbc_err *err, const kbc_store *s,
+                               int64_t *out) {
+  int64_t exists = 0;
+  kbc_status st = count_query(
+      err, s,
+      "SELECT COUNT(*) FROM sqlite_master"
+      " WHERE type = 'table' AND name = 'schema_version';",
+      NULL, &exists);
   if (st != KBC_OK) return st;
+  if (exists == 0) {
+    *out = 0;
+    return KBC_OK;
+  }
+  return count_query(err, s,
+                     "SELECT IFNULL(MAX(version), 0) FROM schema_version;", NULL,
+                     out);
+}
+
+/* The boot guard, ported from Rust's refuse_if_volume_ahead
+ * (kb-core/src/sibling.rs:119). The condition is `volume > binary` and
+ * nothing else: a volume at or behind the binary is what every ordinary open
+ * looks like, and only a volume AHEAD has been forward-migrated by a newer
+ * binary that this one cannot read. The direction is written out here rather
+ * than folded into the caller's comparison because getting it backwards
+ * refuses every valid volume.
+ *
+ * A hard error naming both epochs, never a warning: refinery only ever
+ * migrates forward, so the alternative is a green health check on a daemon
+ * that fails on the first query touching a column it has never heard of —
+ * the 13.5 h outage that made Rust write this. Both epochs lead the message
+ * because kbc_err's buffer is 256 bytes and a long db_path would otherwise
+ * truncate them off the end. */
+static kbc_status refuse_if_volume_ahead(kbc_err *err, const char *db_path,
+                                         int64_t volume) {
+  if (volume <= (int64_t)BINARY_EPOCH) return KBC_OK;
+  return kbc_err_set(err, KBC_ERR_CONFLICT,
+                     "refusing to open %s: schema epoch V%lld on disk is NEWER "
+                     "than this binary's V%d - deploy a binary >= epoch V%lld "
+                     "or restore the backup matching epoch V%d",
+                     db_path, (long long)volume, BINARY_EPOCH,
+                     (long long)volume, BINARY_EPOCH);
+}
+
+/* Records one version INSIDE the transaction that applies it, so the
+ * recorded version can never claim a step that did not commit. */
+static kbc_status record_version(kbc_err *err, const kbc_store *s,
+                                 int version) {
   sqlite3_stmt *ins = NULL;
-  st = prepare(err, s,
-               "INSERT OR IGNORE INTO schema_version(version) VALUES (?1);",
-               &ins);
-  if (st != KBC_OK) return st;
-  st = bind_i64(err, s, ins, 1, 1); /* step 1, whatever SCHEMA_VERSION is today */
+  kbc_status st = prepare(err, s,
+                           "INSERT OR IGNORE INTO schema_version(version) "
+                           "VALUES (?1);",
+                           &ins);
+  if (st == KBC_OK) st = bind_i64(err, s, ins, 1, version);
   if (st == KBC_OK) {
     int step = sqlite3_step(ins);
     if (step != SQLITE_DONE)
@@ -435,61 +633,6 @@ static kbc_status apply_v1(kbc_store *s, kbc_err *err) {
   kbc_status fin = finalize(err, s, ins, st);
   return st != KBC_OK ? st : fin;
 }
-
-static kbc_status apply_v2(kbc_store *s, kbc_err *err) {
-  kbc_status st = exec_plain(err, s, SCHEMA_V2);
-  if (st != KBC_OK) return st;
-  sqlite3_stmt *ins = NULL;
-  st = prepare(err, s,
-               "INSERT OR IGNORE INTO schema_version(version) VALUES (?1);",
-               &ins);
-  if (st != KBC_OK) return st;
-  st = bind_i64(err, s, ins, 1, 2);
-  if (st == KBC_OK) {
-    int step = sqlite3_step(ins);
-    if (step != SQLITE_DONE)
-      st = sql_fail(err, s, "record schema version", step);
-  }
-  kbc_status fin = finalize(err, s, ins, st);
-  return st != KBC_OK ? st : fin;
-}
-
-static kbc_status apply_v3(kbc_store *s, kbc_err *err) {
-  kbc_status st = exec_plain(err, s, SCHEMA_V3);
-  if (st != KBC_OK) return st;
-  sqlite3_stmt *ins = NULL;
-  st = prepare(err, s,
-               "INSERT OR IGNORE INTO schema_version(version) VALUES (?1);",
-               &ins);
-  if (st != KBC_OK) return st;
-  st = bind_i64(err, s, ins, 1, 3);
-  if (st == KBC_OK) {
-    int step = sqlite3_step(ins);
-    if (step != SQLITE_DONE)
-      st = sql_fail(err, s, "record schema version", step);
-  }
-  kbc_status fin = finalize(err, s, ins, st);
-  return st != KBC_OK ? st : fin;
-}
-
-static kbc_status apply_v4(kbc_store *s, kbc_err *err) {
-  kbc_status st = exec_plain(err, s, SCHEMA_V4);
-  if (st != KBC_OK) return st;
-  sqlite3_stmt *ins = NULL;
-  st = prepare(err, s,
-               "INSERT OR IGNORE INTO schema_version(version) VALUES (?1);",
-               &ins);
-  if (st != KBC_OK) return st;
-  st = bind_i64(err, s, ins, 1, 4);
-  if (st == KBC_OK) {
-    int step = sqlite3_step(ins);
-    if (step != SQLITE_DONE)
-      st = sql_fail(err, s, "record schema version", step);
-  }
-  kbc_status fin = finalize(err, s, ins, st);
-  return st != KBC_OK ? st : fin;
-}
-
 
 static kbc_status migrate_locked(kbc_store *s, kbc_err *err) {
   kbc_status st = exec_plain(err, s,
@@ -498,32 +641,31 @@ static kbc_status migrate_locked(kbc_store *s, kbc_err *err) {
   if (st != KBC_OK) return st;
 
   int64_t have = 0;
-  st = count_query(err, s,
-                   "SELECT IFNULL(MAX(version), 0) FROM schema_version;", NULL,
-                   &have);
+  st = volume_epoch(err, s, &have);
   if (st != KBC_OK) return st;
-  if (have >= SCHEMA_VERSION) {
+  if (have >= (int64_t)BINARY_EPOCH) {
     atomic_store(s->version, (int)have);
     return KBC_OK;
   }
 
-  /* One transaction for the whole ladder: each step and its version record
-   * land together, so a crash mid-migration leaves the previous version
-   * intact and the next open re-runs the same steps. Every step is written
-   * to be re-runnable (IF NOT EXISTS / OR IGNORE), so a database that
-   * already has step 1 only pays for step 2. */
-  st = exec_plain(err, s, "BEGIN IMMEDIATE;");
-  if (st != KBC_OK) return st;
-  if (have < 1) st = apply_v1(s, err);
-  if (st == KBC_OK && have < 2) st = apply_v2(s, err);
-  if (st == KBC_OK && have < 3) st = apply_v3(s, err);
-  if (st == KBC_OK && have < 4) st = apply_v4(s, err);
-  if (st == KBC_OK) st = exec_plain(err, s, "COMMIT;");
-  if (st != KBC_OK) {
-    rollback(s);
-    return st;
+  /* ONE TRANSACTION PER VERSION. That granularity IS the property: a version
+   * that fails leaves the recorded version at the last one that fully
+   * committed, so the next open re-runs exactly the version that failed and
+   * none of the ones before it. Every step is written to be re-runnable (IF
+   * NOT EXISTS / OR IGNORE), so a database that already carries a step only
+   * pays for the ones after it. */
+  for (size_t i = 0; i < MIGRATION_COUNT; i++) {
+    if ((int64_t)MIGRATIONS[i].version <= have) continue;
+    st = exec_plain(err, s, "BEGIN IMMEDIATE;");
+    if (st == KBC_OK) st = exec_plain(err, s, MIGRATIONS[i].sql);
+    if (st == KBC_OK) st = record_version(err, s, MIGRATIONS[i].version);
+    if (st == KBC_OK) st = exec_plain(err, s, "COMMIT;");
+    if (st != KBC_OK) {
+      rollback(s);
+      return st;
+    }
   }
-  atomic_store(s->version, SCHEMA_VERSION);
+  atomic_store(s->version, BINARY_EPOCH);
   return KBC_OK;
 }
 
@@ -1995,4 +2137,1178 @@ kbc_status kbc_store_set_comment_resolved(kbc_store *s, const char *comment_id,
     st = kbc_err_set(err, KBC_ERR_NOTFOUND, "comment %s: not found", comment_id);
   unlock(s);
   return st;
+}
+
+/* ===================================================== stage 1: the rest ==
+ *
+ * The eight tables the Rust original keeps in sqlite beside its columnar
+ * index (see the section banner in store.h for the scope contract). Two
+ * properties hold across all of them and are worth stating once here:
+ *
+ *  - They OUTLIVE the artifact. None of these tables has a foreign key to
+ *    `artifacts`, because Rust's cascade stops at artifacts, chunks,
+ *    comments and edges (sqlite.rs:6392) and a user's reading history
+ *    outliving the document they read is the behaviour being preserved.
+ *  - Every list is ordered most-recent-first, and the tiebreak after the
+ *    timestamp is stated at each query: a burst of rows inside one second
+ *    must not come back in rowid order, which is insertion order and changes
+ *    with the order the writer happened to use.
+ */
+
+/* `finished_at` for a run that has not finished. Rust stores SQL NULL there;
+ * a C row struct cannot be NULL, so the store writes ONE sentinel and a
+ * reader tests for a negative value. Every write path goes through
+ * finish_value() so a caller cannot mint a second in-flight value that some
+ * other reader's `== RUN_IN_FLIGHT` comparison would miss. */
+#define RUN_IN_FLIGHT ((int64_t)-1)
+
+static int64_t finish_value(int64_t finished_at) {
+  return finished_at < 0 ? RUN_IN_FLIGHT : finished_at;
+}
+
+/* Bounds for the free text these tables carry. A corpus slug and a path reuse
+ * the limits the rest of the file already applies; a message, a note, a query
+ * and a section id have no natural length, and every one of them can carry
+ * bytes taken out of a corpus file (AGENTS.md rule 9), so each gets a
+ * ceiling here rather than an unbounded column. */
+enum {
+  KBC_MAX_ERROR_KIND_LEN = 64,
+  KBC_MAX_ERROR_MESSAGE_LEN = 65536,
+  KBC_MAX_CONTENT_HASH_LEN = 128,
+  KBC_MAX_EXCLUSION_NOTE_LEN = 4096,
+  KBC_MAX_HISTORY_QUERY_LEN = 4096,
+  KBC_MAX_HISTORY_SECTION_LEN = 512,
+  KBC_MAX_HISTORY_SOURCE_LEN = 64,
+  KBC_MAX_HISTORY_USER_LEN = 255
+};
+
+/* The two steps every list_* below shares: how many rows the page can hold,
+ * and an exactly-sized, zeroed arena block to decode them into. `limit` has
+ * already been clamped to KBC_MAX_HITS by the caller, which is what makes the
+ * count*elem_size multiply below provably in range. `count_sql` references
+ * ?1 only when `corpus` is non-NULL, per count_query's contract. */
+static kbc_status page_block(kbc_err *err, kbc_store *s, kbc_arena *a,
+                             const char *count_sql, const char *corpus,
+                             size_t limit, size_t elem_size, void **out,
+                             size_t *n_out) {
+  *out = NULL;
+  *n_out = 0;
+  int64_t n64 = 0;
+  kbc_status st = count_query(err, s, count_sql, corpus, &n64);
+  if (st != KBC_OK) return st;
+  if (n64 < 0) n64 = 0;
+  const size_t n = (n64 > (int64_t)limit) ? limit : (size_t)n64;
+  if (n == 0) return KBC_OK;
+  void *block = kbc_arena_calloc(a, n, elem_size);
+  if (block == NULL)
+    return kbc_err_set(err, KBC_ERR_NOMEM, "list: %zu rows of %zu bytes", n,
+                       elem_size);
+  *out = block;
+  *n_out = n;
+  return KBC_OK;
+}
+
+/* -------------------------------------------------------------- sources -- */
+
+/* `added_at` and `paused` are deliberately absent from the UPDATE set.
+ * `added_at` is when the source was FIRST seen, not when the row was last
+ * written, so a re-ingest must not move it; `paused` is operator intent that
+ * an ingest has no business undoing (Rust sets only `path`,
+ * sqlite.rs:217, and pause is otherwise lost on every restart). */
+kbc_status kbc_store_put_source(kbc_store *s, const kbc_source *src,
+                                kbc_err *err) {
+  if (s == NULL || src == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "put_source: null argument");
+  kbc_status st = require_text(err, "source corpus", src->corpus, 255);
+  if (st == KBC_OK)
+    st = require_text(err, "source path", src->path, KBC_MAX_PATH_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "INSERT INTO sources(slug, path, added_at, paused)"
+               " VALUES(?1,?2,?3,?4)"
+               " ON CONFLICT(slug) DO UPDATE SET path = excluded.path;",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, src->corpus);
+  if (st == KBC_OK) st = bind_text(err, s, q, 2, src->path);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 3, src->added_at);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 4, src->paused ? 1 : 0);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    /* The only constraint this can hit is `path` already naming another
+     * source — a caller that has aliased two corpora onto one directory. */
+    if (step == SQLITE_CONSTRAINT)
+      st = kbc_err_set(err, KBC_ERR_CONFLICT,
+                       "put_source %s: %s is already another source's path",
+                       src->corpus, src->path);
+    else if (step != SQLITE_DONE)
+      st = sql_fail(err, s, "put source", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  unlock(s);
+  return st;
+}
+
+static void read_source(kbc_arena *a, sqlite3_stmt *st, kbc_source *out) {
+  out->corpus = col_str(a, st, 0);
+  out->path = col_str(a, st, 1);
+  out->added_at = (int64_t)sqlite3_column_int64(st, 2);
+  out->paused = sqlite3_column_int(st, 3) != 0;
+}
+
+kbc_status kbc_store_get_source(kbc_store *s, kbc_arena *a, const char *corpus,
+                                kbc_source *out, kbc_err *err) {
+  if (s == NULL || a == NULL || out == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "get_source: null argument");
+  kbc_status st = require_text(err, "source corpus", corpus, 255);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "SELECT slug, path, added_at, paused FROM sources"
+               " WHERE slug = ?1;",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, corpus);
+  if (st != KBC_OK) {
+    (void)finalize(err, s, q, st);
+    unlock(s);
+    return st;
+  }
+  const int step = sqlite3_step(q);
+  if (step == SQLITE_ROW) {
+    read_source(a, q, out);
+  } else if (step == SQLITE_DONE) {
+    st = kbc_err_set(err, KBC_ERR_NOTFOUND, "source %s: not found", corpus);
+  } else {
+    st = sql_fail(err, s, "get source", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  return st != KBC_OK ? st : fin;
+}
+
+/* Most recently added first, corpus as the tiebreak so two sources adopted in
+ * the same second do not come back in insertion order. */
+kbc_status kbc_store_list_sources(kbc_store *s, kbc_arena *a, size_t limit,
+                                  kbc_source **out, size_t *n_out,
+                                  kbc_err *err) {
+  if (s == NULL || a == NULL || out == NULL || n_out == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "list_sources: null argument");
+  if (limit > KBC_MAX_HITS) limit = KBC_MAX_HITS;
+  *out = NULL;
+  *n_out = 0;
+  if (limit == 0) return KBC_OK;
+
+  lock(s);
+  void *block = NULL;
+  size_t n = 0;
+  kbc_status st = page_block(err, s, a, "SELECT COUNT(*) FROM sources;", NULL,
+                             limit, sizeof(kbc_source), &block, &n);
+  sqlite3_stmt *q = NULL;
+  if (st == KBC_OK)
+    st = prepare(err, s,
+                 "SELECT slug, path, added_at, paused FROM sources"
+                 " ORDER BY added_at DESC, slug ASC LIMIT ?1;",
+                 &q);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 1, (int64_t)n);
+  kbc_source *arr = block;
+  size_t i = 0;
+  while (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_DONE) break;
+    if (step != SQLITE_ROW) {
+      st = sql_fail(err, s, "list sources: step", step);
+      break;
+    }
+    if (i >= n) {
+      st = kbc_err_set(err, KBC_ERR_INTERNAL, "list sources: row overflow");
+      break;
+    }
+    read_source(a, q, &arr[i]);
+    i++;
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  if (st != KBC_OK) return st != KBC_OK ? st : fin;
+  *out = arr;
+  *n_out = i;
+  return KBC_OK;
+}
+
+kbc_status kbc_store_set_source_paused(kbc_store *s, const char *corpus,
+                                       bool paused, kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "set_source_paused: null store");
+  kbc_status st = require_text(err, "source corpus", corpus, 255);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s, "UPDATE sources SET paused = ?1 WHERE slug = ?2;", &q);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 1, paused ? 1 : 0);
+  if (st == KBC_OK) st = bind_text(err, s, q, 2, corpus);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE)
+      st = sql_fail(err, s, "pause source", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK && sqlite3_changes(s->db) == 0)
+    st = kbc_err_set(err, KBC_ERR_NOTFOUND, "source %s: not found", corpus);
+  unlock(s);
+  return st != KBC_OK ? st : fin;
+}
+
+/* ----------------------------------------------------------- index runs -- */
+
+static void read_index_run(kbc_arena *a, sqlite3_stmt *st, kbc_index_run *out) {
+  out->id = col_str(a, st, 0);
+  out->corpus = col_str(a, st, 1);
+  out->started_at = (int64_t)sqlite3_column_int64(st, 2);
+  out->finished_at = (int64_t)sqlite3_column_int64(st, 3);
+  out->ok_count = (int64_t)sqlite3_column_int64(st, 4);
+  out->err_count = (int64_t)sqlite3_column_int64(st, 5);
+}
+
+kbc_status kbc_store_put_index_run(kbc_store *s, const kbc_index_run *run,
+                                   kbc_err *err) {
+  if (s == NULL || run == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "put_index_run: null argument");
+  kbc_status st = require_text(err, "run id", run->id, KBC_MAX_ID_LEN);
+  if (st == KBC_OK) st = require_text(err, "run corpus", run->corpus, 255);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "INSERT INTO index_runs(id, corpus, started_at, finished_at,"
+               " ok_count, err_count) VALUES(?1,?2,?3,?4,?5,?6);",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, run->id);
+  if (st == KBC_OK) st = bind_text(err, s, q, 2, run->corpus);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 3, run->started_at);
+  if (st == KBC_OK)
+    st = bind_i64(err, s, q, 4, finish_value(run->finished_at));
+  if (st == KBC_OK) st = bind_i64(err, s, q, 5, run->ok_count);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 6, run->err_count);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    /* The foreign key is the only constraint here that a caller can reach:
+     * a run is always about a source that exists, because the source row is
+     * what the run is FOR. */
+    if (step == SQLITE_CONSTRAINT)
+      st = kbc_err_set(err, KBC_ERR_CONFLICT,
+                       "index run %s: no source named %s (or duplicate run id)",
+                       run->id, run->corpus);
+    else if (step != SQLITE_DONE)
+      st = sql_fail(err, s, "put index run", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  unlock(s);
+  return st;
+}
+
+kbc_status kbc_store_finish_index_run(kbc_store *s, const char *id,
+                                      int64_t finished_at, int64_t ok_count,
+                                      int64_t err_count, kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "finish_index_run: null store");
+  kbc_status st = require_text(err, "run id", id, KBC_MAX_ID_LEN);
+  if (st != KBC_OK) return st;
+  /* A finished run that reads back as in flight would be indistinguishable
+   * from one that never finished, which is the one distinction this column
+   * exists to carry. */
+  if (finished_at < 0)
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "finish_index_run %s: finished_at %lld is negative",
+                       id, (long long)finished_at);
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "UPDATE index_runs SET finished_at = ?1, ok_count = ?2,"
+               " err_count = ?3 WHERE id = ?4;",
+               &q);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 1, finished_at);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 2, ok_count);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 3, err_count);
+  if (st == KBC_OK) st = bind_text(err, s, q, 4, id);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE)
+      st = sql_fail(err, s, "finish index run", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK && sqlite3_changes(s->db) == 0)
+    st = kbc_err_set(err, KBC_ERR_NOTFOUND, "index run %s: not found", id);
+  unlock(s);
+  return st != KBC_OK ? st : fin;
+}
+
+/* Newest pass first, id as the tiebreak so two passes started in the same
+ * second do not ride insertion order. `corpus` NULL asks for every source. */
+kbc_status kbc_store_list_index_runs(kbc_store *s, kbc_arena *a,
+                                     const char *corpus, size_t limit,
+                                     kbc_index_run **out, size_t *n_out,
+                                     kbc_err *err) {
+  if (s == NULL || a == NULL || out == NULL || n_out == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "list_index_runs: null argument");
+  if (corpus != NULL && corpus[0] == '\0')
+    return kbc_err_set(err, KBC_ERR_INVALID, "list_index_runs: empty corpus");
+  if (limit > KBC_MAX_HITS) limit = KBC_MAX_HITS;
+  *out = NULL;
+  *n_out = 0;
+  if (limit == 0) return KBC_OK;
+
+  lock(s);
+  void *block = NULL;
+  size_t n = 0;
+  kbc_status st =
+      page_block(err, s, a,
+                 corpus != NULL
+                     ? "SELECT COUNT(*) FROM index_runs WHERE corpus = ?1;"
+                     : "SELECT COUNT(*) FROM index_runs;",
+                 corpus, limit, sizeof(kbc_index_run), &block, &n);
+  sqlite3_stmt *q = NULL;
+  if (st == KBC_OK)
+    st = prepare(err, s,
+                 corpus != NULL
+                     ? "SELECT id, corpus, started_at, finished_at, ok_count,"
+                       " err_count FROM index_runs WHERE corpus = ?1"
+                       " ORDER BY started_at DESC, id ASC LIMIT ?2;"
+                     : "SELECT id, corpus, started_at, finished_at, ok_count,"
+                       " err_count FROM index_runs"
+                       " ORDER BY started_at DESC, id ASC LIMIT ?1;",
+                 &q);
+  if (st == KBC_OK && corpus != NULL) st = bind_text(err, s, q, 1, corpus);
+  if (st == KBC_OK)
+    st = bind_i64(err, s, q, corpus != NULL ? 2 : 1, (int64_t)n);
+  kbc_index_run *arr = block;
+  size_t i = 0;
+  while (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_DONE) break;
+    if (step != SQLITE_ROW) {
+      st = sql_fail(err, s, "list index runs: step", step);
+      break;
+    }
+    if (i >= n) {
+      st = kbc_err_set(err, KBC_ERR_INTERNAL, "list index runs: row overflow");
+      break;
+    }
+    read_index_run(a, q, &arr[i]);
+    i++;
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  if (st != KBC_OK) return st != KBC_OK ? st : fin;
+  *out = arr;
+  *n_out = i;
+  return KBC_OK;
+}
+
+/* --------------------------------------------------------------- errors -- */
+
+static void read_error_row(kbc_arena *a, sqlite3_stmt *st,
+                           kbc_error_row *out) {
+  out->id = col_str(a, st, 0);
+  out->kind = col_str(a, st, 1);
+  out->corpus = col_str(a, st, 2);
+  out->path = col_str(a, st, 3);
+  out->message = col_str(a, st, 4);
+  out->content_hash = col_str(a, st, 5);
+  out->retry_count = (int64_t)sqlite3_column_int64(st, 6);
+  out->created_at = (int64_t)sqlite3_column_int64(st, 7);
+  out->dismissed = sqlite3_column_int(st, 8) != 0;
+}
+
+/* One row per failing path. A second failure of the SAME (corpus, path)
+ * increments `retry_count` and refreshes the message and the timestamp; it
+ * does not insert a duplicate. That counter is the quarantine gate's only
+ * input (store.h), so a store that duplicated instead of counting would let a
+ * document that fails forever be embedded forever.
+ *
+ * `UPDATE` then `INSERT` in ONE transaction, the shape Rust uses
+ * (sqlite.rs:363): the two statements cannot both run without the
+ * transaction, because a crash between them would lose the increment and
+ * start the count again.
+ *
+ * A row that has been dismissed is not matched by the UPDATE — a cleared
+ * error stays cleared until the file's content hash moves it — so a
+ * re-exclusion is an INSERT and gets a fresh id. */
+kbc_status kbc_store_record_error(kbc_store *s, const kbc_error_row *row,
+                                  kbc_err *err) {
+  if (s == NULL || row == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "record_error: null argument");
+  kbc_status st = require_text(err, "error id", row->id, KBC_MAX_ID_LEN);
+  if (st == KBC_OK) st = require_text(err, "error kind", row->kind,
+                                      KBC_MAX_ERROR_KIND_LEN);
+  if (st == KBC_OK) st = require_text(err, "error corpus", row->corpus, 255);
+  if (st == KBC_OK)
+    st = require_text(err, "error path", row->path, KBC_MAX_PATH_LEN);
+  if (st == KBC_OK)
+    st = require_text(err, "error message", row->message,
+                      KBC_MAX_ERROR_MESSAGE_LEN);
+  if (st == KBC_OK && row->content_hash != NULL)
+    st = require_text(err, "error content hash", row->content_hash,
+                      KBC_MAX_CONTENT_HASH_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  st = exec_plain(err, s, "BEGIN IMMEDIATE;");
+  sqlite3_stmt *q = NULL;
+  if (st == KBC_OK) {
+    const kbc_status prepared = prepare(
+        err, s,
+        "UPDATE errors SET retry_count = retry_count + 1, message = ?1,"
+        " created_at = ?2 WHERE corpus = ?3 AND path = ?4 AND dismissed = 0;",
+        &q);
+    if (prepared != KBC_OK) {
+      st = prepared;
+    } else {
+      st = bind_text(err, s, q, 1, row->message);
+      if (st == KBC_OK) st = bind_i64(err, s, q, 2, row->created_at);
+      if (st == KBC_OK) st = bind_text(err, s, q, 3, row->corpus);
+      if (st == KBC_OK) st = bind_text(err, s, q, 4, row->path);
+      if (st == KBC_OK) {
+        const int step = sqlite3_step(q);
+        if (step != SQLITE_DONE)
+          st = sql_fail(err, s, "bump retry count", step);
+      }
+      /* finalize() reports OK for a statement whose own work already failed,
+       * so the caller's diagnosis has to survive it. */
+      const kbc_status fin = finalize(err, s, q, st);
+      if (st == KBC_OK) st = fin;
+    }
+  }
+  /* sqlite3_finalize has run, so the write is complete and the change count
+   * is this statement's — read it before the next statement resets it. */
+  if (st == KBC_OK && sqlite3_changes(s->db) == 0) {
+    const kbc_status prepared = prepare(
+        err, s,
+        "INSERT INTO errors(id, kind, corpus, path, message, content_hash,"
+        " retry_count, created_at, dismissed)"
+        " VALUES(?1,?2,?3,?4,?5,?6,0,?7,0);",
+        &q);
+    if (prepared != KBC_OK) {
+      st = prepared;
+    } else {
+      st = bind_text(err, s, q, 1, row->id);
+      if (st == KBC_OK) st = bind_text(err, s, q, 2, row->kind);
+      if (st == KBC_OK) st = bind_text(err, s, q, 3, row->corpus);
+      if (st == KBC_OK) st = bind_text(err, s, q, 4, row->path);
+      if (st == KBC_OK) st = bind_text(err, s, q, 5, row->message);
+      if (st == KBC_OK && row->content_hash != NULL)
+        st = bind_text(err, s, q, 6, row->content_hash);
+      if (st == KBC_OK) st = bind_i64(err, s, q, 7, row->created_at);
+      if (st == KBC_OK) {
+        const int step = sqlite3_step(q);
+        if (step == SQLITE_CONSTRAINT)
+          st = kbc_err_set(err, KBC_ERR_CONFLICT,
+                           "record_error %s: duplicate error id", row->id);
+        else if (step != SQLITE_DONE)
+          st = sql_fail(err, s, "record error", step);
+      }
+      const kbc_status fin = finalize(err, s, q, st);
+      if (st == KBC_OK) st = fin;
+    }
+  }
+  if (st != KBC_OK) {
+    rollback(s);
+    unlock(s);
+    return st;
+  }
+  st = exec_plain(err, s, "COMMIT;");
+  unlock(s);
+  return st;
+}
+
+/* The quarantine gate. 0 for a path with no open error, which is what a
+ * document that has never failed must read as. A DISMISSED row is not
+ * counted: clearing an error is what gives a document a fresh budget of
+ * attempts (Rust's un-quarantine route, sqlite.rs:413). */
+kbc_status kbc_store_retry_count_for_path(kbc_store *s, const char *corpus,
+                                          const char *path, int64_t *out,
+                                          kbc_err *err) {
+  if (s == NULL || out == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "retry_count_for_path: null argument");
+  kbc_status st = require_text(err, "error corpus", corpus, 255);
+  if (st == KBC_OK)
+    st = require_text(err, "error path", path, KBC_MAX_PATH_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "SELECT IFNULL((SELECT retry_count FROM errors"
+               " WHERE corpus = ?1 AND path = ?2 AND dismissed = 0"
+               " LIMIT 1), 0);",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, corpus);
+  if (st == KBC_OK) st = bind_text(err, s, q, 2, path);
+  if (st != KBC_OK) {
+    (void)finalize(err, s, q, st);
+    unlock(s);
+    return st;
+  }
+  const int step = sqlite3_step(q);
+  if (step == SQLITE_ROW) {
+    *out = (int64_t)sqlite3_column_int64(q, 0);
+  } else if (step == SQLITE_DONE) {
+    st = kbc_err_set(err, KBC_ERR_INTERNAL, "retry count: no row");
+  } else {
+    st = sql_fail(err, s, "retry count", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  return st != KBC_OK ? st : fin;
+}
+
+/* Clears every open error for a path — the "the file changed, the parse
+ * error may no longer apply" path and the un-quarantine route. Dismissed, not
+ * deleted: the history of a failure is what tells an operator why a document
+ * is being treated differently. NOTFOUND when there was nothing open, so a
+ * caller that believes it cleared something is told it did not. */
+kbc_status kbc_store_clear_error(kbc_store *s, const char *corpus,
+                                 const char *path, kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "clear_error: null store");
+  kbc_status st = require_text(err, "error corpus", corpus, 255);
+  if (st == KBC_OK)
+    st = require_text(err, "error path", path, KBC_MAX_PATH_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "UPDATE errors SET dismissed = 1"
+               " WHERE corpus = ?1 AND path = ?2 AND dismissed = 0;",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, corpus);
+  if (st == KBC_OK) st = bind_text(err, s, q, 2, path);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "clear error", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK && sqlite3_changes(s->db) == 0)
+    st = kbc_err_set(err, KBC_ERR_NOTFOUND, "error %s/%s: nothing open",
+                     corpus, path);
+  unlock(s);
+  return st != KBC_OK ? st : fin;
+}
+
+/* Newest failure first, id ascending as the tiebreak: a burst of failures in
+ * one second must come back in a deterministic order, and Rust's is exactly
+ * this (sqlite.rs:436). `open_only` is the query idx_errors_open exists to
+ * serve, and `corpus` NULL asks for every source. */
+kbc_status kbc_store_list_errors(kbc_store *s, kbc_arena *a, const char *corpus,
+                                 bool open_only, size_t limit,
+                                 kbc_error_row **out, size_t *n_out,
+                                 kbc_err *err) {
+  if (s == NULL || a == NULL || out == NULL || n_out == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "list_errors: null argument");
+  if (corpus != NULL && corpus[0] == '\0')
+    return kbc_err_set(err, KBC_ERR_INVALID, "list_errors: empty corpus");
+  if (limit > KBC_MAX_HITS) limit = KBC_MAX_HITS;
+  *out = NULL;
+  *n_out = 0;
+  if (limit == 0) return KBC_OK;
+
+  /* Four fixed statements, each a compile-time literal chosen by two
+   * booleans — the same shape kbc_store_list_artifact_ids uses. No value
+   * ever reaches the SQL text; the corpus and the page size are bound. */
+  static const char *const COUNTS[4] = {
+      "SELECT COUNT(*) FROM errors;",
+      "SELECT COUNT(*) FROM errors WHERE dismissed = 0;",
+      "SELECT COUNT(*) FROM errors WHERE corpus = ?1;",
+      "SELECT COUNT(*) FROM errors WHERE corpus = ?1 AND dismissed = 0;"};
+  static const char *const PAGES[4] = {
+      "SELECT id, kind, corpus, path, message, content_hash, retry_count,"
+      " created_at, dismissed FROM errors ORDER BY created_at DESC, id ASC"
+      " LIMIT ?1;",
+      "SELECT id, kind, corpus, path, message, content_hash, retry_count,"
+      " created_at, dismissed FROM errors WHERE dismissed = 0"
+      " ORDER BY created_at DESC, id ASC LIMIT ?1;",
+      "SELECT id, kind, corpus, path, message, content_hash, retry_count,"
+      " created_at, dismissed FROM errors WHERE corpus = ?1"
+      " ORDER BY created_at DESC, id ASC LIMIT ?2;",
+      "SELECT id, kind, corpus, path, message, content_hash, retry_count,"
+      " created_at, dismissed FROM errors"
+      " WHERE corpus = ?1 AND dismissed = 0"
+      " ORDER BY created_at DESC, id ASC LIMIT ?2;"};
+  const size_t which = (corpus != NULL ? 2u : 0u) + (open_only ? 1u : 0u);
+
+  lock(s);
+  void *block = NULL;
+  size_t n = 0;
+  kbc_status st = page_block(err, s, a, COUNTS[which], corpus, limit,
+                             sizeof(kbc_error_row), &block, &n);
+  sqlite3_stmt *q = NULL;
+  if (st == KBC_OK) st = prepare(err, s, PAGES[which], &q);
+  if (st == KBC_OK && corpus != NULL) st = bind_text(err, s, q, 1, corpus);
+  if (st == KBC_OK)
+    st = bind_i64(err, s, q, corpus != NULL ? 2 : 1, (int64_t)n);
+  kbc_error_row *arr = block;
+  size_t i = 0;
+  while (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_DONE) break;
+    if (step != SQLITE_ROW) {
+      st = sql_fail(err, s, "list errors: step", step);
+      break;
+    }
+    if (i >= n) {
+      st = kbc_err_set(err, KBC_ERR_INTERNAL, "list errors: row overflow");
+      break;
+    }
+    read_error_row(a, q, &arr[i]);
+    i++;
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  if (st != KBC_OK) return st != KBC_OK ? st : fin;
+  *out = arr;
+  *n_out = i;
+  return KBC_OK;
+}
+
+/* ------------------------------------------------------ excluded files -- */
+
+/* Durable operator intent, so re-adding an already-excluded path is a no-op
+ * that keeps the ORIGINAL excluded_at and note: the first decision is the
+ * one the operator made, and a bring-up that re-asserted it would push the
+ * path down the "newest exclusions" list every restart (Rust's add_exclusion,
+ * sqlite.rs:266). */
+kbc_status kbc_store_add_exclusion(kbc_store *s, const kbc_exclusion *x,
+                                   kbc_err *err) {
+  if (s == NULL || x == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "add_exclusion: null argument");
+  kbc_status st = require_text(err, "excluded path", x->path, KBC_MAX_PATH_LEN);
+  if (st == KBC_OK && x->note != NULL)
+    st = require_text(err, "exclusion note", x->note,
+                      KBC_MAX_EXCLUSION_NOTE_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "INSERT INTO excluded_files(path, excluded_at, note)"
+               " VALUES(?1,?2,?3) ON CONFLICT(path) DO NOTHING;",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, x->path);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 2, x->excluded_at);
+  if (st == KBC_OK && x->note != NULL)
+    st = bind_text(err, s, q, 3, x->note);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "add exclusion", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  unlock(s);
+  return st;
+}
+
+kbc_status kbc_store_remove_exclusion(kbc_store *s, const char *path,
+                                      kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "remove_exclusion: null store");
+  kbc_status st = require_text(err, "excluded path", path, KBC_MAX_PATH_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s, "DELETE FROM excluded_files WHERE path = ?1;", &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, path);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "remove exclusion", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK && sqlite3_changes(s->db) == 0)
+    st = kbc_err_set(err, KBC_ERR_NOTFOUND, "exclusion %s: not found", path);
+  unlock(s);
+  return st != KBC_OK ? st : fin;
+}
+
+/* Newest exclusion first, path ascending as the tiebreak so a bulk exclude
+ * lands in a stable order. Read once at bring-up into the caller's ingest
+ * gate: nothing consults this table per document, which is why a limit here
+ * costs the caller nothing — a caller that needs the whole set asks for
+ * KBC_MAX_HITS. */
+kbc_status kbc_store_list_exclusions(kbc_store *s, kbc_arena *a, size_t limit,
+                                     kbc_exclusion **out, size_t *n_out,
+                                     kbc_err *err) {
+  if (s == NULL || a == NULL || out == NULL || n_out == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "list_exclusions: null argument");
+  if (limit > KBC_MAX_HITS) limit = KBC_MAX_HITS;
+  *out = NULL;
+  *n_out = 0;
+  if (limit == 0) return KBC_OK;
+
+  lock(s);
+  void *block = NULL;
+  size_t n = 0;
+  kbc_status st = page_block(err, s, a,
+                             "SELECT COUNT(*) FROM excluded_files;", NULL,
+                             limit, sizeof(kbc_exclusion), &block, &n);
+  sqlite3_stmt *q = NULL;
+  if (st == KBC_OK)
+    st = prepare(err, s,
+                 "SELECT path, excluded_at, note FROM excluded_files"
+                 " ORDER BY excluded_at DESC, path ASC LIMIT ?1;",
+                 &q);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 1, (int64_t)n);
+  kbc_exclusion *arr = block;
+  size_t i = 0;
+  while (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_DONE) break;
+    if (step != SQLITE_ROW) {
+      st = sql_fail(err, s, "list exclusions: step", step);
+      break;
+    }
+    if (i >= n) {
+      st = kbc_err_set(err, KBC_ERR_INTERNAL, "list exclusions: row overflow");
+      break;
+    }
+    arr[i].path = col_str(a, q, 0);
+    arr[i].excluded_at = (int64_t)sqlite3_column_int64(q, 1);
+    arr[i].note = col_str(a, q, 2);
+    i++;
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  if (st != KBC_OK) return st != KBC_OK ? st : fin;
+  *out = arr;
+  *n_out = i;
+  return KBC_OK;
+}
+
+/* --------------------------------------------------------- doc history -- */
+
+/* The kind is NOT validated in C: the CHECK on the table is the invariant,
+ * and a second copy of the list would be a second thing to forget when a
+ * fourth kind is added. A rejected kind comes back as KBC_ERR_INVALID with
+ * the offending value in the message, which is what the caller needs.
+ *
+ * `user` is stored as '' when the caller passes NULL: the column is NOT NULL
+ * upstream, where '' is exactly the "pre-multi-user row" marker the identity
+ * backfill looks for. `id` is ignored on the way in — it is the rowid, and
+ * the row's own value comes back from a list. */
+kbc_status kbc_store_add_history(kbc_store *s, const kbc_history_row *row,
+                                 kbc_err *err) {
+  if (s == NULL || row == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "add_history: null argument");
+  kbc_status st = require_text(err, "history kind", row->kind, 32);
+  if (st == KBC_OK && row->artifact_id != NULL)
+    st = require_text(err, "history artifact id", row->artifact_id,
+                      KBC_MAX_ID_LEN);
+  if (st == KBC_OK && row->query != NULL)
+    st = require_text(err, "history query", row->query,
+                      KBC_MAX_HISTORY_QUERY_LEN);
+  if (st == KBC_OK && row->comment_id != NULL)
+    st = require_text(err, "history comment id", row->comment_id,
+                      KBC_MAX_ID_LEN);
+  if (st == KBC_OK && row->last_section != NULL)
+    st = require_text(err, "history section", row->last_section,
+                      KBC_MAX_HISTORY_SECTION_LEN);
+  if (st == KBC_OK && row->source != NULL)
+    st = require_text(err, "history source", row->source,
+                      KBC_MAX_HISTORY_SOURCE_LEN);
+  if (st == KBC_OK && row->user != NULL)
+    st = require_text(err, "history user", row->user, KBC_MAX_HISTORY_USER_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "INSERT INTO history(kind, artifact_id, query, comment_id,"
+               " scroll_y, scroll_max, scroll_y_max, active_ms, last_section,"
+               " source, user, started_at, updated_at)"
+               " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13);",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, row->kind);
+  if (st == KBC_OK && row->artifact_id != NULL)
+    st = bind_text(err, s, q, 2, row->artifact_id);
+  if (st == KBC_OK && row->query != NULL)
+    st = bind_text(err, s, q, 3, row->query);
+  if (st == KBC_OK && row->comment_id != NULL)
+    st = bind_text(err, s, q, 4, row->comment_id);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 5, row->scroll_y);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 6, row->scroll_max);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 7, row->scroll_y_max);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 8, row->active_ms);
+  if (st == KBC_OK && row->last_section != NULL)
+    st = bind_text(err, s, q, 9, row->last_section);
+  if (st == KBC_OK && row->source != NULL)
+    st = bind_text(err, s, q, 10, row->source);
+  if (st == KBC_OK)
+    st = bind_text(err, s, q, 11, row->user != NULL ? row->user : "");
+  if (st == KBC_OK) st = bind_i64(err, s, q, 12, row->started_at);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 13, row->updated_at);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_CONSTRAINT)
+      st = kbc_err_set(err, KBC_ERR_INVALID,
+                       "add_history: kind \"%s\" is not one of"
+                       " open, search, comment",
+                       row->kind);
+    else if (step != SQLITE_DONE)
+      st = sql_fail(err, s, "add history", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  unlock(s);
+  return st;
+}
+
+/* Newest first — the order every history surface uses — with the rowid
+ * DESCENDING as the tiebreak so two events inside one second come back in
+ * the order they happened. `user` NULL asks for every user. */
+kbc_status kbc_store_list_history(kbc_store *s, kbc_arena *a, const char *user,
+                                  size_t limit, kbc_history_row **out,
+                                  size_t *n_out, kbc_err *err) {
+  if (s == NULL || a == NULL || out == NULL || n_out == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "list_history: null argument");
+  if (user != NULL && user[0] == '\0')
+    return kbc_err_set(err, KBC_ERR_INVALID, "list_history: empty user");
+  if (limit > KBC_MAX_HITS) limit = KBC_MAX_HITS;
+  *out = NULL;
+  *n_out = 0;
+  if (limit == 0) return KBC_OK;
+
+  lock(s);
+  void *block = NULL;
+  size_t n = 0;
+  kbc_status st =
+      page_block(err, s, a,
+                 user != NULL ? "SELECT COUNT(*) FROM history WHERE user = ?1;"
+                              : "SELECT COUNT(*) FROM history;",
+                 user, limit, sizeof(kbc_history_row), &block, &n);
+  sqlite3_stmt *q = NULL;
+  if (st == KBC_OK)
+    st = prepare(err, s,
+                 user != NULL
+                     ? "SELECT id, kind, artifact_id, query, comment_id,"
+                       " source, user, scroll_y, scroll_max, scroll_y_max,"
+                       " active_ms, last_section, started_at, updated_at"
+                       " FROM history WHERE user = ?1"
+                       " ORDER BY started_at DESC, id DESC LIMIT ?2;"
+                     : "SELECT id, kind, artifact_id, query, comment_id,"
+                       " source, user, scroll_y, scroll_max, scroll_y_max,"
+                       " active_ms, last_section, started_at, updated_at"
+                       " FROM history ORDER BY started_at DESC, id DESC"
+                       " LIMIT ?1;",
+                 &q);
+  if (st == KBC_OK && user != NULL) st = bind_text(err, s, q, 1, user);
+  if (st == KBC_OK) st = bind_i64(err, s, q, user != NULL ? 2 : 1, (int64_t)n);
+  kbc_history_row *arr = block;
+  size_t i = 0;
+  while (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_DONE) break;
+    if (step != SQLITE_ROW) {
+      st = sql_fail(err, s, "list history: step", step);
+      break;
+    }
+    if (i >= n) {
+      st = kbc_err_set(err, KBC_ERR_INTERNAL, "list history: row overflow");
+      break;
+    }
+    kbc_history_row *r = &arr[i];
+    r->id = (int64_t)sqlite3_column_int64(q, 0);
+    r->kind = col_str(a, q, 1);
+    r->artifact_id = col_str(a, q, 2);
+    r->query = col_str(a, q, 3);
+    r->comment_id = col_str(a, q, 4);
+    r->source = col_str(a, q, 5);
+    r->user = col_str(a, q, 6);
+    r->scroll_y = (int64_t)sqlite3_column_int64(q, 7);
+    r->scroll_max = (int64_t)sqlite3_column_int64(q, 8);
+    r->scroll_y_max = (int64_t)sqlite3_column_int64(q, 9);
+    r->active_ms = (int64_t)sqlite3_column_int64(q, 10);
+    r->last_section = col_str(a, q, 11);
+    r->started_at = (int64_t)sqlite3_column_int64(q, 12);
+    r->updated_at = (int64_t)sqlite3_column_int64(q, 13);
+    i++;
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  if (st != KBC_OK) return st != KBC_OK ? st : fin;
+  *out = arr;
+  *n_out = i;
+  return KBC_OK;
+}
+
+/* ----------------------------------------------------------- corkboard -- */
+
+/* Anchoring twice is a no-op that keeps the ORIGINAL created_at: the corkboard
+ * is "when did you anchor this", and a re-anchor must not make an old
+ * document look new (Rust's corkboard_add, sqlite.rs:2831). */
+kbc_status kbc_store_add_corkboard(kbc_store *s, const char *artifact_id,
+                                   int64_t created_at, kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "add_corkboard: null store");
+  kbc_status st = require_text(err, "artifact id", artifact_id, KBC_MAX_ID_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "INSERT INTO corkboard(artifact_id, created_at) VALUES(?1,?2)"
+               " ON CONFLICT(artifact_id) DO NOTHING;",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, artifact_id);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 2, created_at);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "anchor", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  unlock(s);
+  return st;
+}
+
+kbc_status kbc_store_remove_corkboard(kbc_store *s, const char *artifact_id,
+                                      kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "remove_corkboard: null store");
+  kbc_status st = require_text(err, "artifact id", artifact_id, KBC_MAX_ID_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s, "DELETE FROM corkboard WHERE artifact_id = ?1;", &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, artifact_id);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "unanchor", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK && sqlite3_changes(s->db) == 0)
+    st = kbc_err_set(err, KBC_ERR_NOTFOUND, "corkboard %s: not anchored",
+                     artifact_id);
+  unlock(s);
+  return st != KBC_OK ? st : fin;
+}
+
+/* Most recently anchored first, artifact_id ascending as the tiebreak. */
+kbc_status kbc_store_list_corkboard(kbc_store *s, kbc_arena *a, size_t limit,
+                                    kbc_corkboard_row **out, size_t *n_out,
+                                    kbc_err *err) {
+  if (s == NULL || a == NULL || out == NULL || n_out == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "list_corkboard: null argument");
+  if (limit > KBC_MAX_HITS) limit = KBC_MAX_HITS;
+  *out = NULL;
+  *n_out = 0;
+  if (limit == 0) return KBC_OK;
+
+  lock(s);
+  void *block = NULL;
+  size_t n = 0;
+  kbc_status st = page_block(err, s, a, "SELECT COUNT(*) FROM corkboard;", NULL,
+                             limit, sizeof(kbc_corkboard_row), &block, &n);
+  sqlite3_stmt *q = NULL;
+  if (st == KBC_OK)
+    st = prepare(err, s,
+                 "SELECT artifact_id, created_at FROM corkboard"
+                 " ORDER BY created_at DESC, artifact_id ASC LIMIT ?1;",
+                 &q);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 1, (int64_t)n);
+  kbc_corkboard_row *arr = block;
+  size_t i = 0;
+  while (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_DONE) break;
+    if (step != SQLITE_ROW) {
+      st = sql_fail(err, s, "list corkboard: step", step);
+      break;
+    }
+    if (i >= n) {
+      st = kbc_err_set(err, KBC_ERR_INTERNAL, "list corkboard: row overflow");
+      break;
+    }
+    arr[i].artifact_id = col_str(a, q, 0);
+    arr[i].created_at = (int64_t)sqlite3_column_int64(q, 1);
+    i++;
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  if (st != KBC_OK) return st != KBC_OK ? st : fin;
+  *out = arr;
+  *n_out = i;
+  return KBC_OK;
+}
+
+/* Same shape as the corkboard and the same reason: a pin that is set twice
+ * keeps the time it was first pinned. */
+kbc_status kbc_store_pin_memory(kbc_store *s, const char *artifact_id,
+                                int64_t pinned_at, kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "pin_memory: null store");
+  kbc_status st = require_text(err, "artifact id", artifact_id, KBC_MAX_ID_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "INSERT INTO pinned_memories(artifact_id, pinned_at)"
+               " VALUES(?1,?2) ON CONFLICT(artifact_id) DO NOTHING;",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, artifact_id);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 2, pinned_at);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "pin memory", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  unlock(s);
+  return st;
+}
+
+kbc_status kbc_store_unpin_memory(kbc_store *s, const char *artifact_id,
+                                  kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "unpin_memory: null store");
+  kbc_status st = require_text(err, "artifact id", artifact_id, KBC_MAX_ID_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s, "DELETE FROM pinned_memories WHERE artifact_id = ?1;",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, artifact_id);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "unpin memory", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK && sqlite3_changes(s->db) == 0)
+    st = kbc_err_set(err, KBC_ERR_NOTFOUND, "pinned memory %s: not pinned",
+                     artifact_id);
+  unlock(s);
+  return st != KBC_OK ? st : fin;
+}
+
+/* Most recently pinned first, artifact_id ascending as the tiebreak. */
+kbc_status kbc_store_list_pins(kbc_store *s, kbc_arena *a, size_t limit,
+                               kbc_pin_row **out, size_t *n_out, kbc_err *err) {
+  if (s == NULL || a == NULL || out == NULL || n_out == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "list_pins: null argument");
+  if (limit > KBC_MAX_HITS) limit = KBC_MAX_HITS;
+  *out = NULL;
+  *n_out = 0;
+  if (limit == 0) return KBC_OK;
+
+  lock(s);
+  void *block = NULL;
+  size_t n = 0;
+  kbc_status st = page_block(err, s, a,
+                             "SELECT COUNT(*) FROM pinned_memories;", NULL,
+                             limit, sizeof(kbc_pin_row), &block, &n);
+  sqlite3_stmt *q = NULL;
+  if (st == KBC_OK)
+    st = prepare(err, s,
+                 "SELECT artifact_id, pinned_at FROM pinned_memories"
+                 " ORDER BY pinned_at DESC, artifact_id ASC LIMIT ?1;",
+                 &q);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 1, (int64_t)n);
+  kbc_pin_row *arr = block;
+  size_t i = 0;
+  while (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_DONE) break;
+    if (step != SQLITE_ROW) {
+      st = sql_fail(err, s, "list pins: step", step);
+      break;
+    }
+    if (i >= n) {
+      st = kbc_err_set(err, KBC_ERR_INTERNAL, "list pins: row overflow");
+      break;
+    }
+    arr[i].artifact_id = col_str(a, q, 0);
+    arr[i].pinned_at = (int64_t)sqlite3_column_int64(q, 1);
+    i++;
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  if (st != KBC_OK) return st != KBC_OK ? st : fin;
+  *out = arr;
+  *n_out = i;
+  return KBC_OK;
+}
+
+/* -------------------------------------------------------- first indexed -- */
+
+/* INSERT OR IGNORE, and that is the entire behaviour. A reindex MUST NOT move
+ * this timestamp: it is the anchor a "created" sort needs, and it has to
+ * survive both a reindex and a file copy — mtime drifts on edit, btime does
+ * not survive a copy, and indexed_at refreshes every pass. An UPDATE here
+ * would silently turn the table into a no-op table. */
+kbc_status kbc_store_first_seen(kbc_store *s, const char *artifact_id,
+                                int64_t first_indexed_unix, kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "first_seen: null store");
+  kbc_status st = require_text(err, "artifact id", artifact_id, KBC_MAX_ID_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "INSERT OR IGNORE INTO doc_first_seen(artifact_id,"
+               " first_indexed_unix) VALUES(?1,?2);",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, artifact_id);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 2, first_indexed_unix);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "record first seen", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  unlock(s);
+  return st;
+}
+
+kbc_status kbc_store_get_first_seen(kbc_store *s, const char *artifact_id,
+                                    int64_t *out, kbc_err *err) {
+  if (s == NULL || out == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "get_first_seen: null argument");
+  kbc_status st = require_text(err, "artifact id", artifact_id, KBC_MAX_ID_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "SELECT first_indexed_unix FROM doc_first_seen"
+               " WHERE artifact_id = ?1;",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, artifact_id);
+  if (st != KBC_OK) {
+    (void)finalize(err, s, q, st);
+    unlock(s);
+    return st;
+  }
+  const int step = sqlite3_step(q);
+  if (step == SQLITE_ROW) {
+    *out = (int64_t)sqlite3_column_int64(q, 0);
+  } else if (step == SQLITE_DONE) {
+    st = kbc_err_set(err, KBC_ERR_NOTFOUND, "artifact %s: never indexed",
+                     artifact_id);
+  } else {
+    st = sql_fail(err, s, "get first seen", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  return st != KBC_OK ? st : fin;
 }

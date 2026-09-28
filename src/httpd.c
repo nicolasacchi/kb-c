@@ -1,7 +1,8 @@
 /* httpd.c — epoll + SO_REUSEPORT HTTP/1.1 daemon.
- *
  * Organised as: (1) socket + worker plumbing, (2) HTTP/1.1 parsing,
- * (3) the routing table, (4) the SSE endpoint, (5) the KBC_ROUTES export.
+ * (3) the routing table, (4) the SSE endpoint, (5) the serving surface —
+ * artifact bytes, the artifact subdomain, the static fallback and /metrics —
+ * (6) the KBC_ROUTES export.
  *
  * Concurrency: cfg->http_workers threads, one listening socket each
  * (SO_REUSEPORT, so the kernel balances accepts without a lock), one epoll set
@@ -64,6 +65,15 @@
  * the data it actually asked for. */
 #define KBC_CORS_MAX_ORIGINS 32u
 #define KBC_PEER_ADDR_MAX 64u
+
+/* The origin split's two constants. `artifact_host_suffix` and
+ * `parent_origin` are `[server]` keys in the original; kbc_config has no
+ * server section, so they come from the environment (KBC_ARTIFACT_HOST_SUFFIX,
+ * KBC_PARENT_ORIGIN) and are read once at bring-up. The parent-origin default
+ * is the "not configured for production" sentinel: the subdomain serve sends
+ * NO frame-ancestors CSP for it, exactly as `artifact.rs:36-49` does. */
+#define KBC_HOST_SUFFIX_DEFAULT ".artifacts.localhost"
+#define KBC_PARENT_ORIGIN_DEFAULT "http://localhost:4000"
 
 /* ------------------------------------------------------------------ util -- */
 
@@ -170,6 +180,13 @@ typedef struct conn {
    * extra header line (Retry-After on a 429). */
   const char *cors_origin;
   const char *extra_hdr;
+  /* Header lines the NEXT response adds, already formatted as "Name: value".
+   * Emitted verbatim by the write path just before its own nosniff, and
+   * cleared there, so a handler that sets them on a 200 cannot leak them onto
+   * the next response on the same connection. The frozen kbc_response carries
+   * no header list (see the port report), so this is where a route's own
+   * headers travel. */
+  kbc_str extra;
 
   /* SSE state. `closed` and the conn list are guarded by h->conns_mu; the
    * frame queue is guarded by `mu`. Lock order: conns_mu, then mu. */
@@ -185,6 +202,49 @@ typedef struct {
   char *type;
   char *json;
 } sse_hist;
+
+/* Latency histogram. 12 boundaries + one overflow slot, the same 13 the
+ * original carries (`kb-core/src/metrics.rs:31-33`). A sample at `ms` lands in
+ * the first slot whose boundary it does not exceed, so slot 12 is the ">10s"
+ * overflow. Counters, not locks: `observe` runs on every worker. */
+#define KBC_LAT_BOUNDARIES 12u
+#define KBC_LAT_SLOTS 13u
+
+typedef struct {
+  _Atomic uint64_t count;
+  _Atomic uint64_t slot[KBC_LAT_SLOTS]; /* cumulative per boundary */
+} route_hist;
+
+/* `RouteKind::ALL` order (`kb-server/src/state.rs:542-552`): the exposition
+ * lists the families in enum order, so the array order IS the wire order. */
+#define KBC_ROUTE_KINDS 9u
+
+/* The counters `/metrics` renders. There is no registry and no naming layer
+ * in the original either (`state.rs:396-437` is a plain struct of atomics);
+ * what the port owes it is the same fixed cardinality, so a family is either
+ * always emitted or not emitted at all — never emitted only once it has a
+ * value. */
+typedef struct {
+  _Atomic uint64_t total;              /* kb_http_requests_total */
+  route_hist route[KBC_ROUTE_KINDS];  /* kb_route_* */
+  route_hist per_kb[KBC_MAX_CORPORA]; /* pre-seeded from the kb set */
+  size_t n_kb;                         /* live entries of per_kb */
+  bool detailed;                       /* the `[server] metrics` layer */
+  /* BORROWED from cfg->corpora, which outlives the httpd. Sorted at EMIT time
+   * only: the index space stays the bring-up order, so an observation is a
+   * linear scan over a fixed array instead of a lookup in a moving order. */
+  const char *kb_names[KBC_MAX_CORPORA];
+} metrics_reg;
+
+/* One configured corpus and the CANONICAL path of its source root. The root
+ * is canonicalised once, at bring-up: the containment guard compares against
+ * it on every artifact request, and a per-request realpath(3) would make the
+ * trust boundary depend on a filesystem state the request controls. */
+typedef struct {
+  char *name; /* KBC_OWN */
+  char *root; /* KBC_OWN, realpath(3) of the corpus path, NULL when absent */
+} kb_root;
+
 
 struct kbc_worker {
   kbc_httpd *h;
@@ -222,6 +282,18 @@ struct kbc_httpd {
   size_t all_len, all_cap;
 
   pthread_mutex_t ring_mu;
+
+  /* The origin split, brought up once (see section 5). The corpus roots are
+   * canonicalised HERE so the per-request guard is a pure string comparison
+   * (`routes/artifact.rs:597-602`), and neither getenv nor realpath runs on
+   * the request path. kbc_config has no field for any of them — the config
+   * keys they should become are in the port report. */
+  char *host_suffix;   /* KBC_OWN, default KBC_HOST_SUFFIX_DEFAULT */
+  char *parent_origin; /* KBC_OWN, default KBC_PARENT_ORIGIN_DEFAULT */
+  char *spa_root;      /* KBC_OWN, canonicalised; NULL when no SPA dist */
+  kb_root *roots;      /* KBC_OWN, cfg->ncorpora entries */
+  size_t nroots;
+  metrics_reg m;       /* lock-free: every worker writes it */
   sse_hist ring[KBC_SSE_RING_CAP];
   size_t ring_next; /* next slot to write; == the oldest when full */
   uint64_t next_id;
@@ -241,6 +313,10 @@ static const char *const CT_TEXT = "text/plain; charset=utf-8";
 static const char *const CT_SSE = "text/event-stream; charset=utf-8";
 static const char *const CT_PROBLEM =
     "application/problem+json; charset=utf-8";
+/* Scrapers branch on `version=0.0.4`; `charset=utf-8` is the form the
+ * exposition spec names (`routes/metrics.rs:115`). */
+static const char *const KBC_PROM_CONTENT_TYPE =
+    "text/plain; version=0.0.4; charset=utf-8";
 
 void kbc_response_init(kbc_response *r) {
   if (!r) return;
@@ -433,6 +509,19 @@ static int64_t query_int(const char *query, const char *key) {
   return acc;
 }
 
+/* A boolean query flag, which is not an integer: the original's `?cm=on`
+ * accepts exactly `on`, `1` and `true` and nothing else
+ * (`routes/artifact.rs:933-940`). Reading it with query_int answers -1 for
+ * "on" and would quietly turn the annotator payload off. */
+static bool query_flag(const char *query, const char *key) {
+  const char *vs;
+  size_t vn;
+  if (!query_pair(query, key, &vs, &vn)) return false;
+  return (vn == 2 && vs[0] == 'o' && vs[1] == 'n') ||
+         (vn == 1 && vs[0] == '1') ||
+         (vn == 4 && memcmp(vs, "true", 4) == 0);
+}
+
 /* Decodes, then rejects NUL / '\' / "..", collapses '//' and drops a trailing
  * '/'. Runs before the router and before anything reaches the filesystem. */
 static kbc_status path_normalize(kbc_arena *a, const char *raw, char **out,
@@ -472,7 +561,12 @@ static kbc_status path_normalize(kbc_arena *a, const char *raw, char **out,
     }
     norm[o++] = (char)c;
   }
-  if (o == 1) norm[o++] = '/';
+  /* Only an EMPTY target needs the root written here. The loop already wrote
+   * the leading '/' before it, so a target of "/" left `o == 1` on the
+   * trailing-slash break above and this used to append a second one, turning
+   * "GET /" into the path "//" — which matched no route and fell through to the
+   * origin fallback. The condition is on the INPUT, not on the output. */
+  if (n == 0) norm[o++] = '/';
   norm[o] = '\0';
   *out = norm;
   return KBC_OK;
@@ -1176,13 +1270,17 @@ static kbc_status route_banner(kbc_str *out) {
       "  GET  /api/search?q=<terms>&kb=<corpus>&kind=&mode=&limit=&offset=\n"
       "  GET  /api/artifacts?kb=<corpus>&kind=&limit=&offset=\n"
       "  GET  /api/artifacts/{id}?source=1\n"
+      "  GET  /api/kb/<corpus>/artifact/{id}?download=1\n"
       "  POST /api/reindex\n"
       "  GET  /api/events\n"
       "  GET  /api/stats\n"
+      "  GET  /metrics\n"
       "Errors are RFC 7807 application/problem+json.\n"
       "One trust tier: identity is attribution, not authorization.\n"
       "CORS is same-origin only unless KBC_CORS_ORIGINS names origins;\n"
-      "KBC_RATE_LIMIT_RPS caps requests per connection per second.\n",
+      "KBC_RATE_LIMIT_RPS caps requests per connection per second.\n"
+      "A Host of <id>.artifacts.localhost serves one artifact per origin;\n"
+      "anything else falls back to the static root in KB_SPA_DIST.\n",
       KBC_VERSION);
 }
 
@@ -1233,116 +1331,282 @@ static const char *err_msg(const kbc_err *err, kbc_status st) {
   return err->msg[0] != '\0' ? err->msg : kbc_status_str(st);
 }
 
+/* Everything a request needs that is not on the request itself: where a
+ * route's own response headers go, the metrics registry, and the `unmatched`
+ * out-flag. The registry is NULL for a socketless call — there is no daemon,
+ * so nothing has been counted — and `unmatched` lets the connection layer take
+ * the origin fallback (`routes/dispatch.rs:46-50`) without the router having
+ * to know what that fallback serves. */
+typedef struct {
+  kbc_str *extra;       /* header lines for this response; may be NULL */
+  const metrics_reg *m; /* NULL for a socketless handle */
+  bool *unmatched;      /* out; may be NULL */
+} req_ctx;
+
+/* (5)'s two dispatched routes, defined with the rest of the serving surface. */
+static kbc_status route_artifact_bytes(kbc_app *app, kbc_arena *a,
+                                       const kbc_config *cfg, const char *kb,
+                                       const char *id, const char *query,
+                                       kbc_str *hdrs, kbc_str *out,
+                                       kbc_err *err);
+static kbc_status route_prometheus(kbc_app *app, const metrics_reg *m,
+                                   kbc_str *hdrs, kbc_str *out, kbc_err *err);
+
+/* `/api` and everything under it. The origin split never claims these: an
+ * unmatched `/api` path is a 404 problem+json, never the static shell
+ * (`dispatch.rs:51-59`, `:88-96`). */
+static bool path_is_api(const char *p) {
+  return strncmp(p, "/api", 4) == 0 && (p[4] == '\0' || p[4] == '/');
+}
+
 static kbc_status dispatch(kbc_app *app, const kbc_config *cfg,
-                           const kbc_request *req, kbc_response *out,
-                           kbc_err *err, int64_t uptime_s) {
+                           const kbc_request *req, const req_ctx *ctx,
+                           kbc_response *out, kbc_err *err, int64_t uptime_s) {
   const char *m = req->method;
   const char *p = req->path;
   bool is_get = strcmp(m, "GET") == 0;
   bool is_post = strcmp(m, "POST") == 0;
+  /* A route's own header lines are built here and published to the response
+   * only on success, so an error path can never leave a half-written header
+   * set on a problem+json answer. */
+  kbc_str local_hdrs;
+  kbc_str_init(&local_hdrs);
+  kbc_str *hdrs = &local_hdrs;
+  kbc_status result = KBC_OK;
 
   if (is_get && strcmp(p, "/") == 0) {
     out->content_type = CT_TEXT;
-    return route_banner(&out->body);
+    result = route_banner(&out->body);
+    goto done;
   }
   if (is_get && strcmp(p, "/api/health") == 0) {
-    return route_health(app, &out->body, uptime_s);
+    result = route_health(app, &out->body, uptime_s);
+    goto done;
   }
 
+
   auth_tier tier = TIER_OPEN;
-  if (kbc_failed(check_auth(cfg, req, out, &tier))) return KBC_OK;
+  if (kbc_failed(check_auth(cfg, req, out, &tier))) goto done;
 
   if (strcmp(p, "/api/identity") == 0) {
-    if (!is_get) return method_not_allowed(out, m, p);
+    if (!is_get) {
+      result = method_not_allowed(out, m, p);
+      goto done;
+    }
     /* No arena: this route decodes nothing and allocates nothing a request
      * outlives. */
     kbc_status st = route_identity(req->query, req, tier, &out->body, err);
     if (kbc_failed(st)) {
-      return resp_error(out, 400, st, "%s", err_msg(err, st));
+      result = resp_error(out, 400, st, "%s", err_msg(err, st));
+      goto done;
     }
-    return KBC_OK;
+    goto done;
   }
   if (strcmp(p, "/api/kbs") == 0) {
-    if (!is_get) return method_not_allowed(out, m, p);
+    if (!is_get) {
+      result = method_not_allowed(out, m, p);
+      goto done;
+    }
     kbc_arena *a = kbc_arena_new(16384);
-    if (a == NULL) return resp_error(out, 500, KBC_ERR_NOMEM, "no arena");
+    if (a == NULL) {
+      result = resp_error(out, 500, KBC_ERR_NOMEM, "no arena");
+      goto done;
+    }
     kbc_status st = route_kbs(app, a, req->query, cfg, &out->body, err);
     kbc_arena_free(a);
     if (st == KBC_ERR_NOTFOUND) {
-      return resp_error(out, 404, st, "%s", err_msg(err, st));
+      result = resp_error(out, 404, st, "%s", err_msg(err, st));
+      goto done;
     }
     if (kbc_failed(st)) {
-      return resp_error(out, 400, st, "%s", err_msg(err, st));
+      result = resp_error(out, 400, st, "%s", err_msg(err, st));
+      goto done;
     }
-    return KBC_OK;
+    goto done;
   }
 
   if (strcmp(p, "/api/stats") == 0) {
-    if (!is_get) return method_not_allowed(out, m, p);
+    if (!is_get) {
+      result = method_not_allowed(out, m, p);
+      goto done;
+    }
     kbc_status st = route_stats(app, &out->body, err);
-    if (kbc_failed(st)) return resp_error(out, 500, st, "stats: %s", err_msg(err, st));
-    return KBC_OK;
+    if (kbc_failed(st)) {
+      result = resp_error(out, 500, st, "stats: %s", err_msg(err, st));
+      goto done;
+    }
+    goto done;
   }
   if (strcmp(p, "/api/search") == 0) {
-    if (!is_get) return method_not_allowed(out, m, p);
+    if (!is_get) {
+      result = method_not_allowed(out, m, p);
+      goto done;
+    }
     kbc_arena *a = kbc_arena_new(16384);
-    if (a == NULL) return resp_error(out, 500, KBC_ERR_NOMEM, "no arena");
+    if (a == NULL) {
+      result = resp_error(out, 500, KBC_ERR_NOMEM, "no arena");
+      goto done;
+    }
     kbc_status st = route_search(app, cfg, a, req->query, &out->body, err);
     kbc_arena_free(a);
     if (kbc_failed(st)) {
-      return resp_error(out, 400, st, "%s", err_msg(err, st));
+      result = resp_error(out, 400, st, "%s", err_msg(err, st));
+      goto done;
     }
-    return KBC_OK;
+    goto done;
   }
   if (strcmp(p, "/api/artifacts") == 0) {
-    if (!is_get) return method_not_allowed(out, m, p);
+    if (!is_get) {
+      result = method_not_allowed(out, m, p);
+      goto done;
+    }
     kbc_arena *a = kbc_arena_new(16384);
-    if (a == NULL) return resp_error(out, 500, KBC_ERR_NOMEM, "no arena");
+    if (a == NULL) {
+      result = resp_error(out, 500, KBC_ERR_NOMEM, "no arena");
+      goto done;
+    }
     kbc_status st = route_artifacts(app, a, req->query, &out->body, err);
     kbc_arena_free(a);
     if (kbc_failed(st)) {
-      return resp_error(out, 400, st, "%s", err_msg(err, st));
+      result = resp_error(out, 400, st, "%s", err_msg(err, st));
+      goto done;
     }
-    return KBC_OK;
+    goto done;
   }
   static const char kOne[] = "/api/artifacts/";
   if (strncmp(p, kOne, sizeof kOne - 1) == 0 && p[sizeof kOne - 1] != '\0') {
-    if (!is_get) return method_not_allowed(out, m, p);
+    if (!is_get) {
+      result = method_not_allowed(out, m, p);
+      goto done;
+    }
     const char *id = p + sizeof kOne - 1;
     if (strchr(id, '/') != NULL) {
-      return resp_error(out, 404, KBC_ERR_NOTFOUND, "no route for %s", p);
+      result = resp_error(out, 404, KBC_ERR_NOTFOUND, "no route for %s", p);
+      goto done;
     }
     kbc_arena *a = kbc_arena_new(16384);
-    if (a == NULL) return resp_error(out, 500, KBC_ERR_NOMEM, "no arena");
+    if (a == NULL) {
+      result = resp_error(out, 500, KBC_ERR_NOMEM, "no arena");
+      goto done;
+    }
     kbc_status st = route_artifact_one(app, a, id, req->query, &out->body, err);
     kbc_arena_free(a);
     if (st == KBC_ERR_NOTFOUND) {
-      return resp_error(out, 404, st, "no artifact with id %s", id);
+      result = resp_error(out, 404, st, "no artifact with id %s", id);
+      goto done;
     }
     if (kbc_failed(st)) {
-      return resp_error(out, 400, st, "%s", err_msg(err, st));
+      result = resp_error(out, 400, st, "%s", err_msg(err, st));
+      goto done;
     }
-    return KBC_OK;
+    goto done;
   }
   if (strcmp(p, "/api/reindex") == 0) {
-    if (!is_post) return method_not_allowed(out, m, p);
+    if (!is_post) {
+      result = method_not_allowed(out, m, p);
+      goto done;
+    }
     kbc_status st = route_reindex(app, &out->body, err);
     if (kbc_failed(st)) {
-      return resp_error(out, 500, st, "reindex: %s", err_msg(err, st));
+      result = resp_error(out, 500, st, "reindex: %s", err_msg(err, st));
+      goto done;
     }
     out->status = 202;
-    return KBC_OK;
+    goto done;
+  }
+  /* Top-level, not under /api: the original mounts it on its own router so the
+   * api tree's auth does not re-wrap it, and so it answers on EVERY origin
+   * (`router.rs:1003-1025`). Being outside that tree is also why it is neither
+   * counted nor classified as an API route below. */
+  if (strcmp(p, "/metrics") == 0) {
+    if (!is_get) {
+      result = method_not_allowed(out, m, p);
+      goto done;
+    }
+    /* A socketless call has no daemon and therefore no counters; the
+     * fixed-cardinality families still render, at 0. */
+    metrics_reg zero;
+    memset(&zero, 0, sizeof zero);
+    kbc_status st = route_prometheus(app, ctx->m != NULL ? ctx->m : &zero,
+                                     hdrs, &out->body, err);
+    if (kbc_failed(st)) {
+      kbc_str_clear(hdrs);
+      result = resp_error(out, 500, st, "metrics: %s", err_msg(err, st));
+      goto done;
+    }
+    out->content_type = KBC_PROM_CONTENT_TYPE;
+    goto done;
+  }
+  /* `/api/kb/{kb}/artifact/{id}` — the artifact's bytes on the parent origin. */
+  static const char kArt[] = "/api/kb/";
+  if (strncmp(p, kArt, sizeof kArt - 1) == 0) {
+    const char *rest = p + sizeof kArt - 1;
+    const char *slash = strchr(rest, '/');
+    if (slash != NULL && strncmp(slash + 1, "artifact/", 9) == 0) {
+      const char *id = slash + 10;
+      /* The kb name is a path SEGMENT, copied out rather than NUL-terminated in
+       * place: `req.path` is the connection's parsed target and the fallback
+       * below still reads it. */
+      char kb[256];
+      size_t kbl = (size_t)(slash - rest);
+      if (kbl == 0 || id[0] == '\0' || strchr(id, '/') != NULL ||
+          kbl >= sizeof kb) {
+        result = resp_error(out, 404, KBC_ERR_NOTFOUND, "no route for %s", p);
+        goto done;
+      }
+      memcpy(kb, rest, kbl);
+      kb[kbl] = '\0';
+      if (!is_get) {
+        result = method_not_allowed(out, m, p);
+        goto done;
+      }
+      kbc_arena *a = kbc_arena_new(16384);
+      if (a == NULL) {
+        result = resp_error(out, 500, KBC_ERR_NOMEM, "no arena");
+        goto done;
+      }
+      kbc_status st = route_artifact_bytes(app, a, cfg, kb, id, req->query,
+                                           hdrs, &out->body, err);
+      kbc_arena_free(a);
+      if (kbc_failed(st)) {
+        /* The three answers are the original's: an unknown kb or id is a 404, a
+         * file that will not read is a 500 (`Io(_) => 500`), and a source that
+         * cannot be rendered under a text/html label is a 400. */
+        kbc_str_clear(hdrs);
+        int status = st == KBC_ERR_NOTFOUND   ? 404
+                     : st == KBC_ERR_IO        ? 500
+                                                 : 400;
+        result = resp_error(out, status, st, "%s", err_msg(err, st));
+        goto done;
+      }
+      out->content_type = "text/html; charset=utf-8";
+      goto done;
+    }
   }
   if (strcmp(p, "/api/events") == 0) {
-    if (!is_get) return method_not_allowed(out, m, p);
+    if (!is_get) {
+      result = method_not_allowed(out, m, p);
+      goto done;
+    }
     /* Over a socket this becomes a live stream; a socketless caller gets the
      * head of that stream, which is the whole non-streaming part of it. */
     out->status = 200;
     out->content_type = CT_SSE;
     out->sse = true;
-    return kbc_str_puts(&out->body, "retry: 3000\n\n:ok\n\n");
+    result = kbc_str_puts(&out->body, "retry: 3000\n\n:ok\n\n");
+    goto done;
   }
-  return resp_error(out, 404, KBC_ERR_NOTFOUND, "no route for %s %s", m, p);
+  if (ctx->unmatched != NULL) *ctx->unmatched = true;
+  result = resp_error(out, 404, KBC_ERR_NOTFOUND, "no route for %s %s", m, p);
+done:
+  /* Publish the route's own header lines only when the route SUCCEEDED, so a
+   * 404 problem+json can never carry an artifact id or a sandbox CSP. */
+  if (ctx->extra != NULL && local_hdrs.len > 0 &&
+      kbc_failed(kbc_str_append(ctx->extra, local_hdrs.ptr, local_hdrs.len))) {
+    kbc_str_clear(ctx->extra);
+  }
+  kbc_str_free(&local_hdrs);
+  return result;
 }
 
 kbc_status kbc_httpd_handle(kbc_app *app, const kbc_config *cfg,
@@ -1360,7 +1624,12 @@ kbc_status kbc_httpd_handle(kbc_app *app, const kbc_config *cfg,
   }
   /* No server clock here: uptime_s is 0 for a socketless call, because the only
    * uptime that means anything belongs to a running kbc_httpd. */
-  return dispatch(app, cfg, req, out, err, 0);
+  /* No server clock here: uptime_s is 0 for a socketless call, because the only
+   * uptime that means anything belongs to a running kbc_httpd. Nothing is
+   * counted either — there is no daemon to count it against. */
+  req_ctx ctx;
+  memset(&ctx, 0, sizeof ctx);
+  return dispatch(app, cfg, req, &ctx, out, err, 0);
 }
 
 /* ---------------------------------------------------------- (4) the SSE --- */
@@ -1493,6 +1762,1329 @@ static void sse_replay(kbc_httpd *h, conn *c, uint64_t last_id) {
   pthread_mutex_unlock(&h->ring_mu);
 }
 
+/* ------------------------------------------------- (5) the serving surface --
+ *
+ * Four surfaces hang off the daemon beside the JSON API: the artifact bytes
+ * on the PARENT origin, the artifact SUBDOMAIN (one origin per artifact, so a
+ * hostile artifact cannot reach the trusted app origin), the parent-origin
+ * static handler the daemon falls back to for every path no route claimed,
+ * and the Prometheus text endpoint.
+ *
+ * The origin split is the Rust `routes::dispatch::fallback` branch
+ * (`dispatch.rs:46-50`): a `Host:` that parses as an artifact subdomain goes
+ * to the artifact serve, anything else to the static handler. Both sit
+ * OUTSIDE the token gate there, and they do here for the same reason — `Host:`
+ * is chosen by the client, so gating on it would be theatre; what protects the
+ * corpus is the bind guard (a routable bind with no token is refused outright)
+ * and the token on /api. What the artifact surfaces carry instead is origin
+ * isolation: a sandbox CSP on the parent origin, a frame-ancestors CSP on the
+ * subdomain. */
+
+/* Defined with the write path below; every origin handler answers through it. */
+static void conn_queue_response(conn *c, int status, const char *ct,
+                                const char *body, size_t body_len,
+                                bool close_after, bool sse);
+
+/* The trust boundary, and the one place in this file where the obvious
+ * implementation is a vulnerability.
+ *
+ * The original compares `resolved.starts_with(&source_root)`
+ * (`routes/artifact.rs:648`, the walk-up; `:687`, the unconditional re-check;
+ * `routes/spa.rs:290`, the static handler). Rust's `Path::starts_with` is
+ * COMPONENT-WISE: `/root/data` is a prefix of `/root/data` and of
+ * `/root/data/x`, and is NOT a prefix of `/root/data-secret`. A C port that
+ * wrote `strncmp(path, root, strlen(root)) == 0` would accept the sibling
+ * directory `/root/data-secret/secret.txt` and serve it.
+ *
+ * A `../` test does not catch that, and that is the point: strncmp rejects
+ * `../` too. Only the sibling case separates the two implementations, which is
+ * why the traversal test in tests/test_httpd.c pins `<root>-secret` and not
+ * just `..`.
+ *
+ * Both arguments must already be canonical (see `canon`). `..` and symlink
+ * resolution are the filesystem's job; the guard's job is the component
+ * comparison, and running it on a raw path would be the same bug in a
+ * different hat. */
+static bool path_within(const char *root, const char *path) {
+  if (root == NULL || path == NULL || root[0] == '\0') return false;
+  const char *r = root;
+  const char *p = path;
+  for (;;) {
+    while (*r == '/') r++;
+    while (*p == '/') p++;
+    size_t rl = 0;
+    size_t pl = 0;
+    while (r[rl] != '\0' && r[rl] != '/') rl++;
+    while (p[pl] != '\0' && p[pl] != '/') pl++;
+    /* The root has run out of components: `path` IS the root or lives under
+     * it. This is the only place containment succeeds. */
+    if (rl == 0) return true;
+    if (rl != pl || memcmp(r, p, rl) != 0) return false;
+    r += rl;
+    p += pl;
+  }
+}
+
+/* Rust's `Path::canonicalize`: resolve every symlink and every "..", hand back
+ * an absolute path, and answer NULL when nothing is there. realpath(3) is the
+ * same operation with the same all-or-nothing answer, which is what lets the
+ * walk-up below treat "no such file" as "look one level up" — there is no
+ * partially-resolved answer to second-guess. */
+static char *canon(const char *path) { return realpath(path, NULL); }
+
+/* Parent directory, KBC_OWN. NULL when there is none, which for an absolute
+ * path means the root itself — the walk-up uses NULL as "exhausted"
+ * (`artifact.rs:658-662`). */
+static char *path_dir(const char *p) {
+  size_t n = strlen(p);
+  while (n > 1 && p[n - 1] == '/') n--;
+  while (n > 0 && p[n - 1] != '/') n--;
+  if (n == 0) return NULL; /* no separator: relative, and we only walk abs */
+  while (n > 1 && p[n - 1] == '/') n--;
+  if (n == 1) {
+    char *slash = malloc(2);
+    if (slash == NULL) return NULL;
+    slash[0] = '/';
+    slash[1] = '\0';
+    return slash;
+  }
+  char *d = malloc(n + 1);
+  if (d == NULL) return NULL;
+  memcpy(d, p, n);
+  d[n] = '\0';
+  return d;
+}
+
+/* KBC_OWN join, bounded by KBC_MAX_PATH_LEN. `rel` is request-derived, so the
+ * bound is the guard: an unbounded join is an unbounded malloc on a hostile
+ * input. */
+static char *path_join(const char *base, const char *rel) {
+  size_t bn = strlen(base);
+  size_t rn = strlen(rel);
+  bool need_sep = bn > 0 && base[bn - 1] != '/';
+  if (rn + bn + 2 > KBC_MAX_PATH_LEN) return NULL;
+  char *p = malloc(bn + rn + 2);
+  if (p == NULL) return NULL;
+  memcpy(p, base, bn);
+  size_t o = bn;
+  if (need_sep) p[o++] = '/';
+  memcpy(p + o, rel, rn);
+  p[o + rn] = '\0';
+  return p;
+}
+
+/* Whole file into `out`. Deliberately UNBOUNDED: the original's `std::fs::read`
+ * is unbounded on both serve paths (`docs.rs:1472`, `artifact.rs:693`) and
+ * every 413 in the Rust corpus is on an upload or an export
+ * (`routes/download.rs:194`, `routes/review.rs:158`). A cap here would be a
+ * rejection the original does not have; the real bound is that an indexed
+ * corpus file is already capped at KBC_MAX_ARTIFACT_BYTES. */
+static kbc_status read_whole_file(const char *path, kbc_str *out,
+                                  kbc_err *err) {
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return kbc_err_set(err, KBC_ERR_IO, "open %s: %s", path, strerror(errno));
+  }
+  kbc_status st = KBC_OK;
+  char buf[65536];
+  for (;;) {
+    ssize_t n = read(fd, buf, sizeof buf);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      st = kbc_err_set(err, KBC_ERR_IO, "read %s: %s", path, strerror(errno));
+      goto done;
+    }
+    if (n == 0) break;
+    st = kbc_str_append(out, buf, (size_t)n);
+    if (kbc_failed(st)) goto done;
+  }
+done:
+  if (close(fd) != 0 && !kbc_failed(st)) {
+    st = kbc_err_set(err, KBC_ERR_IO, "close %s: %s", path, strerror(errno));
+  }
+  return st;
+}
+
+/* Both handlers that label a body text/html refuse invalid UTF-8 rather than
+ * serve bytes the declared type does not match (`docs.rs:1489`,
+ * `artifact.rs:712`). Overlong forms, surrogates and >U+10FFFF are rejected
+ * too, because Rust's `str::from_utf8` rejects them. */
+static bool is_utf8(const char *p, size_t n) {
+  size_t i = 0;
+  while (i < n) {
+    unsigned char c = (unsigned char)p[i];
+    size_t need;
+    uint32_t cp;
+    if (c < 0x80u) {
+      i++;
+      continue;
+    }
+    if ((c & 0xe0u) == 0xc0u) {
+      need = 1;
+      cp = c & 0x1fu;
+    } else if ((c & 0xf0u) == 0xe0u) {
+      need = 2;
+      cp = c & 0x0fu;
+    } else if ((c & 0xf8u) == 0xf0u) {
+      need = 3;
+      cp = c & 0x07u;
+    } else {
+      return false;
+    }
+    if (n - i <= need) return false;
+    for (size_t k = 1; k <= need; k++) {
+      unsigned char cc = (unsigned char)p[i + k];
+      if ((cc & 0xc0u) != 0x80u) return false;
+      cp = (cp << 6) | (uint32_t)(cc & 0x3fu);
+    }
+    if ((need == 1 && cp < 0x80u) || (need == 2 && cp < 0x800u) ||
+        (need == 3 && cp < 0x10000u)) {
+      return false;
+    }
+    if (cp > 0x10ffffu || (cp >= 0xd800u && cp <= 0xdfffu)) return false;
+    i += need + 1;
+  }
+  return true;
+}
+
+/* `routes::guess_content_type` (`routes/mod.rs:58-83`), fallthrough included.
+ * There is deliberately NO unsupported-extension rejection: the function
+ * never fails, and the only 415 in the corpus is on the upload path
+ * (`routes/artifacts.rs:547`), never on serve. */
+static const char *guess_content_type(const char *path) {
+  static const char *const kMap[][2] = {
+      {"html", "text/html; charset=utf-8"},
+      {"htm", "text/html; charset=utf-8"},
+      {"css", "text/css; charset=utf-8"},
+      {"js", "application/javascript; charset=utf-8"},
+      {"mjs", "application/javascript; charset=utf-8"},
+      {"json", "application/json"},
+      {"webmanifest", "application/manifest+json"},
+      {"svg", "image/svg+xml"},
+      {"png", "image/png"},
+      {"jpg", "image/jpeg"},
+      {"jpeg", "image/jpeg"},
+      {"gif", "image/gif"},
+      {"ico", "image/x-icon"},
+      {"woff", "font/woff"},
+      {"woff2", "font/woff2"},
+      {"map", "application/json"},
+      {"txt", "text/plain; charset=utf-8"},
+  };
+  const char *dot = strrchr(path, '.');
+  const char *slash = strrchr(path, '/');
+  if (dot == NULL || (slash != NULL && dot < slash)) {
+    return "application/octet-stream";
+  }
+  for (size_t i = 0; i < sizeof kMap / sizeof kMap[0]; i++) {
+    if (str_ieq(dot + 1, kMap[i][0])) return kMap[i][1];
+  }
+  return "application/octet-stream";
+}
+
+static const char *path_ext(const char *path) {
+  const char *dot = strrchr(path, '.');
+  const char *slash = strrchr(path, '/');
+  if (dot == NULL || (slash != NULL && dot < slash)) return NULL;
+  return dot + 1;
+}
+
+/* The original reads this out of the per-kb resolved extension map
+ * (`ctx.ext_map.is_markdown`, SC5) because a `[indexer.indexable_extensions]`
+ * mapping can name another extension. kb-c has no extension map and no config
+ * key for one, so the two built-in extensions are the whole rule. */
+static bool is_markdown(const char *path) {
+  const char *e = path_ext(path);
+  return e != NULL && (str_ieq(e, "md") || str_ieq(e, "markdown"));
+}
+
+/* `kb_core::iframe::parse_artifact_id`: the LABEL between the host and the
+ * configured subdomain suffix, with the four rejections that make a label safe
+ * to map onto a filesystem — never empty, no leading or trailing dot, no "..",
+ * and nothing outside `[A-Za-z0-9._-]`. A Host that fails any of them is the
+ * parent origin, not an artifact, which is how `dispatch.rs:46-50` tells the
+ * two apart. */
+static bool parse_artifact_host(const char *host, const char *suffix,
+                                const char **label, size_t *label_len) {
+  if (host == NULL || suffix == NULL || suffix[0] == '\0') return false;
+  size_t sl = strlen(suffix);
+  size_t hl = strcspn(host, ":"); /* the port is not part of the label */
+  if (hl <= sl) return false;
+  const char *id = host;
+  size_t n = hl - sl;
+  if (strncmp(id + n, suffix, sl) != 0) return false;
+  if (id[0] == '.' || id[n - 1] == '.') return false;
+  for (size_t i = 0; i + 1 < n; i++) {
+    if (id[i] == '.' && id[i + 1] == '.') return false;
+  }
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)id[i];
+    bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+    if (!ok) return false;
+  }
+  *label = id;
+  *label_len = n;
+  return true;
+}
+
+/* A plain-text answer, which is what the two origin serves return for a
+ * "not found": the original builds those with `(StatusCode, "...")` and never
+ * reaches the problem+json helper (`artifact.rs:550`, `:594`, `:626`). */
+static void origin_plain(conn *c, int status, const char *msg) {
+  kbc_response r;
+  kbc_response_init(&r);
+  r.status = status;
+  r.content_type = CT_TEXT;
+  (void)kbc_str_puts(&r.body, msg);
+  conn_queue_response(c, r.status, r.content_type, r.body.ptr, r.body.len, false,
+                      false);
+  kbc_response_free(&r);
+}
+
+/* The `frame-ancestors` CSP for a subdomain response, or NULL when none is
+ * sent. It is omitted entirely in the DEFAULT dev configuration
+ * (`artifact.rs:66-78`): an empty parent origin, or the default sentinel
+ * itself, means "not configured for production", and a strict target would
+ * break the dev flows the sentinel exists for. Reproduced rather than always
+ * emitted. The value is header-injection-safe: the origin comes from the
+ * operator's environment, and a value carrying a control byte is dropped
+ * instead of written into the response. */
+static const char *artifact_csp(const kbc_httpd *h) {
+  const char *p = h->parent_origin;
+  if (p == NULL || p[0] == '\0' || strcmp(p, KBC_PARENT_ORIGIN_DEFAULT) == 0) {
+    return NULL;
+  }
+  for (const char *q = p; *q != '\0'; q++) {
+    unsigned char c = (unsigned char)*q;
+    if (c < 0x20u || c == 0x7fu) return NULL;
+  }
+  return p;
+}
+
+/* The subdomain's own header set, and it is NOT the parent origin's set, in a
+ * different order: Content-Type and X-Kb-Artifact-Id first, then the cache
+ * headers (?cm=on forces private, no-store and widens Vary to Authorization so
+ * no proxy hands one user's comment payload to another), and the frame-ancestors
+ * CSP LAST (`artifact.rs:828-861`). The daemon's own `Vary: Origin` is emitted
+ * by the write path on every response; Vary is a set, so the two combine. */
+static kbc_status artifact_origin_headers(kbc_str *hdrs, const char *id,
+                                          bool cm_on, const kbc_httpd *h) {
+  kbc_status st = kbc_str_printf(hdrs, "X-Kb-Artifact-Id: %s\r\n", id);
+  if (kbc_failed(st)) return st;
+  if (cm_on) {
+    st = kbc_str_puts(hdrs, "Cache-Control: private, no-store\r\n"
+                           "Vary: Authorization, Accept, Cookie\r\n");
+  } else {
+    st = kbc_str_puts(hdrs, "Vary: Accept, Cookie\r\n");
+  }
+  if (kbc_failed(st)) return st;
+  const char *csp = artifact_csp(h);
+  if (csp != NULL) {
+    st = kbc_str_printf(hdrs, "Content-Security-Policy: frame-ancestors %s;\r\n",
+                        csp);
+  }
+  return st;
+}
+
+/* Exactly 12 lowercase hex chars — `kb_core::ids::ArtifactId`'s shape
+ * (`iframe.rs:158-163`). Length-checked against the slice, never a NUL: the
+ * label is a substring of the Host header, not a C string. */
+static bool id_is_hex12(const char *p, size_t n) {
+  if (n != KBC_MAX_ID_LEN) return false;
+  for (size_t i = 0; i < n; i++) {
+    if (!((p[i] >= '0' && p[i] <= '9') || (p[i] >= 'a' && p[i] <= 'f'))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/* `[a-z0-9][a-z0-9-]*` — a non-empty, DNS-label-safe `kb_enc`
+ * (`iframe.rs:122-129`). */
+static bool kb_enc_shape(const char *p, size_t n) {
+  if (n == 0) return false;
+  if (!((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= '0' && p[0] <= '9'))) {
+    return false;
+  }
+  for (size_t i = 1; i < n; i++) {
+    char c = p[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/* A corpus name with every '_' folded to '-' (`encode_kb_name`,
+ * `iframe.rs:127-131`). The encoding is lossy ON PURPOSE, so this is a linear
+ * scan over the configured corpora, never a direct lookup. */
+static bool encode_kb_name_eq(const char *name, const char *enc, size_t n) {
+  size_t i = 0;
+  for (const char *p = name; *p != '\0'; p++, i++) {
+    if (i >= n) return false;
+    char c = *p == '_' ? '-' : *p;
+    if (c != enc[i]) return false;
+  }
+  return i == n;
+}
+
+/* Resolve a subdomain LABEL to the artifact it names. The bare form is a
+ * 12-hex id; the qualified form is `{kb_enc}--{id}` and names its kb
+ * explicitly, split at the RIGHTMOST `--` so a kb_enc that itself contains
+ * `--` still parses deterministically (`iframe.rs:145-156`). The original
+ * needs the qualified form because two kbs sharing a source-relative path hash
+ * to the same id; kb-c mints ids from (corpus, path) so they cannot collide,
+ * and the split is kept anyway because it is the grammar on the wire. */
+static bool resolve_host_artifact(kbc_app *app, kbc_arena *a,
+                                  const kbc_httpd *h, const char *label,
+                                  size_t llen, kbc_artifact *art,
+                                  const kb_root **root_out) {
+  const char *kb_enc = NULL;
+  size_t kb_len = 0;
+  const char *id = label + llen; /* points at the NUL when there is no `--` */
+  size_t idlen = 0;
+  for (size_t i = 0; i + 1 < llen; i++) {
+    if (label[i] == '-' && label[i + 1] == '-') {
+      kb_enc = label;
+      kb_len = i;
+      id = label + i + 2;
+      idlen = llen - i - 2;
+    }
+  }
+  const kb_root *want = NULL;
+  if (kb_enc != NULL && kb_enc_shape(kb_enc, kb_len)) {
+    for (size_t i = 0; i < h->nroots; i++) {
+      if (encode_kb_name_eq(h->roots[i].name, kb_enc, kb_len)) {
+        want = &h->roots[i];
+        break;
+      }
+    }
+  }
+  if (kb_enc == NULL) {
+    /* Bare: the label is the id. kb-c mints no legacy file-stem ids, so the
+     * original's "or whose source tree contains <id>.html" fallback has no
+     * counterpart here — a label that is not a 12-hex id resolves to nothing. */
+    id = label;
+    idlen = llen;
+  } else if (want == NULL) {
+    return false; /* qualified, but this daemon has no such kb */
+  }
+  if (!id_is_hex12(id, idlen)) return false;
+  /* The label is a SLICE of the Host header, not a C string: the storage API
+   * takes a NUL-terminated id, and handing it the header tail would look up
+   * "<id>.artifacts.localhost". */
+  char idbuf[KBC_MAX_ID_LEN + 1];
+  memcpy(idbuf, id, idlen);
+  idbuf[idlen] = '\0';
+  if (kbc_failed(kbc_app_get_artifact(app, a, idbuf, false, art, NULL))) {
+    return false;
+  }
+  for (size_t i = 0; i < h->nroots; i++) {
+    if (art->corpus == NULL || strcmp(art->corpus, h->roots[i].name) != 0) {
+      continue;
+    }
+    /* A qualified label is a claim about WHICH kb, and a claim that does not
+     * match the owner resolves to nothing (404) rather than to the other
+     * corpus's copy. */
+    if (want != NULL && want != &h->roots[i]) return false;
+    *root_out = &h->roots[i];
+    return true;
+  }
+  return false;
+}
+
+/* Serves a resolved file with the daemon's own response machinery, on a body
+ * already read into memory, and adds the handler's own header lines. The
+ * Content-Type travels on `kbc_response` (the write path always emits it) and
+ * everything else through `c->extra`, which is emitted verbatim just before
+ * the write path's own `nosniff`. */
+static void origin_file(conn *c, const char *ct, kbc_str *body,
+                        const kbc_str *extra) {
+  kbc_response resp;
+  kbc_response_init(&resp);
+  resp.content_type = ct;
+  (void)kbc_str_append(&resp.body, body->ptr, body->len);
+  kbc_status st = extra != NULL
+                      ? kbc_str_append(&c->extra, extra->ptr, extra->len)
+                      : KBC_OK;
+  if (kbc_failed(st)) kbc_str_clear(&c->extra);
+  conn_queue_response(c, resp.status, resp.content_type, resp.body.ptr,
+                      resp.body.len, false, false);
+  kbc_response_free(&resp);
+}
+
+/* The artifact subdomain (`routes/artifact.rs:539-866`).
+ *
+ * One Origin per artifact, so a hostile artifact that gets script execution
+ * cannot reach the trusted app origin, its cookies or its storage. Everything
+ * below the resolution is the containment walk, and the walk IS the security
+ * boundary: it changes WHERE the resolver looks — upward, so a nearer
+ * `_assets/` shadows a further one — and never WHAT is reachable. */
+static void serve_artifact_origin(conn *c, const http_req *r) {
+  const kbc_httpd *h = c->h;
+  const char *label = NULL;
+  size_t llen = 0;
+  if (!parse_artifact_host(hdr_find(r, "Host"), h->host_suffix, &label, &llen)) {
+    origin_plain(c, 404, "not an artifact subdomain");
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(16384);
+  if (a == NULL) {
+    origin_plain(c, 500, "no arena");
+    return;
+  }
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  const kb_root *root = NULL;
+  bool found = resolve_host_artifact(h->app, a, h, label, llen, &art, &root);
+  char *entry = NULL;
+  char art_id[KBC_MAX_ID_LEN + 1];
+  art_id[0] = '\0';
+  if (found && root != NULL && root->root != NULL && art.path != NULL) {
+    char *abs = path_join(root->root, art.path);
+    if (abs != NULL) {
+      entry = canon(abs);
+      free(abs);
+    }
+    /* The id is copied out before the arena dies: every field of `art` points
+     * into it, and the header set below is written long after the lookup. */
+    if (art.id != NULL && strlen(art.id) <= KBC_MAX_ID_LEN) {
+      memcpy(art_id, art.id, strlen(art.id) + 1);
+    }
+  }
+  kbc_arena_free(a);
+  if (entry == NULL) {
+    /* Unresolvable kb+id, and a `/` whose entrypoint no longer canonicalises
+     * (`artifact.rs:594`, `:626`) — the same answer for both. */
+    origin_plain(c, 404, "artifact not found");
+    return;
+  }
+  /* The entrypoint is the row's own path, so it still has to be INSIDE the
+   * root, and the check is unconditional: the `/` branch never enters the
+   * walk-up loop, so nothing else would look at it (`artifact.rs:687-690`). */
+  if (!path_within(root->root, entry)) {
+    free(entry);
+    kbc_response pr;
+    kbc_response_init(&pr);
+    (void)resp_error(&pr, 400, KBC_ERR_INVALID, "path traversal");
+    conn_queue_response(c, pr.status, pr.content_type, pr.body.ptr, pr.body.len,
+                        false, false);
+    kbc_response_free(&pr);
+    return;
+  }
+
+  const char *rel = r->path[0] == '/' ? r->path + 1 : r->path;
+  char *resolved = NULL;
+  if (rel[0] == '\0') {
+    /* `/` is the artifact itself. Ownership moves to `resolved`; freeing
+     * `entry` again below would hand the read path a freed pointer. */
+    resolved = entry;
+    entry = NULL;
+  } else {
+    char *base = path_dir(entry);
+    if (base == NULL) {
+      free(entry);
+      origin_plain(c, 404, "artifact not found");
+      return;
+    }
+    /* Walk up from the entrypoint's own directory toward the source root,
+     * probing each level; first hit wins (`artifact.rs:633-664`). An
+     * Ok-but-outside answer is refused AT EVERY LEVEL, not only the last: a
+     * guard that ran only after the loop would still have opened every
+     * intermediate one. And `probe == source_root` ends the walk, which is
+     * what makes "/etc/passwd" a 400 rather than an unbounded climb to "/". */
+    for (;;) {
+      char *cand = path_join(base, rel);
+      if (cand == NULL) break;
+      char *p = canon(cand);
+      free(cand);
+      if (p != NULL) {
+        if (path_within(root->root, p)) {
+          resolved = p;
+          break;
+        }
+        free(p);
+        free(base);
+        free(entry);
+        kbc_response pr;
+        kbc_response_init(&pr);
+        (void)resp_error(&pr, 400, KBC_ERR_INVALID, "path traversal");
+        conn_queue_response(c, pr.status, pr.content_type, pr.body.ptr,
+                            pr.body.len, false, false);
+        kbc_response_free(&pr);
+        return;
+      }
+      if (strcmp(base, root->root) == 0) break;
+      char *up = path_dir(base);
+      free(base);
+      if (up == NULL) break;
+      base = up;
+    }
+    free(base);
+  }
+  free(entry);
+  if (resolved == NULL) {
+    origin_plain(c, 404, "artifact not found");
+    return;
+  }
+
+  kbc_str body;
+  kbc_str_init(&body);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_status st = read_whole_file(resolved, &body, &err);
+  /* The name is read while the path is still ours: the content type is a
+   * function of the extension, and guessing it after free(3) would be a
+   * use-after-free. */
+  const char *ct = guess_content_type(resolved);
+  bool md = is_markdown(resolved);
+  free(resolved);
+  if (kbc_failed(st)) {
+    /* The read fails after a successful canonicalize when the file went away
+     * or is unreadable, and the original answers 404, not 500
+     * (`artifact.rs:692-696`). */
+    char msg[256];
+    snprintf(msg, sizeof msg, "read failed: %.180s", err.msg);
+    kbc_str_free(&body);
+    origin_plain(c, 404, msg);
+    return;
+  }
+  bool html_branch = md || strcmp(ct, "text/html; charset=utf-8") == 0;
+  if (html_branch && !is_utf8(body.ptr, body.len)) {
+    /* A body the declared text type does not match is refused rather than
+     * served: 500 here and 400 on the parent origin, because the two handlers
+     * disagree about it in the original (`artifact.rs:715`, `docs.rs:1489`) and
+     * the disagreement is preserved. */
+    kbc_str_free(&body);
+    origin_plain(c, 500, "non-utf8 artifact");
+    return;
+  }
+  kbc_str hdrs;
+  kbc_str_init(&hdrs);
+  if (html_branch) {
+    st = artifact_origin_headers(&hdrs, art_id, query_flag(r->query, "cm"), h);
+  }
+  if (kbc_failed(st)) {
+    kbc_str_free(&hdrs);
+    kbc_str_free(&body);
+    origin_plain(c, 500, "no headers");
+    return;
+  }
+  /* kb-c has no Markdown renderer yet (a separate port unit), so the markdown
+   * branch serves the source under the HTML branch's headers rather than a
+   * rendered page. Every other part of this branch — the UTF-8 refusal, the
+   * header set, the origin isolation — is the original's. */
+  origin_file(c, ct, &body, html_branch ? &hdrs : NULL);
+  kbc_str_free(&hdrs);
+  kbc_str_free(&body);
+}
+
+/* The parent-origin static handler (`routes/spa.rs:33-70`, `:285-317`),
+ * reached for every path the router did not claim on a non-artifact Host. The
+ * containment guard is the SAME one the subdomain uses and for the same
+ * reason: `spa.rs:290` is a `starts_with` against the dist root, so a
+ * byte-prefix comparison would serve `<dist>-backup/…` exactly as happily as
+ * the subdomain would serve `<root>-secret/…`. */
+static void serve_static_origin(conn *c, const http_req *r) {
+  const kbc_httpd *h = c->h;
+  const char *trimmed = r->path[0] == '/' ? r->path + 1 : r->path;
+  if (h->spa_root == NULL) {
+    /* No dist: a 404 that says WHY, so the answer is actionable
+     * (`spa.rs:400-411`). */
+    kbc_response pr;
+    kbc_response_init(&pr);
+    (void)resp_error(&pr, 404, KBC_ERR_NOTFOUND,
+                     "the daemon was started without a static root; set "
+                     "KB_SPA_DIST to a directory holding index.html");
+    conn_queue_response(c, pr.status, pr.content_type, pr.body.ptr, pr.body.len,
+                        false, false);
+    kbc_response_free(&pr);
+    return;
+  }
+  /* A ".." segment never reaches the filesystem. The guard already stops an
+   * escape; this stops a request that obviously MEANT to traverse from being
+   * answered with the shell instead of a 404 (`spa.rs:37-41`). */
+  for (const char *q = trimmed;;) {
+    const char *slash = strchr(q, '/');
+    size_t seg = slash != NULL ? (size_t)(slash - q) : strlen(q);
+    if (seg == 2 && q[0] == '.' && q[1] == '.') {
+      origin_plain(c, 404, "not found");
+      return;
+    }
+    if (slash == NULL) break;
+    q = slash + 1;
+  }
+  /* An asset request is the file or a 404. Vite content-hashes everything under
+   * assets/, so those are cacheable forever; the PWA manifest is the unhashed
+   * install descriptor and must stay revalidated (`spa.rs:293-310`). */
+  char *cand = path_join(h->spa_root, trimmed);
+  char *p = cand != NULL ? canon(cand) : NULL;
+  free(cand);
+  if (p != NULL && !path_within(h->spa_root, p)) {
+    free(p);
+    p = NULL;
+  }
+  if (p != NULL) {
+    kbc_str body;
+    kbc_str_init(&body);
+    kbc_err err;
+    kbc_err_reset(&err);
+    kbc_status st = read_whole_file(p, &body, &err);
+    if (kbc_failed(st)) {
+      free(p);
+      kbc_str_free(&body);
+      origin_plain(c, 404, "not found");
+      return;
+    }
+    kbc_str hdrs;
+    kbc_str_init(&hdrs);
+    const char *e = path_ext(p);
+    bool manifest = e != NULL && str_ieq(e, "webmanifest");
+    bool hashed = strncmp(p, h->spa_root, strlen(h->spa_root)) == 0 &&
+                  strncmp(p + strlen(h->spa_root), "/assets", 7) == 0;
+    st = kbc_str_printf(&hdrs, "Cache-Control: %s\r\n",
+                        manifest ? "no-cache"
+                                 : (hashed ? "public, max-age=31536000, immutable"
+                                           : "public, max-age=3600"));
+    if (!kbc_failed(st)) {
+      origin_file(c, guess_content_type(p), &body, &hdrs);
+    } else {
+      kbc_str_clear(&c->extra);
+    }
+    free(p);
+    kbc_str_free(&hdrs);
+    kbc_str_free(&body);
+    return;
+  }
+  /* No file. A client-routed URL (`/a/{kb}/{rel}`) still gets the shell so the
+   * SPA's own router can answer it; anything else is a plain 404
+   * (`spa.rs:65-70`). kb-c has no SPA router and no per-artifact OpenGraph
+   * splice, so the shell is the whole of that branch. */
+  if (strncmp(trimmed, "a/", 2) != 0) {
+    origin_plain(c, 404, "not found");
+    return;
+  }
+  char *shell = path_join(h->spa_root, "index.html");
+  char *sh = shell != NULL ? canon(shell) : NULL;
+  free(shell);
+  if (sh == NULL || !path_within(h->spa_root, sh)) {
+    free(sh);
+    origin_plain(c, 404, "not found");
+    return;
+  }
+  kbc_str body;
+  kbc_str_init(&body);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_status st = read_whole_file(sh, &body, &err);
+  free(sh);
+  if (kbc_failed(st)) {
+    kbc_str_free(&body);
+    origin_plain(c, 404, "not found");
+    return;
+  }
+  kbc_str hdrs;
+  kbc_str_init(&hdrs);
+  st = kbc_str_puts(&hdrs, "Cache-Control: no-cache\r\n");
+  if (!kbc_failed(st)) {
+    origin_file(c, "text/html; charset=utf-8", &body, &hdrs);
+  } else {
+    kbc_str_clear(&c->extra);
+  }
+  kbc_str_free(&hdrs);
+  kbc_str_free(&body);
+}
+
+/* `attachment_disposition` (`docs.rs:1574-1596`): an ASCII fallback name plus
+ * the RFC 5987 percent-encoded form carrying the real name. The whole value is
+ * ASCII, so it can never be rejected as a header — which is the point, since
+ * the name comes off the filesystem and a corpus file may hold anything. */
+static kbc_status append_attachment(kbc_str *hdrs, const char *name) {
+  kbc_str ascii;
+  kbc_str_init(&ascii);
+  kbc_status st = KBC_OK;
+  for (const char *p = name; *p != '\0'; p++) {
+    unsigned char c = (unsigned char)*p;
+    bool keep = c < 0x80u && c != '"' && c != '\\' && c >= 0x20u && c != 0x7fu;
+    st = kbc_str_putc(&ascii, keep ? (char)c : '_');
+    if (kbc_failed(st)) goto done;
+  }
+  if (ascii.len == 0) {
+    st = kbc_str_puts(&ascii, "download");
+    if (kbc_failed(st)) goto done;
+  }
+  st = kbc_str_printf(hdrs, "Content-Disposition: attachment; filename=\"%.*s\"; "
+                           "filename*=UTF-8''",
+                      (int)ascii.len, ascii.ptr);
+  if (kbc_failed(st)) goto done;
+  for (const char *p = name; *p != '\0'; p++) {
+    unsigned char c = (unsigned char)*p;
+    bool bare = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' ||
+                c == '~';
+    st = bare ? kbc_str_putc(hdrs, (char)c)
+              : kbc_str_printf(hdrs, "%%%02X", (unsigned)c);
+    if (kbc_failed(st)) goto done;
+  }
+  st = kbc_str_putc(hdrs, '\r');
+done:
+  kbc_str_free(&ascii);
+  return st;
+}
+
+/* A corpus-relative path as stored by the indexer. The original does NOT
+ * check it (`routes/docs.rs:1472` reads `row.path` straight into fs::read —
+ * containment is established at index time), but that column is read out of a
+ * database file rather than out of the request, and kb-c's rule 9 says any
+ * path that reaches the filesystem is checked. A row that fails is corrupt
+ * storage, not a client error, so it is a 500 and not a 400. */
+static bool stored_rel_is_safe(const char *rel) {
+  if (rel == NULL || rel[0] == '\0' || rel[0] == '/') return false;
+  for (const char *p = rel;;) {
+    const char *slash = strchr(p, '/');
+    size_t seg = slash != NULL ? (size_t)(slash - p) : strlen(p);
+    if (seg == 0) return false; /* "//" or a trailing '/' */
+    if (seg == 2 && p[0] == '.' && p[1] == '.') return false;
+    for (size_t i = 0; i < seg; i++) {
+      unsigned char c = (unsigned char)p[i];
+      if (c < 0x20u || c == 0x7fu || c == '\\') return false;
+    }
+    if (slash == NULL) break;
+    p = slash + 1;
+  }
+  return strlen(rel) < KBC_MAX_PATH_LEN;
+}
+
+/* GET /api/kb/{kb}/artifact/{id} — the artifact's bytes on the PARENT origin
+ * (`routes/docs.rs:1450-1542`).
+ *
+ * This route serves artifact HTML INLINE, in the trusted app origin, which is
+ * why the header set below is not decoration: `Content-Security-Policy:
+ * sandbox` — literally that, nothing else — forces the response into a unique
+ * opaque origin with scripts, forms and same-origin access disabled, and
+ * `nosniff` stops a browser from sniffing a mislabelled body into something
+ * active. Without both, a hostile artifact navigated to here would execute in
+ * the app origin: a stored-XSS and sandbox-bypass hole the moment a corpus can
+ * hold untrusted content. The value is the whole policy; a `default-src` or a
+ * `frame-ancestors` added to it would be a different policy. */
+static kbc_status route_artifact_bytes(kbc_app *app, kbc_arena *a,
+                                       const kbc_config *cfg, const char *kb,
+                                       const char *id, const char *query,
+                                       kbc_str *hdrs, kbc_str *out,
+                                       kbc_err *err) {
+  const kbc_corpus_cfg *c = kbc_config_corpus(cfg, kb);
+  if (c == NULL) {
+    return kbc_err_set(err, KBC_ERR_NOTFOUND, "no corpus named \"%s\"", kb);
+  }
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  kbc_status st = kbc_app_get_artifact(app, a, id, false, &art, err);
+  if (kbc_failed(st)) return st;
+  if (!stored_rel_is_safe(art.path)) {
+    return kbc_err_set(err, KBC_ERR_IO,
+                       "artifact %s has a stored path this daemon will not "
+                       "join to %s",
+                       id, c->path);
+  }
+  char *abs = path_join(c->path, art.path);
+  if (abs == NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "path for %s exceeds %u bytes", id,
+                       KBC_MAX_PATH_LEN);
+  }
+  st = read_whole_file(abs, out, err);
+  bool md = is_markdown(art.path);
+  free(abs);
+  if (kbc_failed(st)) return st;
+  if (md && !is_utf8(out->ptr, out->len)) {
+    /* A `.md` that is not valid UTF-8 cannot be rendered, and serving the raw
+     * source under a text/html label is worse than refusing: 400, mirroring
+     * `docs.rs:1489-1493`. */
+    kbc_str_clear(out);
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "markdown source is not valid UTF-8");
+  }
+  /* Header order is the original's: Content-Type (carried on the response),
+   * nosniff (emitted by the write path on every response), then the sandbox
+   * CSP, then the artifact id (`docs.rs:1512-1542`). */
+  st = kbc_str_printf(hdrs, "Content-Security-Policy: sandbox\r\n"
+                           "X-Kb-Artifact-Id: %s\r\n",
+                      art.id);
+  if (kbc_failed(st)) return st;
+  if (query_int(query, "download") != 1) return KBC_OK;
+  /* A rendered markdown download is `.html`, because the body is HTML and not
+   * `.md` source (`docs.rs:1545-1553`). */
+  const char *base = strrchr(art.path, '/');
+  base = base != NULL ? base + 1 : art.path;
+  char name[256];
+  if (md) {
+    const char *dot = strrchr(base, '.');
+    if (dot != NULL && (size_t)(dot - base) < sizeof name - 6) {
+      snprintf(name, sizeof name, "%.*s.html", (int)(dot - base), base);
+    } else {
+      snprintf(name, sizeof name, "%.200s", base);
+    }
+  } else {
+    snprintf(name, sizeof name, "%.200s", base);
+  }
+  if (name[0] == '\0') snprintf(name, sizeof name, "%s.html", art.id);
+  return append_attachment(hdrs, name);
+}
+
+/* ---------------------------------------------------------- /metrics ----- */
+
+static const char *const kRouteLabels[KBC_ROUTE_KINDS] = {
+    "search", "atlas",  "history", "review", "events",
+    "read",   "ops",    "sessions", "other"};
+static const uint32_t kLatMs[KBC_LAT_BOUNDARIES] = {
+    1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000};
+static const char *const kQuantiles[3] = {"0.5", "0.95", "0.99"};
+/* `SearchStage::ALL` (`state.rs:455-459`). */
+static const char *const kStageLabels[4] = {"embed", "bm25", "vector", "hybrid"};
+/* `StorageKind::ALL` (`kb-core/src/metrics.rs:154-163`). */
+static const char *const kStorageKinds[8] = {"query", "upsert", "delete", "read",
+                                             "history", "enrich", "admin",
+                                             "other"};
+
+/* `percentile_ms` (`kb-core/src/metrics.rs:105-118`): the UPPER boundary of
+ * the bucket the p-th observation falls in, 0 on an empty histogram, and
+ * last-boundary + 1 as the ">10s" sentinel for the overflow slot. The quantile
+ * is exact rational arithmetic, not a double: `ceil` is not available without
+ * libm and 0.95 is not representable anyway. */
+static uint64_t lat_percentile(const uint64_t *b, uint64_t num, uint64_t den) {
+  uint64_t total = 0;
+  for (size_t i = 0; i < KBC_LAT_SLOTS; i++) total += b[i];
+  if (total == 0) return 0;
+  uint64_t target = total > UINT64_MAX / den
+                        ? total
+                        : (total * num + den - 1) / den; /* ceil */
+  if (target == 0) target = 1;
+  uint64_t cum = 0;
+  for (size_t i = 0; i < KBC_LAT_SLOTS; i++) {
+    cum += b[i];
+    if (cum >= target) {
+      return i < KBC_LAT_BOUNDARIES ? (uint64_t)kLatMs[i]
+                                    : (uint64_t)kLatMs[KBC_LAT_BOUNDARIES - 1] + 1;
+    }
+  }
+  return (uint64_t)kLatMs[KBC_LAT_BOUNDARIES - 1] + 1;
+}
+
+static void lat_snapshot(const route_hist *h, uint64_t *out) {
+  for (size_t i = 0; i < KBC_LAT_SLOTS; i++) {
+    out[i] = atomic_load_explicit(&h->slot[i], memory_order_relaxed);
+  }
+}
+
+/* THREE substitutions and nothing else (`routes/metrics.rs:583-601`): a
+ * backslash, a newline, a double quote. Carriage return is deliberately NOT
+ * escaped, because the original does not escape it either — and the corpus
+ * names that reach here are validated at config load, so no CR can be in one.
+ * Escaping a byte the original leaves raw would make kb-c's exposition differ
+ * from kb's for the same input. */
+static kbc_status prom_escape(kbc_str *o, const char *v) {
+  for (const char *p = v; *p != '\0'; p++) {
+    kbc_status st;
+    switch (*p) {
+    case '\\': st = kbc_str_puts(o, "\\\\"); break;
+    case '\n': st = kbc_str_puts(o, "\\n"); break;
+    case '"': st = kbc_str_puts(o, "\\\""); break;
+    default: st = kbc_str_putc(o, *p); break;
+    }
+    if (kbc_failed(st)) return st;
+  }
+  return KBC_OK;
+}
+
+/* `# HELP` then `# TYPE`, once per family, immediately before that family's
+ * samples (`metrics.rs:563-575`). Single spaces, no quoting of the help text,
+ * `\n` terminators. */
+static kbc_status prom_family(kbc_str *o, const char *name, const char *kind,
+                              const char *help) {
+  return kbc_str_printf(o, "# HELP %s %s\n# TYPE %s %s\n", name, help, name,
+                        kind);
+}
+
+/* `sample` (`metrics.rs:578-601`): name, then the label set only if it is
+ * non-empty, then one space, then the UNSIGNED DECIMAL INTEGER, then `\n`. No
+ * timestamp, no float, no `_sum`/`_count`. The label-order asymmetry the
+ * original has is preserved by the caller: `kb_route_latency_ms` is
+ * {route,quantile} while `kb_indexer_latency_ms` is {quantile} alone. */
+static kbc_status prom_sample(kbc_str *o, const char *name, const char *k1,
+                              const char *v1, const char *k2, const char *v2,
+                              uint64_t value) {
+  kbc_status st = kbc_str_puts(o, name);
+  if (kbc_failed(st)) return st;
+  if (k1 != NULL) {
+    st = kbc_str_printf(o, "{%s=\"", k1);
+    if (kbc_failed(st)) return st;
+    st = prom_escape(o, v1);
+    if (kbc_failed(st)) return st;
+    if (k2 != NULL) {
+      st = kbc_str_printf(o, "\",%s=\"", k2);
+      if (kbc_failed(st)) return st;
+      st = prom_escape(o, v2);
+      if (kbc_failed(st)) return st;
+    }
+    st = kbc_str_puts(o, "\"}");
+    if (kbc_failed(st)) return st;
+  }
+  return kbc_str_printf(o, " %llu\n", (unsigned long long)value);
+}
+
+static kbc_status prom_route_hist(kbc_str *o, const char *name,
+                                  const char *k1, const char *v1,
+                                  const route_hist *h) {
+  uint64_t b[KBC_LAT_SLOTS];
+  lat_snapshot(h, b);
+  for (size_t i = 0; i < KBC_LAT_SLOTS; i++) {
+    /* `le_ms` is an ORDINARY label, not the histogram `le` convention, and
+     * the series is NOT cumulative: one bucket per observation, no `_sum`, no
+     * `_count`. Rendering it as a real Prometheus histogram — cumulative
+     * `_bucket{le=…}` plus `_sum`/`_count` and `# TYPE … histogram` — is the
+     * obvious thing to do here and it is wrong: the exposition format requires
+     * a histogram's buckets to be cumulative, and these are not, so a scraper
+     * would read a CDF that over-counts. The overflow slot's label is the
+     * literal `+Inf` (`metrics.rs:326-341`). */
+    char le[16];
+    if (i < KBC_LAT_BOUNDARIES) {
+      snprintf(le, sizeof le, "%u", kLatMs[i]);
+    } else {
+      snprintf(le, sizeof le, "+Inf");
+    }
+    kbc_status st = prom_sample(o, name, k1, v1, "le_ms", le, b[i]);
+    if (kbc_failed(st)) return st;
+  }
+  return KBC_OK;
+}
+
+static kbc_status prom_route_percentiles(kbc_str *o, const char *name,
+                                         const char *k1, const char *v1,
+                                         const route_hist *h) {
+  static const uint64_t kNum[3] = {1, 19, 99};
+  static const uint64_t kDen[3] = {2, 20, 100};
+  uint64_t b[KBC_LAT_SLOTS];
+  lat_snapshot(h, b);
+  for (size_t i = 0; i < 3; i++) {
+    kbc_status st = prom_sample(o, name, k1, v1, "quantile", kQuantiles[i],
+                                lat_percentile(b, kNum[i], kDen[i]));
+    if (kbc_failed(st)) return st;
+  }
+  return KBC_OK;
+}
+
+/* `classify_route` (`state.rs:583-621`), ported whole: most-specific first,
+ * then the per-kb segment match, then the top-level metadata. A per-path
+ * counter map would be the lazy version, and it is what makes the exposition
+ * unbounded — the enum is the bound. */
+static size_t classify_route(const char *path) {
+  const char *p = path;
+  while (*p == '/') p++;
+  if (strncmp(p, "api/", 4) == 0) p += 4;
+  if (strcmp(p, "search") == 0) return 0;
+  if (strcmp(p, "events") == 0 || strcmp(p, "events.schema.json") == 0 ||
+      strncmp(p, "events/", 7) == 0) {
+    return 4;
+  }
+  if (strcmp(p, "queries") == 0 || strncmp(p, "queries/", 8) == 0) return 5;
+  if (strcmp(p, "sessions") == 0 || strncmp(p, "sessions/", 9) == 0) return 7;
+  if (strncmp(p, "kb/", 3) == 0) {
+    static const struct {
+      const char *seg;
+      size_t kind;
+    } kSeg[] = {
+        {"atlas", 1},        {"history", 2},   {"review", 3},
+        {"sessions", 7},     {"docs", 5},      {"artifact", 5},
+        {"graph", 5},        {"edges", 5},     {"tags", 5},
+        {"folders", 5},      {"stats", 5},     {"runs", 5},
+        {"queries", 5},      {"sources", 6},   {"errors", 6},
+        {"reindex", 6},      {"exclusions", 6}};
+    const char *after = strchr(p + 3, '/');
+    if (after == NULL) return 8;
+    after++;
+    const char *end = strchr(after, '/');
+    size_t n = end != NULL ? (size_t)(end - after) : strlen(after);
+    for (size_t i = 0; i < sizeof kSeg / sizeof kSeg[0]; i++) {
+      if (strlen(kSeg[i].seg) == n && memcmp(after, kSeg[i].seg, n) == 0) {
+        return kSeg[i].kind;
+      }
+    }
+    return 8;
+  }
+  if (strcmp(p, "identity") == 0 || strcmp(p, "kbs") == 0 ||
+      strcmp(p, "stats") == 0 || strcmp(p, "settings") == 0 ||
+      strcmp(p, "metrics") == 0) {
+    return 5;
+  }
+  return 8;
+}
+
+/* The kb a `/kb/{kb}/…` path is scoped to, or NULL (`kb_from_path`,
+ * `state.rs:637-649`). The same nest-stripped-vs-full normalisation as
+ * classify_route, so both agree on which request belongs to which kb. */
+static const char *kb_from_path(const char *path, size_t *len) {
+  const char *p = path;
+  while (*p == '/') p++;
+  if (strncmp(p, "api/", 4) == 0) p += 4;
+  if (strncmp(p, "kb/", 3) != 0) return NULL;
+  const char *rest = p + 3;
+  const char *slash = strchr(rest, '/');
+  size_t n = slash != NULL ? (size_t)(slash - rest) : strlen(rest);
+  if (n == 0) return NULL;
+  *len = n;
+  return rest;
+}
+
+/* One observation. The histogram is CUMULATIVE in memory (that is what makes
+ * `percentile_ms` a single pass) even though the rendered series is not. */
+static void metrics_observe(metrics_reg *m, const char *path, uint64_t ms) {
+  atomic_fetch_add_explicit(&m->total, 1, memory_order_relaxed);
+  size_t idx = 0;
+  while (idx + 1 < KBC_LAT_BOUNDARIES && ms > (uint64_t)kLatMs[idx]) idx++;
+  route_hist *hists[2] = {&m->route[classify_route(path)], NULL};
+  size_t nlen = 0;
+  const char *kb = kb_from_path(path, &nlen);
+  for (size_t i = 0; i < m->n_kb; i++) {
+    if (strlen(m->kb_names[i]) == nlen &&
+        memcmp(m->kb_names[i], kb, nlen) == 0) {
+      hists[1] = &m->per_kb[i];
+      break;
+    }
+  }
+  for (size_t i = 0; i < 2; i++) {
+    if (hists[i] == NULL) continue;
+    atomic_fetch_add_explicit(&hists[i]->slot[idx], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&hists[i]->count, 1, memory_order_relaxed);
+  }
+}
+
+/* GET /metrics — Prometheus text exposition 0.0.4 (`routes/metrics.rs:178-186`).
+ *
+ * Always 200, always `text/plain; version=0.0.4; charset=utf-8`, always
+ * `Cache-Control: no-store`. Mounted on its own router so the /api tree's auth
+ * does not re-wrap it, and it sits OUTSIDE that tree, so it is neither counted
+ * nor rate-limited as an API request — the same placement the original has. */
+static kbc_status route_prometheus(kbc_app *app, const metrics_reg *m,
+                                   kbc_str *hdrs, kbc_str *out,
+                                   kbc_err *err) {
+  kbc_app_stats st;
+  memset(&st, 0, sizeof st);
+  kbc_status s = kbc_app_stats_get(app, &st, err);
+  if (kbc_failed(s)) return s;
+  s = kbc_str_puts(hdrs, "Cache-Control: no-store\r\n");
+  if (kbc_failed(s)) return s;
+
+  /* The six scalars, then the route series, then — only when the detailed
+   * layer is on — search/per-kb, then the index pipeline, then the storage
+   * families. The order is hand-written and fixed (`metrics.rs:198-205`); a
+   * scrape diffs by line, so it is part of the contract. */
+  s = prom_family(out, "kb_http_requests_total", "counter",
+                  "HTTP requests since daemon boot (GET /api/metrics "
+                  "requests_total).");
+  if (kbc_failed(s)) return s;
+  s = prom_sample(out, "kb_http_requests_total", NULL, NULL, NULL, NULL,
+                  atomic_load(&m->total));
+  if (kbc_failed(s)) return s;
+  s = prom_family(out, "kb_storage_channel_depth", "gauge",
+                  "Busiest kb storage-actor queue depth.");
+  if (kbc_failed(s)) return s;
+  /* kb-c has no storage actor: a synchronous call is the whole "queue", so
+   * the honest reading of both the depth and the capacity is 0. A fixed-
+   * cardinality family renders at 0 when it has observed nothing — that is the
+   * format's own answer, not a placeholder (`metrics.rs:266-271`). */
+  s = prom_sample(out, "kb_storage_channel_depth", NULL, NULL, NULL, NULL, 0);
+  if (kbc_failed(s)) return s;
+  s = prom_family(out, "kb_storage_channel_capacity", "gauge",
+                  "Storage-actor channel capacity.");
+  if (kbc_failed(s)) return s;
+  s = prom_sample(out, "kb_storage_channel_capacity", NULL, NULL, NULL, NULL, 0);
+  if (kbc_failed(s)) return s;
+  s = prom_family(out, "kb_embedder_degraded", "gauge",
+                  "1 if any embedder subprocess is currently unrecoverable.");
+  if (kbc_failed(s)) return s;
+  s = prom_sample(out, "kb_embedder_degraded", NULL, NULL, NULL, NULL, 0);
+  if (kbc_failed(s)) return s;
+  s = prom_family(out, "kb_embedder_respawns_total", "counter",
+                  "Embedder subprocess respawns since boot.");
+  if (kbc_failed(s)) return s;
+  s = prom_sample(out, "kb_embedder_respawns_total", NULL, NULL, NULL, NULL, 0);
+  if (kbc_failed(s)) return s;
+  s = prom_family(out, "kb_metrics_detailed", "gauge",
+                  "1 if the detailed metrics layer is enabled.");
+  if (kbc_failed(s)) return s;
+  s = prom_sample(out, "kb_metrics_detailed", NULL, NULL, NULL, NULL,
+                  m->detailed ? 1u : 0u);
+  if (kbc_failed(s)) return s;
+
+  s = prom_family(out, "kb_route_requests_total", "counter",
+                  "Requests since boot by route family.");
+  if (kbc_failed(s)) return s;
+  for (size_t i = 0; i < KBC_ROUTE_KINDS; i++) {
+    s = prom_sample(out, "kb_route_requests_total", "route", kRouteLabels[i],
+                    NULL, NULL,
+                    atomic_load(&m->route[i].count));
+    if (kbc_failed(s)) return s;
+  }
+  s = prom_family(out, "kb_route_latency_ms", "gauge",
+                  "Bucket-approximated route latency percentile, "
+                  "milliseconds.");
+  if (kbc_failed(s)) return s;
+  for (size_t i = 0; i < KBC_ROUTE_KINDS; i++) {
+    s = prom_route_percentiles(out, "kb_route_latency_ms", "route",
+                               kRouteLabels[i], &m->route[i]);
+    if (kbc_failed(s)) return s;
+  }
+  s = prom_family(out, "kb_route_latency_bucket", "counter",
+                  "Non-cumulative latency-bucket observations by route (le_ms "
+                  "is the upper bound; +Inf is overflow).");
+  if (kbc_failed(s)) return s;
+  for (size_t i = 0; i < KBC_ROUTE_KINDS; i++) {
+    s = prom_route_hist(out, "kb_route_latency_bucket", "route",
+                        kRouteLabels[i], &m->route[i]);
+    if (kbc_failed(s)) return s;
+  }
+
+  /* The ENTIRE detailed block is absent when the layer is off — not zero, not
+   * commented (`metrics.rs:202-204`, `:661`). */
+  if (!m->detailed) return KBC_OK;
+
+  s = prom_family(out, "kb_search_stage_requests_total", "counter",
+                  "Search-stage observations since boot.");
+  if (kbc_failed(s)) return s;
+  for (size_t i = 0; i < 4; i++) {
+    /* kb-c's search runs its stages inline with no per-stage timing surface,
+     * so these are 0 for the same reason the storage families are. */
+    s = prom_sample(out, "kb_search_stage_requests_total", "stage",
+                    kStageLabels[i], NULL, NULL, 0);
+    if (kbc_failed(s)) return s;
+  }
+  s = prom_family(out, "kb_search_stage_latency_ms", "gauge",
+                  "Bucket-approximated search-stage latency percentile, "
+                  "milliseconds.");
+  if (kbc_failed(s)) return s;
+  for (size_t i = 0; i < 4; i++) {
+    s = prom_sample(out, "kb_search_stage_latency_ms", "stage", kStageLabels[i],
+                    "quantile", kQuantiles[0], 0);
+    if (kbc_failed(s)) return s;
+    s = prom_sample(out, "kb_search_stage_latency_ms", "stage", kStageLabels[i],
+                    "quantile", kQuantiles[1], 0);
+    if (kbc_failed(s)) return s;
+    s = prom_sample(out, "kb_search_stage_latency_ms", "stage", kStageLabels[i],
+                    "quantile", kQuantiles[2], 0);
+    if (kbc_failed(s)) return s;
+  }
+  /* per_kb is the one SORTED set: the original's map iterates in random order
+   * and sorts by name for a stable response (`metrics.rs:131-136`). Sorted here
+   * rather than at bring-up, so the observation index space never moves under a
+   * worker mid-scrape. The entries are pre-seeded from the fixed kb set, so a
+   * configured kb renders at 0 before its first request instead of being
+   * absent. */
+  size_t order[KBC_MAX_CORPORA];
+  for (size_t i = 0; i < m->n_kb; i++) order[i] = i;
+  for (size_t i = 1; i < m->n_kb; i++) {
+    size_t v = order[i];
+    size_t j = i;
+    while (j > 0 && strcmp(m->kb_names[order[j - 1]], m->kb_names[v]) > 0) {
+      order[j] = order[j - 1];
+      j--;
+    }
+    order[j] = v;
+  }
+  s = prom_family(out, "kb_per_kb_requests_total", "counter",
+                  "Requests since boot attributed to a kb.");
+  if (kbc_failed(s)) return s;
+  for (size_t i = 0; i < m->n_kb; i++) {
+    s = prom_sample(out, "kb_per_kb_requests_total", "kb",
+                    m->kb_names[order[i]], NULL, NULL,
+                    atomic_load(&m->per_kb[order[i]].count));
+    if (kbc_failed(s)) return s;
+  }
+  s = prom_family(out, "kb_per_kb_latency_ms", "gauge",
+                  "Bucket-approximated per-kb request latency percentile, "
+                  "milliseconds.");
+  if (kbc_failed(s)) return s;
+  for (size_t i = 0; i < m->n_kb; i++) {
+    s = prom_route_percentiles(out, "kb_per_kb_latency_ms", "kb",
+                               m->kb_names[order[i]], &m->per_kb[order[i]]);
+    if (kbc_failed(s)) return s;
+  }
+
+  s = prom_family(out, "kb_pipeline_enabled", "gauge",
+                  "1 if ingest-pipeline timing is being recorded.");
+  if (kbc_failed(s)) return s;
+  s = prom_sample(out, "kb_pipeline_enabled", NULL, NULL, NULL, NULL, 0);
+  if (kbc_failed(s)) return s;
+  s = prom_family(out, "kb_indexer_files_total", "counter",
+                  "Files observed by the indexer.");
+  if (kbc_failed(s)) return s;
+  s = prom_sample(out, "kb_indexer_files_total", NULL, NULL, NULL, NULL,
+                  st.artifacts_indexed > 0 ? (uint64_t)st.artifacts_indexed : 0u);
+  if (kbc_failed(s)) return s;
+  s = prom_family(out, "kb_indexer_latency_ms", "gauge",
+                  "Bucket-approximated indexer file latency percentile, "
+                  "milliseconds.");
+  if (kbc_failed(s)) return s;
+  for (size_t i = 0; i < 3; i++) {
+    /* {quantile} ALONE — no `route` label. The original's label sets differ
+     * between families and a port that "tidied" them would break the golden
+     * line `kb_route_latency_ms{route="search",quantile="0.5"} 5`
+     * (`metrics.rs:657-659`). */
+    s = prom_sample(out, "kb_indexer_latency_ms", "quantile", kQuantiles[i],
+                    NULL, NULL, 0);
+    if (kbc_failed(s)) return s;
+  }
+  s = prom_family(out, "kb_index_embed_calls_total", "counter",
+                  "Index-side embed calls.");
+  if (kbc_failed(s)) return s;
+  s = prom_sample(out, "kb_index_embed_calls_total", NULL, NULL, NULL, NULL, 0);
+  if (kbc_failed(s)) return s;
+  s = prom_family(out, "kb_index_embed_docs_total", "counter",
+                  "Documents passed to the index-side embedder.");
+  if (kbc_failed(s)) return s;
+  s = prom_sample(out, "kb_index_embed_docs_total", NULL, NULL, NULL, NULL, 0);
+  if (kbc_failed(s)) return s;
+  s = prom_family(out, "kb_index_embed_latency_ms", "gauge",
+                  "Bucket-approximated index-side embed latency percentile, "
+                  "milliseconds.");
+  if (kbc_failed(s)) return s;
+  for (size_t i = 0; i < 3; i++) {
+    s = prom_sample(out, "kb_index_embed_latency_ms", "quantile", kQuantiles[i],
+                    NULL, NULL, 0);
+    if (kbc_failed(s)) return s;
+  }
+  s = prom_family(out, "kb_storage_ops_total", "counter",
+                  "Storage-actor operations by kind.");
+  if (kbc_failed(s)) return s;
+  for (size_t i = 0; i < 8; i++) {
+    s = prom_sample(out, "kb_storage_ops_total", "kind", kStorageKinds[i], NULL,
+                    NULL, 0);
+    if (kbc_failed(s)) return s;
+  }
+  s = prom_family(out, "kb_storage_handler_latency_ms", "gauge",
+                  "Bucket-approximated storage-handler latency percentile, "
+                  "milliseconds.");
+  if (kbc_failed(s)) return s;
+  for (size_t i = 0; i < 8; i++) {
+    for (size_t j = 0; j < 3; j++) {
+      s = prom_sample(out, "kb_storage_handler_latency_ms", "kind",
+                      kStorageKinds[i], "quantile", kQuantiles[j], 0);
+      if (kbc_failed(s)) return s;
+    }
+  }
+  s = prom_family(out, "kb_storage_queue_wait_ms", "gauge",
+                  "Bucket-approximated storage-actor queue-wait percentile, "
+                  "milliseconds.");
+  if (kbc_failed(s)) return s;
+  for (size_t i = 0; i < 8; i++) {
+    for (size_t j = 0; j < 3; j++) {
+      s = prom_sample(out, "kb_storage_queue_wait_ms", "kind", kStorageKinds[i],
+                      "quantile", kQuantiles[j], 0);
+      if (kbc_failed(s)) return s;
+    }
+  }
+  return KBC_OK;
+}
+
 /* ------------------------------------------------- connection bookkeeping -- */
 
 static void conn_epoll(conn *c, uint32_t events) {
@@ -1549,6 +3141,7 @@ static void conn_destroy(conn *c) {
   free(c->q);
   kbc_str_free(&c->in);
   kbc_str_free(&c->out);
+  kbc_str_free(&c->extra);
   if (c->arena != NULL) kbc_arena_free(c->arena);
   pthread_mutex_destroy(&c->mu);
   atomic_fetch_sub(&c->h->conns, 1);
@@ -1571,8 +3164,24 @@ static void conn_close(kbc_httpd *h, conn *c) {
   }
   pthread_mutex_unlock(&h->conns_mu);
   if (c->w != NULL) {
-    (void)ptr_push(&c->w->zomb, &c->w->zomb_len, &c->w->zomb_cap,
-                   KBC_HTTP_MAX_CONNECTIONS, c);
+    /* The return is checked, not cast away. A conn is unlinked from
+     * h->all_conns above, so a push that fails here has nowhere left to be
+     * reached and leaks. It cannot be destroyed inline instead: the deferral
+     * exists because the conn owns two fds and the second one's event may
+     * still be sitting in this batch's epoll_wait result, and freeing it now
+     * is the use-after-free the deferral was written to prevent. So the
+     * failure is logged and the connection is lost slowly rather than
+     * crashed into — the only one of the three ptr_push call sites that could
+     * do otherwise, and the only one that discarded the answer.
+     *
+     * Reachable only on realloc failure: zomb_len counts connections closed
+     * in this one batch, and every conn_push-able connection is already
+     * capped at KBC_HTTP_MAX_CONNECTIONS, so the (cap + 1)th push — the only
+     * one the hard limit could reject — cannot happen. */
+    if (!ptr_push(&c->w->zomb, &c->w->zomb_len, &c->w->zomb_cap,
+                  KBC_HTTP_MAX_CONNECTIONS, c)) {
+      KBC_LOGE("conn_close: no room to defer conn %p, it leaks", (void *)c);
+    }
   } else {
     conn_destroy(c);
   }
@@ -1646,6 +3255,15 @@ static kbc_status queue_headers(conn *c, int status, const char *ct,
   }
   st = kbc_str_puts(&c->out, "X-Content-Type-Options: nosniff\r\n");
   if (kbc_failed(st)) return st;
+  /* The route's own header lines, in the order the handler set them. They land
+   * after nosniff, which the daemon emits on every response anyway, so the
+   * RELATIVE order the original establishes (nosniff, then the sandbox CSP,
+   * then the artifact id) is preserved on the wire. */
+  if (c->extra.len > 0) {
+    st = kbc_str_append(&c->out, c->extra.ptr, c->extra.len);
+    if (kbc_failed(st)) return st;
+    kbc_str_clear(&c->extra);
+  }
   if (status == 401) {
     st = kbc_str_puts(&c->out, "WWW-Authenticate: Bearer realm=\"kb\"\r\n");
     if (kbc_failed(st)) return st;
@@ -1832,6 +3450,7 @@ static void serve_request(conn *c, const http_req *r) {
   const char *origin = hdr_find(r, "Origin");
   c->cors_origin = cors_match(c->h, origin);
   c->extra_hdr = NULL;
+  kbc_str_clear(&c->extra);
   if (strcmp(r->method, "OPTIONS") == 0 && strncmp(r->path, "/api/", 5) == 0) {
     serve_preflight(c, r);
     return;
@@ -1868,6 +3487,22 @@ static void serve_request(conn *c, const http_req *r) {
     c->rl_count++;
   }
 
+  /* The origin split (`routes/dispatch.rs:46-50`), taken before the router and
+   * for the same reason it is a FALLBACK there: an artifact Host owns every
+   * non-/api path, `/` included, because `<id>.artifacts.<suffix>/` is how an
+   * artifact is loaded. `/metrics` is the one exception — it is an explicit
+   * route in the original too, and an explicit route answers on every origin
+   * (`router.rs:1013-1021`). */
+  const char *label = NULL;
+  size_t llen = 0;
+  if (!path_is_api(r->path) && strcmp(r->path, "/metrics") != 0 &&
+      parse_artifact_host(hdr_find(r, "Host"), c->h->host_suffix, &label,
+                          &llen)) {
+    serve_artifact_origin(c, r);
+    if (c->eof) c->close_after = true;
+    return;
+  }
+
   kbc_request req;
   memset(&req, 0, sizeof req);
   req.method = r->method;
@@ -1882,8 +3517,29 @@ static void serve_request(conn *c, const http_req *r) {
   kbc_response_init(&resp);
   kbc_err err;
   kbc_err_reset(&err);
-  kbc_status st = dispatch(c->h->app, c->h->cfg, &req, &resp, &err,
+  bool unmatched = false;
+  req_ctx ctx;
+  memset(&ctx, 0, sizeof ctx);
+  ctx.extra = &c->extra;
+  ctx.m = &c->h->m;
+  ctx.unmatched = &unmatched;
+  int64_t t0 = kbc_now_ns();
+  kbc_status st = dispatch(c->h->app, c->h->cfg, &req, &ctx, &resp, &err,
                            (kbc_now_ns() - c->h->started_ns) / 1000000000ll);
+  /* Only /api requests are counted, because only /api requests are counted in
+   * the original: `count_requests` is a layer INSIDE the /api nest, so
+   * /metrics, the artifact subdomain and the static fallback are all outside
+   * it (`router.rs:955-963`). */
+  if (path_is_api(r->path)) {
+    uint64_t ms = (uint64_t)((kbc_now_ns() - t0) / 1000000ll);
+    metrics_observe(&c->h->m, r->path, ms);
+  }
+  if (!kbc_failed(st) && unmatched && !path_is_api(r->path)) {
+    kbc_response_free(&resp);
+    serve_static_origin(c, r);
+    if (c->eof) c->close_after = true;
+    return;
+  }
   if (kbc_failed(st)) {
     kbc_response_free(&resp);
     kbc_response_init(&resp);
@@ -2169,6 +3825,7 @@ static void worker_accept(kbc_worker *w) {
     }
     kbc_str_init(&c->in);
     kbc_str_init(&c->out);
+    kbc_str_init(&c->extra);
     pthread_mutex_init(&c->mu, NULL);
     c->arena = kbc_arena_new(8192);
     if (c->arena == NULL || !httpd_track(h, c)) {
@@ -2176,6 +3833,7 @@ static void worker_accept(kbc_worker *w) {
       pthread_mutex_destroy(&c->mu);
       kbc_str_free(&c->in);
       kbc_str_free(&c->out);
+      kbc_str_free(&c->extra);
       close(fd);
       free(c);
       continue;
@@ -2424,6 +4082,98 @@ kbc_httpd *kbc_httpd_start(kbc_app *app, const kbc_config *cfg, kbc_err *err) {
     }
     h->rate_limit = v;
   }
+
+  /* The origin split's bring-up. Everything here is read ONCE: a worker must
+   * not call getenv on the request path, and the corpus roots in particular
+   * must not be canonicalised per request — the containment guard's soundness
+   * depends on the root it compares against being a fixed, already-resolved
+   * path (`artifact.rs:597-602`). */
+  const char *suffix = getenv("KBC_ARTIFACT_HOST_SUFFIX");
+  if (suffix == NULL || suffix[0] == '\0') suffix = KBC_HOST_SUFFIX_DEFAULT;
+  const char *parent = getenv("KBC_PARENT_ORIGIN");
+  if (parent == NULL) parent = KBC_PARENT_ORIGIN_DEFAULT;
+  h->host_suffix = strdup(suffix);
+  h->parent_origin = strdup(parent);
+  if (h->host_suffix == NULL || h->parent_origin == NULL) {
+    (void)kbc_err_set(err, KBC_ERR_NOMEM, "httpd: origin strings");
+    kbc_httpd_stop(h);
+    return NULL;
+  }
+  /* A suffix the host parser can never match is a misconfiguration worth
+   * naming at start rather than at the first request: every Host would fall
+   * through to the parent origin and the subdomain would be unreachable. */
+  for (const char *q = h->host_suffix; *q != '\0'; q++) {
+    if (!(strchr("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                 "0123456789.-_", *q) != NULL)) {
+      (void)kbc_err_set(err, KBC_ERR_INVALID,
+                        "KBC_ARTIFACT_HOST_SUFFIX: \"%s\" is not a hostname "
+                        "suffix",
+                        h->host_suffix);
+      kbc_httpd_stop(h);
+      return NULL;
+    }
+  }
+  const char *detailed = getenv("KBC_METRICS_DETAILED");
+  h->m.detailed = detailed != NULL && strcmp(detailed, "1") == 0;
+  h->nroots = cfg->ncorpora;
+  if (h->nroots > 0) {
+    h->roots = calloc(h->nroots, sizeof *h->roots);
+    if (h->roots == NULL) {
+      (void)kbc_err_set(err, KBC_ERR_NOMEM, "httpd: corpus roots");
+      kbc_httpd_stop(h);
+      return NULL;
+    }
+  }
+  for (size_t i = 0; i < h->nroots; i++) {
+    const kbc_corpus_cfg *c = &cfg->corpora[i];
+    h->roots[i].name = c->name;
+    /* NULL when the corpus does not exist yet: there is nothing to serve from
+     * it, and a guard against a NULL root would be a guard that cannot fail. */
+    h->roots[i].root = canon(c->path);
+    if (i < KBC_MAX_CORPORA) {
+      h->m.kb_names[i] = c->name;
+      /* Pre-seeded at bring-up so an observation is a lookup, never an insert
+       * on the hot path — and so a configured kb renders at 0 in the
+       * exposition before its first request (`state.rs:432-436`). */
+      atomic_init(&h->m.per_kb[i].count, 0);
+      for (size_t b = 0; b < KBC_LAT_SLOTS; b++) {
+        atomic_init(&h->m.per_kb[i].slot[b], 0);
+      }
+      h->m.n_kb = i + 1;
+    }
+    if (h->roots[i].root == NULL) {
+      KBC_LOGW("httpd: corpus %s has no readable root at %s", c->name, c->path);
+    }
+  }
+  atomic_init(&h->m.total, 0);
+  for (size_t i = 0; i < KBC_ROUTE_KINDS; i++) {
+    atomic_init(&h->m.route[i].count, 0);
+    for (size_t b = 0; b < KBC_LAT_SLOTS; b++) {
+      atomic_init(&h->m.route[i].slot[b], 0);
+    }
+  }
+  /* The static root, resolved the same way: KB_SPA_DIST when it holds an
+   * index.html, and no root at all otherwise, which is a 404 that says why
+   * (`spa.rs:412-427`). */
+  const char *dist = getenv("KB_SPA_DIST");
+  if (dist != NULL && dist[0] != '\0') {
+    char *shell = path_join(dist, "index.html");
+    if (shell != NULL) {
+      char *c = canon(shell);
+      free(shell);
+      if (c != NULL) {
+        h->spa_root = canon(dist);
+        free(c);
+      }
+    }
+    if (h->spa_root == NULL) {
+      (void)kbc_err_set(err, KBC_ERR_INVALID,
+                        "KB_SPA_DIST: \"%s\" has no index.html to serve",
+                        dist);
+      kbc_httpd_stop(h);
+      return NULL;
+    }
+  }
   /* The wake pipe is the only cross-thread wake-up a worker needs: one read end
    * is registered in every epoll set. */
   int fds[2];
@@ -2537,6 +4287,11 @@ void kbc_httpd_stop(kbc_httpd *h) {
     free(h->ring[i].type);
     free(h->ring[i].json);
   }
+  for (size_t i = 0; i < h->nroots; i++) free(h->roots[i].root);
+  free(h->roots);
+  free(h->host_suffix);
+  free(h->parent_origin);
+  free(h->spa_root);
   kbc_strlist_free(&h->cors);
   free(h->bind_addr);
   free(h->listen_fd);
@@ -2549,11 +4304,19 @@ void kbc_httpd_stop(kbc_httpd *h) {
 
 int kbc_httpd_port(const kbc_httpd *h) { return h != NULL ? h->port : 0; }
 
-/* CORS and the per-connection request cap have no field in kbc_config, so they
- * are read once at start from KBC_CORS_ORIGINS and KBC_RATE_LIMIT_RPS; see
- * kbc_httpd_start. Defaults: no cross-origin caller at all, and a cap of
- * KBC_RATE_LIMIT_DEFAULT requests per connection per second. */
-/* ------------------------------------------------------ (5) route export -- */
+/* CORS, the per-connection request cap, the artifact-subdomain suffix, the
+ * parent origin, the static root and the detailed metrics layer have no field
+ * in kbc_config, so they are read once at start from KBC_CORS_ORIGINS,
+ * KBC_RATE_LIMIT_RPS, KBC_ARTIFACT_HOST_SUFFIX, KBC_PARENT_ORIGIN,
+ * KB_SPA_DIST and KBC_METRICS_DETAILED; see kbc_httpd_start. */
+/* ------------------------------------------------------ (6) route export --
+ *
+ * Two of these rows are ORIGIN-scoped rather than path-scoped, and the path
+ * column says so: a request is routed by its `Host:` before it is routed by
+ * its path (`routes/dispatch.rs:46-50`). They are listed with `needs_auth`
+ * false because the Host is chosen by the client and is therefore not
+ * admission control — the same posture the original takes, where the origin
+ * split sits outside the /api auth layer (`router.rs:1000-1025`). */
 
 const kbc_route KBC_ROUTES[] = {
     {"GET", "/api/health", "liveness, version, uptime, indexed doc count",
@@ -2568,8 +4331,17 @@ const kbc_route KBC_ROUTES[] = {
      true},
     {"GET", "/api/artifacts/{id}", "one artifact, ?source=1 adds the raw text",
      true},
+    {"GET", "/api/kb/{kb}/artifact/{id}",
+     "artifact bytes, sandboxed CSP + nosniff, ?download=1 attaches", true},
     {"POST", "/api/reindex", "synchronous full rescan, answers 202", true},
     {"GET", "/api/events", "server-sent event stream", true},
+    {"GET", "/metrics", "Prometheus text exposition 0.0.4, no-store", true},
     {"GET", "/", "plain-text API banner (no reader UI in this port)", false},
+    {"GET", "*", "parent-origin static files from KB_SPA_DIST, else 404",
+     false},
+    {"GET", "<id>.artifacts.localhost/*",
+     "artifact subdomain: one origin per artifact, canonicalised under the "
+     "corpus root",
+     false},
 };
 const size_t KBC_ROUTES_LEN = sizeof KBC_ROUTES / sizeof KBC_ROUTES[0];

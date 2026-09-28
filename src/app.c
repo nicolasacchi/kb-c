@@ -98,6 +98,11 @@ typedef struct {
 static void app_edge_srcs_free(app_edge_src *v, size_t n);
 static kbc_status store_write_links(kbc_app *app, app_edge_src *v, size_t nsrc,
                                     kbc_err *err);
+/* "A document went away": the ONE removal. Declared here because the reconcile
+ * sweep is defined above its definition and must reach the same implementation
+ * the watcher does — a second copy of this cascade is how the two drift. */
+static kbc_status store_forget_path(kbc_app *app, const char *corpus,
+                                    const char *rel_path, kbc_err *err);
 
 
 /* Links recorded per document. A document with more outbound links than this
@@ -630,8 +635,13 @@ static kbc_status walk_dir(kbc_app *app, const kbc_corpus_cfg *cc,
 
     struct stat st;
     if (fstatat(dfd, ent->d_name, &st, 0) != 0) {
-      /* Vanished between readdir and fstatat: not an error, the next reindex
-       * will not see it either. */
+      /* Vanished between readdir and fstatat: not an error, and not a removal
+       * either. The walk has no authority over what it could not stat — the
+       * file is simply not in the manifest, and the store still holds its row.
+       * The reconcile sweep is where that gets decided: it re-stats every
+       * stored row the walk did not see and removes the ones the filesystem
+       * says are gone. Treating the miss here as "it is not there any more"
+       * would make the walk, which only ever LOOKS, the thing that deletes. */
       kbc_str_free(&rel);
       continue;
     }
@@ -1243,6 +1253,28 @@ static bool path_set_has(const path_set *ps, const char *key) {
   return bsearch(&key, ps->keys, ps->n, sizeof(*ps->keys), path_key_cmp) !=
          NULL;
 }
+/* Asks the filesystem whether a stored row's file is still there. Only ENOENT
+ * and ENOTDIR count as "gone": any other errno is a stat that did not ANSWER,
+ * EACCES on a directory the daemon may not read being the ordinary one, and
+ * answering "gone" to a question nobody could ask is how a permission problem
+ * becomes data loss. The Rust original draws the same line and keeps the row
+ * on a failed stat (indexer.rs:787, `Err(_) => continue`). */
+static kbc_status row_file_gone(const kbc_corpus_cfg *cc, const char *rel,
+                                bool *gone, kbc_err *err) {
+  kbc_str full;
+  kbc_str_init(&full);
+  kbc_status s = kbc_str_printf(&full, "%s/%s", cc->path, rel);
+  if (kbc_failed(s)) {
+    kbc_str_free(&full);
+    return kbc_err_set(err, KBC_ERR_NOMEM, "sweep path for %s/%s", cc->name,
+                       rel);
+  }
+  struct stat sb;
+  *gone = stat(full.ptr, &sb) != 0 && (errno == ENOENT || errno == ENOTDIR);
+  kbc_str_free(&full);
+  return KBC_OK;
+}
+
 
 /* One store row, one arena: the artifact's `path` is carved out of `qa`, so
  * the arena has to outlive every use of it — the probe key, the delete
@@ -1277,24 +1309,54 @@ static kbc_status sweep_one_id(kbc_app *app, const kbc_corpus_cfg *cc,
   } else if (path_set_has(seen, probe->ptr)) {
     s = KBC_OK;
   } else {
-    /* The graph rows leave with the document, exactly as they do on the
-     * single-file removal path (store_forget_path). Dropping only the
-     * artifact row would leave its edges behind: an edge to a document that
-     * is not indexed any more is an in-degree nothing can attach to. */
-    kbc_status d = kbc_store_forget_document(app->store, cc->name, prev.path,
-                                             err);
-    if (d == KBC_OK) d = kbc_store_delete_artifact(app->store, id, err);
-    if (kbc_failed(d)) {
-      /* One stuck row must not cost the whole rescan: the row stays
-       * visible and the next reindex tries again. */
-      KBC_LOGW("sweep: cannot drop %s/%s: %s", cc->name,
-               prev.path ? prev.path : "?", err->msg);
-      kbc_err_reset(err);
+    /* The corpus on disk is the authority, and this is the only place in a
+     * full pass that gets to ask it. Not seeing the path in the manifest is
+     * NOT the same as the file being gone: the walk declines a file it cannot
+     * stat (vanished between readdir and fstatat), one whose extension is not
+     * indexable, one an ignore pattern covers, and one whose size is out of
+     * range. Every one of those is a rule the user can change back, and a
+     * document that is still on disk is not a removal.
+     *
+     * The old code removed on the manifest's word alone, so a walk rule could
+     * destroy a document that was sitting in the corpus, comments and all. The
+     * Rust original makes the same distinction (indexer.rs:756-798) and calls
+     * the opposite guard THE TRAP: `if path.try_exists() { continue }` kept
+     * every still-existing file, so a de-mapped file's row — and every real
+     * delete — lingered forever. Both arms are needed; only the filesystem
+     * decides which one this is. */
+    bool gone = false;
+    s = row_file_gone(cc, prev.path != NULL ? prev.path : "", &gone, err);
+    if (kbc_failed(s)) {
+      kbc_arena_free(qa);
+      return s;
+    }
+    if (!gone) {
+      /* Kept, not dropped: dropping is the destructive direction and it is not
+       * recoverable. `artifacts` cascades to chunks AND comments, and a
+       * comment is not re-derivable from anything. Under-deleting costs a
+       * stale row the next pass can still drop; over-deleting costs the
+       * user's data the moment they change their mind about the rule. */
+      KBC_LOGW("sweep: %s/%s is on disk but was not walked; the row stays",
+               cc->name, prev.path != NULL ? prev.path : "?");
       s = KBC_OK;
     } else {
-      (*removed)++;
-      KBC_LOGI("sweep: %s/%s is no longer in the corpus, dropped", cc->name,
-               prev.path ? prev.path : "?");
+      /* The watcher's removal, not a second one: the same forget-then-delete
+       * cascade, and through it the same watch.delete the watcher publishes.
+       * One implementation of "a document went away" is the whole point — two
+       * would drift, and the one that drifted is the one nobody tests. */
+      kbc_status d = store_forget_path(app, cc->name, prev.path, err);
+      if (kbc_failed(d)) {
+        /* One stuck row must not cost the whole rescan: the row stays
+         * visible and the next reindex tries again. */
+        KBC_LOGW("sweep: cannot drop %s/%s: %s", cc->name,
+                 prev.path != NULL ? prev.path : "?", err->msg);
+        kbc_err_reset(err);
+        s = KBC_OK;
+      } else {
+        (*removed)++;
+        KBC_LOGI("sweep: %s/%s is no longer in the corpus, dropped", cc->name,
+                 prev.path != NULL ? prev.path : "?");
+      }
     }
   }
   kbc_arena_free(qa);
@@ -1877,9 +1939,66 @@ kbc_status kbc_app_reindex(kbc_app *app, kbc_err *err) {
   return KBC_OK;
 }
 
-/* Drops the store row for one path. A path that is not there is not a failure:
- * the caller is bringing the index in line with the filesystem, and the
- * filesystem has already said the document does not exist. */
+/* The removal, announced. The Rust daemon emits `watch.delete` with a payload
+ * of exactly {kb, path} from BOTH the watcher and its reconcile pass
+ * (indexer.rs:795, routes/schema.rs:284), and kb-c emitted nothing at all: a
+ * document deleted while the daemon was not watching changed the index under
+ * every subscriber — an SSE client, `kb watch` — with no word about what
+ * changed in it, so a client had to diff the whole document set to notice.
+ *
+ * Both values are escaped: a corpus name comes from a config file and a path
+ * comes off the filesystem, where `a"b.md` is a perfectly legal file name and
+ * a raw format would emit invalid JSON on a name the user chose. */
+static void publish_document_gone(kbc_app *app, const char *corpus,
+                                  const char *rel_path) {
+  kbc_str payload;
+  kbc_str_init(&payload);
+  kbc_status s = kbc_str_puts(&payload, "{\"kb\":");
+  if (s == KBC_OK) s = kbc_str_append_json_string(&payload, corpus, strlen(corpus));
+  if (s == KBC_OK) s = kbc_str_puts(&payload, ",\"path\":");
+  if (s == KBC_OK) {
+    s = kbc_str_append_json_string(&payload, rel_path, strlen(rel_path));
+  }
+  if (s == KBC_OK) s = kbc_str_puts(&payload, "}");
+  if (s == KBC_OK) {
+    kbc_app_publish(app, "watch.delete", payload.ptr);
+  } else {
+    /* Observability, not correctness: a payload that would not build must not
+     * fail a removal the store already committed. The removal itself is
+     * logged, loudly, by its caller. */
+    KBC_LOGW("watch.delete for %s/%s: no payload (%s)", corpus, rel_path,
+             kbc_status_str(s));
+  }
+  kbc_str_free(&payload);
+}
+
+/* THE removal, and the only one: the watcher's delete event, the reconcile
+ * sweep's and kbc_app_delete_path's all arrive here. A path that is not there
+ * is not a failure — the caller is bringing the index in line with the
+ * filesystem, or the user asked for the document to be gone, and either way
+ * the document is not coming back under that id.
+ *
+ * The cascade, in full, because this is the site that has to say it:
+ *
+ *   GOES, with the document —
+ *     edges (outbound deleted, inbound demoted to pending_links)   store.c
+ *     doc_metas (a facet is a name the document wrote into itself)  store.c
+ *     artifacts                                                   store.c
+ *     chunks and comments, which the artifacts row cascades to     store.c
+ *
+ *   STAYS, deliberately —
+ *     history, corkboard, pinned_memories, reading_sections.
+ *
+ * The last four are the user's, not the document's. A comment is a reply to
+ * something the document said; reading history is the fact that the user read
+ * it, a pin is a decision they made about it, and a corkboard entry is where
+ * they put it. None of them can be reconstructed from the bytes, and none of
+ * them become false because the bytes are gone — the user read it, and they
+ * still have. So a removal must not take a user's reading history with it:
+ * the day the document comes back, its history is still theirs. That is
+ * invariant 8 of the port plan, and the reason this cascade stops where it
+ * stops. It is also why the reconcile sweep refuses to run it for a file
+ * that is merely unwalked — see sweep_one_id. */
 static kbc_status store_forget_path(kbc_app *app, const char *corpus,
                                     const char *rel_path, kbc_err *err) {
   kbc_arena *qa = kbc_arena_new(4096u);
@@ -1897,7 +2016,11 @@ static kbc_status store_forget_path(kbc_app *app, const char *corpus,
     /* Not a row, but the graph rows it left are still ours to drop: a
      * document that was re-ingested without its store row is not a
      * document. */
-    return kbc_store_forget_document(app->store, corpus, rel_path, err);
+    s = kbc_store_forget_document(app->store, corpus, rel_path, err);
+    if (s == KBC_OK) {
+      publish_document_gone(app, corpus, rel_path);
+    }
+    return s;
   }
   /* The graph rows go with the document, outbound AND inbound, and the
    * inbound edges are demoted to pending links rather than dropped: the
@@ -1910,6 +2033,9 @@ static kbc_status store_forget_path(kbc_app *app, const char *corpus,
   }
   s = kbc_store_delete_artifact(app->store, prev.id, err);
   kbc_arena_free(qa);
+  if (s == KBC_OK) {
+    publish_document_gone(app, corpus, rel_path);
+  }
   return s;
 }
 
@@ -2399,6 +2525,85 @@ kbc_status kbc_app_reindex_file(kbc_app *app, const char *corpus,
 kbc_status kbc_app_reindex_remove(kbc_app *app, const char *corpus,
                                   const char *rel_path, kbc_err *err) {
   return reindex_one(app, corpus, rel_path, err);
+}
+
+/* include/kbc/app.h is frozen and has no by-path delete, so the declaration
+ * lives here and the header line is reported rather than edited. The line
+ * app.h should carry, verbatim:
+ *
+ *   kbc_status kbc_app_delete_path(kbc_app *app, const char *corpus,
+ *                                  const char *rel_path, kbc_err *err);
+ */
+kbc_status kbc_app_delete_path(kbc_app *app, const char *corpus,
+                               const char *rel_path, kbc_err *err);
+
+/* Deletes ONE document, named by its path, whether or not the file is still
+ * on disk. That is the difference from kbc_app_reindex_remove, which asks
+ * the filesystem what happened and follows it: this one is the statement, and
+ * the filesystem is not consulted. A file that is still there comes back at
+ * the next full pass, because the corpus on disk is the authority — but it
+ * comes back as a fresh ingest, and the history, corkboard entries, pins and
+ * reading sections it left behind are still the user's.
+ *
+ * The cascade is store_forget_path's and is documented there in full: edges
+ * and doc_metas and artifacts go, chunks and comments cascade with the
+ * artifacts row, and history, corkboard, pinned_memories and reading_sections
+ * stay. A removal must not take a user's reading history with it.
+ *
+ * LOCKING. reindex_mu, the OUTER lock, taken here and released on every
+ * return: this writes the same store rows and the same index the full pass
+ * does, so it is excluded from exactly the same set of callers, and it is
+ * taken BEFORE the rwlock. The rwlock is taken by index_touch_one, once,
+ * around the index mutation — never before the mutex, never twice. Nothing
+ * below re-enters a reindex entry point: reindex_one and reindex_locked would
+ * both self-deadlock on this mutex, and neither is what this does.
+ *
+ * Not a full-scan fallback on an index failure, deliberately, where
+ * reindex_one_locked has one. A full scan would re-ingest the file if it is
+ * still on disk — silently undoing the delete the caller asked for, which is
+ * the one outcome worse than reporting the failure. Nor is it needed for
+ * consistency: the store row is already gone, and resolve_rows drops an index
+ * row the store cannot resolve, so the document is unreachable from search
+ * either way. What is left is a posting list the next full pass rebuilds. */
+kbc_status kbc_app_delete_path(kbc_app *app, const char *corpus,
+                               const char *rel_path, kbc_err *err) {
+  if (!app) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "delete_path: app is NULL");
+  }
+  if (!corpus || !rel_path || rel_path[0] == '\0') {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "delete_path: corpus and path are both required");
+  }
+  /* The same two gates reindex_one applies, for the same reason: this path
+   * reaches the filesystem, and a corpus name from a request body is hostile
+   * input like anything else. */
+  if (strlen(rel_path) > (size_t)KBC_MAX_PATH_LEN) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "%s/%s: path over the %u byte cap",
+                       corpus, rel_path, (unsigned)KBC_MAX_PATH_LEN);
+  }
+  if (strstr(rel_path, "..") != NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "%s/%s: '..' is not allowed",
+                       corpus, rel_path);
+  }
+  const kbc_corpus_cfg *cc = kbc_config_corpus(app->cfg, corpus);
+  if (!cc) {
+    return kbc_err_set(err, KBC_ERR_NOTFOUND, "corpus %s is not configured",
+                       corpus);
+  }
+
+  pthread_mutex_lock(&app->reindex_mu);
+  /* The store first, so the index is never the side that still knows about a
+   * document the store has dropped. */
+  kbc_status s = store_forget_path(app, corpus, rel_path, err);
+  if (s == KBC_OK && app->index != NULL) {
+    s = index_touch_one(app, cc, rel_path, true, err);
+  }
+  pthread_mutex_unlock(&app->reindex_mu);
+  if (kbc_failed(s)) {
+    KBC_LOGW("delete_path %s/%s: %s", corpus, rel_path,
+             err != NULL ? err->msg : kbc_status_str(s));
+  }
+  return s;
 }
 
 

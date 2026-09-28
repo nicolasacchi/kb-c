@@ -206,6 +206,202 @@ kbc_status kbc_store_list_comments(kbc_store *s, kbc_arena *a,
 kbc_status kbc_store_set_comment_resolved(kbc_store *s, const char *comment_id,
                                           bool resolved, kbc_err *err);
 
+/* ------------------------------------------------ stage 1: the rest of it --
+ *
+ * The Rust original's per-kb SQLite schema is a forward-only migration list
+ * of 42 embedded .sql files (kb-core/migrations/, run from Db::open at
+ * storage/sqlite.rs:198). kb-c does not take all 42: INVENTORY.md is the scope
+ * contract and every OUT-OF-SCOPE row there carries its reason. These are the
+ * tables kb-c claims. Their DDL is the Rust DDL, unchanged except for the
+ * table and column names kb-c already uses (`corpus` for `source_slug`).
+ *
+ * `identity_backfill_done` is deliberately NOT ported. It is a once-only
+ * marker for `Db::identity_backfill`, which backfills per-user read/unread
+ * overrides for list entries. kb-c has no list entries and no per-user
+ * override state in its scope, so the marker would gate a pass that has
+ * nothing to do — a table with no writer and no reader.
+ */
+
+/* ---------------------------------------------------------------- sources -- */
+
+/* One row per indexed root. `slug` is kb-c's corpus name and is the primary
+ * key, matching Rust's SourceSlug; `paused` is 0/1, not a bool, because it is
+ * an INTEGER column there and a caller may read it back verbatim. */
+typedef struct {
+  const char *corpus;  /* ARENA */
+  const char *path;    /* ARENA */
+  int64_t added_at;    /* unix seconds */
+  bool paused;
+} kbc_source;
+
+/* Inserts or updates by corpus: an existing row keeps its `added_at`, because
+ * that is when the source was first seen, not when it was last written. */
+kbc_status kbc_store_put_source(kbc_store *s, const kbc_source *src,
+                                kbc_err *err);
+kbc_status kbc_store_get_source(kbc_store *s, kbc_arena *a, const char *corpus,
+                                kbc_source *out, kbc_err *err);
+kbc_status kbc_store_list_sources(kbc_store *s, kbc_arena *a, size_t limit,
+                                  kbc_source **out, size_t *n_out,
+                                  kbc_err *err);
+kbc_status kbc_store_set_source_paused(kbc_store *s, const char *corpus,
+                                       bool paused, kbc_err *err);
+
+/* ------------------------------------------------------------- index runs -- */
+
+/* One row per reindex pass. `finished_at` is negative while the run is still
+ * in flight, which is the Rust convention (a NULL column) expressed in a
+ * field that cannot be NULL; a caller reading it must test for that. */
+typedef struct {
+  const char *id;      /* ARENA, "r-" + 6 base32 */
+  const char *corpus;  /* ARENA */
+  int64_t started_at;
+  int64_t finished_at; /* < 0 while in flight */
+  int64_t ok_count;
+  int64_t err_count;
+} kbc_index_run;
+
+kbc_status kbc_store_put_index_run(kbc_store *s, const kbc_index_run *run,
+                                   kbc_err *err);
+kbc_status kbc_store_finish_index_run(kbc_store *s, const char *id,
+                                      int64_t finished_at, int64_t ok_count,
+                                      int64_t err_count, kbc_err *err);
+kbc_status kbc_store_list_index_runs(kbc_store *s, kbc_arena *a,
+                                     const char *corpus, size_t limit,
+                                     kbc_index_run **out, size_t *n_out,
+                                     kbc_err *err);
+
+/* ----------------------------------------------------------------- errors -- */
+
+/* One row per ingest failure. `content_hash` clears the row when the file's
+ * content changes, and `retry_count` is what the quarantine gate reads: a
+ * document whose retries reach QUARANTINE_THRESHOLD stops being embedded and
+ * stays keyword-searchable. `dismissed` is 0/1, and the "open errors" query is
+ * a partial index over exactly `dismissed = 0`. */
+typedef struct {
+  const char *id;      /* ARENA, "e-" + 6 base32 */
+  const char *kind;    /* ARENA: parse | io | sqlite | lance | embed */
+  const char *corpus;  /* ARENA */
+  const char *path;    /* ARENA, source-relative, forward-slash */
+  const char *message; /* ARENA */
+  const char *content_hash; /* ARENA or NULL */
+  int64_t retry_count;
+  int64_t created_at;
+  bool dismissed;
+} kbc_error_row;
+
+/* Records a failure. Keyed by (corpus, path) in the Rust original's caller,
+ * so a second failure for the same path increments `retry_count` rather than
+ * inserting a duplicate row. */
+kbc_status kbc_store_record_error(kbc_store *s, const kbc_error_row *row,
+                                  kbc_err *err);
+/* The quarantine gate. Returns 0 when there is no row for the path. */
+kbc_status kbc_store_retry_count_for_path(kbc_store *s, const char *corpus,
+                                          const char *path, int64_t *out,
+                                          kbc_err *err);
+kbc_status kbc_store_clear_error(kbc_store *s, const char *corpus,
+                                 const char *path, kbc_err *err);
+kbc_status kbc_store_list_errors(kbc_store *s, kbc_arena *a, const char *corpus,
+                                 bool open_only, size_t limit,
+                                 kbc_error_row **out, size_t *n_out,
+                                 kbc_err *err);
+
+/* -------------------------------------------------------- excluded files -- */
+
+/* Operator intent, keyed by the source-relative forward-slash path — the same
+ * string the artifact id is hashed from, so an exclusion cannot be attached
+ * to the wrong document by a path-normalisation difference. NOT the quarantine
+ * pattern: this is durable operator intent, quarantine is failure-driven. */
+typedef struct {
+  const char *path;        /* ARENA, source-relative forward-slash */
+  int64_t excluded_at;     /* unix seconds */
+  const char *note;        /* ARENA or NULL */
+} kbc_exclusion;
+
+kbc_status kbc_store_add_exclusion(kbc_store *s, const kbc_exclusion *x,
+                                   kbc_err *err);
+kbc_status kbc_store_remove_exclusion(kbc_store *s, const char *path,
+                                      kbc_err *err);
+/* Loads every exclusion at daemon bring-up into the caller's ingest gate. A
+ * caller that has no gate yet may ignore them safely: nothing reads the table
+ * directly, by design, so a half-built daemon degrades to indexing everything
+ * rather than to a query that returns the wrong answer. */
+kbc_status kbc_store_list_exclusions(kbc_store *s, kbc_arena *a, size_t limit,
+                                     kbc_exclusion **out, size_t *n_out,
+                                     kbc_err *err);
+
+/* ----------------------------------------------------------- doc history -- */
+
+/* The corkboard (a user's "anchored" artifacts), pinned memories, and the
+ * reading/search history. These three exist for ONE reason in this port: a
+ * document removal must leave them alone. Rust's CASCADE_STEPS
+ * (storage/sqlite.rs:6392) drops artifacts, chunks, comments, edges and
+ * friends, and stops there; a user's reading history outliving the document
+ * they read is the behaviour to preserve, and it is only assertable if the
+ * tables exist. */
+typedef struct {
+  const char *artifact_id; /* ARENA */
+  int64_t created_at;      /* unix seconds */
+} kbc_corkboard_row;
+
+typedef struct {
+  const char *artifact_id; /* ARENA */
+  int64_t pinned_at;       /* unix seconds */
+} kbc_pin_row;
+
+/* A history row is one of three kinds, discriminated exactly as Rust does
+ * with a CHECK-constrained `kind`: "open" (a reading visit, non-null
+ * artifact_id), "search" (non-null query), "comment" (non-null comment_id).
+ * The kind-specific fields are NULL for the other two. */
+typedef struct {
+  int64_t id;             /* rowid, 0 on write */
+  const char *kind;       /* ARENA: open | search | comment */
+  const char *artifact_id; /* ARENA or NULL */
+  const char *query;      /* ARENA or NULL */
+  const char *comment_id; /* ARENA or NULL */
+  const char *source;     /* ARENA or NULL */
+  const char *user;       /* ARENA or NULL */
+  int64_t scroll_y;
+  int64_t scroll_max;
+  int64_t scroll_y_max;
+  int64_t active_ms;
+  const char *last_section; /* ARENA or NULL */
+  int64_t started_at;
+  int64_t updated_at;
+} kbc_history_row;
+
+kbc_status kbc_store_add_history(kbc_store *s, const kbc_history_row *row,
+                                 kbc_err *err);
+/* Most recent first, which is the order every history surface uses. */
+kbc_status kbc_store_list_history(kbc_store *s, kbc_arena *a, const char *user,
+                                  size_t limit, kbc_history_row **out,
+                                  size_t *n_out, kbc_err *err);
+
+kbc_status kbc_store_add_corkboard(kbc_store *s, const char *artifact_id,
+                                   int64_t created_at, kbc_err *err);
+kbc_status kbc_store_remove_corkboard(kbc_store *s, const char *artifact_id,
+                                      kbc_err *err);
+kbc_status kbc_store_list_corkboard(kbc_store *s, kbc_arena *a, size_t limit,
+                                    kbc_corkboard_row **out, size_t *n_out,
+                                    kbc_err *err);
+
+kbc_status kbc_store_pin_memory(kbc_store *s, const char *artifact_id,
+                                int64_t pinned_at, kbc_err *err);
+kbc_status kbc_store_unpin_memory(kbc_store *s, const char *artifact_id,
+                                  kbc_err *err);
+kbc_status kbc_store_list_pins(kbc_store *s, kbc_arena *a, size_t limit,
+                               kbc_pin_row **out, size_t *n_out, kbc_err *err);
+
+/* --------------------------------------------------------- first indexed -- */
+
+/* Insert-or-ignore. The point is that a reindex must NOT refresh it: a
+ * "created" sort needs an anchor that survives both a reindex and a file
+ * copy, and mtime drifts on edit while btime does not survive a copy. */
+kbc_status kbc_store_first_seen(kbc_store *s, const char *artifact_id,
+                                int64_t first_indexed_unix, kbc_err *err);
+kbc_status kbc_store_get_first_seen(kbc_store *s, const char *artifact_id,
+                                    int64_t *out, kbc_err *err);
+
+
 #ifdef __cplusplus
 }
 #endif

@@ -1712,6 +1712,685 @@ KBC_TEST(a_refused_start_leaves_the_callers_descriptors_open) {
   fx_teardown(&f);
 }
 
+/* ------------------------------------------------------- the serving surface */
+
+/* The corpus root the artifact serve is bounded by, and everything reachable
+ * only from OUTSIDE it. The sibling directory `<root>-secret` is the case that
+ * separates a component-wise containment check from a byte-prefix one: it
+ * shares every byte of the root's name and none of its components. */
+#define OUT_IN_ROOT "IN-ROOT-BYTES"
+#define OUT_SIBLING "OUTSIDE-SIBLING-SECRET"
+#define OUT_ESCAPE "OUTSIDE-ROOT-SECRET"
+
+typedef struct {
+  fixture f;
+  char sub[KBC_TEST_PATH_MAX];   /* <root>/kb/sub — the asset base */
+  char secret_dir[KBC_TEST_PATH_MAX]; /* <root>/kb-secret */
+  char outside[KBC_TEST_PATH_MAX];    /* <root>/outside */
+  char id[KBC_MAX_ID_LEN + 1];  /* the id of kb/sub/one.md */
+} origin_fixture;
+
+/* Assembled with a length check, never snprintf: the build runs
+ * -Werror=format-truncation, and a 4096-byte root plus a leaf is a warning no
+ * matter how carefully the sizes are written. A silently truncated path in a
+ * traversal test would assert the wrong thing and pass. */
+static void path_under(char *buf, size_t cap, const char *root,
+                       const char *rel) {
+  size_t rl = strlen(root), ll = strlen(rel);
+  if (rl + 1 + ll + 1 > cap) {
+    kbc_test_fail(__FILE__, __LINE__, "%s/%s does not fit in %zu bytes", root,
+                  rel, cap);
+    buf[0] = '\0';
+    return;
+  }
+  memcpy(buf, root, rl);
+  buf[rl] = '/';
+  memcpy(buf + rl + 1, rel, ll + 1);
+}
+
+/* Adds the origin layout on top of the standard fixture and re-indexes, so the
+ * artifact ids in the store match the files the traversal cases create. */
+static void ofx_setup(origin_fixture *o) {
+  fx_setup(&o->f, NULL);
+  path_under(o->sub, sizeof o->sub, o->f.root, "kb/sub");
+  path_under(o->secret_dir, sizeof o->secret_dir, o->f.root, "kb-secret");
+  path_under(o->outside, sizeof o->outside, o->f.root, "outside");
+  char p[KBC_TEST_PATH_MAX];
+  kbc_test_mkdir_p(o->sub);
+  kbc_test_mkdir_p(o->secret_dir);
+  kbc_test_mkdir_p(o->outside);
+  path_under(p, sizeof p, o->sub, "one.md");
+  kbc_test_write_file(p, "# One\n\nsub artifact\n");
+  /* A legitimate sibling asset, INSIDE the root: the guard must not refuse
+   * this, or "refuse everything" would pass every escape test. */
+  path_under(p, sizeof p, o->sub, "sibling.txt");
+  kbc_test_write_file(p, OUT_IN_ROOT);
+  path_under(p, sizeof p, o->secret_dir, "secret.txt");
+  kbc_test_write_file(p, OUT_SIBLING);
+  path_under(p, sizeof p, o->outside, "secret.txt");
+  kbc_test_write_file(p, OUT_ESCAPE);
+  /* Two escapes, both symlinks because that is the only way a canonicalised
+   * path under a probed base can leave the root: one into the SIBLING
+   * directory (the byte-prefix trap) and one into an unrelated directory. */
+  char target[KBC_TEST_PATH_MAX];
+  path_under(p, sizeof p, o->sub, "into-sibling");
+  path_under(target, sizeof target, o->secret_dir, "secret.txt");
+  KBC_CHECK(symlink(target, p) == 0);
+  path_under(p, sizeof p, o->sub, "escape.txt");
+  path_under(target, sizeof target, o->outside, "secret.txt");
+  KBC_CHECK(symlink(target, p) == 0);
+
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(o->f.app, &err));
+
+  /* The id of sub/one.md, found through the public listing rather than
+   * recomputed: the test must not re-implement the id minting to find its
+   * own fixture. */
+  kbc_response r;
+  KBC_CHECK_EQ_INT(call(&o->f, "GET", "/api/artifacts", AT0, NULL, &r), 200);
+  o->id[0] = '\0';
+  {
+    /* The id that goes WITH the path, not the first one in the list: walking
+     * the objects and remembering the most recent id is the only way to pair
+     * them without re-implementing the JSON shape. */
+    const char *cur = NULL;
+    for (const char *q = r.body.ptr; *q != '\0'; q++) {
+      if (strncmp(q, "\"id\":\"", 6) == 0) cur = q + 6;
+      if (strncmp(q, "\"path\":\"sub/one.md\"", 19) == 0 && cur != NULL) {
+        size_t i = 0;
+        while (cur[i] != '\0' && cur[i] != '"' && i < KBC_MAX_ID_LEN) {
+          o->id[i] = cur[i];
+          i++;
+        }
+        o->id[i] = '\0';
+        break;
+      }
+    }
+  }
+  kbc_response_free(&r);
+  KBC_CHECK_MSG(o->id[0] != '\0', "no id found for kb/sub/one.md: %s", "");
+}
+
+static void ofx_teardown(origin_fixture *o) { fx_teardown(&o->f); }
+
+/* One request on the artifact subdomain, spelled out raw so the Host is
+ * exactly what the test means it to be. */
+static int origin_get(server *s, const char *host, const char *path,
+                      const char *query, char *reply, size_t cap) {
+  kbc_str req;
+  kbc_str_init(&req);
+  (void)kbc_str_printf(&req, "GET %s%s HTTP/1.1\r\nHost: %s\r\n\r\n", path,
+                       query != NULL ? query : "", host);
+  int status = 0;
+  bool ok = raw_exchange(s, req.ptr, req.len, &status, reply, cap);
+  kbc_str_free(&req);
+  KBC_CHECK_MSG(ok, "no HTTP reply for %s %s", path, host);
+  return status;
+}
+
+/* The traversal suite. Every case asserts the same two things: a 4xx, and no
+ * byte of anything outside the source root in the answer. The sibling case is
+ * the one that fails for a `strncmp(path, root, strlen(root))` guard — a
+ * `../` case does not, because strncmp rejects `../` too. */
+KBC_TEST(no_path_outside_the_source_root_is_ever_served) {
+  origin_fixture o;
+  ofx_setup(&o);
+  server s;
+  srv_start(&s, &o.f);
+  if (s.h == NULL || o.id[0] == '\0') {
+    srv_stop(&s);
+    ofx_teardown(&o);
+    return;
+  }
+  char host[KBC_TEST_PATH_MAX];
+  snprintf(host, sizeof host, "%s.artifacts.localhost", o.id);
+  char reply[8192];
+  int status = 0;
+
+  /* The control: a sibling asset inside the root IS served, byte for byte. A
+   * guard that refuses everything would pass every case below. */
+  status = origin_get(&s, host, "/sibling.txt", NULL, reply, sizeof reply);
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK_MSG(strstr(reply, OUT_IN_ROOT) != NULL,
+                "an in-root sibling asset is not served: %s", reply);
+
+  /* 1. SIBLING DIRECTORY. `/into-sibling` canonicalises to <root>-secret/
+   * secret.txt, which shares every byte of the root's name. A byte-prefix
+   * containment check accepts it and serves the file; the component-wise one
+   * refuses it as path traversal. */
+  status = origin_get(&s, host, "/into-sibling", NULL, reply, sizeof reply);
+  KBC_CHECK_MSG(status != 200, "the sibling directory was served: %d %s",
+                status, reply);
+  KBC_CHECK_MSG(status == 400 || status == 404, "expected 400 or 404, got %d",
+                status);
+  KBC_CHECK_MSG(strstr(reply, OUT_SIBLING) == NULL,
+                "a byte outside the root was served: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "\"type\":\"urn:kb:errors:bad-request\"") != NULL,
+                "a resolved-outside-root path is not a problem+json 400: %s",
+                reply);
+
+  /* 2. SYMLINK OUT OF THE ROOT. The e2e assertion in the original: a symlink
+   * that escapes must be 400 (kb-server/tests/end_to_end.rs:4891-4897). */
+  status = origin_get(&s, host, "/escape.txt", NULL, reply, sizeof reply);
+  KBC_CHECK_EQ_INT(status, 400);
+  KBC_CHECK_MSG(strstr(reply, OUT_ESCAPE) == NULL,
+                "a symlink escape served host bytes: %s", reply);
+
+  /* 3. ABSOLUTE PATH. Not found under the root, and the walk-up never climbs
+   * past it, so it is a miss and never a read of /etc/passwd. */
+  status = origin_get(&s, host, "/etc/passwd", NULL, reply, sizeof reply);
+  KBC_CHECK_MSG(status == 400 || status == 404,
+                "an absolute path must be 400 or 404, got %d: %s", status,
+                reply);
+  KBC_CHECK_MSG(strstr(reply, "root:") == NULL,
+                "an absolute path served /etc/passwd: %s", reply);
+
+  /* 4. ".." IN A SEGMENT, plain and percent-encoded. The request parser
+   * refuses both before the router, so the guard is never reached — and the
+   * point is that the answer is a refusal either way
+   * (kb-server/tests/end_to_end.rs:3459-3467). */
+  {
+    const char *dots = "GET /../outside/secret.txt HTTP/1.1\r\nHost: ";
+    kbc_str req;
+    kbc_str_init(&req);
+    (void)kbc_str_puts(&req, dots);
+    (void)kbc_str_puts(&req, host);
+    (void)kbc_str_puts(&req, "\r\n\r\n");
+    KBC_CHECK(raw_exchange(&s, req.ptr, req.len, &status, reply,
+                           sizeof reply));
+    KBC_CHECK_MSG(status >= 400 && status < 500, "\"..\" answered %d", status);
+    KBC_CHECK_MSG(strstr(reply, OUT_ESCAPE) == NULL,
+                  "\"..\" served a byte outside the root: %s", reply);
+    kbc_str_free(&req);
+  }
+  {
+    const char *enc = "GET /%2e%2e/outside/secret.txt HTTP/1.1\r\nHost: ";
+    kbc_str req;
+    kbc_str_init(&req);
+    (void)kbc_str_puts(&req, enc);
+    (void)kbc_str_puts(&req, host);
+    (void)kbc_str_puts(&req, "\r\n\r\n");
+    KBC_CHECK(raw_exchange(&s, req.ptr, req.len, &status, reply,
+                           sizeof reply));
+    KBC_CHECK_MSG(status >= 400 && status < 500,
+                  "an encoded \"..\" answered %d", status);
+    KBC_CHECK_MSG(strstr(reply, OUT_ESCAPE) == NULL,
+                  "an encoded \"..\" served a byte outside the root: %s",
+                  reply);
+    kbc_str_free(&req);
+  }
+
+  srv_stop(&s);
+  ofx_teardown(&o);
+}
+
+/* The subdomain is selected by Host, and only by Host: the same path on the
+ * parent origin is the banner, on an artifact host it is the artifact. */
+KBC_TEST(the_artifact_subdomain_is_chosen_by_host) {
+  origin_fixture o;
+  ofx_setup(&o);
+  server s;
+  srv_start(&s, &o.f);
+  if (s.h == NULL || o.id[0] == '\0') {
+    srv_stop(&s);
+    ofx_teardown(&o);
+    return;
+  }
+  char host[KBC_TEST_PATH_MAX];
+  snprintf(host, sizeof host, "%s.artifacts.localhost", o.id);
+  char reply[8192];
+
+  /* `/` on the artifact host is the artifact itself. */
+  int status = origin_get(&s, host, "/", NULL, reply, sizeof reply);
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK_MSG(strstr(reply, "sub artifact") != NULL,
+                "the artifact subdomain did not serve the artifact: %s", reply);
+  char want[128];
+  snprintf(want, sizeof want, "X-Kb-Artifact-Id: %s", o.id);
+  KBC_CHECK_MSG(strstr(reply, want) != NULL,
+                "no X-Kb-Artifact-Id for the served artifact: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "Vary: Accept, Cookie") != NULL,
+                "no Vary on a plain artifact serve: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "Cache-Control: private, no-store") == NULL,
+                "a plain artifact serve is not no-store: %s", reply);
+  /* The default parent origin is the "not configured for production"
+   * sentinel, and the original sends NO frame-ancestors CSP for it
+   * (artifact.rs:36-49). Emitting one anyway would break the dev flows the
+   * sentinel exists for. */
+  KBC_CHECK_MSG(strstr(reply, "Content-Security-Policy") == NULL,
+                "a default-dev subdomain response carries a frame-ancestors "
+                "CSP: %s",
+                reply);
+
+  /* ?cm=on is the per-user comment payload: private, no-store, and Vary
+   * widened to Authorization so no proxy hands it to another user. */
+  status = origin_get(&s, host, "/", "?cm=on", reply, sizeof reply);
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK_MSG(strstr(reply, "Cache-Control: private, no-store") != NULL,
+                "?cm=on is not private, no-store: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "Vary: Authorization, Accept, Cookie") != NULL,
+                "?cm=on does not widen Vary to Authorization: %s", reply);
+
+  /* A configured parent origin turns the CSP on, and it is the LAST header the
+   * handler sets. */
+  KBC_CHECK(setenv("KBC_PARENT_ORIGIN", "https://kb.example.com", 1) == 0);
+  {
+    server s2;
+    srv_start(&s2, &o.f);
+    if (s2.h != NULL) {
+      status = origin_get(&s2, host, "/", NULL, reply, sizeof reply);
+      KBC_CHECK_EQ_INT(status, 200);
+      KBC_CHECK_MSG(
+          strstr(reply, "Content-Security-Policy: frame-ancestors "
+                        "https://kb.example.com;") != NULL,
+          "a configured parent origin sends no frame-ancestors CSP: %s", reply);
+      srv_stop(&s2);
+    }
+  }
+  (void)unsetenv("KBC_PARENT_ORIGIN");
+
+  /* An unresolvable label is a 404, and the parent origin is never an
+   * artifact: `Host: kb.artifacts.localhost` is not a 12-hex id, so it must
+   * not resolve to anything. */
+  status = origin_get(&s, "notanid.artifacts.localhost", "/", NULL, reply,
+                      sizeof reply);
+  KBC_CHECK_EQ_INT(status, 404);
+  KBC_CHECK_MSG(strstr(reply, "artifact not found") != NULL,
+                "an unresolvable label is not 404 artifact-not-found: %s",
+                reply);
+
+  /* A host that is not an artifact subdomain is the parent origin, and `/`
+   * there is the API banner — the split is a branch, not a takeover. */
+  status = origin_get(&s, "kb.example.com", "/", NULL, reply, sizeof reply);
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK_MSG(strstr(reply, "self-hosted system of record") != NULL,
+                "the parent origin did not answer with its banner: %s", reply);
+
+  /* An unmatched /api path is never the subdomain: the api tree answers it. */
+  {
+    const char *req = "GET /api/health HTTP/1.1\r\nHost: ";
+    kbc_str r2;
+    kbc_str_init(&r2);
+    (void)kbc_str_puts(&r2, req);
+    (void)kbc_str_puts(&r2, host);
+    (void)kbc_str_puts(&r2, "\r\n\r\n");
+    KBC_CHECK(raw_exchange(&s, r2.ptr, r2.len, &status, reply, sizeof reply));
+    KBC_CHECK_EQ_INT(status, 200);
+    KBC_CHECK_MSG(strstr(reply, "\"status\":\"ok\"") != NULL,
+                  "an artifact host hijacked an /api route: %s", reply);
+    kbc_str_free(&r2);
+  }
+
+  srv_stop(&s);
+  ofx_teardown(&o);
+}
+
+/* The parent-origin artifact route: the header set and its order, the status
+ * codes, and the download disposition. */
+KBC_TEST(artifact_bytes_on_the_parent_origin) {
+  origin_fixture o;
+  ofx_setup(&o);
+  server s;
+  srv_start(&s, &o.f);
+  if (s.h == NULL || o.id[0] == '\0') {
+    srv_stop(&s);
+    ofx_teardown(&o);
+    return;
+  }
+  char path[256];
+  char reply[8192];
+  int status = 0;
+
+  snprintf(path, sizeof path, "/api/kb/kb/artifact/%s", o.id);
+  {
+    kbc_str req;
+    kbc_str_init(&req);
+    (void)kbc_str_printf(&req, "GET %s HTTP/1.1\r\nHost: x\r\n\r\n", path);
+    KBC_CHECK(raw_exchange(&s, req.ptr, req.len, &status, reply, sizeof reply));
+    kbc_str_free(&req);
+  }
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK_MSG(strstr(reply, "sub artifact") != NULL,
+                "the artifact bytes were not served: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "Content-Type: text/html; charset=utf-8") != NULL,
+                "artifact bytes are not text/html: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "X-Content-Type-Options: nosniff") != NULL,
+                "artifact bytes carry no nosniff: %s", reply);
+  /* The CSP value is the whole policy — literally `sandbox`, nothing else. */
+  KBC_CHECK_MSG(strstr(reply, "Content-Security-Policy: sandbox\r\n") != NULL,
+                "artifact bytes carry no bare `sandbox` CSP: %s", reply);
+  {
+    char want[128];
+    snprintf(want, sizeof want, "X-Kb-Artifact-Id: %s", o.id);
+    KBC_CHECK_MSG(strstr(reply, want) != NULL,
+                  "artifact bytes carry no X-Kb-Artifact-Id: %s", reply);
+  }
+  KBC_CHECK_MSG(strstr(reply, "Content-Disposition") == NULL,
+                "an attachment was offered without ?download=1: %s", reply);
+
+  /* ?download=1 attaches, and a markdown source is offered as .html because
+   * the body is served as HTML. */
+  {
+    kbc_str req;
+    kbc_str_init(&req);
+    (void)kbc_str_printf(&req, "GET %s?download=1 HTTP/1.1\r\nHost: x\r\n\r\n",
+                         path);
+    KBC_CHECK(raw_exchange(&s, req.ptr, req.len, &status, reply, sizeof reply));
+    kbc_str_free(&req);
+  }
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK_MSG(strstr(reply, "Content-Disposition: attachment;") != NULL,
+                "?download=1 does not attach: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "filename=\"one.html\"") != NULL,
+                "a markdown download is not offered as .html: %s", reply);
+
+  /* Status codes. An unknown corpus and an unknown id are both 404; a
+   * malformed id is 400 — the shape is checked before the lookup. */
+  {
+    kbc_response r;
+    char p2[256];
+    snprintf(p2, sizeof p2, "/api/kb/nosuchkb/artifact/%s", o.id);
+    KBC_CHECK_EQ_INT(call(&o.f, "GET", p2, NULL, NULL, &r), 404);
+    kbc_response_free(&r);
+    snprintf(p2, sizeof p2, "/api/kb/kb/artifact/000000000000");
+    KBC_CHECK_EQ_INT(call(&o.f, "GET", p2, NULL, NULL, &r), 404);
+    kbc_response_free(&r);
+    snprintf(p2, sizeof p2, "/api/kb/kb/artifact/xyz");
+    KBC_CHECK_EQ_INT(call(&o.f, "GET", p2, NULL, NULL, &r), 400);
+    kbc_response_free(&r);
+    /* A slash in the id position is a different route, not a lookup. */
+    KBC_CHECK_EQ_INT(call(&o.f, "GET", "/api/kb/kb/artifact/aa/bb", NULL, NULL,
+                          &r),
+                     404);
+    kbc_response_free(&r);
+    /* A method that is not GET is 405, not a silent 200. */
+    KBC_CHECK_EQ_INT(call(&o.f, "POST", path, NULL, NULL, &r), 405);
+    kbc_response_free(&r);
+  }
+
+  srv_stop(&s);
+  ofx_teardown(&o);
+}
+
+/* The Prometheus text endpoint. The shape is the contract: a scraper that
+ * cannot parse this sees no metrics at all, whatever the numbers are. */
+KBC_TEST(metrics_is_prometheus_text_exposition) {
+  fixture f;
+  fx_setup(&f, NULL);
+  kbc_response r;
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/metrics", NULL, NULL, &r), 200);
+  KBC_CHECK_EQ_STR(r.content_type, "text/plain; version=0.0.4; charset=utf-8");
+  const char *b = r.body.ptr;
+
+  /* A counter: HELP, TYPE, then the sample. */
+  KBC_CHECK_MSG(strstr(b, "# HELP kb_http_requests_total HTTP requests since "
+                          "daemon boot (GET /api/metrics requests_total).\n"
+                          "# TYPE kb_http_requests_total counter\n"
+                          "kb_http_requests_total 0\n") != NULL,
+                "the counter family is not HELP+TYPE+sample: %s", b);
+  /* A gauge. */
+  KBC_CHECK_MSG(strstr(b, "# TYPE kb_storage_channel_depth gauge\n"
+                          "kb_storage_channel_depth 0\n") != NULL,
+                "the gauge family is not TYPE+sample: %s", b);
+  /* The latency "histogram" is NOT a Prometheus histogram: it is a counter
+   * with `le_ms` as an ordinary label, non-cumulative, with the overflow slot
+   * labelled `+Inf`. Rendering `_sum`/`_count`/cumulative `_bucket{le=}` here
+   * would be the obvious thing and is wrong — a scraper reads a histogram's
+   * buckets as a CDF, and these are not one. */
+  KBC_CHECK_MSG(strstr(b, "# TYPE kb_route_latency_bucket counter\n") != NULL,
+                "kb_route_latency_bucket is not typed counter: %s", b);
+  KBC_CHECK_MSG(strstr(b, "kb_route_latency_bucket{route=\"search\",le_ms="
+                          "\"1\"} 0\n") != NULL,
+                "the first latency bucket line is wrong: %s", b);
+  KBC_CHECK_MSG(strstr(b, "kb_route_latency_bucket{route=\"search\",le_ms="
+                          "\"10000\"} 0\n") != NULL,
+                "the last bounded bucket line is wrong: %s", b);
+  KBC_CHECK_MSG(strstr(b, "kb_route_latency_bucket{route=\"search\",le_ms="
+                          "\"+Inf\"} 0\n") != NULL,
+                "the overflow bucket is not labelled +Inf: %s", b);
+  KBC_CHECK_MSG(strstr(b, "_sum") == NULL && strstr(b, "_count{") == NULL,
+                "the latency series grew a _sum/_count: %s", b);
+  /* A real Prometheus histogram writes `{le="1"}`; this one writes
+   * `{route="search",le_ms="1"}`. `quantile="` also ENDS in `le="`, so the
+   * check is for the label START, not for the suffix. */
+  KBC_CHECK_MSG(strstr(b, "{le=\"") == NULL && strstr(b, ",le=\"") == NULL &&
+                   strstr(b, "TYPE kb_route_latency_bucket histogram") == NULL,
+                "the latency series is being rendered as a real histogram: %s",
+                b);
+  /* All nine route families render, in enum order, even with nothing
+   * observed — a family that appears only once it has a value is a family a
+   * dashboard cannot rely on. */
+  for (size_t i = 0; i < 9; i++) {
+    char pat[128];
+    snprintf(pat, sizeof pat, "kb_route_requests_total{route=\"%s\"} 0\n",
+             i == 0 ? "search" : i == 1 ? "atlas" : i == 2   ? "history"
+             : i == 3 ? "review" : i == 4 ? "events" : i == 5 ? "read"
+             : i == 6 ? "ops" : i == 7   ? "sessions"
+                                      : "other");
+    KBC_CHECK_MSG(strstr(b, pat) != NULL, "missing route family line %s", pat);
+  }
+  /* The percentile gauges: {route,quantile} for this family, and the value is
+   * the spanning bucket's UPPER boundary, 0 on an empty histogram. */
+  KBC_CHECK_MSG(strstr(b, "kb_route_latency_ms{route=\"search\",quantile="
+                          "\"0.5\"} 0\n") != NULL,
+                "the p50 line is wrong: %s", b);
+  KBC_CHECK_MSG(strstr(b, "kb_route_latency_ms{route=\"other\",quantile="
+                          "\"0.99\"} 0\n") != NULL,
+                "the p99 line for the last route is wrong: %s", b);
+  /* The detailed block is ABSENT, not zero, when the layer is off. */
+  KBC_CHECK_MSG(strstr(b, "# TYPE kb_metrics_detailed gauge\n"
+                          "kb_metrics_detailed 0\n") != NULL,
+                "kb_metrics_detailed is not reported as 0: %s", b);
+  KBC_CHECK_MSG(strstr(b, "kb_search_stage_requests_total") == NULL,
+                "the detailed block is present with the layer off: %s", b);
+  KBC_CHECK_MSG(strstr(b, "kb_per_kb_requests_total") == NULL,
+                "the per-kb families are present with the layer off: %s", b);
+  /* Every line ends in \n, the last one included. */
+  KBC_CHECK_MSG(b[0] != '\0' && strrchr(b, '\n')[1] == '\0',
+                "the exposition does not end with a newline");
+  kbc_response_free(&r);
+
+  /* A method that is not GET is 405, not an empty 200 a scraper would parse
+   * as an empty metric set. */
+  KBC_CHECK_EQ_INT(call(&f, "POST", "/metrics", NULL, NULL, &r), 405);
+  kbc_response_free(&r);
+
+  fx_teardown(&f);
+}
+
+/* Over a socket the endpoint is no-store and it reports what the daemon has
+ * actually served — a metrics endpoint that renders zeros forever is a lie a
+ * dashboard cannot detect. */
+KBC_TEST(metrics_counts_served_api_requests) {
+  fixture f;
+  fx_setup(&f, NULL);
+  server s;
+  srv_start(&s, &f);
+  if (s.h == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char reply[16384];
+  int status = 0;
+  /* Two /api requests. `/api/health` is a Read-family route
+   * (`classify_route`: "health" is not a named segment, so it falls to the
+   * top-level match — which lists stats/kbs/identity/metrics, not health, and
+   * therefore Other). `/api/kbs` is unambiguously Read. */
+  for (int i = 0; i < 2; i++) {
+    const char *req = "GET /api/kbs HTTP/1.1\r\nHost: x\r\n\r\n";
+    KBC_CHECK(raw_exchange(&s, req, strlen(req), &status, reply, sizeof reply));
+    KBC_CHECK_EQ_INT(status, 200);
+ }
+  const char *m = "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n";
+  KBC_CHECK(raw_exchange(&s, m, strlen(m), &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK_MSG(strstr(reply, "Content-Type: text/plain; version=0.0.4; "
+                              "charset=utf-8") != NULL,
+                "/metrics is not text/plain 0.0.4: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "Cache-Control: no-store") != NULL,
+                "/metrics is cacheable: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "kb_http_requests_total 2\n") != NULL,
+                "two served /api requests did not count as 2: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "kb_route_requests_total{route=\"read\"} 2\n") !=
+                    NULL,
+                "the requests were not attributed to the read family: %s",
+                reply);
+  /* /metrics is outside the /api tree in the original, so it is not counted
+   * against itself. */
+  KBC_CHECK_MSG(strstr(reply, "kb_route_requests_total{route=\"other\"} 0\n") !=
+                   NULL,
+                "/metrics counted itself: %s", reply);
+
+  srv_stop(&s);
+  fx_teardown(&f);
+}
+
+/* With the detailed layer on, the families the original gates behind
+ * `[server] metrics` appear — and the per-kb set is sorted, because the
+ * original's map iterates in random order and a response that reshuffles
+ * between scrapes is not a response anyone can diff. */
+KBC_TEST(the_detailed_metrics_layer_appears_when_enabled) {
+  fixture f;
+  fx_setup(&f, NULL);
+  KBC_CHECK(setenv("KBC_METRICS_DETAILED", "1", 1) == 0);
+  server s;
+  srv_start(&s, &f);
+  if (s.h == NULL) {
+    (void)unsetenv("KBC_METRICS_DETAILED");
+    fx_teardown(&f);
+    return;
+  }
+  const char *req = "GET /api/kbs HTTP/1.1\r\nHost: x\r\n\r\n";
+  char reply[16384];
+  int status = 0;
+  KBC_CHECK(raw_exchange(&s, req, strlen(req), &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 200);
+  const char *m = "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n";
+  KBC_CHECK(raw_exchange(&s, m, strlen(m), &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK_MSG(strstr(reply, "kb_metrics_detailed 1\n") != NULL,
+                "the detailed layer is on but does not say so: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "# TYPE kb_search_stage_requests_total "
+                              "counter\n") != NULL,
+                "the search-stage family is missing with the layer on: %s",
+                reply);
+  KBC_CHECK_MSG(strstr(reply, "kb_per_kb_requests_total{kb=\"kb\"} 0\n") !=
+                    NULL,
+                "a configured kb does not render at 0 before its first "
+                "request: %s",
+                reply);
+  KBC_CHECK_MSG(strstr(reply, "kb_storage_ops_total{kind=\"upsert\"} 0\n") !=
+                    NULL,
+                "the storage families are missing with the layer on: %s",
+                reply);
+  /* The one detailed family kb-c can answer with a real number: the files the
+   * indexer has observed. The rest of the block renders 0 because the layers
+   * behind it — storage actor, pipeline timing, search stages — do not exist
+   * in this port, and 0 is the format's own answer for an unobserved
+   * fixed-cardinality family. */
+  KBC_CHECK_MSG(strstr(reply, "kb_indexer_files_total 2\n") != NULL,
+                "the indexed file count is not the real one: %s", reply);
+  srv_stop(&s);
+  (void)unsetenv("KBC_METRICS_DETAILED");
+  fx_teardown(&f);
+}
+
+/* The static fallback runs only where a static root is configured, and it is
+ * bounded by the same component-wise containment check as the artifact
+ * serve. */
+KBC_TEST(the_static_fallback_is_bounded_by_its_root) {
+  fixture f;
+  fx_setup(&f, NULL);
+  char dist[KBC_TEST_PATH_MAX];
+  path_under(dist, sizeof dist, f.root, "dist");
+  char p[KBC_TEST_PATH_MAX];
+  kbc_test_mkdir_p(dist);
+  path_under(p, sizeof p, dist, "index.html");
+  kbc_test_write_file(p, "<html>shell</html>");
+  path_under(p, sizeof p, dist, "app.js");
+  kbc_test_write_file(p, "console.log(1)");
+  /* A sibling of the static root, named so a byte-prefix guard would take it
+   * for a child. */
+  char sibling[KBC_TEST_PATH_MAX];
+  path_under(sibling, sizeof sibling, f.root, "dist-backup");
+  kbc_test_mkdir_p(sibling);
+  path_under(p, sizeof p, sibling, "leak.js");
+  kbc_test_write_file(p, "STATIC-ROOT-ESCAPE");
+  /* Reached through a symlink, because that is the only way a canonicalised
+   * path under the root can leave it — and it is exactly the shape a
+   * byte-prefix `strncmp` guard waves through. */
+  char target[KBC_TEST_PATH_MAX];
+  path_under(p, sizeof p, dist, "into-backup.js");
+  path_under(target, sizeof target, sibling, "leak.js");
+  KBC_CHECK(symlink(target, p) == 0);
+  KBC_CHECK(setenv("KB_SPA_DIST", dist, 1) == 0);
+  server s;
+  srv_start(&s, &f);
+  if (s.h == NULL) {
+    (void)unsetenv("KB_SPA_DIST");
+    fx_teardown(&f);
+    return;
+  }
+  char reply[8192];
+  int status = 0;
+  {
+    const char *req = "GET /app.js HTTP/1.1\r\nHost: x\r\n\r\n";
+    KBC_CHECK(raw_exchange(&s, req, strlen(req), &status, reply, sizeof reply));
+    KBC_CHECK_EQ_INT(status, 200);
+    KBC_CHECK_MSG(strstr(reply, "console.log(1)") != NULL,
+                  "a static asset inside the root is not served: %s", reply);
+    KBC_CHECK_MSG(strstr(reply, "Content-Type: application/javascript; "
+                                "charset=utf-8") != NULL,
+                  "a .js asset has the wrong content type: %s", reply);
+ }
+  {
+    const char *req = "GET /dist-backup/leak.js HTTP/1.1\r\nHost: x\r\n\r\n";
+    KBC_CHECK(raw_exchange(&s, req, strlen(req), &status, reply, sizeof reply));
+    KBC_CHECK_MSG(status != 200, "a file in the static root's SIBLING was "
+                                  "served: %d %s",
+                  status, reply);
+    KBC_CHECK_MSG(strstr(reply, "STATIC-ROOT-ESCAPE") == NULL,
+                  "a byte outside the static root was served: %s", reply);
+ }
+  {
+    const char *req = "GET /into-backup.js HTTP/1.1\r\nHost: x\r\n\r\n";
+    KBC_CHECK(raw_exchange(&s, req, strlen(req), &status, reply, sizeof reply));
+    KBC_CHECK_MSG(status != 200,
+                  "a symlink into the static root's SIBLING was served: %d %s",
+                  status, reply);
+    KBC_CHECK_MSG(strstr(reply, "STATIC-ROOT-ESCAPE") == NULL,
+                  "the static fallback followed a symlink out of its root: %s",
+                  reply);
+  }
+  srv_stop(&s);
+  (void)unsetenv("KB_SPA_DIST");
+  fx_teardown(&f);
+}
+
+/* Without a static root the fallback says WHY it is a 404 instead of looking
+ * like a missing page. */
+KBC_TEST(no_static_root_says_so) {
+  fixture f;
+  fx_setup(&f, NULL);
+  (void)unsetenv("KB_SPA_DIST");
+  server s;
+  srv_start(&s, &f);
+  if (s.h == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char reply[8192];
+  int status = 0;
+  const char *req = "GET /index.html HTTP/1.1\r\nHost: x\r\n\r\n";
+  KBC_CHECK(raw_exchange(&s, req, strlen(req), &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 404);
+  KBC_CHECK_MSG(strstr(reply, "KB_SPA_DIST") != NULL,
+                "the 404 does not name the remedy: %s", reply);
+  srv_stop(&s);
+  fx_teardown(&f);
+}
+
 
 /* ------------------------------------------------------------------- main -- */
 
@@ -1751,6 +2430,20 @@ int main(void) {
        sse_attach_racing_the_event_fan_out_keeps_the_daemon},
       {"a_refused_start_leaves_the_callers_descriptors_open",
        a_refused_start_leaves_the_callers_descriptors_open},
+      {"no_path_outside_the_source_root_is_ever_served",
+       no_path_outside_the_source_root_is_ever_served},
+      {"the_artifact_subdomain_is_chosen_by_host",
+       the_artifact_subdomain_is_chosen_by_host},
+      {"artifact_bytes_on_the_parent_origin",
+       artifact_bytes_on_the_parent_origin},
+      {"metrics_is_prometheus_text_exposition",
+       metrics_is_prometheus_text_exposition},
+      {"metrics_counts_served_api_requests", metrics_counts_served_api_requests},
+      {"the_detailed_metrics_layer_appears_when_enabled",
+       the_detailed_metrics_layer_appears_when_enabled},
+      {"the_static_fallback_is_bounded_by_its_root",
+       the_static_fallback_is_bounded_by_its_root},
+      {"no_static_root_says_so", no_static_root_says_so},
       {NULL, NULL},
   };
   return kbc_test_run("httpd", cases);

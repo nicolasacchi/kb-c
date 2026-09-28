@@ -32,6 +32,11 @@
 kbc_status kbc_store_drain_pending(kbc_store *s, const char *corpus,
                                    const char *dst_path, kbc_err *err);
 int64_t kbc_store_pending_count(kbc_store *s, kbc_err *err);
+/* include/kbc/app.h is frozen and carries no by-path delete; app.c defines it
+ * and reports the header line. Declared here on the same terms so the
+ * by-path case can be driven from the public boundary. */
+kbc_status kbc_app_delete_path(kbc_app *app, const char *corpus,
+                               const char *rel_path, kbc_err *err);
 
 #define CORPUS_A "alpha"
 #define CORPUS_B "beta"
@@ -2635,6 +2640,441 @@ KBC_TEST(an_aborted_reindex_leaves_the_previous_generation_serving) {
   fx_teardown(&f);
 }
 
+/* ----------------------------------------------------------------- bus --- */
+
+/* The event bus, collected. publish calls the callback on the publishing
+ * thread, so a plain struct is the whole synchronization story here — and a
+ * mutex would be a lie about a contract the test does not have. */
+typedef struct {
+  char type[32];
+  char json[256];
+  size_t n;
+} event_log;
+
+static void collect_event(void *user, const char *type, const char *json) {
+  event_log *log = (event_log *)user;
+  if (log == NULL || log->n >= 8) return;
+  event_log *slot = &log[log->n++];
+  snprintf(slot->type, sizeof slot->type, "%s", type != NULL ? type : "");
+  snprintf(slot->json, sizeof slot->json, "%s", json != NULL ? json : "");
+}
+
+/* How many collected events of `type` name `path` in their payload. */
+static size_t events_naming(const event_log *log, const char *type,
+                            const char *path) {
+  size_t n = 0;
+  char needle[128];
+  snprintf(needle, sizeof needle, "\"%s\"", path);
+  for (size_t i = 0; i < log->n; i++) {
+    if (strcmp(log[i].type, type) == 0 && strstr(log[i].json, needle) != NULL) {
+      n++;
+    }
+  }
+  return n;
+}
+
+/* Chunks of one document, counted through a second connection.
+ * kbc_store_list_chunks copies the whole result into a caller array whose size
+ * it does not tell you, which is fine for a store round trip and not fine for
+ * a test that must not be the thing that overflows. */
+static int64_t chunk_count(db_side *side, const char *doc_id) {
+  sqlite3_stmt *q = NULL;
+  if (sqlite3_prepare_v2(side->db,
+                         "SELECT COUNT(*) FROM chunks WHERE doc_id = ?1;", -1,
+                         &q, NULL) != SQLITE_OK) {
+    return -1;
+  }
+  int64_t n = -1;
+  if (sqlite3_bind_text(q, 1, doc_id, -1, SQLITE_STATIC) == SQLITE_OK &&
+      sqlite3_step(q) == SQLITE_ROW) {
+    n = sqlite3_column_int64(q, 0);
+  }
+  (void)sqlite3_finalize(q);
+  return n;
+}
+
+/* The artifact id one path mints, or NULL when the store has no such row. */
+static const char *id_of_path(const kbc_config *cfg, const char *corpus,
+                              const char *path, kbc_arena *a) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = kbc_store_open(cfg, &err);
+  if (s == NULL) return NULL;
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  kbc_status st = kbc_store_get_artifact_by_path(s, a, corpus, path, &art, &err);
+  kbc_store_close(s);
+  return st == KBC_OK ? art.id : NULL;
+}
+
+static size_t comment_count(const kbc_config *cfg, const char *doc_id,
+                            kbc_arena *a) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = kbc_store_open(cfg, &err);
+  if (s == NULL) return 0;
+  kbc_comment *rows = NULL;
+  size_t n = 0;
+  /* `rows` is arena-owned (store.h: every field of kbc_comment is ARENA), so
+   * it dies with `a` and must not be freed here. */
+  kbc_status st =
+      kbc_store_list_comments(s, a, doc_id, 50u, &rows, &n, &err);
+  kbc_store_close(s);
+  return st == KBC_OK ? n : 0;
+}
+
+/* The three tables a removal must NOT touch, read back through the public
+ * store API. Each counts only the rows naming one artifact id, because the
+ * listings are per-user (history) or whole-table (corkboard, pins) and a count
+ * of everything would pass even if the delete took the row with it. */
+static size_t history_visits(const kbc_config *cfg, const char *user,
+                             const char *doc_id, kbc_arena *a) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = kbc_store_open(cfg, &err);
+  if (s == NULL) return 0;
+  kbc_history_row *rows = NULL;
+  size_t n = 0, kept = 0;
+  kbc_status st = kbc_store_list_history(s, a, user, 100u, &rows, &n, &err);
+  if (st == KBC_OK) {
+    for (size_t i = 0; i < n; i++) {
+      if (rows[i].artifact_id != NULL &&
+          strcmp(rows[i].artifact_id, doc_id) == 0) {
+        kept++;
+      }
+    }
+  }
+  kbc_store_close(s);
+  return kept;
+}
+
+static size_t corkboard_entries(const kbc_config *cfg, const char *doc_id,
+                                kbc_arena *a) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = kbc_store_open(cfg, &err);
+  if (s == NULL) return 0;
+  kbc_corkboard_row *rows = NULL;
+  size_t n = 0, kept = 0;
+  kbc_status st = kbc_store_list_corkboard(s, a, 100u, &rows, &n, &err);
+  if (st == KBC_OK) {
+    for (size_t i = 0; i < n; i++) {
+      if (rows[i].artifact_id != NULL &&
+          strcmp(rows[i].artifact_id, doc_id) == 0) {
+        kept++;
+      }
+    }
+  }
+  kbc_store_close(s);
+  return kept;
+}
+
+static size_t pins_of(const kbc_config *cfg, const char *doc_id, kbc_arena *a) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = kbc_store_open(cfg, &err);
+  if (s == NULL) return 0;
+  kbc_pin_row *rows = NULL;
+  size_t n = 0, kept = 0;
+  kbc_status st = kbc_store_list_pins(s, a, 100u, &rows, &n, &err);
+  if (st == KBC_OK) {
+    for (size_t i = 0; i < n; i++) {
+      if (rows[i].artifact_id != NULL &&
+          strcmp(rows[i].artifact_id, doc_id) == 0) {
+        kept++;
+      }
+    }
+  }
+  kbc_store_close(s);
+  return kept;
+}
+
+/* Unit 2 — the reconcile delete pass.
+ *
+ * A file deleted while the daemon is not watching never produces an inotify
+ * event, so nothing but the next full pass can notice, and the pass used to
+ * notice it the way the watcher does only by accident. The corpus on disk is
+ * the authority: the pass re-stats every stored row the walk did not see, and
+ * the ones the filesystem says are gone go through the SAME removal the
+ * watcher runs. Before this, the sweep carried its own copy of that cascade
+ * and emitted no event at all, so a document removed by a full scan changed
+ * the index under every subscriber without saying so. */
+KBC_TEST(a_document_deleted_while_nobody_watched_is_reconciled_by_the_pass) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  event_log log[8];
+  memset(log, 0, sizeof log);
+  uint64_t sub = kbc_app_subscribe(f.app, collect_event, &log);
+
+  /* The watcher is not running and never hears about this. */
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, "c.md");
+  KBC_CHECK_MSG(unlink(p) == 0, "unlink %s: %s", p, strerror(errno));
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  /* Gone from the index and from the answers, not merely off a counter. */
+  char path[64], title[64], id[32];
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "verdigris", NULL, path, sizeof path,
+                                  title, sizeof title, id, sizeof id, NULL),
+                   0);
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "quixotic", NULL, path, sizeof path,
+                                  title, sizeof title, id, sizeof id, NULL),
+                   1);
+  KBC_CHECK_EQ_STR(path, "b.md");
+  kbc_app_stats st;
+  KBC_CHECK_OK(kbc_app_stats_get(f.app, &st, &err));
+  KBC_CHECK_EQ_INT(st.index_docs, 2);
+  KBC_CHECK_EQ_INT(store_count(f.cfg), 2);
+
+  /* And it was announced, once, by the same event the watcher emits for the
+   * same removal — the Rust reconcile pass routes its synthetic delete through
+   * the sink precisely so this is observable (indexer.rs:776-779). */
+  KBC_CHECK_EQ_INT(events_naming(log, "watch.delete", "c.md"), 1);
+  KBC_CHECK_EQ_INT(events_naming(log, "watch.delete", "a.md"), 0);
+  KBC_CHECK_EQ_INT(events_naming(log, "watch.delete", "b.md"), 0);
+  KBC_CHECK_MSG(strstr(log[0].json, "\"kb\":\"" CORPUS_A "\"") != NULL,
+                "watch.delete payload does not name the corpus: %s", log[0].json);
+  kbc_app_unsubscribe(f.app, sub);
+  fx_teardown(&f);
+}
+
+/* The other arm of the same re-stat, and the one that was missing: a stored
+ * row the walk did not take because of a WALK RULE is not a removal. The
+ * document is still in the corpus, the rule is the user's to change back, and
+ * the cascade it used to run reaches `comments` — which nothing can rebuild.
+ * The old code dropped the row on the manifest's word alone, so emptying a
+ * file destroyed its comment thread. */
+KBC_TEST(a_document_the_walk_declines_keeps_its_row_and_its_comments) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  const char *id = id_of_path(f.cfg, CORPUS_A, "a.md", a);
+  KBC_CHECK_NOT_NULL(id);
+  if (id == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  char id_copy[KBC_MAX_ID_LEN + 1];
+  snprintf(id_copy, sizeof id_copy, "%s", id);
+
+  kbc_store *st = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(st);
+  if (st == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK_OK(kbc_store_add_comment(st, id_copy, "section:ledger", "nik",
+                                     "the accrual table is wrong", &err));
+  kbc_store_close(st);
+  KBC_CHECK_EQ_INT(comment_count(f.cfg, id_copy, a), 1);
+
+  /* Emptied, not deleted: the walk skips a zero-byte file (size 0 is out of
+   * the 1..KBC_MAX_ARTIFACT_BYTES range), and the file is still right there. */
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, "a.md");
+  kbc_test_write_file(p, "");
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  /* Unsearchable — the walk did not take it, so the rebuilt index has no
+   * posting list for it — and still THERE, which is the whole point. */
+  char path[64], title[64], id2[32];
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "accruals", NULL, path, sizeof path,
+                                  title, sizeof title, id2, sizeof id2, NULL),
+                   0);
+  KBC_CHECK_NOT_NULL(id_of_path(f.cfg, CORPUS_A, "a.md", a));
+  KBC_CHECK_EQ_INT(comment_count(f.cfg, id_copy, a), 1);
+
+  /* Put the content back and it is the same document with its thread on it,
+   * under the same id — the artifact id is a function of (corpus, path), so
+   * nothing was renumbered on the way through. */
+  kbc_test_write_file(p, DOC_A);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "accruals", NULL, path, sizeof path,
+                                  title, sizeof title, id2, sizeof id2, NULL),
+                   1);
+  KBC_CHECK_EQ_STR(id2, id_copy);
+  KBC_CHECK_EQ_INT(comment_count(f.cfg, id_copy, a), 1);
+
+  kbc_arena_free(a);
+  fx_teardown(&f);
+}
+
+/* Unit 4 — delete by path.
+ *
+ * The by-path entry point, and the cascade spelled out: artifacts, chunks,
+ * comments and the graph go; history, corkboard, pinned_memories and
+ * reading_sections stay, because they are the user's and not the document's.
+ * The four are not readable yet — store.h is frozen and unit 1 has not created
+ * the tables — so what this pins is the half that exists: the document is
+ * unreachable and everything the document itself wrote is gone with it. */
+KBC_TEST(delete_by_path_takes_the_document_and_announces_it) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  const char *id = id_of_path(f.cfg, CORPUS_A, "c.md", a);
+  KBC_CHECK_NOT_NULL(id);
+  if (id == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  char id_copy[KBC_MAX_ID_LEN + 1];
+  snprintf(id_copy, sizeof id_copy, "%s", id);
+
+  kbc_store *st = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(st);
+  if (st == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  /* The user's half, seeded on the document that is about to be deleted: a
+   * reading visit (which is where the reading position — Rust's
+   * reading_sections — lives on kb-c's history row), a corkboard entry and a
+   * pin. None of these can be rebuilt from the document's bytes, which is the
+   * whole reason they are on the leave-alone list. */
+  kbc_history_row visit;
+  memset(&visit, 0, sizeof visit);
+  visit.kind = "open";
+  visit.artifact_id = id_copy;
+  visit.user = "nik";
+  visit.last_section = "section:digest";
+  visit.scroll_y = 240;
+  visit.started_at = 1756000000;
+  visit.updated_at = 1756000000;
+  KBC_CHECK_OK(kbc_store_add_history(st, &visit, &err));
+  KBC_CHECK_OK(kbc_store_add_corkboard(st, id_copy, 1756000000, &err));
+  KBC_CHECK_OK(kbc_store_pin_memory(st, id_copy, 1756000000, &err));
+  KBC_CHECK_OK(kbc_store_add_comment(st, id_copy, "section:digest", "nik",
+                                     "verdigris again", &err));
+  kbc_store_close(st);
+
+  db_side side;
+  memset(&side, 0, sizeof side);
+  if (!db_side_open(&side, f.cfg)) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK_MSG(chunk_count(&side, id_copy) > 0, "c.md has no chunks to lose");
+  KBC_CHECK_EQ_INT(comment_count(f.cfg, id_copy, a), 1);
+  KBC_CHECK_EQ_INT(history_visits(f.cfg, "nik", id_copy, a), 1);
+  KBC_CHECK_EQ_INT(corkboard_entries(f.cfg, id_copy, a), 1);
+  KBC_CHECK_EQ_INT(pins_of(f.cfg, id_copy, a), 1);
+
+  event_log log[8];
+  memset(log, 0, sizeof log);
+  uint64_t sub = kbc_app_subscribe(f.app, collect_event, &log);
+
+  /* The file is still on disk. This is the statement, not a question. */
+  KBC_CHECK_OK(kbc_app_delete_path(f.app, CORPUS_A, "c.md", &err));
+
+  /* Unreachable: no store row, no chunks, no comments, no search hit, no
+   * posting list. */
+  KBC_CHECK_NULL(id_of_path(f.cfg, CORPUS_A, "c.md", a));
+  KBC_CHECK_EQ_INT(chunk_count(&side, id_copy), 0);
+  KBC_CHECK_EQ_INT(comment_count(f.cfg, id_copy, a), 0);
+  char path[64], title[64], id2[32];
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "verdigris", NULL, path, sizeof path,
+                                  title, sizeof title, id2, sizeof id2, NULL),
+                   0);
+  kbc_app_stats stats;
+  KBC_CHECK_OK(kbc_app_stats_get(f.app, &stats, &err));
+  KBC_CHECK_EQ_INT(stats.index_docs, 2);
+  /* And the other two are untouched: a delete is about one document. */
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "quixotic", NULL, path, sizeof path,
+                                  title, sizeof title, id2, sizeof id2, NULL),
+                   1);
+  KBC_CHECK_EQ_STR(path, "b.md");
+  KBC_CHECK_EQ_INT(store_count(f.cfg), 2);
+  /* And the user's half is untouched, which is the invariant the cascade is
+   * written around: a removal must not take a user's reading history with it.
+   * The document is gone and the fact that nik read it, pinned it and put it
+   * on the board is not. */
+  KBC_CHECK_EQ_INT(history_visits(f.cfg, "nik", id_copy, a), 1);
+  KBC_CHECK_EQ_INT(corkboard_entries(f.cfg, id_copy, a), 1);
+  KBC_CHECK_EQ_INT(pins_of(f.cfg, id_copy, a), 1);
+
+  /* It is the same removal the watcher runs, so it says the same thing. */
+  KBC_CHECK_EQ_INT(events_naming(log, "watch.delete", "c.md"), 1);
+  kbc_app_unsubscribe(f.app, sub);
+  db_side_close(&side);
+  kbc_arena_free(a);
+  fx_teardown(&f);
+}
+
+/* The boundaries of that entry point, which is reachable from a request body
+ * one day: a path that climbs out of the corpus, a corpus that is not
+ * configured, and a document that is not there — which is the state the caller
+ * asked for, so it is a success and not a 404-shaped error. */
+KBC_TEST(delete_by_path_refuses_a_bad_target_and_forgives_an_absent_one) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  KBC_CHECK_ERR(kbc_app_delete_path(f.app, CORPUS_A, "../a.md", &err),
+                 KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(err);
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_app_delete_path(f.app, CORPUS_B, "a.md", &err),
+                 KBC_ERR_NOTFOUND);
+  KBC_CHECK_ERR_MSG(err);
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_app_delete_path(f.app, NULL, "a.md", &err),
+                 KBC_ERR_INVALID);
+  kbc_err_reset(&err);
+
+  /* Three documents in, three refusals out. */
+  KBC_CHECK_EQ_INT(store_count(f.cfg), 3);
+
+  KBC_CHECK_OK(kbc_app_delete_path(f.app, CORPUS_A, "never-existed.md", &err));
+  KBC_CHECK_EQ_INT(store_count(f.cfg), 3);
+
+  fx_teardown(&f);
+}
+
 int main(void) {
   static const kbc_test_case cases[] = {
       {"ingest_indexes_every_document", ingest_indexes_every_document},
@@ -2704,6 +3144,14 @@ int main(void) {
      a_removal_the_store_cannot_commit_is_reported_not_swallowed},
     {"an_aborted_reindex_leaves_the_previous_generation_serving",
      an_aborted_reindex_leaves_the_previous_generation_serving},
+    {"a_document_deleted_while_nobody_watched_is_reconciled_by_the_pass",
+     a_document_deleted_while_nobody_watched_is_reconciled_by_the_pass},
+    {"a_document_the_walk_declines_keeps_its_row_and_its_comments",
+     a_document_the_walk_declines_keeps_its_row_and_its_comments},
+    {"delete_by_path_takes_the_document_and_announces_it",
+     delete_by_path_takes_the_document_and_announces_it},
+    {"delete_by_path_refuses_a_bad_target_and_forgives_an_absent_one",
+     delete_by_path_refuses_a_bad_target_and_forgives_an_absent_one},
       {NULL, NULL},
   };
   return kbc_test_run("app", cases);
