@@ -4631,6 +4631,684 @@ KBC_TEST(an_interrupted_move_is_listed_and_is_not_yet_a_redirect) {
   fx_teardown(&f);
 }
 
+/* ------------------------------------------------- bring-up: mv helpers -- */
+
+/* Everything below drives a boot. A bring-up pass runs in kbc_app_open, and
+ * the only way to reach code that runs there is to open an app — so each case
+ * seeds the crash through a SECOND connection to the same database, closes the
+ * app, and opens it again. That is the honest shape of the fixture, and what
+ * it does NOT prove is in the report: a seeded row is a row this build
+ * believed it could write, not a row a killed process left behind. */
+
+/* One restart: the same thing an operator does after a crash, and the only
+ * transition that runs code in kbc_app_open. */
+static void reboot(fixture *f) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_app_close(f->app);
+  f->app = kbc_app_open(f->cfg, &err);
+  if (f->app == NULL) fprintf(stderr, "  app_open: %s\n", err.msg);
+  KBC_CHECK_NOT_NULL(f->app);
+}
+
+/* How many moves the store reports as still in flight. The rows are the
+ * pass's whole input, so this is also how a test sees whether it converged
+ * once, twice, or not at all. */
+static size_t incomplete_moves(const kbc_config *cfg) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = kbc_store_open(cfg, &err);
+  if (s == NULL) return 0;
+  kbc_strlist ids, rels;
+  kbc_strlist_init(&ids);
+  kbc_strlist_init(&rels);
+  kbc_status st = kbc_store_list_incomplete_moves(s, &ids, &rels, &err);
+  size_t n = (st == KBC_OK) ? ids.len : 0;
+  kbc_strlist_free(&ids);
+  kbc_strlist_free(&rels);
+  kbc_store_close(s);
+  return n;
+}
+
+/* The state of the move row naming one old id, as the store's own columns
+ * report it: "flight", "abandoned" or "completed".
+ *
+ * Read through a second connection because store.h has no accessor for a
+ * single row's stamps, and the three states are the whole subject here: a
+ * count of in-flight rows cannot tell an abandoned row from one a pass has
+ * not looked at, which is the difference the pass's one refusal turns on. An
+ * empty string means the row or the column could not be read at all, and
+ * every caller below compares against a state that is not empty. */
+static void move_row_state(const kbc_config *cfg, const char *old_id, char *out,
+                           size_t cap) {
+  if (cap > 0) out[0] = '\0';
+  db_side side;
+  memset(&side, 0, sizeof side);
+  if (!db_side_open(&side, cfg)) return;
+  sqlite3_stmt *q = NULL;
+  if (sqlite3_prepare_v2(side.db,
+                         "SELECT completed_at IS NOT NULL,"
+                         " abandoned_at IS NOT NULL FROM moves"
+                         " WHERE old_id = ?1 ORDER BY id DESC LIMIT 1;",
+                         -1, &q, NULL) == SQLITE_OK &&
+      sqlite3_bind_text(q, 1, old_id, -1, SQLITE_STATIC) == SQLITE_OK &&
+      sqlite3_step(q) == SQLITE_ROW) {
+    int done = sqlite3_column_int(q, 0) != 0;
+    int gone = sqlite3_column_int(q, 1) != 0;
+    (void)snprintf(out, cap, "%s",
+                   done ? (gone ? "completed+abandoned" : "completed")
+                        : (gone ? "abandoned" : "flight"));
+  }
+  sqlite3_finalize(q);
+  db_side_close(&side);
+}
+
+/* How many hops a stale reference would be redirected through, by id. Zero is
+ * the answer that matters: it is what an abandoned row owes the caller, where
+ * a completed row hands back a destination. */
+static size_t redirect_hops(const kbc_config *cfg, const char *id) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = kbc_store_open(cfg, &err);
+  if (s == NULL) return 0;
+  kbc_strlist hops;
+  kbc_strlist_init(&hops);
+  kbc_status st = kbc_store_moves_lookup(s, id, &hops, &err);
+  size_t n = (st == KBC_OK) ? hops.len : 0;
+  kbc_strlist_free(&hops);
+  kbc_store_close(s);
+  return n;
+}
+
+/* And the same question asked by PATH, which is the one a stale reference in
+ * a document, a pin or a corkboard entry actually asks. */
+static size_t redirect_hops_for_rel(const kbc_config *cfg, const char *rel) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = kbc_store_open(cfg, &err);
+  if (s == NULL) return 0;
+  kbc_strlist hops;
+  kbc_strlist_init(&hops);
+  kbc_status st = kbc_store_moves_lookup_path(s, rel, &hops, &err);
+  size_t n = (st == KBC_OK) ? hops.len : 0;
+  kbc_strlist_free(&hops);
+  kbc_store_close(s);
+  return n;
+}
+
+/* The `moves` and `artifacts` tables as one string each, so two boots can be
+ * compared EXACTLY. BOTH move stamps are in the digest on purpose: a pass
+ * that re-decided a row it had already ended would leave every other column
+ * identical and change only `abandoned_at`, and a digest carrying one stamp
+ * would call that a no-op. */
+static void table_digest(const kbc_config *cfg, const char *sql, char *out,
+                         size_t cap) {
+  db_side side;
+  memset(&side, 0, sizeof side);
+  if (cap > 0) out[0] = '\0';
+  if (!db_side_open(&side, cfg)) return;
+  sqlite3_stmt *q = NULL;
+  if (sqlite3_prepare_v2(side.db, sql, -1, &q, NULL) == SQLITE_OK) {
+    while (sqlite3_step(q) == SQLITE_ROW) {
+      for (int i = 0; i < sqlite3_column_count(q); i++) {
+        size_t used = strlen(out);
+        if (used + 1u >= cap) break;
+        const char *v = (const char *)sqlite3_column_text(q, i);
+        (void)snprintf(out + used, cap - used, "%s|", v != NULL ? v : "");
+      }
+    }
+  }
+  sqlite3_finalize(q);
+  db_side_close(&side);
+}
+
+
+/* A crash between step 1 of kbc_app_move_path and step 2: the intent row is
+ * written and the process is gone before the rename. Seeded through the store,
+ * which is the same write move_path makes. */
+static void seed_interrupted_move(const kbc_config *cfg, const char *old_id,
+                                  const char *new_id, const char *old_rel,
+                                  const char *new_rel) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = kbc_store_open(cfg, &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) return;
+  KBC_CHECK_OK(kbc_store_record_move(s, old_id, new_id, old_rel, new_rel, 1700,
+                                     &err));
+  kbc_store_close(s);
+}
+
+/* NOT RENAMED YET: the file is still where the move was going to take it from,
+ * so the intent names a rename that never reached the disk. This is the state
+ * a crash between record_move and rename() leaves, and the document is whole:
+ * nothing has been lost, only a promise is outstanding. */
+KBC_TEST(a_move_interrupted_before_the_rename_is_abandoned_at_bring_up) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  const char *id = id_of_path(f.cfg, CORPUS_A, "c.md", a);
+  KBC_CHECK_NOT_NULL(id);
+  if (id == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  char old_id[KBC_MAX_ID_LEN + 1];
+  memcpy(old_id, id, sizeof old_id);
+  char new_id[KBC_MAX_ID_LEN + 1];
+  kbc_id_for_artifact(new_id, CORPUS_A, "renamed-away.md");
+  seed_interrupted_move(f.cfg, old_id, new_id, "c.md", "renamed-away.md");
+
+  /* The row is there to be converged: without the pass, this is where every
+   * boot after the crash would find it again. */
+  KBC_CHECK_EQ_INT(incomplete_moves(f.cfg), 1);
+
+  reboot(&f);
+
+  /* CONVERGED ONCE, and by the right verb. The row has left the replay list,
+   * so the next boot finds nothing and says nothing: a row that stayed is a
+   * loop, not convergence. */
+  KBC_CHECK_MSG(incomplete_moves(f.cfg) == 0,
+                "the interrupted move is still in flight after a boot: bring-up "
+                "will re-decide it on every start and the warning will never "
+                "stop");
+
+  /* ABANDONED, not completed. This is the whole change, and it is visible in
+   * one column: `completed_at` is a promise that the document is at the new
+   * id, and nothing here published that id. A pass that stamped it would
+   * redirect a stale reference to a document that does not exist — a wrong
+   * answer, not a missing one, and kbc_app_get_artifact follows that chain. */
+  char state[32];
+  move_row_state(f.cfg, old_id, state, sizeof state);
+  KBC_CHECK_MSG(strcmp(state, "abandoned") == 0,
+                "bring-up ended the interrupted move with state \"%s\"; the "
+                "pass never ran the rekey, so completed_at would be a redirect "
+                "to a document that was never published", state);
+
+  /* And the consequence a caller can observe, which is the reason the verb
+   * differs: nothing is redirected. The document is still at its own path
+   * under its own id, so a stale reference must still land on IT and not be
+   * walked somewhere the rename never reached. */
+  KBC_CHECK_MSG(redirect_hops(f.cfg, old_id) == 0,
+                "an abandoned move still redirects a stale id: %zu hops, which "
+                "sends a bookmark to a destination no document holds",
+                redirect_hops(f.cfg, old_id));
+  KBC_CHECK_MSG(redirect_hops_for_rel(f.cfg, "c.md") == 0,
+                "an abandoned move still redirects a stale PATH reference: %zu "
+                "hops for c.md, which is where the document still is",
+                redirect_hops_for_rel(f.cfg, "c.md"));
+
+  /* The filesystem is the authority, and it said the file never moved. So the
+   * pass did not move it, and did not invent the destination the intent row
+   * promises: the row is handed over WITHOUT the new path, and a pass that
+   * walked the corpus to recover it would be a full pass on every boot. */
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, "c.md");
+  KBC_CHECK_MSG(kbc_path_exists(p),
+                "bring-up removed a file the interrupted move never renamed "
+                "away");
+  join(p, sizeof p, f.corpus_a, "renamed-away.md");
+  KBC_CHECK_MSG(!kbc_path_exists(p),
+                "bring-up created %s: the intent row does not say where the "
+                "rename was going, and a pass that guessed would be renaming "
+                "user files on every boot",
+                p);
+
+  /* And the document is untouched: still indexed under its own id, at its
+   * own path, with nothing published under the id the abandoned move minted. */
+  kbc_store *st = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(st);
+  if (st != NULL) {
+    kbc_artifact art;
+    memset(&art, 0, sizeof art);
+    KBC_CHECK_OK(kbc_store_get_artifact(st, a, old_id, false, &art, &err));
+    KBC_CHECK_EQ_STR(art.path, "c.md");
+    memset(&art, 0, sizeof art);
+    kbc_err_reset(&err);
+    KBC_CHECK_ERR(
+        kbc_store_get_artifact(st, a, new_id, false, &art, &err),
+        KBC_ERR_NOTFOUND);
+    kbc_store_close(st);
+  }
+  kbc_arena_free(a);
+  fx_teardown(&f);
+}
+
+/* RENAMED, AND THE CARRY NEVER HAPPENED. The crash the other way round: the
+ * rename reached the disk and the rekey did not, so the document is at its new
+ * path under a NEW id while everything keyed to the old one — the comments
+ * with their minted ids and timestamps, the corkboard anchor, the pin, the
+ * first-indexed second, the reading history — was never carried.
+ *
+ * The decision this pins is that bring-up does NOT re-run the rekey. The
+ * alternative is not merely slower: `comments` cascades off artifacts(id), so
+ * a rekey re-run after a later reconcile sweep has already dropped the old row
+ * would move NOTHING and still leave the intent row stamped — a move the log
+ * would report as having carried state it did not carry. */
+KBC_TEST(a_move_interrupted_after_the_rename_announces_what_was_lost) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  const char *id = id_of_path(f.cfg, CORPUS_A, "c.md", a);
+  KBC_CHECK_NOT_NULL(id);
+  if (id == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  char old_id[KBC_MAX_ID_LEN + 1];
+  memcpy(old_id, id, sizeof old_id);
+  char new_id[KBC_MAX_ID_LEN + 1];
+  kbc_id_for_artifact(new_id, CORPUS_A, "moved.md");
+
+  /* State that exists ONLY under the old id, so the loss below is a fact
+   * about rows rather than a claim in a comment. It is written before the
+   * crash, exactly as a reader's comment and anchor would have been. */
+  kbc_store *st = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(st);
+  if (st == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK_OK(kbc_store_add_comment(st, old_id, "section:digest", "ada",
+                                     "the digest is quarterly", &err));
+  KBC_CHECK_OK(kbc_store_add_corkboard(st, old_id, 1000, &err));
+  KBC_CHECK_EQ_INT(comment_count(f.cfg, old_id, a), 1);
+  kbc_store_close(st);
+
+  /* The crash: the file is renamed, the rekey never runs, the intent row is
+   * never stamped. The rename is done by hand because a test cannot kill a
+   * process between two of its own statements. */
+  char from[KBC_TEST_PATH_MAX];
+  char to[KBC_TEST_PATH_MAX];
+  join(from, sizeof from, f.corpus_a, "c.md");
+  join(to, sizeof to, f.corpus_a, "moved.md");
+  KBC_CHECK_EQ_INT(rename(from, to), 0);
+  seed_interrupted_move(f.cfg, old_id, new_id, "c.md", "moved.md");
+  KBC_CHECK_EQ_INT(incomplete_moves(f.cfg), 1);
+
+  /* Boot, with the log captured: a move whose carried state is gone has to SAY
+   * so, at WARN, naming the paths. A silent finish here would be
+   * indistinguishable from a move that worked, which is the whole failure this
+   * pass exists to prevent. */
+  log_capture cap;
+  log_capture_begin(&cap);
+  reboot(&f);
+  char *log_text = log_capture_end(&cap);
+  KBC_CHECK_NOT_NULL(log_text);
+  if (log_text == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK_MSG(strstr(log_text, "warn") != NULL,
+                "an interrupted move whose comments and anchor were left behind "
+                "finished without a warning: [%s]", log_text);
+  KBC_CHECK_MSG(strstr(log_text, "c.md") != NULL,
+                "the warning does not name the path the document was moved "
+                "from: [%s]", log_text);
+  KBC_CHECK_MSG(strstr(log_text, old_id) != NULL,
+                "the warning does not name the id whose state was left behind: "
+                "[%s]", log_text);
+  /* The log is read by an operator long after the row has settled, and an
+   * abandoned row and a completed one are different facts. A line that only
+   * said "converged" or "stamped" could not tell them apart. */
+  KBC_CHECK_MSG(strstr(log_text, "ABANDONED") != NULL,
+                "the warning does not say the move was ABANDONED, so this log "
+                "is indistinguishable from one about a completed move: [%s]",
+                log_text);
+  free(log_text);
+
+  /* Converged once, and by the right verb. The file DID leave that path, so
+   * the old id is a stale reference to a document that is genuinely not there
+   * any more — which is exactly why the row must not be COMPLETED: the
+   * destination a completed row names is the new id, and no document was ever
+   * published under it, so a redirect would send a bookmark into a hole. The
+   * honest answer is the miss, and abandoned is the state that gives it. */
+  KBC_CHECK_EQ_INT(incomplete_moves(f.cfg), 0);
+  char state[32];
+  move_row_state(f.cfg, old_id, state, sizeof state);
+  KBC_CHECK_MSG(strcmp(state, "abandoned") == 0,
+                "bring-up ended the interrupted move with state \"%s\"; the "
+                "carry never ran, so a completed row would redirect %s to a "
+                "document that does not exist", state, old_id);
+  KBC_CHECK_MSG(redirect_hops(f.cfg, old_id) == 0,
+                "the abandoned row still redirects %s: %zu hops into a "
+                "destination the pass never published", old_id,
+                redirect_hops(f.cfg, old_id));
+
+  /* The carry was NOT re-run. The old row is still where the crash left it and
+   * nothing was published under the id the new path mints — the pass reported
+   * a loss, it did not paper over one, and it certainly did not reindex the
+   * corpus to find the destination the intent row never recorded. */
+  st = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(st);
+  if (st != NULL) {
+    kbc_artifact art;
+    memset(&art, 0, sizeof art);
+    KBC_CHECK_OK(kbc_store_get_artifact(st, a, old_id, false, &art, &err));
+    KBC_CHECK_EQ_STR(art.path, "c.md");
+    memset(&art, 0, sizeof art);
+    kbc_err_reset(&err);
+    KBC_CHECK_ERR(kbc_store_get_artifact(st, a, new_id, false, &art, &err),
+                  KBC_ERR_NOTFOUND);
+    kbc_store_close(st);
+  }
+  KBC_CHECK_MSG(comment_count(f.cfg, old_id, a) == 1,
+                "the comment is no longer on the old id, so this case no longer "
+                "describes a rekey that never ran");
+  KBC_CHECK_MSG(comment_count(f.cfg, new_id, a) == 0,
+                "a comment appeared under the new id: something re-ran the "
+                "carry, and the warning above then describes a recovery that "
+                "did not happen");
+
+  /* The document itself is not lost — its bytes are at the new path, and the
+   * reconcile sweep is what indexes them there. The pass neither renamed nor
+   * deleted anything. */
+  KBC_CHECK_MSG(kbc_path_exists(to), "bring-up deleted the renamed document");
+  KBC_CHECK_MSG(!kbc_path_exists(from),
+                "bring-up put the file back at the old path: the disk said the "
+                "rename happened, and the disk is the authority");
+  kbc_arena_free(a);
+  fx_teardown(&f);
+}
+
+/* CONVERGES ONCE. Two interrupted moves in one database — one whose file never
+ * left, one whose file did — and two boots. The second boot must change
+ * nothing at all: same rows, same stamps, same files. A pass that re-stamped a
+ * row it had already decided would pass a count check and fail this one, which
+ * is why the digest carries completed_at. */
+KBC_TEST(a_second_boot_after_an_interrupted_move_changes_nothing) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  const char *stayed_id_ptr = id_of_path(f.cfg, CORPUS_A, "c.md", a);
+  const char *moved_id_ptr = id_of_path(f.cfg, CORPUS_A, "b.md", a);
+  KBC_CHECK_NOT_NULL(stayed_id_ptr);
+  KBC_CHECK_NOT_NULL(moved_id_ptr);
+  if (stayed_id_ptr == NULL || moved_id_ptr == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  char stayed_id[KBC_MAX_ID_LEN + 1];
+  char moved_id[KBC_MAX_ID_LEN + 1];
+  memcpy(stayed_id, stayed_id_ptr, sizeof stayed_id);
+  memcpy(moved_id, moved_id_ptr, sizeof moved_id);
+  char stayed_new[KBC_MAX_ID_LEN + 1];
+  char moved_new[KBC_MAX_ID_LEN + 1];
+  kbc_id_for_artifact(stayed_new, CORPUS_A, "stayed-at-c.md");
+  kbc_id_for_artifact(moved_new, CORPUS_A, "b-renamed.md");
+
+  char from[KBC_TEST_PATH_MAX];
+  char to[KBC_TEST_PATH_MAX];
+  join(from, sizeof from, f.corpus_a, "b.md");
+  join(to, sizeof to, f.corpus_a, "b-renamed.md");
+  KBC_CHECK_EQ_INT(rename(from, to), 0);
+  seed_interrupted_move(f.cfg, stayed_id, stayed_new, "c.md", "stayed-at-c.md");
+  seed_interrupted_move(f.cfg, moved_id, moved_new, "b.md", "b-renamed.md");
+  KBC_CHECK_EQ_INT(incomplete_moves(f.cfg), 2);
+
+  reboot(&f);
+  KBC_CHECK_MSG(incomplete_moves(f.cfg) == 0,
+                "the first boot left %zu of 2 moves in flight",
+                incomplete_moves(f.cfg));
+
+  /* Both rows went to the same terminal state, on both filesystem answers. */
+  char state[32];
+  move_row_state(f.cfg, stayed_id, state, sizeof state);
+  KBC_CHECK_MSG(strcmp(state, "abandoned") == 0,
+                "the move whose file never left ended in state \"%s\"", state);
+  move_row_state(f.cfg, moved_id, state, sizeof state);
+  KBC_CHECK_MSG(strcmp(state, "abandoned") == 0,
+                "the move whose file did leave ended in state \"%s\"", state);
+
+  char moves_before[1024];
+  char artifacts_before[1024];
+  table_digest(f.cfg,
+               "SELECT id, old_id, new_id, old_rel, new_rel, completed_at, "
+               "abandoned_at FROM moves ORDER BY id;",
+               moves_before, sizeof moves_before);
+  table_digest(f.cfg,
+               "SELECT id, corpus, path FROM artifacts ORDER BY id;",
+               artifacts_before, sizeof artifacts_before);
+  /* A digest that failed to prepare is an empty string, and two empty strings
+   * compare equal — so without this the equality below would be evidence of
+   * nothing. Named ids are what a real digest contains. */
+  KBC_CHECK_MSG(strstr(moves_before, stayed_id) != NULL &&
+                    strstr(moves_before, moved_id) != NULL,
+                "the moves digest is [%s], which cannot be the two rows this "
+                "test seeded", moves_before);
+
+  /* The second boot, with the log captured. An abandoned row is TERMINAL, so
+   * the pass has nothing left to do: it is out of the replay list, and no
+   * branch of the pass reaches a row it did not list. The log is the
+   * observable of that — a pass that re-decided would re-warn, and a warning
+   * replayed on every boot is the loop this test exists to rule out. */
+  log_capture cap;
+  log_capture_begin(&cap);
+  reboot(&f);
+  char *log_text = log_capture_end(&cap);
+  KBC_CHECK_NOT_NULL(log_text);
+  if (log_text != NULL) {
+    KBC_CHECK_MSG(strstr(log_text, "move bring-up") == NULL,
+                  "the second boot decided an interrupted move again: [%s]",
+                  log_text);
+    free(log_text);
+  }
+
+  char moves_after[1024];
+  char artifacts_after[1024];
+  table_digest(f.cfg,
+               "SELECT id, old_id, new_id, old_rel, new_rel, completed_at, "
+               "abandoned_at FROM moves ORDER BY id;",
+               moves_after, sizeof moves_after);
+  table_digest(f.cfg,
+               "SELECT id, corpus, path FROM artifacts ORDER BY id;",
+               artifacts_after, sizeof artifacts_after);
+  KBC_CHECK_MSG(strcmp(moves_before, moves_after) == 0,
+                "a second boot rewrote the move rows: [%s] -> [%s]",
+                moves_before, moves_after);
+  KBC_CHECK_MSG(strcmp(artifacts_before, artifacts_after) == 0,
+                "a second boot wrote to the artifacts table, so bring-up is "
+                "re-indexing a corpus it was asked to leave alone: [%s] -> "
+                "[%s]", artifacts_before, artifacts_after);
+  join(from, sizeof from, f.corpus_a, "c.md");
+  join(to, sizeof to, f.corpus_a, "b-renamed.md");
+  KBC_CHECK_MSG(kbc_path_exists(from) && kbc_path_exists(to),
+                "a second boot moved a file: the corpus is [%s] -> [%s]", from,
+                to);
+  kbc_arena_free(a);
+  fx_teardown(&f);
+}
+
+/* AN EMPTY LIST AND AN UNREADABLE TABLE ARE DIFFERENT ANSWERS. Here the moves
+ * table is replaced by a view that cannot answer the query, with the rows
+ * intact behind it. A pass that treated the failed read as "no moves" would
+ * come up clean and serve a daemon that cannot say which renames are half
+ * done; so the open is refused, and the rows are still there, still unstamped,
+ * for the next boot that can read them. */
+KBC_TEST(a_daemon_does_not_start_when_the_move_intents_cannot_be_read) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  static const char seeded[KBC_MAX_ID_LEN + 1] = "aaaaaaaaaaaa";
+  char staged[KBC_MAX_ID_LEN + 1];
+  kbc_id_for_artifact(staged, CORPUS_A, "unreadable.md");
+  seed_interrupted_move(f.cfg, seeded, staged, "c.md", "unreadable.md");
+  KBC_CHECK_EQ_INT(incomplete_moves(f.cfg), 1);
+
+  /* A view by the name the query uses, over a table it cannot select from:
+ * `moves` still holds its row, and the query now fails where it used to
+ * answer. The migration ladder will not put the table back — its version is
+ * already recorded — so this is the state the next open really finds. */
+  kbc_app_close(f.app);
+  f.app = NULL;
+  db_side side;
+  memset(&side, 0, sizeof side);
+  KBC_CHECK(db_side_open(&side, f.cfg));
+  KBC_CHECK_OK(db_side_exec(&side, "ALTER TABLE moves RENAME TO moves_stash;"));
+  KBC_CHECK_OK(db_side_exec(
+      &side, "CREATE VIEW moves AS SELECT old_id FROM moves_stash;"));
+  db_side_close(&side);
+
+  kbc_err_reset(&err);
+  kbc_app *app = kbc_app_open(f.cfg, &err);
+  KBC_CHECK_MSG(app == NULL,
+                "the daemon came up with an unreadable moves table: it cannot "
+                "tell a clean boot from a rename it never finished");
+  KBC_CHECK_ERR_MSG(err);
+  if (app != NULL) kbc_app_close(app);
+
+  /* And nothing was converged on the way to finding out: the row is where the
+   * crash left it. BOTH columns, because `completed_at IS NULL` alone no
+   * longer distinguishes an untouched row from one this pass abandoned — which
+   * would leave a bring-up that converged anyway passing here. */
+  db_side after;
+  memset(&after, 0, sizeof after);
+  KBC_CHECK(db_side_open(&after, f.cfg));
+  sqlite3_stmt *q = NULL;
+  KBC_CHECK_EQ_INT(
+      sqlite3_prepare_v2(
+          after.db,
+          "SELECT COUNT(*) FROM moves_stash WHERE completed_at IS NULL"
+          " AND abandoned_at IS NULL;",
+          -1, &q, NULL),
+      SQLITE_OK);
+  if (q != NULL) {
+    KBC_CHECK_EQ_INT(sqlite3_step(q), SQLITE_ROW);
+    KBC_CHECK_MSG(sqlite3_column_int64(q, 0) == 1,
+                  "a boot that could not read the move intents still converged "
+                  "them");
+    sqlite3_finalize(q);
+  }
+  db_side_close(&after);
+  fx_teardown(&f);
+}
+
+/* A row this pass cannot place is a row it will not decide. kbc_app_move_path
+ * refuses a path that is not corpus-relative, so a row naming one was not
+ * written by a move: stamping it would publish a decision built out of a
+ * corrupt record, and joining it onto a corpus root would look outside every
+ * corpus.
+ *
+ * This is the one branch the third state does NOT swallow. Abandoned and
+ * in-flight look alike from the outside — both are out of the happy path and
+ * neither redirects — so the temptation is to tidy the refused row into an
+ * abandoned one. They are different facts: "nobody has looked at this yet"
+ * and "somebody looked and it could not happen" are exactly the case where a
+ * human has to be told, and a row that quietly becomes terminal stops being
+ * re-listed. So the assertion is on the STATE, not merely on the count. */
+KBC_TEST(a_bring_up_pass_refuses_a_move_row_it_cannot_place) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  static const char seeded[KBC_MAX_ID_LEN + 1] = "bbbbbbbbbbbb";
+  char staged[KBC_MAX_ID_LEN + 1];
+  kbc_id_for_artifact(staged, CORPUS_A, "wherever.md");
+  seed_interrupted_move(f.cfg, seeded, staged, "../../outside.md",
+                        "wherever.md");
+  KBC_CHECK_EQ_INT(incomplete_moves(f.cfg), 1);
+
+  /* The daemon still starts: one unreadable row is not a broken store, and
+   * refusing to serve over it would be a worse failure than leaving it. */
+  log_capture cap;
+  log_capture_begin(&cap);
+  reboot(&f);
+  char *log_text = log_capture_end(&cap);
+  KBC_CHECK_NOT_NULL(log_text);
+  if (log_text != NULL) {
+    KBC_CHECK_MSG(strstr(log_text, "left in flight") != NULL,
+                  "the pass did not say it is leaving the row in flight: [%s]",
+                  log_text);
+    KBC_CHECK_MSG(strstr(log_text, seeded) != NULL &&
+                      strstr(log_text, "../../outside.md") != NULL,
+                  "the refusal does not name the row a human has to look at: "
+                  "[%s]", log_text);
+    free(log_text);
+  }
+  KBC_CHECK_MSG(incomplete_moves(f.cfg) == 1,
+                "bring-up ended a move row naming %s, which is outside every "
+                "corpus: a decision published from a path it cannot resolve is "
+                "worse than a row it says it will not touch",
+                "../../outside.md");
+  char state[32];
+  move_row_state(f.cfg, seeded, state, sizeof state);
+  KBC_CHECK_MSG(strcmp(state, "flight") == 0,
+                "the row the pass REFUSED is in state \"%s\": refusing is not "
+                "abandoning. Abandoned means somebody looked and it could not "
+                "happen, and this row is the one case a human still has to "
+                "look at", state);
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.root, "outside.md");
+  KBC_CHECK_MSG(!kbc_path_exists(p),
+                "bring-up stat'ed a path outside the corpus root");
+
+  /* And a second boot still refuses it, rather than the first boot having
+   * quietly retired it: an in-flight row is re-listed, and a human who has
+   * not fixed the row must keep being told about it. */
+  reboot(&f);
+  move_row_state(f.cfg, seeded, state, sizeof state);
+  KBC_CHECK_MSG(strcmp(state, "flight") == 0,
+                "the refused row reached state \"%s\" on a second boot", state);
+  fx_teardown(&f);
+}
+
 /* A bookmark to the old id. The id is a function of (corpus, path), so the
  * move necessarily mints a new one, and every id handed out before it names
  * a document that still exists under a name the holder does not know. The
@@ -6592,6 +7270,16 @@ int main(void) {
      a_corkboard_anchor_older_than_the_listing_page_survives_a_move},
     {"an_interrupted_move_is_listed_and_is_not_yet_a_redirect",
      an_interrupted_move_is_listed_and_is_not_yet_a_redirect},
+    {"a_move_interrupted_before_the_rename_is_abandoned_at_bring_up",
+     a_move_interrupted_before_the_rename_is_abandoned_at_bring_up},
+    {"a_move_interrupted_after_the_rename_announces_what_was_lost",
+     a_move_interrupted_after_the_rename_announces_what_was_lost},
+    {"a_second_boot_after_an_interrupted_move_changes_nothing",
+     a_second_boot_after_an_interrupted_move_changes_nothing},
+    {"a_daemon_does_not_start_when_the_move_intents_cannot_be_read",
+     a_daemon_does_not_start_when_the_move_intents_cannot_be_read},
+    {"a_bring_up_pass_refuses_a_move_row_it_cannot_place",
+     a_bring_up_pass_refuses_a_move_row_it_cannot_place},
     {"a_stale_id_resolves_to_the_document_after_a_move",
      a_stale_id_resolves_to_the_document_after_a_move},
       {"chunk_zero_is_title_plus_headings", chunk_zero_is_title_plus_headings},

@@ -567,6 +567,25 @@ kbc_status kbc_store_moves_lookup_path(kbc_store *s, const char *rel,
 kbc_status kbc_store_list_incomplete_moves(kbc_store *s, kbc_strlist *old_ids,
                                            kbc_strlist *old_rels, kbc_err *err);
 
+/* Marks a move as ABANDONED rather than completed.
+ *
+ * `completed_at` alone has two states and the convergence pass needs three. A
+ * rename that never reached the disk still has to leave the replay list — a
+ * pass that re-decides it every boot is a loop with a log line — and stamping
+ * it "completed" makes `moves_lookup` redirect a stale id to a destination
+ * that does not exist. That is a wrong answer, not a missing one, and it is
+ * reachable today because `kbc_app_get_artifact` follows the chain.
+ *
+ * So a third terminal state, and it is explicitly not a redirect: the id stays
+ * where it was, and the row is a record that somebody tried and it did not
+ * happen. It also fixes the standing warning — a permanent one on every boot
+ * for a move the operator has long since given up on.
+ *
+ * Distinct from `kbc_store_complete_move` in the strongest way available: a
+ * completed move is a promise about where the document IS. */
+kbc_status kbc_store_abandon_move(kbc_store *s, const char *old_id,
+                                  kbc_err *err);
+
 kbc_status kbc_store_add_corkboard(kbc_store *s, const char *artifact_id,
                                    int64_t created_at, kbc_err *err);
 kbc_status kbc_store_remove_corkboard(kbc_store *s, const char *artifact_id,

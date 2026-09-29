@@ -113,6 +113,10 @@ static void app_edge_srcs_free(kbc_enrich_source *v, size_t n);
  * the watcher does — a second copy of this cascade is how the two drift. */
 static kbc_status store_forget_path(kbc_app *app, const char *corpus,
                                     const char *rel_path, kbc_err *err);
+/* Bring-up for a rename a crash interrupted: the one reader of the intent rows
+ * kbc_app_move_path writes. Declared here because kbc_app_open calls it and
+ * the definition sits beside the move it finishes. */
+static kbc_status converge_incomplete_moves(kbc_app *app, kbc_err *err);
 
 
 /* Links recorded per document. A document with more outbound links than this
@@ -2745,6 +2749,31 @@ kbc_app *kbc_app_open(const kbc_config *cfg, kbc_err *err) {
     }
   }
 
+  /* Bring-up for a rename a crash interrupted, and the only reader of the
+   * intent rows kbc_app_move_path writes before the rename. It sits HERE:
+   * after the store is open and the corpora are registered, which are the two
+   * things it reads; before the index is loaded, because it does not consult
+   * the index at all; and before kbc_app_start_watcher, which is a separate
+   * call the daemon makes after this returns. So no thread exists yet and it
+   * takes NO lock — reindex_mu is the OUTER lock for the reindex paths, and a
+   * pass that re-indexes nothing has no business inside one.
+   *
+   * It re-indexes nothing on purpose. The reconcile sweep already re-stats
+   * every stored row the walk did not see and removes the ones the filesystem
+   * says are gone, so a bring-up pass that triggered a pass of its own would
+   * be a full corpus walk on every boot, to finish a rename that happened
+   * once.
+   *
+   * A FAILED read here fails the open, and that is deliberate: an empty list
+   * and an unreadable moves table are different answers, and a daemon that
+   * came up on the first one would be serving documents whose renames it
+   * cannot account for. It is the same posture as the unreadable index below
+   * — quietly starting anyway makes "nothing was interrupted" and "we could
+   * not look" indistinguishable. */
+  if (kbc_failed(converge_incomplete_moves(app, err))) {
+    goto fail;
+  }
+
   /* A missing index is normal — first start, or before the first reindex. A
    * corrupt one is not: there are bytes on disk we cannot read, and quietly
    * starting empty would make "never indexed" and "written by another build"
@@ -5272,6 +5301,267 @@ out:
   kbc_str_free(&old_abs);
   kbc_str_free(&new_abs);
   kbc_arena_free(a);
+  return s;
+}
+
+/* ===================================================== bring-up: mv ===== */
+
+/* Converges the renames a crash interrupted, from kbc_app_open.
+ *
+ * WHY THE FILESYSTEM IS THE AUTHORITY, and not the row. The row says what the
+ * rename was GOING to do; the disk says what it did. A row that disagrees with
+ * the disk is the ORDINARY state of a crash, so the row cannot also be the
+ * witness — and the one thing this file will not do is take a row's word for a
+ * document that may not exist. The store is asked a second question, below the
+ * decision, and only to make the warning say something true.
+ *
+ * THE DECISION — for a row whose old path is GONE and whose new path exists,
+ * does this pass RE-RUN the rekey, or warn and abandon? It abandons. Three
+ * reasons, in the order they decided it:
+ *
+ *   1 IT CANNOT NAME THE DESTINATION.
+ *     kbc_store_list_incomplete_moves hands over the old id and the old path
+ *     and nothing else — deliberately: the two lists come back parallel
+ *     precisely so that a bring-up pass cannot pair them wrongly. The new path
+ *     is not in what it was given, and the new id is a hash OF that path, so
+ *     the destination is not recoverable from the store at all. Recovering it
+ *     would mean walking a corpus — a full pass, on every boot, to finish a
+ *     rename that happened once. The rekey's own signature wants both halves
+ *     of the pair, and this pass has one.
+ *
+ *   2 THE CARRY MAY ALREADY BE GONE, AND A RE-RUN WOULD NOT NOTICE.
+ *     `comments` is ON DELETE CASCADE from artifacts(id), and both
+ *     kbc_store_forget_document and the reconcile sweep drop the artifacts
+ *     row. So by the time bring-up runs, the comments may be deleted outright
+ *     and the corkboard anchor, the pin, the first-indexed second and the
+ *     reading history — none of which has a foreign key — may be orphaned.
+ *     A rekey re-run against that state moves NOTHING and still leaves the
+ *     intent row stamped: a move the log would report as having carried state
+ *     it did not carry. That outcome is worse than the loss it is trying to
+ *     repair, because it spends the operator's trust on a repair that never
+ *     happened.
+ *
+ *   3 THE DOCUMENT ITSELF IS NOT LOST. Its bytes are on disk at the new path,
+ *     and the reconcile sweep will index them under whatever id that path
+ *     mints. What is lost is the ID-KEYED state, and the whole difference
+ *     between a bad afternoon and a bad month is that the loss is announced
+ *     here, at WARN, naming the paths — because a silent finish is
+ *     indistinguishable from a move that worked.
+ *
+ * WHAT IT TOUCHES: the `moves` rows, and nothing else. No rename, no rekey,
+ * no reindex, no index touch, no event. Every one of those is a write to a
+ * user's corpus driven by a row that may be stale, and the filesystem answer
+ * above is not precise enough to justify any of them.
+ *
+ * WHERE THE ROW ENDS. Every row this pass DECIDES leaves the replay list,
+ * because a row that stays is a row every later boot re-decides, re-logs and
+ * re-reads: a loop with a log line, which is not convergence. It leaves it by
+ * being ABANDONED, and that word is the whole point — it is not the same verb
+ * as kbc_app_move_path's kbc_store_complete_move, and the two answers are
+ * different facts.
+ *
+ *   completed_at says the document IS at new_id. This pass has no way to make
+ *   that true: it never ran the rekey, so nothing published new_id, and
+ *   kbc_store_moves_lookup would happily redirect a stale id to a destination
+ *   that does not exist. get_artifact_following_moves follows that chain, so
+ *   the cost is not theoretical — a wrong answer instead of a missing one,
+ *   handed to a caller as a document.
+ *
+ *   abandoned_at says somebody tried and it did not happen. The id stays
+ *   where it was, the row is a record rather than a promise, and a reference
+ *   to the old id gets the honest miss. For the not-renamed case that is
+ *   exactly right too: the document never left, so its id is still its id and
+ *   there is nothing to redirect. The warnings below say which of the two
+ *   happened, so an operator reading the log later can tell an abandoned row
+ *   from a completed one.
+ *
+ * THE ONE DELIBERATE EXCEPTION to "every decided row is abandoned" is a row
+ * this pass REFUSES to decide: a move row whose old path is not a
+ * corpus-relative path at all. kbc_app_move_path cannot write one, so this is
+ * a corrupt or hand-edited row, and a pass that stamped it — either way —
+ * would be publishing a decision built out of a record it cannot even read.
+ * It stays IN FLIGHT, named at WARN, for a human. In-flight-and-refused and
+ * abandoned are different facts: one says "nobody has looked at this", the
+ * other says "somebody looked and it could not happen", and collapsing them
+ * loses the only case where a human is needed.
+ */
+
+/* A move row naming something that is not a corpus-relative path. The store
+ * bounds the length (require_text) but not the shape, and the shape is what
+ * keeps the join below inside a corpus root. */
+static bool move_rel_is_corpus_relative(const char *rel) {
+  return rel != NULL && rel[0] != '\0' && rel[0] != '/' &&
+         strstr(rel, "..") == NULL;
+}
+
+/* Which configured corpus, if any, still has a file at `old_rel`; NULL for
+ * "nowhere", which is a real answer and not a failure.
+ *
+ * EVERY configured corpus is asked, not only the one the store's row names.
+ * The corpus a document was indexed under is a config fact that can change
+ * under a database, and `old_rel` is corpus-relative, so "the file is still
+ * there" is only ever a statement about SOME root. It is at most
+ * KBC_MAX_CORPORA stat() calls and never a readdir, so the cost is bounded by
+ * the config and not by the size of anything. */
+static kbc_status move_old_path_home(const kbc_app *app, const char *old_rel,
+                                     const kbc_corpus_cfg **out,
+                                     kbc_err *err) {
+  for (size_t i = 0; i < app->cfg->ncorpora; i++) {
+    const kbc_corpus_cfg *cc = &app->cfg->corpora[i];
+    kbc_str full;
+    kbc_str_init(&full);
+    kbc_status s = kbc_str_printf(&full, "%s/%s", cc->path, old_rel);
+    bool there = false;
+    if (kbc_failed(s)) {
+      s = kbc_err_set(err, KBC_ERR_NOMEM, "move bring-up: %s/%s", cc->name,
+                      old_rel);
+    } else {
+      there = kbc_path_exists(full.ptr);
+    }
+    kbc_str_free(&full);
+    if (kbc_failed(s)) return s;
+    if (there) {
+      *out = cc;
+      return KBC_OK;
+    }
+  }
+  *out = NULL;
+  return KBC_OK;
+}
+
+/* One interrupted move, decided. Every branch that DECIDES ends the row, and
+ * every one of them ends it by abandoning rather than completing it; the one
+ * branch it REFUSES ends nothing and stays in flight. */
+static kbc_status converge_one_move(kbc_app *app, const char *old_id,
+                                    const char *old_rel, kbc_err *err) {
+  if (!move_rel_is_corpus_relative(old_rel)) {
+    KBC_LOGW("move bring-up: row for %s names \"%s\", which is not a "
+             "corpus-relative path; not converged and left in flight",
+             old_id, old_rel != NULL ? old_rel : "");
+    return KBC_OK;
+  }
+
+  const kbc_corpus_cfg *home = NULL;
+  kbc_status s = move_old_path_home(app, old_rel, &home, err);
+  if (kbc_failed(s)) return s;
+
+  /* What the store still holds for the old id. CORROBORATION, not the
+   * decision: the filesystem above is the authority, and a store that cannot
+   * answer does not get to overrule it. It is read because it is what makes
+   * the warning below a statement about the state rather than a guess —
+   * NOTFOUND is the ordinary answer for a document a reconcile sweep has
+   * already re-indexed under the id its new path mints. */
+  bool store_answered = false;
+  bool store_has_old_id = false;
+  kbc_arena *a = kbc_arena_new(4096u);
+  if (a == NULL) {
+    return kbc_err_set(err, KBC_ERR_NOMEM, "move bring-up arena for %s",
+                       old_id);
+  }
+  kbc_artifact prev;
+  memset(&prev, 0, sizeof prev);
+  kbc_err local;
+  kbc_err_reset(&local);
+  kbc_status gs =
+      kbc_store_get_artifact(app->store, a, old_id, false, &prev, &local);
+  if (gs == KBC_OK) {
+    store_answered = true;
+    store_has_old_id = true;
+  } else if (gs != KBC_ERR_NOTFOUND) {
+    KBC_LOGW("move bring-up: %s: the store could not be asked whether the old "
+             "id is still indexed: %s",
+             old_rel, local.msg);
+  }
+  kbc_arena_free(a);
+
+  if (home != NULL) {
+    /* NOT RENAMED. The file never left, so the document never left either:
+     * its id, its comments, its anchor, its pin, its first-indexed second and
+     * its history are all exactly where they were and nothing was lost. The
+     * intent is a record of an intention that did not happen, and it is
+     * recorded as ABANDONED: the old id is still the document's own id, so
+     * there is nothing to redirect, and a lookup on it keeps resolving to the
+     * document that is really there. */
+    KBC_LOGW("move bring-up: %s/%s (%s) never reached its rename — the file is "
+             "still there, so the move is ABANDONED and the document keeps "
+             "everything it had. The intent row is marked abandoned rather "
+             "than completed, so it stops being replayed on every boot and a "
+             "stale reference to %s still resolves to the document at its own "
+             "path; retry the move to mint the new id.",
+             home->name, old_rel, old_id, old_id);
+  } else {
+    /* THE FILE IS NOT AT THE OLD PATH. Whether the rename reached the disk or
+     * the document was removed outright is NOT decidable here — that is what
+     * the new path would say, and the intent row does not carry it — so the
+     * warning states only what is true, and the `carry` clause says where the
+     * stranded state actually is. Neither reading is reported as a recovery,
+     * because this pass does not perform one. */
+    const char *carry =
+        store_has_old_id
+            ? "still keyed to the old id, which no document holds any more"
+            : (store_answered
+                   ? "gone from the store with the artifact row that cascaded "
+                     "it away, and not recoverable from here"
+                   : "of unknown status, because the store could not be asked");
+    KBC_LOGW("move bring-up: %s (%s) — the interrupted move's old path holds "
+             "no file in any configured corpus, and this pass will NOT re-run "
+             "the carry: the intent row records the old id and the old path "
+             "only, so the new path cannot even be named. The state a rekey "
+             "carries — the comments with their ids and their timestamps, the "
+             "corkboard anchor, the pin, the first-indexed second, the reading "
+             "history and the inbound links — is %s. The row is marked "
+             "ABANDONED, not completed: it records that the move did not "
+             "happen, so it stops being replayed, and a reference to %s gets "
+             "the miss rather than a redirect to a destination this pass never "
+             "published. The reconcile sweep indexes the file at its new path "
+             "under the id that path mints.",
+             old_rel, old_id, carry, old_id);
+  }
+
+  /* ABANDON, never complete. `completed_at` is a promise about where the
+   * document IS, and this pass has not made that true on either branch: it
+   * never ran the rekey, so nothing published the new id. Stamping it anyway
+   * would hand get_artifact_following_moves a chain whose destination is
+   * missing — a wrong answer, delivered as a document, where an honest miss
+   * would have cost nothing. Abandoning is also what makes the second boot a
+   * no-op: the row leaves the replay list AND every redirect walk, so there
+   * is nothing left for the pass to decide. */
+  s = kbc_store_abandon_move(app->store, old_id, err);
+  return s;
+}
+
+/* Every move the store reports as in flight, in the order it reports them.
+ *
+ * The list read is the one that must not be guessed at. An empty list and an
+ * unreadable table are DIFFERENT answers, and treating the second as the
+ * first is how a bring-up pass deletes rows that were perfectly fine: this
+ * returns the failure and kbc_app_open refuses to come up, rather than
+ * serving a daemon that cannot say which renames are half-done.
+ *
+ * A failure part-way through the loop is returned, not swallowed, and the rows
+ * already stamped stay stamped. Each row is independent and terminal on its
+ * own, so there is nothing to undo, and the open that failed will try the
+ * rest again. */
+static kbc_status converge_incomplete_moves(kbc_app *app, kbc_err *err) {
+  kbc_strlist ids;
+  kbc_strlist rels;
+  kbc_strlist_init(&ids);
+  kbc_strlist_init(&rels);
+  kbc_status s = kbc_store_list_incomplete_moves(app->store, &ids, &rels, err);
+  if (kbc_failed(s) || ids.len == 0) {
+    kbc_strlist_free(&ids);
+    kbc_strlist_free(&rels);
+    return s;
+  }
+  for (size_t i = 0; i < ids.len; i++) {
+    /* Parallel by contract, and the guard is one comparison against reading
+     * past the end of a list another layer filled. */
+    if (i >= rels.len) break;
+    s = converge_one_move(app, ids.items[i], rels.items[i], err);
+    if (kbc_failed(s)) break;
+  }
+  kbc_strlist_free(&ids);
+  kbc_strlist_free(&rels);
   return s;
 }
 

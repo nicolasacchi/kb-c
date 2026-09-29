@@ -242,14 +242,13 @@ static const char *const SCHEMA_V10 =
  * (RUN_IN_FLIGHT). The index names are the Rust ones, so a database opened by
  * either program plans the same lookups.
  *
- * NO READER YET, and that is a reported gap rather than an oversight: the
- * redirect of a stale id or path handed out BEFORE the move needs
- * moves_lookup (sqlite.rs:5876) with its chain-walk and 64-hop cycle bound,
- * the watcher's delete guard needs moves_suppresses_delete (:5928), and
- * startup replay needs moves_list_incomplete (:5953). None of those three is
- * declared in store.h, and a definition with no declaration and no caller is
- * an entry point with no contract to satisfy — see the handoff note on this
- * function. The table itself is pure data and can land ahead of them. */
+ * The readers landed with it: kbc_store_record_move / _complete_move write
+ * the log, kbc_store_moves_lookup / _lookup_path resolve a stale reference,
+ * kbc_store_list_incomplete_moves hands the bring-up pass its replay list, and
+ * kbc_store_rekey_artifact carries the rows. The table was originally allowed
+ * to land ahead of them, on the grounds that a definition with no declaration
+ * and no caller is an entry point with no contract to satisfy.
+ */
 static const char *const SCHEMA_V11 =
     "CREATE TABLE IF NOT EXISTS moves ("
     " id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -261,6 +260,41 @@ static const char *const SCHEMA_V11 =
     " completed_at INTEGER);"
     "CREATE INDEX IF NOT EXISTS idx_moves_old_id ON moves(old_id);"
     "CREATE INDEX IF NOT EXISTS idx_moves_old_rel ON moves(old_rel);";
+
+/* v12 — `abandoned_at`, the third terminal state of a move.
+ *
+ * `completed_at` alone has two states and the bring-up pass needs three. A
+ * rename that never reached the disk still has to LEAVE the replay list — a
+ * pass that re-decides it on every boot is a loop with a log line — and
+ * stamping it "completed" is not available, because a completed row is a
+ * promise about where the document IS and moves_lookup follows it to a
+ * destination that does not exist. That is a wrong answer rather than a
+ * missing one, and it is reachable today because kbc_app_get_artifact follows
+ * the chain. NULL means "not abandoned" and is what every existing row reads
+ * as, so the ALTER is a no-op on the data.
+ *
+ * WHY NOT FOLDED INTO v11, WHICH IS UNRELEASED. The v5..v10 note above folds
+ * every unreleased Rust ALTER into the CREATE that introduces its table, and
+ * v11 has been in the tree for days, not releases. The fold is still wrong
+ * here, for one reason: it is only safe while NO volume anywhere has recorded
+ * version 11, and the ladder can never repair it afterwards. migrate_locked
+ * skips every version at or below what the volume has recorded, so a volume
+ * that already applied v11 would keep a `moves` table with no `abandoned_at`,
+ * and the first query naming the column would fail with "no such column" on a
+ * schema whose own version number says it is current — silent drift, which is
+ * the class the epoch guard exists to make loud. Any build run since v11
+ * landed owns such a volume. One ALTER is the cheap side of that trade; the
+ * alternative's cost is a class of broken volumes that nothing detects.
+ *
+ * The only step in this ladder that is not re-runnable on its own: ADD COLUMN
+ * fails outright if the column is already there. It still cannot run twice,
+ * because it shares a transaction with the row that records version 12 — a
+ * failure rolls the ALTER back with the version, and a volume that recorded 12
+ * skips the step. Every other step gets that from IF NOT EXISTS; here the
+ * transaction is the ONLY thing giving it, which is the point of one
+ * transaction per version. */
+static const char *const SCHEMA_V12 =
+    "ALTER TABLE moves ADD COLUMN abandoned_at INTEGER;";
 
 /* The ladder, in the shape refinery's Runner has it: an ordered list of
  * (version, sql), applied FORWARD-ONLY, one transaction per version. Rust
@@ -277,6 +311,7 @@ static const kbc_migration MIGRATIONS[] = {
     {1, SCHEMA_V1},   {2, SCHEMA_V2},   {3, SCHEMA_V3},   {4, SCHEMA_V4},
     {5, SCHEMA_V5},   {6, SCHEMA_V6},   {7, SCHEMA_V7},   {8, SCHEMA_V8},
     {9, SCHEMA_V9},   {10, SCHEMA_V10},  {11, SCHEMA_V11},
+    {12, SCHEMA_V12},
 };
 
 #define MIGRATION_COUNT (sizeof(MIGRATIONS) / sizeof(MIGRATIONS[0]))
@@ -722,8 +757,20 @@ static kbc_status migrate_locked(kbc_store *s, kbc_err *err) {
    * that fails leaves the recorded version at the last one that fully
    * committed, so the next open re-runs exactly the version that failed and
    * none of the ones before it. Every step is written to be re-runnable (IF
-   * NOT EXISTS / OR IGNORE), so a database that already carries a step only
-   * pays for the ones after it. */
+   * NOT EXISTS / OR IGNORE) — EXCEPT v12's ADD COLUMN, which fails if the
+   * column is already there and is safe only because it shares that
+   * transaction: a failed step rolls the ALTER back with the version row, and
+   * a volume that recorded 12 skips the step entirely.
+   *
+   * THE ONE STATE THIS DOES NOT SURVIVE: a volume whose schema_version has
+   * been rolled back by hand below what its schema actually is. The ladder
+   * trusts that table — it is the only record of what ran — so v12 is re-run
+   * against a table that already has the column and the open fails with
+   * SQLite's "duplicate column name". That is loud rather than silent, it is
+   * corruption the ladder itself cannot produce (one transaction adds the
+   * column and records the version together), and repairing it would mean a
+   * per-step "is this already applied" probe for a state that only a damaged
+   * file or a hand-edited table reaches. */
   for (size_t i = 0; i < MIGRATION_COUNT; i++) {
     if ((int64_t)MIGRATIONS[i].version <= have) continue;
     st = exec_plain(err, s, "BEGIN IMMEDIATE;");
@@ -3760,7 +3807,15 @@ kbc_status kbc_store_record_move(kbc_store *s, const char *old_id,
  * the same finished move. A single-row UPDATE would leave one of them
  * incomplete forever, and an incomplete row suppresses the watcher's delete
  * guard and shows up in the bring-up replay list for a move that completed
- * long ago. */
+ * long ago.
+ *
+ * NEVER a row somebody has ABANDONED, and `abandoned_at IS NULL` is the whole
+ * guard. An abandoned row is a DECISION that the rename did not happen, and
+ * stamping it completed here would turn that decision into the exact wrong
+ * answer it exists to prevent: a redirect to a destination the document never
+ * reached. A bring-up pass that abandoned a move and a later caller that
+ * completes the same id must not be able to disagree about what happened —
+ * the row is the record, and only one of them can be right about it. */
 kbc_status kbc_store_complete_move(kbc_store *s, const char *old_id,
                                    kbc_err *err) {
   if (s == NULL)
@@ -3772,7 +3827,8 @@ kbc_status kbc_store_complete_move(kbc_store *s, const char *old_id,
   sqlite3_stmt *q = NULL;
   st = prepare(err, s,
                "UPDATE moves SET completed_at = ?2"
-               " WHERE old_id = ?1 AND completed_at IS NULL;",
+               " WHERE old_id = ?1 AND completed_at IS NULL"
+               " AND abandoned_at IS NULL;",
                &q);
   if (st == KBC_OK) st = bind_text(err, s, q, 1, old_id);
   if (st == KBC_OK) st = bind_i64(err, s, q, 2, (int64_t)time(NULL));
@@ -3790,6 +3846,56 @@ kbc_status kbc_store_complete_move(kbc_store *s, const char *old_id,
   return st;
 }
 
+/* The third terminal state, and the only one that is not a promise about
+ * where the document is.
+ *
+ * `completed_at` alone has two states and the bring-up pass needs three: a
+ * rename that never reached the disk still has to leave the replay list, and
+ * the only way out of the replay list today is to stamp the row completed,
+ * which hands `moves_lookup` a destination that does not exist. The pass
+ * would then answer a stale reference with a document that is not there, and
+ * `kbc_app_get_artifact` follows that chain, so the wrong answer is reachable
+ * rather than theoretical.
+ *
+ * The predicate is the same shape complete_move's mirror: every IN-FLIGHT,
+ * not-yet-abandoned row naming old_id, because a document moved twice before
+ * either stamp landed has two intent rows for the same rename. It deliberately
+ * will not touch a row that is already completed: an abandoned flag on a
+ * finished move would retract a redirect the document actually earned, which
+ * is the same class of wrong answer pointed the other way, and this is a
+ * bring-up decision about a move that is still in flight.
+ *
+ * A row that matches nothing is NOT a failure, for the reason
+ * `kbc_store_complete_move` gives: this is an intent journal, and the caller
+ * has still decided the move is not going to happen. Reporting NOTFOUND would
+ * make a second bring-up pass that saw the row before it was stamped look
+ * like a broken database. */
+kbc_status kbc_store_abandon_move(kbc_store *s, const char *old_id,
+                                  kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "abandon_move: null store");
+  kbc_status st = require_text(err, "move old_id", old_id, KBC_MAX_ID_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "UPDATE moves SET abandoned_at = ?2"
+               " WHERE old_id = ?1 AND completed_at IS NULL"
+               " AND abandoned_at IS NULL;",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, old_id);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 2, (int64_t)time(NULL));
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "abandon move", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  unlock(s);
+  return st;
+}
+
 /* Follows a chain of COMPLETED moves and appends the destination to `out`.
  *
  * CHAIN-WALKED, not a single hop, because a path can be renamed more than
@@ -3801,6 +3907,27 @@ kbc_status kbc_store_complete_move(kbc_store *s, const char *old_id,
  * finished, so its `new_id` is a name the document may never have reached;
  * following it would resolve a bookmark to a document that does not exist,
  * which is worse than reporting the id unchanged.
+ *
+ * An ABANDONED row is skipped for the same reason, and it is not the same
+ * thing. Incomplete is an accident — nobody decided, the process died
+ * mid-move — while abandoned is a decision RECORDED IN THE ROW: somebody
+ * tried, it did not happen, the id stays where it was. The two states need the
+ * same answer (a completed move is a promise about where the document IS; an
+ * abandoned one is a promise that it never went anywhere) and they get it from
+ * the same clause, which is why `abandoned_at IS NULL` sits next to
+ * `completed_at IS NOT NULL` on every hop rather than in a filter upstream: a
+ * chain walked hop by hop can pass THROUGH an abandoned row, and only the
+ * hop's own predicate can refuse it.
+ *
+ * A row carrying BOTH stamps is refused by this predicate, and ABANDONED WINS
+ * — deliberately, because the two writers above cannot produce the state and
+ * the clause is therefore the only thing that decides it. Both stamps name a
+ * different destination, so one of them is wrong, and the two answers a caller
+ * can get are "this id never moved" and "this id is at a place it is not".
+ * Only the first is safe, so the state resolves to it. Keep the clause even
+ * though removing it changes nothing the public API can reach: the lookup's
+ * predicate is the contract, and a future writer that stamps a row directly
+ * must not be able to make this the one place a wrong answer escapes.
  *
  * The walk is bounded twice over, and both bounds are needed. MOVE_MAX_HOPS
  * stops a long chain, and the explicit "have I seen this id" comparison stops
@@ -3830,9 +3957,11 @@ static kbc_status moves_walk(kbc_err *err, kbc_store *s, bool by_path,
      * un-bound strings in this file's SQL are compile-time literals. */
     const char *sql =
         by_path ? "SELECT new_rel FROM moves WHERE old_rel = ?1"
-                  " AND completed_at IS NOT NULL ORDER BY id DESC LIMIT 1;"
+                  " AND completed_at IS NOT NULL AND abandoned_at IS NULL"
+                  " ORDER BY id DESC LIMIT 1;"
                 : "SELECT new_id FROM moves WHERE old_id = ?1"
-                  " AND completed_at IS NOT NULL ORDER BY id DESC LIMIT 1;";
+                  " AND completed_at IS NOT NULL AND abandoned_at IS NULL"
+                  " ORDER BY id DESC LIMIT 1;";
     st = prepare(err, s, sql, &q);
     if (st == KBC_OK) st = bind_text(err, s, q, 1, cur);
     if (st == KBC_OK) {
@@ -3862,8 +3991,9 @@ static kbc_status moves_walk(kbc_err *err, kbc_store *s, bool by_path,
     if (st == KBC_OK) st = fin;
     if (st != KBC_OK) return st;
 
-    /* No completed row: either the chain ends here, or the only row is an
-     * interrupted move that must not be followed. Either way, stop. */
+    /* No followed row: the chain ends here, or the only row naming this name
+     * is an interrupted or an abandoned move that must not be followed.
+     * Either way, stop. */
     if (next[0] == '\0') break;
     /* The CYCLE guard, and it must test the value we are ABOUT TO move TO,
      * not the one we are leaving. Testing the current value against what has
@@ -3916,10 +4046,18 @@ kbc_status kbc_store_moves_lookup_path(kbc_store *s, const char *rel,
  * entry i of `old_rels` describe the same interrupted move, because a
  * bring-up pass that has to re-query to pair them can pair them wrongly.
  *
- * `completed_at IS NULL` is the whole predicate — not a timestamp
- * comparison. "Old enough" would be a second, different question (the
- * watcher's 10 s grace), and folding it in here would make a caller unable
- * to ask the first question without the second. */
+ * `completed_at IS NULL AND abandoned_at IS NULL` is the whole predicate — not
+ * a timestamp comparison. "Old enough" would be a second, different question
+ * (the watcher's 10 s grace), and folding it in here would make a caller
+ * unable to ask the first question without the second.
+ *
+ * The `abandoned_at` clause is why the replay list terminates. An abandoned
+ * row HAS left the replay list — that is what abandoning one means — so a
+ * bring-up pass that re-listed it would re-decide the same move on every boot,
+ * which is a loop with a log line and a permanent warning for an operator who
+ * gave up on that rename long ago. Re-listing it would also misdescribe the
+ * state: "started and never finished" is the undecidedness an abandoned row no
+ * longer has. */
 kbc_status kbc_store_list_incomplete_moves(kbc_store *s, kbc_strlist *old_ids,
                                            kbc_strlist *old_rels,
                                            kbc_err *err) {
@@ -3928,11 +4066,11 @@ kbc_status kbc_store_list_incomplete_moves(kbc_store *s, kbc_strlist *old_ids,
                        "list_incomplete_moves: null argument");
   lock(s);
   sqlite3_stmt *q = NULL;
-  kbc_status st =
-      prepare(err, s,
-              "SELECT old_id, old_rel FROM moves WHERE completed_at IS NULL"
-              " ORDER BY id;",
-              &q);
+  kbc_status st = prepare(err, s,
+                         "SELECT old_id, old_rel FROM moves"
+                         " WHERE completed_at IS NULL AND abandoned_at IS NULL"
+                         " ORDER BY id;",
+                         &q);
   for (;;) {
     const int step = (st == KBC_OK) ? sqlite3_step(q) : SQLITE_DONE;
     if (step == SQLITE_DONE) break;

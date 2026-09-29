@@ -13,7 +13,7 @@
  * migration that bumps it has to be a deliberate edit in both places: a
  * binary that migrates past what its tests know about is the failure this
  * pin exists to make loud. */
-#define CURRENT_SCHEMA 11
+#define CURRENT_SCHEMA 12
 
 /* include/kbc/store.h is the orchestrator's file; the pending-links contract
  * is proposed there and these are the signatures it will carry. */
@@ -2095,6 +2095,34 @@ static const char *const V10_DB =
     "INSERT INTO doc_first_seen(artifact_id, first_indexed_unix)"
     " VALUES('old000000001',1000);";
 
+/* The v11 schema — V10_DB plus what step 11 added, and NOT what step 12 adds.
+ * Executed as a second statement rather than concatenated, because V10_DB is a
+ * variable and adjacent-literal concatenation only works on literals; the
+ * ordering is the same, and "a v11 volume" then means exactly what it says.
+ *
+ * The DDL is verbatim from the v11 step in src/store.c, so this fixture is a
+ * volume the previous binary really did write — which is the only kind of
+ * volume the v12 step has to survive. The rows are the two states that matter
+ * to it: one move finished, one still in flight. A completed row that came
+ * back NULL is the failure this test exists to catch, and a step that
+ * backfilled rather than ALTERed would show it as a non-NULL abandoned_at. */
+static const char *const V11_MOVES =
+    "CREATE TABLE moves ("
+    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " old_id TEXT NOT NULL,"
+    " new_id TEXT NOT NULL,"
+    " old_rel TEXT NOT NULL,"
+    " new_rel TEXT NOT NULL,"
+    " moved_at INTEGER NOT NULL,"
+    " completed_at INTEGER);"
+    "CREATE INDEX idx_moves_old_id ON moves(old_id);"
+    "CREATE INDEX idx_moves_old_rel ON moves(old_rel);"
+    "INSERT INTO schema_version(version) VALUES(11);"
+    "INSERT INTO moves(old_id, new_id, old_rel, new_rel, moved_at,"
+    " completed_at) VALUES('aaaaaaaaaaaa','bbbbbbbbbbbb','a.md','b.md',1,10);"
+    "INSERT INTO moves(old_id, new_id, old_rel, new_rel, moved_at,"
+    " completed_at) VALUES('cccccccccccc','dddddddddddd','c.md','d.md',2,NULL);";
+
 /* The database path is assembled with a length check, never snprintf: the
  * build runs -Werror=format-truncation, and a 4096-byte root plus a leaf is a
  * warning no matter how carefully the sizes are written. A silently truncated
@@ -2172,6 +2200,49 @@ static bool index_exists(sqlite3 *h, const char *name) {
                          -1, &q, NULL) == SQLITE_OK) {
     (void)sqlite3_bind_text(q, 1, name, -1, SQLITE_TRANSIENT);
     if (sqlite3_step(q) == SQLITE_ROW) found = sqlite3_column_int(q, 0) > 0;
+  }
+  (void)sqlite3_finalize(q);
+  return found;
+}
+
+/* A column the migration declared, checked as a COLUMN of that table. This is
+ * the one shape an ALTER can get wrong in a way nothing else here can see: the
+ * table exists, the rows read back, every lookup works, and the column the new
+ * code names is not in the schema — a runtime "no such column" on the first
+ * query, in a database whose version number says it is current. */
+static bool column_exists(sqlite3 *h, const char *table, const char *col) {
+  sqlite3_stmt *q = NULL;
+  bool found = false;
+  if (sqlite3_prepare_v2(h,
+                         "SELECT COUNT(*) FROM pragma_table_info(?1)"
+                         " WHERE name = ?2;",
+                         -1, &q, NULL) == SQLITE_OK) {
+    (void)sqlite3_bind_text(q, 1, table, -1, SQLITE_TRANSIENT);
+    (void)sqlite3_bind_text(q, 2, col, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(q) == SQLITE_ROW) found = sqlite3_column_int(q, 0) > 0;
+  }
+  (void)sqlite3_finalize(q);
+  return found;
+}
+
+/* One INTEGER out of the first row `sql` returns for `arg`, and whether that
+ * row exists at all. `*isnull` separates SQL NULL from the value 0, which is
+ * the whole distinction every assertion about an unset stamp is making: a
+ * sentinel would satisfy `== 0` and quietly turn "never completed" into a
+ * timestamp. */
+static bool raw_one_i64(sqlite3 *h, const char *sql, const char *arg, int col,
+                        bool *isnull, int64_t *out) {
+  sqlite3_stmt *q = NULL;
+  bool found = false;
+  *isnull = true;
+  *out = 0;
+  if (sqlite3_prepare_v2(h, sql, -1, &q, NULL) == SQLITE_OK) {
+    (void)sqlite3_bind_text(q, 1, arg, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(q) == SQLITE_ROW) {
+      found = true;
+      *isnull = sqlite3_column_type(q, col) == SQLITE_NULL;
+      *out = (int64_t)sqlite3_column_int64(q, col);
+    }
   }
   (void)sqlite3_finalize(q);
   return found;
@@ -2289,14 +2360,15 @@ KBC_TEST(a_v4_volume_upgrades_to_the_current_schema_with_its_rows_intact) {
   kbc_test_rmrf(root);
 }
 
-/* Migration 11, observed on a REAL v10 volume rather than argued from the
- * ladder array. The two halves are what a migration can get wrong in opposite
- * directions: `moves` must EXIST afterwards, and every row the old volume had
- * must still be there. A test that only checked the version number would pass
- * on a step that recorded 11 and created nothing.
+/* Migrations 11 and 12, observed on a REAL v10 volume rather than argued from
+ * the ladder array. The two halves are what a migration can get wrong in
+ * opposite directions: `moves` must EXIST afterwards, and every row the old
+ * volume had must still be there. A test that only checked the version number
+ * would pass on a step that recorded 11 and created nothing.
  *
- * The fixture is at the immediately previous version, so exactly one step
- * runs — the eleventh, the one under test. */
+ * The fixture is at the version immediately before the first step under test,
+ * so the ladder runs v11 and then v12 and nothing earlier — those two are what
+ * this case covers together. */
 KBC_TEST(a_v10_volume_gains_moves_and_keeps_every_row_it_had) {
   char root[KBC_TEST_PATH_MAX];
   kbc_test_tmpdir(root, sizeof root);
@@ -2388,17 +2460,167 @@ KBC_TEST(a_v10_volume_gains_moves_and_keeps_every_row_it_had) {
   kbc_test_rmrf(root);
 }
 
-/* The DDL of migration 11, read back out of a migrated volume, column by
- * column. A table that merely EXISTS is not the table the original declares,
+/* Migration 12, observed on a REAL v11 volume — one the previous binary
+ * wrote, `moves` and all, and with no abandoned_at anywhere in it.
+ *
+ * A v10 fixture cannot stand in for it. Step 12 ALTERs a table that v10
+ * volumes do not have, so against a v10 volume the only thing under test is
+ * the step before it, and an ALTER that silently did nothing — or that
+ * recorded version 12 and left the schema at 11 — would pass every assertion
+ * a v10 fixture can make.
+ *
+ * What has to survive: the column appears, and BOTH rows keep their stamps.
+ * The completed row coming back with completed_at = 10 is the load-bearing
+ * assertion — a step that rebuilt the table, or that backfilled every row,
+ * would lose it — and the in-flight row's NULL is the other half, because
+ * "in flight" and "never stamped with 0" have to stay distinguishable or
+ * `moves_list_incomplete` starts replaying a finished move forever. */
+KBC_TEST(a_v11_volume_gains_the_abandon_column_and_keeps_its_stamps) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  sqlite3 *raw = raw_open(root, "old.db");
+  KBC_CHECK_NOT_NULL(raw);
+  if (raw == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  raw_exec(raw, V10_DB);
+  raw_exec(raw, V11_MOVES);
+  KBC_CHECK_EQ_INT(raw_version(raw), 11);
+  /* The premise: this volume has a moves table and NOT the column, so the
+   * upgrade has something to do. A fixture that already had the column would
+   * make every assertion below pass for free. */
+  KBC_CHECK_MSG(table_exists(raw, "moves"), "the fixture has no moves table");
+  KBC_CHECK_MSG(!column_exists(raw, "moves", "abandoned_at"),
+                "the fixture already has abandoned_at, so the upgrade proves "
+                "nothing");
+  (void)sqlite3_close(raw);
+
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "old.db", &err);
+  KBC_CHECK_MSG(s != NULL, "upgrade open failed: %s", err.msg);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  KBC_CHECK_EQ_INT(kbc_store_schema_version(s), CURRENT_SCHEMA);
+
+  /* The completed row still redirects, so the ALTER neither lost the row nor
+   * changed what a completed move means. Checked through the API that reads
+   * it, because a row that reads back correctly through raw SQL and is not
+   * followed would be a walk bug wearing a migration's clothes. */
+  kbc_strlist first;
+  kbc_strlist_init(&first);
+  KBC_CHECK_OK(kbc_store_moves_lookup(s, "aaaaaaaaaaaa", &first, &err));
+  KBC_CHECK_MSG(first.len == 1,
+                "the pre-upgrade completed move no longer resolves (%zu hops)",
+                first.len);
+  if (first.len == 1) KBC_CHECK_EQ_STR(first.items[0], "bbbbbbbbbbbb");
+  kbc_strlist_free(&first);
+  kbc_store_close(s);
+
+  /* The stamps, read back out of the file. `abandoned_at` NULL on a row that
+   * predates the ALTER is the whole backfill story: a nullable column added to
+   * an existing table is NULL on every existing row, and anything else here
+   * would be a decision this test did not ask for. */
+  raw = raw_open(root, "old.db");
+  KBC_CHECK_NOT_NULL(raw);
+  if (raw != NULL) {
+    KBC_CHECK_MSG(column_exists(raw, "moves", "abandoned_at"),
+                  "the v12 step recorded its version without adding the column");
+    bool isnull = false;
+    int64_t v = 0;
+    KBC_CHECK_MSG(raw_one_i64(raw,
+                              "SELECT completed_at FROM moves WHERE old_id ="
+                              " ?1;",
+                              "aaaaaaaaaaaa", 0, &isnull, &v),
+                  "the completed move did not survive the upgrade");
+    KBC_CHECK_MSG(!isnull && v == 10,
+                  "completed_at = %s%lld, wanted 10 — the upgrade rewrote a "
+                  "stamp the store had already made",
+                  isnull ? "NULL" : "", (long long)v);
+    KBC_CHECK_MSG(raw_one_i64(raw,
+                              "SELECT abandoned_at FROM moves WHERE old_id ="
+                              " ?1;",
+                              "aaaaaaaaaaaa", 0, &isnull, &v),
+                  "abandoned_at is not readable on the upgraded volume");
+    KBC_CHECK_MSG(isnull,
+                  "abandoned_at = %lld on a row that predates the column; NULL "
+                  "is what 'never abandoned' has to read as",
+                  (long long)v);
+    KBC_CHECK_MSG(raw_one_i64(raw,
+                              "SELECT completed_at FROM moves WHERE old_id ="
+                              " ?1;",
+                              "cccccccccccc", 0, &isnull, &v),
+                  "the in-flight move did not survive the upgrade");
+    KBC_CHECK_MSG(isnull,
+                  "an in-flight move came back with completed_at = %lld, so a "
+                  "finished move and a crashed one are indistinguishable",
+                  (long long)v);
+    /* Both rows, and one row per version: step 12 ran once on a file that had
+     * never seen it. A version table with a duplicate is the shape a re-runnable
+     * step leaves behind when its guard is missing. */
+    KBC_CHECK_EQ_INT(raw_version_rows(raw), CURRENT_SCHEMA);
+    sqlite3_stmt *q = NULL;
+    int64_t rows = 0;
+    if (sqlite3_prepare_v2(raw, "SELECT COUNT(*) FROM moves;", -1, &q,
+                           NULL) == SQLITE_OK &&
+        sqlite3_step(q) == SQLITE_ROW) {
+      rows = (int64_t)sqlite3_column_int64(q, 0);
+    }
+    (void)sqlite3_finalize(q);
+    KBC_CHECK_EQ_INT(rows, 2);
+    (void)sqlite3_close(raw);
+  }
+
+  /* Idempotent on a SECOND opener, which for THIS step is the sharp half: v12
+   * is the one migration in the ladder that is not re-runnable on its own
+   * (ADD COLUMN fails if the column is there), so nothing but the recorded
+   * version stands between an already-migrated file and a duplicate-column
+   * error on the next open. */
+  kbc_err_reset(&err);
+  kbc_store *again = open_at(root, "old.db", &err);
+  KBC_CHECK_MSG(again != NULL, "second open of a migrated file failed: %s",
+                err.msg);
+  if (again != NULL) {
+    KBC_CHECK_EQ_INT(kbc_store_schema_version(again), CURRENT_SCHEMA);
+    kbc_strlist ids;
+    kbc_strlist_init(&ids);
+    KBC_CHECK_OK(kbc_store_moves_lookup(again, "aaaaaaaaaaaa", &ids, &err));
+    KBC_CHECK_EQ_INT((long long)ids.len, 1);
+    kbc_strlist_free(&ids);
+    kbc_store_close(again);
+  }
+  raw = raw_open(root, "old.db");
+  if (raw != NULL) {
+    KBC_CHECK_EQ_INT(raw_version_rows(raw), CURRENT_SCHEMA);
+    (void)sqlite3_close(raw);
+  }
+  kbc_test_rmrf(root);
+}
+
+/* The DDL of migrations 11 and 12, read back out of a migrated volume, column
+ * by column. A table that merely EXISTS is not the table the original declares,
  * and the two things most likely to be wrong — a NOT NULL dropped for
  * convenience, and the nullable completed_at folded into a sentinel like every
  * other nullable-in-Rust column was — are both invisible to table_exists.
  *
- * completed_at is asserted NULLABLE specifically because it is the ONE column
- * here that really is null while a move is in flight: that NULL is the crash
- * signal moves_list_incomplete reads. A NOT NULL with a sentinel would make
- * "never stamped" and "stamped with the sentinel" indistinguishable to it. */
-KBC_TEST(moves_has_the_declared_columns_and_only_completed_at_is_nullable) {
+ * completed_at is asserted NULLABLE specifically because it is a column that
+ * really is null while a move is in flight: that NULL is the crash signal
+ * moves_list_incomplete reads. A NOT NULL with a sentinel would make "never
+ * stamped" and "stamped with the sentinel" indistinguishable to it.
+ *
+ * abandoned_at is kb-c's ONE departure from the Rust DDL, declared here so
+ * that departure is a checked decision rather than an accident: the Rust table
+ * has no third state because the Rust bring-up has no pass that has to leave
+ * one. It is nullable for the same reason completed_at is — NULL is "not
+ * abandoned" — and an ALTER that adds a nullable column gives every existing
+ * row exactly that, so the upgrade needs no backfill. A NOT NULL, or a 0
+ * sentinel, would make "never abandoned" and "abandoned at the epoch"
+ * indistinguishable, and every predicate over it would have to carry the
+ * disambiguation. */
+KBC_TEST(moves_declares_the_rust_columns_plus_the_one_kb_c_adds) {
   char root[KBC_TEST_PATH_MAX];
   kbc_test_tmpdir(root, sizeof root);
   kbc_err err;
@@ -2417,15 +2639,15 @@ KBC_TEST(moves_has_the_declared_columns_and_only_completed_at_is_nullable) {
     kbc_test_rmrf(root);
     return;
   }
-  /* The Rust DDL, in order. `id` is expected NOT NULL = 0 because SQLite
-   * reports an INTEGER PRIMARY KEY that way whatever the DDL says: it is an
-   * alias for the rowid and can never be null in practice. Everything the
-   * migration actually constrains is the other five, plus the one that must
-   * stay NULLABLE. */
+  /* The Rust DDL in order, then the one column kb-c adds. `id` is expected NOT
+   * NULL = 0 because SQLite reports an INTEGER PRIMARY KEY that way whatever
+   * the DDL says: it is an alias for the rowid and can never be null in
+   * practice. Everything a migration actually constrains is the other five,
+   * plus the two that must stay NULLABLE. */
   static const char *const want_name[] = {
       "id",          "old_id",  "new_id",       "old_rel",
-      "new_rel",     "moved_at", "completed_at"};
-  static const int want_notnull[] = {0, 1, 1, 1, 1, 1, 0};
+      "new_rel",     "moved_at", "completed_at", "abandoned_at"};
+  static const int want_notnull[] = {0, 1, 1, 1, 1, 1, 0, 0};
   for (size_t i = 0; i < sizeof want_name / sizeof want_name[0]; i++) {
     int nn = -1;
     sqlite3_stmt *q = NULL;
@@ -2840,6 +3062,417 @@ KBC_TEST(an_interrupted_move_is_listed_for_replay_and_never_followed) {
   kbc_test_rmrf(root);
 }
 
+/* An ABANDONED move answers exactly like an interrupted one, and for the same
+ * reason: neither is a promise about where the document is, and following
+ * either resolves a stale reference to a name the rename never reached. The
+ * difference is not the answer but the decision behind it — a bring-up pass
+ * concluded this one is not going to happen — and the difference that DOES
+ * show is the replay list, which an abandoned row has left and an interrupted
+ * one is still in. Re-deciding it on every boot is a loop with a log line.
+ *
+ * The row itself is asserted, not just the answers, and that is the point:
+ * an implementation that satisfied every lookup above by DELETING the row
+ * would pass all of them. What distinguishes abandoning from forgetting is
+ * that the row survives, with completed_at still NULL — a move that was never
+ * stamped is not a move that finished — and abandoned_at set. */
+KBC_TEST(an_abandoned_move_leaves_the_replay_list_and_is_never_followed) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+
+  /* Two interrupted moves, so abandoning one can be seen to leave the OTHER
+   * in the replay list: a predicate that filtered on the wrong column, or one
+   * that emptied the table, would pass a single-move fixture. */
+  KBC_CHECK_OK(kbc_store_record_move(s, "aaaaaaaaaaaa", "bbbbbbbbbbbb",
+                                     "a.md", "b.md", 1000, &err));
+  KBC_CHECK_OK(kbc_store_record_move(s, "cccccccccccc", "dddddddddddd",
+                                     "c.md", "d.md", 2000, &err));
+  KBC_CHECK_OK(kbc_store_abandon_move(s, "aaaaaaaaaaaa", &err));
+
+  /* Neither lookup follows it. */
+  kbc_strlist ids;
+  kbc_strlist_init(&ids);
+  KBC_CHECK_OK(kbc_store_moves_lookup(s, "aaaaaaaaaaaa", &ids, &err));
+  KBC_CHECK_MSG(ids.len == 0,
+                "an abandoned move was followed to %s — a name the rename "
+                "never reached",
+                ids.len > 0 ? ids.items[0] : "?");
+  kbc_strlist_free(&ids);
+  kbc_strlist rels;
+  kbc_strlist_init(&rels);
+  KBC_CHECK_OK(kbc_store_moves_lookup_path(s, "a.md", &rels, &err));
+  KBC_CHECK_MSG(rels.len == 0,
+                "an abandoned path was followed to %s — a name the rename "
+                "never reached",
+                rels.len > 0 ? rels.items[0] : "?");
+  kbc_strlist_free(&rels);
+
+  /* The replay list holds the other move and only the other move. This is
+   * the assertion that makes the second boot of an abandoned move a no-op. */
+  kbc_strlist old_ids, old_rels;
+  kbc_strlist_init(&old_ids);
+  kbc_strlist_init(&old_rels);
+  KBC_CHECK_OK(kbc_store_list_incomplete_moves(s, &old_ids, &old_rels, &err));
+  KBC_CHECK_MSG(old_ids.len == 1,
+                "the replay list holds %zu rows; the abandoned move must have "
+                "left it and the other must have stayed",
+                old_ids.len);
+  KBC_CHECK_EQ_INT((long long)old_ids.len, (long long)old_rels.len);
+  if (old_ids.len == 1 && old_rels.len == 1) {
+    KBC_CHECK_EQ_STR(old_ids.items[0], "cccccccccccc");
+    KBC_CHECK_EQ_STR(old_rels.items[0], "c.md");
+  }
+  kbc_strlist_free(&old_ids);
+  kbc_strlist_free(&old_rels);
+  kbc_store_close(s);
+
+  /* The row is still THERE, stamped as abandoned and not as completed. The
+   * three answers above are also what a delete would produce, so without this
+   * the case could not tell an abandoned move from a forgotten one — and
+   * "somebody tried and it did not happen" is the entire reason the state
+   * exists. */
+  sqlite3 *raw = raw_open(root, "kb.db");
+  KBC_CHECK_NOT_NULL(raw);
+  if (raw != NULL) {
+    bool isnull = true;
+    int64_t v = 0;
+    KBC_CHECK_MSG(raw_one_i64(raw,
+                              "SELECT completed_at FROM moves WHERE old_id ="
+                              " ?1;",
+                              "aaaaaaaaaaaa", 0, &isnull, &v),
+                  "the abandoned move's row was deleted, so this is a forgotten "
+                  "move rather than an abandoned one");
+    KBC_CHECK_MSG(isnull,
+                  "abandon stamped completed_at = %lld; abandoning is not "
+                  "completing",
+                  (long long)v);
+    KBC_CHECK_MSG(raw_one_i64(raw,
+                              "SELECT abandoned_at FROM moves WHERE old_id ="
+                              " ?1;",
+                              "aaaaaaaaaaaa", 0, &isnull, &v),
+                  "the abandoned move has no row to read abandoned_at from");
+    KBC_CHECK_MSG(!isnull && v > 0,
+                  "abandoned_at is %s; it must carry the moment of the "
+                  "decision, not the NULL that means 'only not completed'",
+                  isnull ? "NULL" : "0");
+    (void)sqlite3_close(raw);
+  }
+  kbc_test_rmrf(root);
+}
+
+/* The two writes that must not be able to disagree.
+ *
+ * A bring-up pass abandons a move; something later calls complete_move on the
+ * same id. If complete_move stamped the abandoned row, the decision is
+ * silently reversed and `moves_lookup` starts redirecting to a destination
+ * that does not exist — the exact wrong answer the abandoned state exists to
+ * prevent, reachable through a perfectly ordinary sequence of two calls. The
+ * guard is one clause of SQL, and this is the only thing that fires it.
+ *
+ * The second move in the same volume is the control: `complete_move` is
+ * filtered PER ROW, so this also fails an implementation that read the
+ * abandoned flag as a statement about the document rather than about one
+ * attempt at renaming it. */
+KBC_TEST(completing_an_abandoned_move_does_not_revive_the_redirect) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  KBC_CHECK_OK(kbc_store_record_move(s, "aaaaaaaaaaaa", "bbbbbbbbbbbb",
+                                     "a.md", "b.md", 1000, &err));
+  KBC_CHECK_OK(kbc_store_record_move(s, "eeeeeeeeeeee", "ffffffffffff",
+                                     "e.md", "f.md", 2000, &err));
+  KBC_CHECK_OK(kbc_store_abandon_move(s, "aaaaaaaaaaaa", &err));
+  KBC_CHECK_OK(kbc_store_complete_move(s, "aaaaaaaaaaaa", &err));
+  /* Completing the abandoned id twice must not be a different answer: an
+   * abandoned row is terminal, and the second call is the one a retrying
+   * bring-up pass would make. */
+  KBC_CHECK_OK(kbc_store_complete_move(s, "aaaaaaaaaaaa", &err));
+
+  kbc_strlist ids;
+  kbc_strlist_init(&ids);
+  KBC_CHECK_OK(kbc_store_moves_lookup(s, "aaaaaaaaaaaa", &ids, &err));
+  KBC_CHECK_MSG(ids.len == 0,
+                "an abandoned move was completed into a redirect to %s",
+                ids.len > 0 ? ids.items[0] : "?");
+  kbc_strlist_free(&ids);
+  kbc_strlist rels;
+  kbc_strlist_init(&rels);
+  KBC_CHECK_OK(kbc_store_moves_lookup_path(s, "a.md", &rels, &err));
+  KBC_CHECK_MSG(rels.len == 0, "the abandoned path was redirected to %s",
+                rels.len > 0 ? rels.items[0] : "?");
+  kbc_strlist_free(&rels);
+
+  /* The replay list now holds the CONTROL move and not the abandoned one, so
+   * the guard is "abandoned rows are terminal" rather than "abandoned rows are
+   * invisible": completing the abandoned id twice did not put it back in the
+   * queue, and it did not take the other row out of it. */
+  kbc_strlist old_ids, old_rels;
+  kbc_strlist_init(&old_ids);
+  kbc_strlist_init(&old_rels);
+  KBC_CHECK_OK(kbc_store_list_incomplete_moves(s, &old_ids, &old_rels, &err));
+  KBC_CHECK_MSG(old_ids.len == 1,
+                "the replay list holds %zu rows; it must hold the move that is "
+                "still in flight and not the abandoned one",
+                old_ids.len);
+  if (old_ids.len == 1) KBC_CHECK_EQ_STR(old_ids.items[0], "eeeeeeeeeeee");
+  kbc_strlist_free(&old_ids);
+  kbc_strlist_free(&old_rels);
+
+  /* And the control: an ordinary move, untouched by any of this, still
+   * redirects. The abandoned filter is per row. */
+  KBC_CHECK_OK(kbc_store_complete_move(s, "eeeeeeeeeeee", &err));
+  kbc_strlist_init(&ids);
+  KBC_CHECK_OK(kbc_store_moves_lookup(s, "eeeeeeeeeeee", &ids, &err));
+  KBC_CHECK_MSG(ids.len == 1,
+                "an ordinary completed move stopped resolving (%zu hops)",
+                ids.len);
+  if (ids.len == 1) KBC_CHECK_EQ_STR(ids.items[0], "ffffffffffff");
+  kbc_strlist_free(&ids);
+
+  /* With both terminal, the replay list is empty: this is the state a second
+   * bring-up pass sees, and it is why it does no work on the next boot. */
+  kbc_strlist_init(&old_ids);
+  kbc_strlist_init(&old_rels);
+  KBC_CHECK_OK(kbc_store_list_incomplete_moves(s, &old_ids, &old_rels, &err));
+  KBC_CHECK_MSG(old_ids.len == 0,
+                "%zu moves are still queued after both reached a terminal "
+                "state",
+                old_ids.len);
+  kbc_strlist_free(&old_ids);
+  kbc_strlist_free(&old_rels);
+  kbc_store_close(s);
+
+  sqlite3 *raw = raw_open(root, "kb.db");
+  if (raw != NULL) {
+    bool isnull = true;
+    int64_t v = 0;
+    KBC_CHECK_MSG(raw_one_i64(raw,
+                              "SELECT completed_at FROM moves WHERE old_id ="
+                              " ?1;",
+                              "aaaaaaaaaaaa", 0, &isnull, &v),
+                  "the abandoned move's row disappeared");
+    KBC_CHECK_MSG(isnull, "the abandoned move was stamped completed = %lld",
+                  (long long)v);
+    KBC_CHECK_MSG(raw_one_i64(raw,
+                              "SELECT abandoned_at FROM moves WHERE old_id ="
+                              " ?1;",
+                              "aaaaaaaaaaaa", 0, &isnull, &v) && !isnull,
+                  "the abandoned flag was cleared, so the row is merely "
+                  "incomplete again");
+    (void)sqlite3_close(raw);
+  }
+  kbc_test_rmrf(root);
+}
+
+/* The other direction: an ordinary completed move is STILL followed. The
+ * abandoned clause is an addition to the walk's predicate, and the way an
+ * addition to a predicate goes wrong is by excluding the rows it was not
+ * meant to touch — `abandoned_at IS NOT NULL`, a missing AND, a NULL default
+ * that makes every migrated row look abandoned. Each of those turns every
+ * bookmark in a real volume into a 404, and each passes a test suite whose
+ * only move fixtures are abandoned ones.
+ *
+ * So the two states share ONE volume here, and the assertion is that they
+ * answer differently, which a predicate that ignored completed_at entirely
+ * cannot do. */
+KBC_TEST(a_completed_move_still_redirects_beside_an_abandoned_one) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+
+  /* a -> b -> c, both hops completed, and one abandoned move beside it. */
+  KBC_CHECK_OK(kbc_store_record_move(s, "aaaaaaaaaaaa", "bbbbbbbbbbbb",
+                                     "a.md", "b.md", 1000, &err));
+  KBC_CHECK_OK(kbc_store_complete_move(s, "aaaaaaaaaaaa", &err));
+  KBC_CHECK_OK(kbc_store_record_move(s, "bbbbbbbbbbbb", "cccccccccccc",
+                                     "b.md", "c.md", 2000, &err));
+  KBC_CHECK_OK(kbc_store_complete_move(s, "bbbbbbbbbbbb", &err));
+  KBC_CHECK_OK(kbc_store_record_move(s, "eeeeeeeeeeee", "ffffffffffff",
+                                     "e.md", "f.md", 3000, &err));
+  KBC_CHECK_OK(kbc_store_abandon_move(s, "eeeeeeeeeeee", &err));
+
+  /* And the mirror of the guard above: abandoning a move that is ALREADY
+   * completed is refused, because the flag would retract a redirect the
+   * document earned. Two promises, one destination each, and this one is the
+   * true one — so the call that would contradict it has to be the one that
+   * loses. It is a bring-up decision about a move still in flight, and this
+   * move is not in flight. */
+  KBC_CHECK_OK(kbc_store_abandon_move(s, "aaaaaaaaaaaa", &err));
+
+  /* The chain still walks to its final home — two hops, not one and not zero.
+   * A walk that stopped at the abandoned-looking rows would report 0, and one
+   * that ignored completed_at entirely would report something else again. */
+  kbc_strlist ids;
+  kbc_strlist_init(&ids);
+  KBC_CHECK_OK(kbc_store_moves_lookup(s, "aaaaaaaaaaaa", &ids, &err));
+  KBC_CHECK_MSG(ids.len == 2,
+                "a completed two-hop chain returned %zu hops beside an "
+                "abandoned move",
+                ids.len);
+  if (ids.len == 2) {
+    KBC_CHECK_EQ_STR(ids.items[0], "bbbbbbbbbbbb");
+    KBC_CHECK_EQ_STR(ids.items[1], "cccccccccccc");
+  }
+  kbc_strlist_free(&ids);
+
+  kbc_strlist rels;
+  kbc_strlist_init(&rels);
+  KBC_CHECK_OK(kbc_store_moves_lookup_path(s, "a.md", &rels, &err));
+  KBC_CHECK_MSG(rels.len == 2, "the completed path chain returned %zu hops",
+                rels.len);
+  kbc_strlist_free(&rels);
+
+  /* The middle id too, and not the abandoned one. */
+  kbc_strlist_init(&ids);
+  KBC_CHECK_OK(kbc_store_moves_lookup(s, "bbbbbbbbbbbb", &ids, &err));
+  KBC_CHECK_EQ_INT((long long)ids.len, 1);
+  if (ids.len == 1) KBC_CHECK_EQ_STR(ids.items[0], "cccccccccccc");
+  kbc_strlist_free(&ids);
+  kbc_strlist_init(&ids);
+  KBC_CHECK_OK(kbc_store_moves_lookup(s, "eeeeeeeeeeee", &ids, &err));
+  KBC_CHECK_EQ_INT((long long)ids.len, 0);
+  kbc_strlist_free(&ids);
+
+  /* Abandoning must not have touched the completed rows either: an
+   * `abandoned_at` written onto a finished move would retract a redirect the
+   * document earned, and the walk would then (correctly, per its own
+   * predicate) refuse to follow it. So the flag has to be absent there. */
+  kbc_store_close(s);
+  sqlite3 *raw = raw_open(root, "kb.db");
+  KBC_CHECK_NOT_NULL(raw);
+  if (raw != NULL) {
+    bool isnull = true;
+    int64_t v = 0;
+    KBC_CHECK_MSG(raw_one_i64(raw,
+                              "SELECT abandoned_at FROM moves WHERE old_id ="
+                              " ?1;",
+                              "aaaaaaaaaaaa", 0, &isnull, &v),
+                  "a completed move has no row");
+    KBC_CHECK_MSG(isnull,
+                  "a completed move was marked abandoned at %lld, so its "
+                  "redirect is now retractable by a row nobody asked to "
+                  "retract",
+                  (long long)v);
+    KBC_CHECK_MSG(raw_one_i64(raw,
+                              "SELECT completed_at FROM moves WHERE old_id ="
+                              " ?1;",
+                              "aaaaaaaaaaaa", 0, &isnull, &v) && !isnull,
+                  "a completed move lost its completed_at");
+    (void)sqlite3_close(raw);
+  }
+  kbc_test_rmrf(root);
+}
+
+/* PRECEDENCE: a row carrying BOTH stamps is not followed, and this is the
+ * only case that can prove it.
+ *
+ * kb-c's two writers make the state unreachable — complete_move refuses an
+ * abandoned row and abandon_move refuses a completed one — so a test written
+ * through the API cannot produce it, and a walk that dropped its
+ * `abandoned_at` clause would pass every other case in this file. The rows go
+ * in through raw SQL for the same reason the cycle test's do: the API will not
+ * write the state the predicate has to survive.
+ *
+ * Abandoned wins, and the reason is which promise is safer to break. Both
+ * stamps name a different destination, so one of them is wrong; a caller that
+ * follows the completed one gets a document that is not there, and a caller
+ * that follows neither gets an id that never moved. The second is a missing
+ * answer, the first is a wrong one, and this store never trades a missing
+ * answer for a wrong one.
+ *
+ * The control row is the half that makes this a precedence test rather than an
+ * "everything is refused" test: an ordinary completed move in the SAME volume
+ * still resolves, so a walk that had simply stopped answering would fail it. */
+KBC_TEST(a_move_stamped_completed_and_abandoned_is_not_followed) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_store_close(s);
+
+  sqlite3 *raw = raw_open(root, "kb.db");
+  KBC_CHECK_NOT_NULL(raw);
+  if (raw == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  raw_exec(raw,
+           "INSERT INTO moves(old_id, new_id, old_rel, new_rel, moved_at,"
+           " completed_at, abandoned_at)"
+           " VALUES('aaaaaaaaaaaa','bbbbbbbbbbbb','a.md','b.md',1,10,20);"
+           "INSERT INTO moves(old_id, new_id, old_rel, new_rel, moved_at,"
+           " completed_at, abandoned_at)"
+           " VALUES('eeeeeeeeeeee','ffffffffffff','e.md','f.md',2,30,40);"
+           /* the control: completed, never abandoned */
+           "INSERT INTO moves(old_id, new_id, old_rel, new_rel, moved_at,"
+           " completed_at) VALUES('gggggggggggg','hhhhhhhhhhhh','g.md','h.md',3,"
+           "50);");
+  (void)sqlite3_close(raw);
+
+  kbc_err_reset(&err);
+  s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_strlist ids;
+  kbc_strlist_init(&ids);
+  KBC_CHECK_OK(kbc_store_moves_lookup(s, "aaaaaaaaaaaa", &ids, &err));
+  KBC_CHECK_MSG(ids.len == 0,
+                "a row stamped both completed and abandoned was followed to %s",
+                ids.len > 0 ? ids.items[0] : "?");
+  kbc_strlist_free(&ids);
+  kbc_strlist_init(&ids);
+  KBC_CHECK_OK(kbc_store_moves_lookup(s, "eeeeeeeeeeee", &ids, &err));
+  KBC_CHECK_EQ_INT((long long)ids.len, 0);
+  kbc_strlist_free(&ids);
+  kbc_strlist rels;
+  kbc_strlist_init(&rels);
+  KBC_CHECK_OK(kbc_store_moves_lookup_path(s, "e.md", &rels, &err));
+  KBC_CHECK_MSG(rels.len == 0,
+                "the path of a doubly-stamped row was followed to %s",
+                rels.len > 0 ? rels.items[0] : "?");
+  kbc_strlist_free(&rels);
+
+  /* The control: completed alone, and it still redirects. */
+  kbc_strlist_init(&ids);
+  KBC_CHECK_OK(kbc_store_moves_lookup(s, "gggggggggggg", &ids, &err));
+  KBC_CHECK_MSG(ids.len == 1, "the control move stopped resolving (%zu hops)",
+                ids.len);
+  if (ids.len == 1) KBC_CHECK_EQ_STR(ids.items[0], "hhhhhhhhhhhh");
+  kbc_strlist_free(&ids);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
 /* The walk must TERMINATE on a cycle, and a cycle is representable: nothing
  * in the schema forbids a -> b -> a, and a buggy writer is exactly the case
  * the bound exists for. Without the guard this is an httpd worker that never
@@ -3012,21 +3645,27 @@ KBC_TEST(the_epoch_guard_refuses_a_volume_ahead_and_nothing_else) {
     (void)sqlite3_close(raw);
   }
 
-  /* Behind: an open that has to migrate forward, which is the normal case. */
-  raw = raw_open(root, "ahead.db");
+  /* Behind: an open that has to migrate forward, which is the normal case.
+   *
+   * A REAL previous-version volume, built from the fixture, rather than the
+   * current one with its version table rewound. The difference is not
+   * cosmetic and this half of the case used to be written the other way: a
+   * rewound `schema_version` claims the volume is older than its schema, and
+   * the ladder trusts that table. Every step used to survive being re-run
+   * (IF NOT EXISTS, OR IGNORE), so the lie was harmless; migration 12's ADD
+   * COLUMN is not, and SQLite's "duplicate column name" is what a volume in
+   * that state now gets. It is a state the ladder cannot produce — a volume
+   * that recorded 11 has never had the column, because the same transaction
+   * adds both — so the fixture below is the honest way to ask the question.
+   * The refusal is not silent: the open fails and names the step. */
+  raw = raw_open(root, "behind.db");
   if (raw != NULL) {
-    raw_exec(raw, "DELETE FROM schema_version;");
-    {
-      char sql[128];
-      (void)snprintf(sql, sizeof sql,
-                     "INSERT INTO schema_version(version) VALUES(%d);",
-                     CURRENT_SCHEMA - 1);
-      raw_exec(raw, sql);
-    }
+    raw_exec(raw, V10_DB);
+    raw_exec(raw, V11_MOVES);
     (void)sqlite3_close(raw);
   }
   kbc_err_reset(&err);
-  s = open_at(root, "ahead.db", &err);
+  s = open_at(root, "behind.db", &err);
   KBC_CHECK_MSG(s != NULL, "a volume behind must open: %s", err.msg);
   if (s != NULL) {
     KBC_CHECK_EQ_INT(kbc_store_schema_version(s), CURRENT_SCHEMA);
@@ -3034,15 +3673,18 @@ KBC_TEST(the_epoch_guard_refuses_a_volume_ahead_and_nothing_else) {
     kbc_artifact again;
     memset(&again, 0, sizeof again);
     KBC_CHECK_OK(
-        kbc_store_get_artifact(s, a, "aaaaaaaaaaaa", false, &again, &err));
+        kbc_store_get_artifact(s, a, "old000000001", false, &again, &err));
     KBC_CHECK_EQ_STR(again.path, "a.md");
     kbc_arena_free(a);
     kbc_store_close(s);
   }
 
-  /* Equal: nothing to do, and still an open. */
+  /* Equal: nothing to do, and still an open. `behind.db` rather than
+   * `ahead.db`, because the ahead half above left that file stamped V13 on
+   * purpose and nothing since has moved it back — the volume that is now at
+   * this binary's epoch is the one the behind half just migrated. */
   kbc_err_reset(&err);
-  s = open_at(root, "ahead.db", &err);
+  s = open_at(root, "behind.db", &err);
   KBC_CHECK_MSG(s != NULL, "a volume at the binary's epoch must open: %s",
                 err.msg);
   if (s != NULL) {
@@ -4026,8 +4668,8 @@ static const kbc_test_case cases[] = {
        comment_docs_of_a_corpus_with_none_is_empty_and_ok},
       {"a_v10_volume_gains_moves_and_keeps_every_row_it_had",
        a_v10_volume_gains_moves_and_keeps_every_row_it_had},
-      {"moves_has_the_declared_columns_and_only_completed_at_is_nullable",
-       moves_has_the_declared_columns_and_only_completed_at_is_nullable},
+      {"moves_declares_the_rust_columns_plus_the_one_kb_c_adds",
+       moves_declares_the_rust_columns_plus_the_one_kb_c_adds},
       {"a_rekey_carries_a_comments_id_created_at_and_resolution",
        a_rekey_carries_a_comments_id_created_at_and_resolution},
       {"a_rekey_moves_the_artifact_row_and_every_table_that_names_it",
@@ -4036,6 +4678,16 @@ static const kbc_test_case cases[] = {
        a_stale_id_follows_a_chain_of_renames_to_its_final_home},
       {"an_interrupted_move_is_listed_for_replay_and_never_followed",
        an_interrupted_move_is_listed_for_replay_and_never_followed},
+      {"a_v11_volume_gains_the_abandon_column_and_keeps_its_stamps",
+       a_v11_volume_gains_the_abandon_column_and_keeps_its_stamps},
+      {"an_abandoned_move_leaves_the_replay_list_and_is_never_followed",
+       an_abandoned_move_leaves_the_replay_list_and_is_never_followed},
+      {"completing_an_abandoned_move_does_not_revive_the_redirect",
+       completing_an_abandoned_move_does_not_revive_the_redirect},
+      {"a_completed_move_still_redirects_beside_an_abandoned_one",
+       a_completed_move_still_redirects_beside_an_abandoned_one},
+      {"a_move_stamped_completed_and_abandoned_is_not_followed",
+       a_move_stamped_completed_and_abandoned_is_not_followed},
       {"a_cyclic_move_chain_terminates_instead_of_hanging",
        a_cyclic_move_chain_terminates_instead_of_hanging},
       {"a_rekey_does_not_reach_into_a_second_corpus_at_the_same_path",
