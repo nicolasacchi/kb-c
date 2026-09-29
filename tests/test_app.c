@@ -11,15 +11,19 @@
  */
 #include <dirent.h>
 #include <errno.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <poll.h>
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -44,6 +48,7 @@ kbc_status kbc_app_delete_path(kbc_app *app, const char *corpus,
  * kbc_app_stats_get like every other counter; only the capacity is app.c's
  * own function, declared here on the same terms as kbc_app_delete_path. */
 size_t kbc_app_query_cache_capacity(const kbc_app *app);
+
 /* The enrichment registry (app.h) and its seam kbc_enrich_run are declared in
  * the header now, so nothing is redeclared here. The context is opaque to
  * these tests: their own hooks take their state in `user` and never read it,
@@ -3086,6 +3091,29 @@ static int64_t chunk_count(db_side *side, const char *doc_id) {
   return n;
 }
 
+/* The corkboard anchor on ONE document, through a second connection, for the
+ * same reason as chunk_count above and with the same shape. The listing is a
+ * PAGE — `created_at DESC LIMIT KBC_MAX_HITS` — so once there are more anchors
+ * than that there is no page-based way at all to ask about a document that is
+ * not among the newest, and the case that needs the answer is exactly such a
+ * document. -1 is "no such anchor"; created_at 0 is a real value. */
+static int64_t corkboard_at_for(db_side *side, const char *doc_id) {
+  sqlite3_stmt *q = NULL;
+  if (sqlite3_prepare_v2(side->db,
+                         "SELECT created_at FROM corkboard WHERE artifact_id "
+                         "= ?1;",
+                         -1, &q, NULL) != SQLITE_OK) {
+    return -1;
+  }
+  int64_t at = -1;
+  if (sqlite3_bind_text(q, 1, doc_id, -1, SQLITE_STATIC) == SQLITE_OK &&
+      sqlite3_step(q) == SQLITE_ROW) {
+    at = sqlite3_column_int64(q, 0);
+  }
+  (void)sqlite3_finalize(q);
+  return at;
+}
+
 /* The artifact id one path mints, or NULL when the store has no such row. */
 static const char *id_of_path(const kbc_config *cfg, const char *corpus,
                               const char *path, kbc_arena *a) {
@@ -3465,6 +3493,1244 @@ KBC_TEST(delete_by_path_refuses_a_bad_target_and_forgives_an_absent_one) {
   KBC_CHECK_OK(kbc_app_delete_path(f.app, CORPUS_A, "never-existed.md", &err));
   KBC_CHECK_EQ_INT(store_count(f.cfg), 3);
 
+  fx_teardown(&f);
+}
+
+/* ============================================================== capture == */
+
+/* The capture's whole compatibility surface is the BYTES it writes, so that
+ * is what these assert: the exact file, not "the keys are present". A set
+ * assertion passes on a wrong order, and a wrong order is a different file
+ * that fails the cross-implementation diff for a reason nobody can see. */
+
+/* A capture input with everything set, so the expected file below names every
+ * key that can be written. `now_unix` is pinned (the original's FrozenNow test
+ * hook serves the same purpose) so the stamp is reproducible. */
+static void full_capture_input(kbc_capture_input *in, const char *body) {
+  static const char *const tags[] = {"Deep Work", "reading list!"};
+  memset(in, 0, sizeof *in);
+  in->corpus = CORPUS_A;
+  in->from = "cli";
+  in->title = "My Note";
+  in->url = "https://example.com/a?b=1";
+  in->original_filename = "notes.md";
+  in->session_id = "sess-7";
+  in->tags = tags;
+  in->n_tags = 2;
+  in->has_expires_at = true;
+  in->expires_at = 1893456000;
+  in->body = body;
+  in->body_len = strlen(body);
+  in->now_unix = 1700000000;
+}
+
+KBC_TEST(a_capture_writes_the_originals_keys_in_the_originals_order) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_capture_input in;
+  full_capture_input(&in, "# Body\n\nhello\n");
+  kbc_capture_result r;
+  memset(&r, 0, sizeof r);
+  KBC_CHECK_OK(kbc_app_capture(f.app, CORPUS_A, &in, &r, &err));
+
+  /* The filename is the slug of the title plus the capture's second — the
+   * original's collision-resistant name (capture.rs:376). */
+  KBC_CHECK_EQ_STR(r.path, "capture/my-note-1700000000.md");
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, r.path);
+  char *got = kbc_test_read_file(p);
+  KBC_CHECK_NOT_NULL(got);
+  if (got == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  /* Byte for byte, in the original's order (capture.rs:517, 518, 523, 529,
+   * 531, 541, 545). A tag is slugified the way the original slugifies it —
+   * ASCII alphanumerics joined by single dashes, so "Deep Work" and
+   * "reading list!" are "deep-work" and "reading-list" — while the two
+   * provenance tags keep the colon the original writes them with. */
+  KBC_CHECK_EQ_STR(
+      got,
+      "---\n"
+      "kb-category: capture\n"
+      "kb-tags: source:upload, from:cli, deep-work, reading-list\n"
+      "kb-capture-original: notes.md\n"
+      "kb-capture-url: https://example.com/a?b=1\n"
+      "kb-capture-at: 1700000000\n"
+      "kb-session: sess-7\n"
+      "kb-expires-at: 1893456000\n"
+      "---\n"
+      "# Body\n\nhello\n");
+  free(got);
+  fx_teardown(&f);
+}
+
+/* The id is a pure function of (corpus, path) and the path carries the
+ * capture's second, so two captures of the same bytes in the same second land
+ * on distinct paths and therefore distinct ids. The stamp cannot see any of
+ * that, which is the point: the same bytes must produce the same bytes. */
+KBC_TEST(the_same_bytes_captured_twice_are_byte_identical) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_capture_input in;
+  full_capture_input(&in, "# Same\n\nbytes every time\n");
+  kbc_capture_result r1, r2;
+  memset(&r1, 0, sizeof r1);
+  memset(&r2, 0, sizeof r2);
+  KBC_CHECK_OK(kbc_app_capture(f.app, CORPUS_A, &in, &r1, &err));
+  KBC_CHECK_OK(kbc_app_capture(f.app, CORPUS_A, &in, &r2, &err));
+
+  /* Distinct paths, distinct ids: nothing silently overwrote. */
+  KBC_CHECK_EQ_STR(r1.path, "capture/my-note-1700000000.md");
+  KBC_CHECK_EQ_STR(r2.path, "capture/my-note-1700000000-1.md");
+  KBC_CHECK(strcmp(r1.id, r2.id) != 0);
+
+  char p1[KBC_TEST_PATH_MAX], p2[KBC_TEST_PATH_MAX];
+  join(p1, sizeof p1, f.corpus_a, r1.path);
+  join(p2, sizeof p2, f.corpus_a, r2.path);
+  char *a1 = kbc_test_read_file(p1);
+  char *a2 = kbc_test_read_file(p2);
+  KBC_CHECK_NOT_NULL(a1);
+  KBC_CHECK_NOT_NULL(a2);
+  if (a1 != NULL && a2 != NULL) {
+    KBC_CHECK_MSG(strcmp(a1, a2) == 0,
+                  "two captures of the same bytes differ:\n[%s]\n[%s]", a1, a2);
+  }
+  KBC_CHECK_EQ_INT(r1.bytes, r2.bytes);
+  free(a1);
+  free(a2);
+  fx_teardown(&f);
+}
+
+/* The title a caller supplies steers the FILENAME and nothing else. A
+ * capture is a real document that the indexer will read, and the document's
+ * own authored title is the truth about what it is called. */
+KBC_TEST(a_capture_never_touches_the_titles_title_already_has) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_capture_input in;
+  full_capture_input(&in,
+                     "---\ntitle: Already Titled\ncustom-key: keep-me\n---\n"
+                     "Body.\n");
+  kbc_capture_result r;
+  memset(&r, 0, sizeof r);
+  KBC_CHECK_OK(kbc_app_capture(f.app, CORPUS_A, &in, &r, &err));
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, r.path);
+  char *got = kbc_test_read_file(p);
+  KBC_CHECK_NOT_NULL(got);
+  if (got == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK(strstr(got, "title: Already Titled") != NULL);
+  KBC_CHECK(strstr(got, "custom-key: keep-me") != NULL);
+  /* The caller's title is nowhere in the document: not as a title, not as a
+ * kb-* facet, not as a heading. */
+  KBC_CHECK(strstr(got, "My Note") == NULL);
+  KBC_CHECK(strstr(got, "kb-title") == NULL);
+  /* Only the title was special-cased, so everything else still landed. */
+  KBC_CHECK(strstr(got, "kb-capture-at: 1700000000") != NULL);
+  free(got);
+  fx_teardown(&f);
+}
+
+/* A key the document already carries is EDITED IN PLACE, not appended: the
+ * original's line-oriented setter rewrites the existing line where it stands
+ * (markdown.rs:384-400), and a new key is appended after it. So the stamped
+ * category keeps the position the author gave it, and the keys that were new
+ * follow the author's own. */
+KBC_TEST(a_capture_edits_a_key_in_place_and_appends_the_rest_after_it) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_capture_input in;
+  full_capture_input(&in,
+                     "---\ntitle: T\nkb-category: hand-written\nx: 1\n---\n"
+                     "Body.\n");
+  kbc_capture_result r;
+  memset(&r, 0, sizeof r);
+  KBC_CHECK_OK(kbc_app_capture(f.app, CORPUS_A, &in, &r, &err));
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, r.path);
+  char *got = kbc_test_read_file(p);
+  KBC_CHECK_NOT_NULL(got);
+  if (got == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK_EQ_STR(
+      got,
+      "---\n"
+      "title: T\n"
+      "kb-category: capture\n"   /* edited where it stood */
+      "x: 1\n"                   /* the author's own key, untouched */
+      "kb-tags: source:upload, from:cli, deep-work, reading-list\n"
+      "kb-capture-original: notes.md\n"
+      "kb-capture-url: https://example.com/a?b=1\n"
+      "kb-capture-at: 1700000000\n"
+      "kb-session: sess-7\n"
+      "kb-expires-at: 1893456000\n"
+      "---\n"
+      "Body.\n");
+  free(got);
+  fx_teardown(&f);
+}
+
+/* kb-session is the one stamped key that refuses to overwrite: the uploaded
+ * content's own session marker is a fact about where the document came from,
+ * and a re-capture must not restamp it (capture.rs:537-542). */
+KBC_TEST(a_capture_does_not_restamp_a_session_the_document_already_carries) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_capture_input in;
+  full_capture_input(&in, "---\ntitle: T\nkb-session: keep-me\n---\nBody.\n");
+  KBC_CHECK_EQ_STR(in.session_id, "sess-7");
+  kbc_capture_result r;
+  memset(&r, 0, sizeof r);
+  KBC_CHECK_OK(kbc_app_capture(f.app, CORPUS_A, &in, &r, &err));
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, r.path);
+  char *got = kbc_test_read_file(p);
+  KBC_CHECK_NOT_NULL(got);
+  if (got == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK(strstr(got, "kb-session: keep-me") != NULL);
+  KBC_CHECK(strstr(got, "sess-7") == NULL);
+  /* Exactly one kb-session line, not a second one appended after it. */
+  size_t hits = 0;
+  for (const char *q = got; (q = strstr(q, "kb-session:")) != NULL; q++) hits++;
+  KBC_CHECK_EQ_INT(hits, 1);
+  free(got);
+  fx_teardown(&f);
+}
+
+/* The writer is line-oriented, so a newline inside an attacker-controlled
+ * value could inject a frontmatter line — or a line reading `---`, closing
+ * the fence early and splicing a whole fake block into the document. */
+KBC_TEST(a_newline_in_an_uploaded_name_cannot_close_the_frontmatter_fence) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_capture_input in;
+  full_capture_input(&in, "body\n");
+  in.original_filename = "evil\n---\nkb-category: smuggled\n---\ntail";
+  kbc_capture_result r;
+  memset(&r, 0, sizeof r);
+  KBC_CHECK_OK(kbc_app_capture(f.app, CORPUS_A, &in, &r, &err));
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, r.path);
+  char *got = kbc_test_read_file(p);
+  KBC_CHECK_NOT_NULL(got);
+  if (got == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK(strstr(got, "\n---\nkb-category: smuggled\n---\n") == NULL);
+  KBC_CHECK(strstr(got,
+                   "kb-capture-original: evil --- kb-category: smuggled --- "
+                   "tail") != NULL);
+  /* Exactly one frontmatter LINE named kb-category, and it is the one the
+   * capture stamped. The smuggled text is still in the file — as the inert
+   * value of kb-capture-original, which is the point — so the count is over
+   * line-initial keys, not over the substring. */
+  size_t cats = 0;
+  for (const char *q = got; (q = strstr(q, "\nkb-category:")) != NULL; q++)
+    cats++;
+  KBC_CHECK_EQ_INT(cats, 1);
+  KBC_CHECK(strstr(got, "\nkb-category: capture\n") != NULL);
+  free(got);
+  fx_teardown(&f);
+}
+
+/* A capture is a REAL file in the corpus: the next pass indexes it, searches
+ * it and mints the id this call already returned. "Physically real, semantically
+ * staged" is the original's phrase and the staging half is asynchronous —
+ * the route answers before the watcher has run. */
+KBC_TEST(a_capture_is_a_document_the_index_picks_up_under_the_id_it_reported) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  kbc_capture_input in;
+  full_capture_input(&in, "# Verdigris\n\nThe digest catalogues verdigris.\n");
+  kbc_capture_result r;
+  memset(&r, 0, sizeof r);
+  KBC_CHECK_OK(kbc_app_capture(f.app, CORPUS_A, &in, &r, &err));
+  /* Not indexed yet: the daemon stages it and the watcher lands it. */
+  KBC_CHECK_EQ_INT(store_count(f.cfg), 3);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  KBC_CHECK_EQ_INT(store_count(f.cfg), 4);
+
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a != NULL) {
+    /* The id the capture reported is the id the index minted, which is only
+     * true because the id is a pure function of (corpus, path). */
+    const char *stored = id_of_path(f.cfg, CORPUS_A, r.path, a);
+    KBC_CHECK_NOT_NULL(stored);
+    if (stored != NULL) KBC_CHECK_EQ_STR(stored, r.id);
+    kbc_arena_free(a);
+  }
+  char path[64], title[64], id[32];
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "verdigris", NULL, path, sizeof path,
+                                  title, sizeof title, id, sizeof id, NULL),
+                   2);
+  KBC_CHECK_EQ_STR(id, r.id);
+  fx_teardown(&f);
+}
+
+/* THE SSRF RULING, as a test. The daemon never fetches a captured URL: the
+ * URL is provenance and nothing else. A listener is bound and pointed at, and
+ * the capture must complete without a single packet reaching it — so a future
+ * reader who helpfully adds a fetch to "enrich" the capture fails here rather
+ * than shipping a server-side request forgery. */
+KBC_TEST(a_capture_records_the_url_without_ever_connecting_to_it) {
+  int lfd = socket(AF_INET, SOCK_STREAM, 0);
+  KBC_CHECK(lfd >= 0);
+  if (lfd < 0) return;
+  int one = 1;
+  setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof addr);
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0; /* the kernel picks a free port */
+  KBC_CHECK(bind(lfd, (struct sockaddr *)&addr, sizeof addr) == 0);
+  KBC_CHECK(listen(lfd, 4) == 0);
+  socklen_t alen = sizeof addr;
+  KBC_CHECK(getsockname(lfd, (struct sockaddr *)&addr, &alen) == 0);
+  char url[128];
+  snprintf(url, sizeof url, "http://127.0.0.1:%u/should-never-be-fetched",
+           (unsigned)ntohs(addr.sin_port));
+
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    close(lfd);
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_capture_input in;
+  full_capture_input(&in, "# Shared\n\nsome shared words\n");
+  in.url = url;
+  in.original_filename = NULL;
+  in.title = "Shared";
+  kbc_capture_result r;
+  memset(&r, 0, sizeof r);
+  KBC_CHECK_OK(kbc_app_capture(f.app, CORPUS_A, &in, &r, &err));
+
+  /* The URL is INERT TEXT in the file. */
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, r.path);
+  char *got = kbc_test_read_file(p);
+  KBC_CHECK_NOT_NULL(got);
+  if (got != NULL) {
+    char line[256];
+    snprintf(line, sizeof line, "kb-capture-url: %s\n", url);
+    KBC_CHECK_MSG(strstr(got, line) != NULL, "no kb-capture-url line in:\n%s",
+                  got);
+    free(got);
+  }
+  /* And nothing connected to it. */
+  struct pollfd pfd;
+  pfd.fd = lfd;
+  pfd.events = POLLIN;
+  pfd.revents = 0;
+  int ready = poll(&pfd, 1, 50);
+  KBC_CHECK_MSG(ready == 0, "a capture connected to the URL it recorded (%d)",
+                ready);
+  close(lfd);
+  fx_teardown(&f);
+}
+
+/* A URL share with no uploaded file: an H1, the URL as a Markdown autolink
+ * and the shared text as a paragraph, tagged so a later reader can tell a
+ * stub from a saved page. The tag keeps its colon, which the slugify would
+ * otherwise collapse to a dash. */
+KBC_TEST(a_url_share_becomes_a_stub_carrying_the_provenance_tag) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_capture_url_input u;
+  memset(&u, 0, sizeof u);
+  u.corpus = CORPUS_A;
+  u.from = "share";
+  u.title = "   "; /* whitespace is not a title */
+  u.url = "https://example.com/page";
+  u.text = "some shared words";
+  u.now_unix = 1700000003;
+  kbc_capture_result r;
+  memset(&r, 0, sizeof r);
+  KBC_CHECK_OK(kbc_app_capture_url_stub(f.app, CORPUS_A, &u, &r, &err));
+  KBC_CHECK_EQ_STR(r.path, "capture/untitled-capture-1700000003.md");
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, r.path);
+  char *got = kbc_test_read_file(p);
+  KBC_CHECK_NOT_NULL(got);
+  if (got == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK_EQ_STR(
+      got,
+      "---\n"
+      "kb-category: capture\n"
+      "kb-tags: source:upload, from:share, kind:url-stub\n"
+      "kb-capture-url: https://example.com/page\n"
+      "kb-capture-at: 1700000003\n"
+      "---\n"
+      "# Untitled capture\n"
+      "\n"
+      "<https://example.com/page>\n"
+      "\n"
+      "some shared words\n");
+  free(got);
+  fx_teardown(&f);
+}
+
+/* The decoder the capture route is built on. It splits a request body into
+ * the fields a capture carries, and it is where a filename first becomes
+ * attacker-controlled text — so the filename has to come out as DATA. */
+KBC_TEST(a_multipart_body_splits_into_the_fields_a_capture_carries) {
+  static const char body[] =
+      "--B\r\n"
+      "Content-Disposition: form-data; name=\"title\"\r\n"
+      "\r\n"
+      "Hello\r\n"
+      "--B\r\n"
+      "Content-Disposition: form-data; name=\"files\"; filename=\"a b.md\"\r\n"
+      "Content-Type: text/markdown\r\n"
+      "\r\n"
+      "# hi\r\n"
+      "--B--\r\n";
+  kbc_arena *a = kbc_arena_new(4096u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) return;
+  kbc_multipart_part parts[8];
+  size_t n = 0;
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_multipart_parse("multipart/form-data; boundary=\"B\"", body,
+                                   strlen(body), parts, 8, &n, a, &err));
+  KBC_CHECK_EQ_INT(n, 2);
+  if (n == 2) {
+    KBC_CHECK_EQ_STR(parts[0].name, "title");
+    KBC_CHECK_NULL(parts[0].filename);
+    KBC_CHECK_EQ_INT(parts[0].len, 5);
+    KBC_CHECK_EQ_STR(parts[0].data, "Hello");
+    KBC_CHECK_EQ_STR(parts[1].name, "files");
+    KBC_CHECK_EQ_STR(parts[1].filename, "a b.md");
+    KBC_CHECK_EQ_INT(parts[1].len, 4);
+    KBC_CHECK_EQ_STR(parts[1].data, "# hi");
+  }
+
+  /* A body that stops before its closing delimiter is malformed. The status
+   * says so, and it is NOT the "your array was too small" status — resizing
+   * would not fix a truncated upload, and a caller sent down the resize road
+   * would loop forever. The count still names the one part that was read
+   * before the body ran out, because the rule is that it always does. */
+  n = 0;
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_multipart_parse("multipart/form-data; boundary=B", body,
+                                   strlen(body) - 6, parts, 8, &n, a, &err),
+                KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(err);
+  KBC_CHECK(strstr(err.msg, "more than") == NULL);
+  KBC_CHECK_EQ_INT(n, 1);
+  if (n == 1) KBC_CHECK_EQ_STR(parts[0].data, "Hello");
+  /* A content type with no boundary parameter is not a multipart body. */
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_multipart_parse("application/json", body, strlen(body),
+                                   parts, 8, &n, a, &err),
+                KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(err);
+  kbc_arena_free(a);
+}
+
+/* A body longer than the caller's array is the case the cap exists for, and
+ * the contract has to serve BOTH callers: the one that reads the status and
+ * resizes, and the one that forgets to.
+ *
+ * The first is what makes the count worth having — *n_out is the TRUE number
+ * of parts, not the number that fitted, so the retry is sized from a fact
+ * about the body rather than a guess about the caller's buffer. The second is
+ * what stops the failure from being silent: the status is a failure, nothing
+ * is written past the array, and *n_out is larger than the array, so a caller
+ * that ignores the status is holding the evidence that it ignored one.
+ *
+ * A truncated array with a success status would be the outcome worth being
+ * afraid of — the first 2 of 3 files captured and a document reported
+ * created — and it is exactly what "count past the cap, return OK" would
+ * produce. */
+KBC_TEST(a_body_longer_than_the_array_reports_the_true_count_so_a_retry_fits) {
+  static const char body[] =
+      "--B\r\n"
+      "Content-Disposition: form-data; name=\"one\"\r\n"
+      "\r\n"
+      "1\r\n"
+      "--B\r\n"
+      "Content-Disposition: form-data; name=\"two\"\r\n"
+      "\r\n"
+      "2\r\n"
+      "--B\r\n"
+      "Content-Disposition: form-data; name=\"three\"\r\n"
+      "\r\n"
+      "3\r\n"
+      "--B--\r\n";
+  kbc_arena *a = kbc_arena_new(4096u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) return;
+  kbc_err err;
+  kbc_err_reset(&err);
+
+  /* Two slots, three parts. */
+  kbc_multipart_part small[2];
+  size_t n = 0;
+  kbc_status s = kbc_multipart_parse("multipart/form-data; boundary=B", body,
+                                     strlen(body), small, 2, &n, a, &err);
+  KBC_CHECK_ERR(s, KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(err);
+  KBC_CHECK_MSG(strstr(err.msg, "more than") != NULL,
+                "the overflow must be distinguishable from a malformed body: "
+                "one is fixed by resizing and the other is not; got \"%s\"",
+                err.msg);
+  KBC_CHECK_EQ_INT(n, 3);
+  /* The two that fitted are real, and nothing was written past the array. */
+  KBC_CHECK_EQ_STR(small[0].name, "one");
+  KBC_CHECK_EQ_STR(small[1].name, "two");
+
+  /* Sized from the number the FAILURE reported, not from a guess and not
+   * from the status alone, the retry succeeds and every part is there —
+   * which is the whole reason the count is worth carrying on a failure. */
+  const size_t need = n;
+  kbc_multipart_part big[3];
+  kbc_err_reset(&err);
+  n = 0;
+  s = kbc_multipart_parse("multipart/form-data; boundary=B", body, strlen(body),
+                          big, need, &n, a, &err);
+  KBC_CHECK_OK(s);
+  KBC_CHECK_EQ_INT(n, 3);
+  if (n == 3) {
+    KBC_CHECK_EQ_STR(big[0].name, "one");
+    KBC_CHECK_EQ_STR(big[0].data, "1");
+    KBC_CHECK_EQ_STR(big[1].name, "two");
+    KBC_CHECK_EQ_STR(big[1].data, "2");
+    KBC_CHECK_EQ_STR(big[2].name, "three");
+    KBC_CHECK_EQ_STR(big[2].data, "3");
+  }
+  kbc_arena_free(a);
+}
+
+/* =================================================================== mv == */
+
+/* A rename is a removal plus a creation, so everything a removal deliberately
+ * leaves behind and a creation cannot rebuild has to be carried across
+ * explicitly — otherwise `mv` is a silent data loss wearing a rename's name.
+ * The id changes (it is a function of the path), so every row keyed on it
+ * would be orphaned: the comment thread, the pin, the corkboard entry. */
+KBC_TEST(a_move_carries_the_comments_the_pin_and_the_corkboard_across) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  const char *old_id = id_of_path(f.cfg, CORPUS_A, "c.md", a);
+  KBC_CHECK_NOT_NULL(old_id);
+  if (old_id == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  char old_id_copy[KBC_MAX_ID_LEN + 1];
+  memcpy(old_id_copy, old_id, sizeof old_id_copy);
+  kbc_store *st = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(st);
+  if (st == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK_OK(kbc_store_add_comment(st, old_id_copy, "section:digest", "nik",
+                                     "worth keeping", &err));
+  KBC_CHECK_OK(kbc_store_add_corkboard(st, old_id_copy, 1700, &err));
+  KBC_CHECK_OK(kbc_store_pin_memory(st, old_id_copy, 1701, &err));
+  kbc_store_close(st);
+  KBC_CHECK_EQ_INT(comment_count(f.cfg, old_id_copy, a), 1);
+
+  KBC_CHECK_OK(kbc_app_move_path(f.app, CORPUS_A, "c.md", "notes/renamed.md",
+                                 &err));
+
+  /* The id is a function of the path, so the move necessarily mints a new
+   * one — which is exactly why the rows keyed on it had to be carried. */
+  const char *new_id = id_of_path(f.cfg, CORPUS_A, "notes/renamed.md", a);
+  KBC_CHECK_NOT_NULL(new_id);
+  if (new_id == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK(strcmp(new_id, old_id_copy) != 0);
+  KBC_CHECK_EQ_INT(comment_count(f.cfg, new_id, a), 1);
+  KBC_CHECK_EQ_INT(corkboard_entries(f.cfg, new_id, a), 1);
+  KBC_CHECK_EQ_INT(pins_of(f.cfg, new_id, a), 1);
+  /* And none of it is left behind on the dead id, which is what makes the
+   * carry a move rather than a copy. */
+  KBC_CHECK_EQ_INT(comment_count(f.cfg, old_id_copy, a), 0);
+  KBC_CHECK_EQ_INT(corkboard_entries(f.cfg, old_id_copy, a), 0);
+  KBC_CHECK_EQ_INT(pins_of(f.cfg, old_id_copy, a), 0);
+  /* The timestamps the user set came with it: a pin re-pinned "now" is a
+   * pin the user did not make. */
+  KBC_CHECK_EQ_INT(pins_of(f.cfg, new_id, a), 1);
+  char p_old[KBC_TEST_PATH_MAX], p_new[KBC_TEST_PATH_MAX];
+  join(p_old, sizeof p_old, f.corpus_a, "c.md");
+  join(p_new, sizeof p_new, f.corpus_a, "notes/renamed.md");
+  KBC_CHECK(kbc_path_exists(p_old) == false);
+  KBC_CHECK(kbc_path_exists(p_new) == true);
+  KBC_CHECK_EQ_INT(store_count(f.cfg), 3);
+  kbc_arena_free(a);
+  fx_teardown(&f);
+}
+
+/* The resolution flag is a decision about a thread, exactly as a pin is, so
+ * it comes across with the thread. kbc_store_add_comment mints it false,
+ * which is precisely why this needs its own case. */
+KBC_TEST(a_resolved_comment_is_still_resolved_after_a_move) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  const char *old_id = id_of_path(f.cfg, CORPUS_A, "c.md", a);
+  KBC_CHECK_NOT_NULL(old_id);
+  if (old_id == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  char old_id_copy[KBC_MAX_ID_LEN + 1];
+  memcpy(old_id_copy, old_id, sizeof old_id_copy);
+  kbc_store *st = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(st);
+  if (st == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  kbc_comment *cs = NULL;
+  size_t n_cs = 0;
+  KBC_CHECK_OK(kbc_store_add_comment(st, old_id_copy, "section:digest", "nik",
+                                     "done", &err));
+  KBC_CHECK_OK(kbc_store_list_comments(st, a, old_id_copy, 16, &cs, &n_cs, &err));
+  KBC_CHECK_EQ_INT(n_cs, 1);
+  if (n_cs == 1) {
+    KBC_CHECK_OK(
+        kbc_store_set_comment_resolved(st, cs[0].id, true, &err));
+  }
+  kbc_store_close(st);
+
+  KBC_CHECK_OK(kbc_app_move_path(f.app, CORPUS_A, "c.md", "moved.md", &err));
+  const char *new_id = id_of_path(f.cfg, CORPUS_A, "moved.md", a);
+  KBC_CHECK_NOT_NULL(new_id);
+  if (new_id != NULL) {
+    st = kbc_store_open(f.cfg, &err);
+    KBC_CHECK_NOT_NULL(st);
+    if (st != NULL) {
+      kbc_comment *after = NULL;
+      size_t n_after = 0;
+      KBC_CHECK_OK(kbc_store_list_comments(st, a, new_id, 16, &after, &n_after,
+                                          &err));
+      KBC_CHECK_EQ_INT(n_after, 1);
+      if (n_after == 1) {
+        KBC_CHECK_EQ_STR(after[0].anchor, "section:digest");
+        KBC_CHECK_EQ_STR(after[0].body, "done");
+        KBC_CHECK_MSG(after[0].resolved,
+                      "a resolved comment came back unresolved after a move");
+      }
+      kbc_store_close(st);
+ }
+  }
+  kbc_arena_free(a);
+  fx_teardown(&f);
+}
+
+/* What a move refuses, and what it refuses it BEFORE touching: a target that
+ * exists is a conflict, a source that is not a file is a miss, a source the
+ * store has never seen is a miss (moving it would silently create a
+ * document), and a path that climbs out of the corpus never reaches the
+ * filesystem at all. */
+KBC_TEST(a_move_refuses_its_bad_targets_before_it_touches_anything) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  KBC_CHECK_ERR(kbc_app_move_path(f.app, CORPUS_A, "c.md", "a.md", &err),
+                KBC_ERR_CONFLICT);
+  KBC_CHECK_ERR_MSG(err);
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_app_move_path(f.app, CORPUS_A, "c.md", "../out.md", &err),
+                KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(err);
+  kbc_err_reset(&err);
+  /* A corpus that is not configured, and a null app, are refusals too. */
+  KBC_CHECK_ERR(
+      kbc_app_move_path(f.app, CORPUS_B, "c.md", "fresh.md", &err),
+      KBC_ERR_NOTFOUND);
+  KBC_CHECK_ERR_MSG(err);
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_app_move_path(NULL, CORPUS_A, "c.md", "fresh.md", &err),
+                KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(err);
+  kbc_err_reset(&err);
+
+  /* c.md is still where it was, and the corpus is untouched by every one of
+   * those refusals: a refused move must not half-apply. */
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, "c.md");
+  KBC_CHECK(kbc_path_exists(p) == true);
+  KBC_CHECK_EQ_INT(store_count(f.cfg), 3);
+  fx_teardown(&f);
+}
+
+/* A file on disk that the store has never indexed is not a document to move:
+ * moving it would create one, which is a write the caller did not ask for.
+ * A file that is not there at all is a miss. */
+KBC_TEST(a_move_of_a_file_the_store_has_never_seen_is_refused) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  /* A .txt is on disk and is not a document: the walk declines it, so the
+   * store has no row. Moving it would create one. */
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, "stray.txt");
+  kbc_test_write_file(p, "never indexed.\n");
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  KBC_CHECK_EQ_INT(store_count(f.cfg), 3);
+
+  KBC_CHECK_ERR(
+      kbc_app_move_path(f.app, CORPUS_A, "stray.txt", "moved.txt", &err),
+      KBC_ERR_NOTFOUND);
+  KBC_CHECK_ERR_MSG(err);
+  KBC_CHECK(kbc_path_exists(p) == true);
+  char q[KBC_TEST_PATH_MAX];
+  join(q, sizeof q, f.corpus_a, "moved.txt");
+  KBC_CHECK(kbc_path_exists(q) == false);
+  KBC_CHECK_EQ_INT(store_count(f.cfg), 3);
+
+  /* And a file that is not there at all is a miss, not a silent success. */
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(
+      kbc_app_move_path(f.app, CORPUS_A, "not-there.md", "moved.md", &err),
+      KBC_ERR_NOTFOUND);
+  KBC_CHECK_ERR_MSG(err);
+  fx_teardown(&f);
+}
+
+/* The one field a move cannot rebuild from the document's bytes: WHEN a
+ * comment was made. kbc_store_add_comment MINTS created_at, so the only way a
+ * carried comment used to keep its own was to re-add it — which stamped it
+ * "now". A body-only assertion would have passed on that version, so this one
+ * compares the stored string.
+ *
+ * The wait is what makes it a test rather than a coin flip. The seed and the
+ * move both mint at second granularity, so a move in the same second as the
+ * seed would compare equal whatever the code did. Crossing a second boundary
+ * first makes "now" and "then" two different values, and the mutation fires. */
+KBC_TEST(a_comment_carried_across_a_move_keeps_the_second_it_was_made) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  const char *old_id = id_of_path(f.cfg, CORPUS_A, "c.md", a);
+  KBC_CHECK_NOT_NULL(old_id);
+  if (old_id == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  char old_id_copy[KBC_MAX_ID_LEN + 1];
+  memcpy(old_id_copy, old_id, sizeof old_id_copy);
+
+  char seeded_at[32];
+  char seeded_cid[64];
+  seeded_at[0] = '\0';
+  seeded_cid[0] = '\0';
+  kbc_store *st = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(st);
+  if (st == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK_OK(kbc_store_add_comment(st, old_id_copy, "section:digest", "nik",
+                                     "worth keeping", &err));
+  kbc_comment *before = NULL;
+  size_t n_before = 0;
+  KBC_CHECK_OK(
+      kbc_store_list_comments(st, a, old_id_copy, 16, &before, &n_before, &err));
+  KBC_CHECK_EQ_INT(n_before, 1);
+  if (n_before == 1) {
+    snprintf(seeded_at, sizeof seeded_at, "%s", before[0].created_at);
+    snprintf(seeded_cid, sizeof seeded_cid, "%s", before[0].id);
+  }
+  kbc_store_close(st);
+
+  /* Cross a second boundary, so any timestamp minted from here on differs
+   * from the one just recorded. */
+  time_t edge = time(NULL);
+  while (time(NULL) == edge) {
+    nap_ms(20);
+  }
+
+  KBC_CHECK_OK(kbc_app_move_path(f.app, CORPUS_A, "c.md", "notes/stamped.md",
+                                 &err));
+  const char *new_id = id_of_path(f.cfg, CORPUS_A, "notes/stamped.md", a);
+  KBC_CHECK_NOT_NULL(new_id);
+  if (new_id != NULL) {
+    st = kbc_store_open(f.cfg, &err);
+    KBC_CHECK_NOT_NULL(st);
+    if (st != NULL) {
+      kbc_comment *after = NULL;
+      size_t n_after = 0;
+      KBC_CHECK_OK(kbc_store_list_comments(st, a, new_id, 16, &after, &n_after,
+                                          &err));
+      KBC_CHECK_EQ_INT(n_after, 1);
+      if (n_after == 1) {
+        KBC_CHECK_EQ_STR(after[0].body, "worth keeping");
+        KBC_CHECK_MSG(strcmp(after[0].created_at, seeded_at) == 0,
+                      "the carried comment is stamped \"%s\"; it was made at "
+                      "\"%s\", and a rename is not the moment it was made",
+                      after[0].created_at, seeded_at);
+        /* The id too: the store re-keys `comments` by doc_id alone, so the
+         * minted primary key is carried rather than reminted. */
+        KBC_CHECK_MSG(strcmp(after[0].id, seeded_cid) == 0,
+                      "the carried comment is a different comment: id \"%s\", "
+                      "it was \"%s\"", after[0].id, seeded_cid);
+      }
+      kbc_store_close(st);
+    }
+  }
+  kbc_arena_free(a);
+  fx_teardown(&f);
+}
+
+/* The silent-anchor-loss bug. The corkboard listing is a PAGE — the N most
+ * RECENT anchors — so a document anchored early is simply not in it, and a
+ * move that read the anchor that way concluded the document had none and
+ * dropped it with nothing anywhere reporting a loss. Filling the page past
+ * the document's own anchor is what makes that reachable: with the anchor
+ * among the newest it survives by luck, which is why this needs its own case
+ * rather than an assertion added to the general carry test. */
+KBC_TEST(a_corkboard_anchor_older_than_the_listing_page_survives_a_move) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  const char *old_id = id_of_path(f.cfg, CORPUS_A, "c.md", a);
+  KBC_CHECK_NOT_NULL(old_id);
+  if (old_id == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  char old_id_copy[KBC_MAX_ID_LEN + 1];
+  memcpy(old_id_copy, old_id, sizeof old_id_copy);
+
+  kbc_store *st = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(st);
+  if (st == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  /* The document's own anchor, the OLDEST in the table. */
+  KBC_CHECK_OK(kbc_store_add_corkboard(st, old_id_copy, 1000, &err));
+  /* KBC_MAX_HITS rows, every one of them newer, so a page of the listing
+   * covers all of them and none of the document. The ids need not exist:
+   * corkboard has no foreign key to artifacts, and only the ordering and the
+   * count are load-bearing here. */
+  for (size_t i = 0; i < (size_t)KBC_MAX_HITS; i++) {
+    char filler[16];
+    snprintf(filler, sizeof filler, "f%011zx", i);
+    kbc_status fs =
+        kbc_store_add_corkboard(st, filler, (int64_t)2000 + (int64_t)i, &err);
+    if (kbc_failed(fs)) {
+      KBC_CHECK_OK(fs);
+      break;
+    }
+  }
+
+  /* THE PREMISE, CHECKED. A test that only asserts the anchor survived proves
+   * nothing about the page bug unless the page really does exclude it, and
+   * "the listing is a page" is the store's contract rather than this file's
+   * to assume. So the page is read here, before the move, and the document is
+   * looked for in it: a version of this that read the anchor that way found
+   * nothing and dropped it with no error anywhere. */
+  {
+    kbc_corkboard_row *page = NULL;
+    size_t n_page = 0;
+    kbc_err_reset(&err);
+    kbc_status ps = kbc_store_list_corkboard(st, a, (size_t)KBC_MAX_HITS, &page,
+                                              &n_page, &err);
+    KBC_CHECK_OK(ps);
+    bool in_page = false;
+    for (size_t i = 0; ps == KBC_OK && i < n_page; i++) {
+      if (page[i].artifact_id != NULL &&
+          strcmp(page[i].artifact_id, old_id_copy) == 0) {
+        in_page = true;
+      }
+    }
+    KBC_CHECK_MSG(!in_page,
+                  "the document's anchor IS in the newest-%zu page, so this "
+                  "case does not reach the bug it is for", (size_t)KBC_MAX_HITS);
+  }
+  kbc_store_close(st);
+
+  KBC_CHECK_OK(kbc_app_move_path(f.app, CORPUS_A, "c.md", "anchored.md", &err));
+  const char *new_id = id_of_path(f.cfg, CORPUS_A, "anchored.md", a);
+  KBC_CHECK_NOT_NULL(new_id);
+  if (new_id != NULL) {
+    char new_id_copy[KBC_MAX_ID_LEN + 1];
+    memcpy(new_id_copy, new_id, KBC_MAX_ID_LEN);
+    new_id_copy[KBC_MAX_ID_LEN] = '\0';
+    /* The page again, to be sure the answer below is not the one the old code
+     * would have got: if the anchor is present under the new id AND still
+     * outside the newest-KBC_MAX_HITS page, only a point read can see it. */
+    db_side side;
+    memset(&side, 0, sizeof side);
+    KBC_CHECK(db_side_open(&side, f.cfg));
+    int64_t carried = corkboard_at_for(&side, new_id_copy);
+    KBC_CHECK_MSG(carried == 1000,
+                  "the anchor did not survive the move: %s was anchored at 1000 "
+                  "before it and reads back as %lld after",
+                  old_id_copy, (long long)carried);
+    /* And it is a move, not a copy: nothing is left on the dead id. */
+    KBC_CHECK_MSG(corkboard_at_for(&side, old_id_copy) == -1,
+                  "an anchor is still on the dead id %s, so the move copied the "
+                  "corkboard instead of moving it", old_id_copy);
+    if (side.db != NULL) sqlite3_close(side.db);
+  }
+  kbc_arena_free(a);
+  fx_teardown(&f);
+}
+
+/* A rename that dies between the two operations nobody can see must leave a
+ * LISTABLE signal, not a document that quietly disappeared. The intent row is
+ * written before the rename and stamped after the rekey, so an interrupted
+ * move is a row with no completed_at — and it is deliberately NOT a
+ * redirect: following it would resolve the document to a name the rename
+ * never reached. */
+KBC_TEST(an_interrupted_move_is_listed_and_is_not_yet_a_redirect) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  const char *old_id = id_of_path(f.cfg, CORPUS_A, "c.md", a);
+  KBC_CHECK_NOT_NULL(old_id);
+  if (old_id == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  char old_id_copy[KBC_MAX_ID_LEN + 1];
+  memcpy(old_id_copy, old_id, sizeof old_id_copy);
+  /* A move of a document that does not exist, which is what an interrupted
+   * one looks like from the table's side. It is a DIFFERENT old id from the
+   * document below on purpose: kbc_store_complete_move stamps every
+   * in-flight row naming the id it is given, so sharing one would have the
+   * app's completion silently converge this row too. */
+  static const char ghost[KBC_MAX_ID_LEN + 1] = "aaaaaaaaaaaa";
+  char staged[KBC_MAX_ID_LEN + 1];
+  kbc_id_for_artifact(staged, CORPUS_A, "ghost.md");
+
+  /* A completed move leaves nothing for bring-up to converge. */
+  kbc_store *st = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(st);
+  if (st == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  kbc_strlist ids, rels;
+  kbc_strlist_init(&ids);
+  kbc_strlist_init(&rels);
+  KBC_CHECK_OK(kbc_store_list_incomplete_moves(st, &ids, &rels, &err));
+  KBC_CHECK_EQ_INT(ids.len, 0);
+  kbc_strlist_free(&ids);
+  kbc_strlist_free(&rels);
+
+  /* Now the crash: recorded, never completed. */
+  KBC_CHECK_OK(
+      kbc_store_record_move(st, ghost, staged, "ghost.md", "ghosted.md", 1700,
+                            &err));
+  kbc_strlist_init(&ids);
+  kbc_strlist_init(&rels);
+  KBC_CHECK_OK(kbc_store_list_incomplete_moves(st, &ids, &rels, &err));
+  KBC_CHECK_MSG(ids.len == 1,
+                "an interrupted move is not listed: bring-up has nothing to "
+                "converge and the document is just gone");
+  if (ids.len == 1) {
+    KBC_CHECK_EQ_STR(ids.items[0], ghost);
+    KBC_CHECK_EQ_STR(rels.items[0], "ghost.md");
+  }
+  kbc_strlist_free(&ids);
+  kbc_strlist_free(&rels);
+
+  /* And it is NOT a redirect yet: an unstamped row names a rename that never
+   * finished, so following it would hand the caller a document that is not
+   * there. */
+  kbc_strlist hops;
+  kbc_strlist_init(&hops);
+  KBC_CHECK_OK(kbc_store_moves_lookup(st, ghost, &hops, &err));
+  KBC_CHECK_MSG(hops.len == 0,
+                "an interrupted move redirected %s to %s, a name the rename "
+                "never reached", ghost, hops.len ? hops.items[0] : "?");
+  kbc_strlist_free(&hops);
+  kbc_store_close(st);
+
+  /* A move the app completes is the opposite: recorded and stamped, so the
+   * redirect is live and bring-up has nothing left to do. */
+  KBC_CHECK_OK(kbc_app_move_path(f.app, CORPUS_A, "c.md", "finished.md", &err));
+  st = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(st);
+  if (st != NULL) {
+    kbc_strlist_init(&ids);
+    kbc_strlist_init(&rels);
+    KBC_CHECK_OK(kbc_store_list_incomplete_moves(st, &ids, &rels, &err));
+    KBC_CHECK_MSG(ids.len == 1,
+                  "the app's own completed move is still listed as incomplete: "
+                  "%zu rows, and only the hand-written one should be", ids.len);
+    kbc_strlist_free(&ids);
+    kbc_strlist_free(&rels);
+    kbc_strlist_init(&hops);
+    KBC_CHECK_OK(kbc_store_moves_lookup(st, old_id_copy, &hops, &err));
+    KBC_CHECK_MSG(hops.len == 1,
+                  "a completed move does not redirect: %zu hops for %s", hops.len,
+                  old_id_copy);
+    if (hops.len == 1) {
+      KBC_CHECK_EQ_STR(hops.items[0], id_of_path(f.cfg, CORPUS_A, "finished.md", a));
+    }
+    kbc_strlist_free(&hops);
+    kbc_store_close(st);
+  }
+  kbc_arena_free(a);
+  fx_teardown(&f);
+}
+
+/* A bookmark to the old id. The id is a function of (corpus, path), so the
+ * move necessarily mints a new one, and every id handed out before it names
+ * a document that still exists under a name the holder does not know. The
+ * walk is chain-following, so a bookmark made before TWO renames lands on the
+ * second — which a single-hop redirect would get wrong. */
+KBC_TEST(a_stale_id_resolves_to_the_document_after_a_move) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  const char *id0 = id_of_path(f.cfg, CORPUS_A, "c.md", a);
+  KBC_CHECK_NOT_NULL(id0);
+  if (id0 == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  char id0_copy[KBC_MAX_ID_LEN + 1];
+  memcpy(id0_copy, id0, sizeof id0_copy);
+
+  KBC_CHECK_OK(kbc_app_move_path(f.app, CORPUS_A, "c.md", "moved.md", &err));
+  /* COPIED, not aliased: id_of_path hands back arena memory, and the
+   * get_artifact below allocates into the same arena and may land on the
+   * same block. Comparing the two pointers would be comparing an id with
+   * itself. */
+  char new_id[KBC_MAX_ID_LEN + 1];
+  new_id[0] = '\0';
+  const char *moved = id_of_path(f.cfg, CORPUS_A, "moved.md", a);
+  KBC_CHECK_NOT_NULL(moved);
+  if (moved != NULL) {
+    memcpy(new_id, moved, KBC_MAX_ID_LEN);
+    new_id[KBC_MAX_ID_LEN] = '\0';
+  }
+  KBC_CHECK(strcmp(new_id, id0_copy) != 0);
+  if (moved != NULL) {
+    kbc_artifact art;
+    memset(&art, 0, sizeof art);
+    kbc_status gs = kbc_app_get_artifact(f.app, a, id0_copy, false, &art, &err);
+    KBC_CHECK_OK(gs);
+    /* Guarded, not assumed: a failed get leaves every field NULL, and reading
+     * one of those is a segfault that hides the assertion that mattered. */
+    if (gs == KBC_OK) {
+      KBC_CHECK_MSG(strcmp(art.id, id0_copy) != 0,
+                    "the stale id %s resolved to itself, so the move is "
+                    "invisible", id0_copy);
+      KBC_CHECK_EQ_STR(art.id, new_id);
+      KBC_CHECK_EQ_STR(art.path, "moved.md");
+      KBC_CHECK_EQ_STR(art.corpus, CORPUS_A);
+    }
+  }
+
+  /* Twice over: the bookmark follows the CHAIN. Stopping at the first hop
+   * would hand back an id that was itself renamed away, which is the same
+   * dead bookmark under a different name. */
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_move_path(f.app, CORPUS_A, "moved.md", "moved2.md",
+                                 &err));
+  char new2_id[KBC_MAX_ID_LEN + 1];
+  new2_id[0] = '\0';
+  const char *moved2 = id_of_path(f.cfg, CORPUS_A, "moved2.md", a);
+  KBC_CHECK_NOT_NULL(moved2);
+  if (moved2 != NULL) {
+    memcpy(new2_id, moved2, KBC_MAX_ID_LEN);
+    new2_id[KBC_MAX_ID_LEN] = '\0';
+  }
+  KBC_CHECK(strcmp(new2_id, new_id) != 0);
+  if (moved2 != NULL) {
+    kbc_artifact art;
+    memset(&art, 0, sizeof art);
+    kbc_status gs = kbc_app_get_artifact(f.app, a, id0_copy, false, &art, &err);
+    KBC_CHECK_OK(gs);
+    if (gs == KBC_OK) {
+      KBC_CHECK_MSG(strcmp(art.id, id0_copy) != 0,
+                    "a bookmark from before the FIRST rename resolved to itself");
+      KBC_CHECK_EQ_STR(art.id, new2_id);
+      KBC_CHECK_EQ_STR(art.path, "moved2.md");
+    }
+  }
+
+  /* An id that never moved is still an honest miss, not a redirect to
+   * something arbitrary and not a crash. */
+  kbc_err_reset(&err);
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  KBC_CHECK_ERR(
+      kbc_app_get_artifact(f.app, a, "000000000000", false, &art, &err),
+      KBC_ERR_NOTFOUND);
+  KBC_CHECK_ERR_MSG(err);
+  kbc_arena_free(a);
   fx_teardown(&f);
 }
 
@@ -5290,6 +6556,44 @@ int main(void) {
      delete_by_path_takes_the_document_and_announces_it},
     {"delete_by_path_refuses_a_bad_target_and_forgives_an_absent_one",
      delete_by_path_refuses_a_bad_target_and_forgives_an_absent_one},
+    {"a_capture_writes_the_originals_keys_in_the_originals_order",
+     a_capture_writes_the_originals_keys_in_the_originals_order},
+    {"the_same_bytes_captured_twice_are_byte_identical",
+     the_same_bytes_captured_twice_are_byte_identical},
+    {"a_capture_never_touches_the_titles_title_already_has",
+     a_capture_never_touches_the_titles_title_already_has},
+    {"a_capture_edits_a_key_in_place_and_appends_the_rest_after_it",
+     a_capture_edits_a_key_in_place_and_appends_the_rest_after_it},
+    {"a_capture_does_not_restamp_a_session_the_document_already_carries",
+     a_capture_does_not_restamp_a_session_the_document_already_carries},
+    {"a_newline_in_an_uploaded_name_cannot_close_the_frontmatter_fence",
+     a_newline_in_an_uploaded_name_cannot_close_the_frontmatter_fence},
+    {"a_capture_is_a_document_the_index_picks_up_under_the_id_it_reported",
+     a_capture_is_a_document_the_index_picks_up_under_the_id_it_reported},
+    {"a_capture_records_the_url_without_ever_connecting_to_it",
+     a_capture_records_the_url_without_ever_connecting_to_it},
+    {"a_url_share_becomes_a_stub_carrying_the_provenance_tag",
+     a_url_share_becomes_a_stub_carrying_the_provenance_tag},
+    {"a_multipart_body_splits_into_the_fields_a_capture_carries",
+     a_multipart_body_splits_into_the_fields_a_capture_carries},
+    {"a_body_longer_than_the_array_reports_the_true_count_so_a_retry_fits",
+     a_body_longer_than_the_array_reports_the_true_count_so_a_retry_fits},
+    {"a_move_carries_the_comments_the_pin_and_the_corkboard_across",
+     a_move_carries_the_comments_the_pin_and_the_corkboard_across},
+    {"a_resolved_comment_is_still_resolved_after_a_move",
+     a_resolved_comment_is_still_resolved_after_a_move},
+    {"a_move_refuses_its_bad_targets_before_it_touches_anything",
+     a_move_refuses_its_bad_targets_before_it_touches_anything},
+    {"a_move_of_a_file_the_store_has_never_seen_is_refused",
+     a_move_of_a_file_the_store_has_never_seen_is_refused},
+    {"a_comment_carried_across_a_move_keeps_the_second_it_was_made",
+     a_comment_carried_across_a_move_keeps_the_second_it_was_made},
+    {"a_corkboard_anchor_older_than_the_listing_page_survives_a_move",
+     a_corkboard_anchor_older_than_the_listing_page_survives_a_move},
+    {"an_interrupted_move_is_listed_and_is_not_yet_a_redirect",
+     an_interrupted_move_is_listed_and_is_not_yet_a_redirect},
+    {"a_stale_id_resolves_to_the_document_after_a_move",
+     a_stale_id_resolves_to_the_document_after_a_move},
       {"chunk_zero_is_title_plus_headings", chunk_zero_is_title_plus_headings},
       {"short_body_is_a_single_window", short_body_is_a_single_window},
       {"long_body_splits_into_overlapping_windows",

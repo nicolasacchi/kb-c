@@ -39,6 +39,7 @@
 #include "kbc/json.h"
 #include "kbc/log.h"
 #include "kbc/markdown.h"
+#include "kbc/parse.h"
 
 #define KBC_EPOLL_MAX_EVENTS 64
 #define KBC_EPOLL_TIMEOUT_MS 200
@@ -99,10 +100,13 @@ static int hex_val(unsigned char c) {
 
 /* RFC 7807 `title`: the reason phrase for the status, so a client that drops
  * the body still has something to show. 429 is here because the per-connection
- * request cap answers with it. */
+ * request cap answers with it; 201 and 415 are here because the capture route
+ * creates documents and gates their extension, and a reason phrase that read
+ * "Error" on a 201 would be the daemon disagreeing with itself on the wire. */
 static const char *status_text(int status) {
   switch (status) {
   case 200: return "OK";
+  case 201: return "Created";
   case 202: return "Accepted";
   case 204: return "No Content";
   case 400: return "Bad Request";
@@ -110,8 +114,10 @@ static const char *status_text(int status) {
   case 403: return "Forbidden";
   case 404: return "Not Found";
   case 405: return "Method Not Allowed";
+  case 409: return "Conflict";
   case 413: return "Payload Too Large";
   case 414: return "URI Too Long";
+  case 415: return "Unsupported Media Type";
   case 429: return "Too Many Requests";
   case 500: return "Internal Server Error";
   case 503: return "Service Unavailable";
@@ -121,7 +127,9 @@ static const char *status_text(int status) {
 
 /* RFC 7807 `type`, a stable URN per status. A client dispatches on this, never
  * on the human `title`; the mapping is deliberately one slug per status so a
- * new call site cannot invent a new type by accident. */
+ * new call site cannot invent a new type by accident. 409 and 415 are the
+ * capture route's: a destination that cannot be written RIGHT NOW, and a file
+ * whose extension this corpus will not index. */
 static const char *problem_type(int status) {
   switch (status) {
   case 400: return "urn:kb:errors:bad-request";
@@ -129,14 +137,17 @@ static const char *problem_type(int status) {
   case 403: return "urn:kb:errors:forbidden";
   case 404: return "urn:kb:errors:not-found";
   case 405: return "urn:kb:errors:method-not-allowed";
+  case 409: return "urn:kb:errors:conflict";
   case 413: return "urn:kb:errors:payload-too-large";
   case 414: return "urn:kb:errors:uri-too-long";
+  case 415: return "urn:kb:errors:unsupported-media-type";
   case 429: return "urn:kb:errors:too-many-requests";
   case 500: return "urn:kb:errors:internal";
   case 503: return "urn:kb:errors:unavailable";
   default: return "urn:kb:errors:error";
   }
 }
+
 
 /* ---------------------------------------------------------- (1) plumbing -- */
 
@@ -258,6 +269,16 @@ struct kbc_worker {
   size_t zomb_len, zomb_cap;
 };
 
+/* One entry of the STALE set: the (artifact_id, comment_id) pair the original
+ * keys its `anchor_state` map on (indexer.rs:3036). Fixed-width, because the
+ * store mints both ids through `mint_id` at KBC_MAX_ID_LEN hex characters and
+ * a comment id that did not fit would be a row this pass cannot key — the
+ * pass refuses it loudly rather than tracking half of it. */
+typedef struct {
+  char doc_id[KBC_MAX_ID_LEN + 1];
+  char comment_id[KBC_MAX_ID_LEN + 1];
+} anchor_key;
+
 struct kbc_httpd {
   kbc_app *app;
   const kbc_config *cfg; /* BORROWED; the daemon outlives its httpd anyway */
@@ -305,6 +326,18 @@ struct kbc_httpd {
    * kb-c serves no web UI, so there is no legitimate cross-origin caller. */
   kbc_strlist cors;
   size_t rate_limit; /* requests per connection per second, 0 disables */
+  /* Anchor re-evaluation, the state behind `comment.anchor_stale` and
+   * `comment.anchor_resolved`. Guarded by `anchors_mu`, which is ALSO the
+   * single-owner lock for the pass: the workers' tick takes it with trylock,
+   * so N workers tick and exactly one of them scans. That is the same
+   * discipline as `all_conns`/`conns_mu` — shared state, mutated from more
+   * than one thread, one lock, initialised in start and destroyed in stop
+   * alongside the other two. Nothing here is read without it. */
+  pthread_mutex_t anchors_mu;
+  anchor_key *anchors; /* KBC_OWN; the STALE set */
+  size_t anchors_len, anchors_cap;
+  atomic_bool anchors_dirty; /* set by `index.updated`, consumed by the pass */
+
 };
 
 /* -------------------------------------------------------- response bits -- */
@@ -1116,11 +1149,23 @@ static kbc_status route_artifact_one(kbc_app *app, kbc_arena *a, const char *id,
   return artifact_json(out, app, a, &art, with_source);
 }
 
-static kbc_status route_reindex(kbc_app *app, kbc_str *out, kbc_err *err) {
+/* Defined with the event plumbing, below: the re-index has just committed, so
+ * this is the one place the anchor pass can run where its events are in the
+ * ring before the response is written. */
+static void anchors_run(kbc_httpd *h);
+
+static kbc_status route_reindex(kbc_app *app, kbc_httpd *h, kbc_str *out,
+                                kbc_err *err) {
   int64_t t0 = kbc_now_ns();
   kbc_status st = kbc_app_reindex(app, err);
   if (kbc_failed(st)) return st;
   int64_t took_us = (kbc_now_ns() - t0) / 1000;
+  /* The re-index's own `index.updated` has already been published and fanned
+   * out by the time this returns, so the pass below is not racing the fan-out
+   * and its events are already in the ring. That is the whole reason this
+   * route runs the pass synchronously and the worker tick only has to cover
+   * the watcher, which has no route. */
+  anchors_run(h);
   kbc_app_stats stats;
   memset(&stats, 0, sizeof stats);
   kbc_err local;
@@ -1571,6 +1616,22 @@ typedef struct {
   const metrics_reg *m; /* NULL for a socketless handle */
   bool *unmatched;      /* out; may be NULL */
   const char *x_kb_token; /* borrowed X-Kb-Token value, "" when absent */
+  /* The request's Content-Type, BORROWED from the connection's header table,
+   * "" when absent. It rides here for the reason x_kb_token does, but this
+   * one is load-bearing rather than optional: a multipart body's boundary
+   * lives in it, so the capture route cannot split a body without it. */
+  const char *content_type;
+  /* `X-Requested-By`, the provenance header the original's from_default reads
+   * (capture.rs:129-137). BORROWED, "" when absent. */
+  const char *x_requested_by;
+  /* The daemon this request arrived on, or NULL for a socketless one. The only
+   * route that needs it is `POST /api/reindex`, which owns the anchor pass's
+   * synchronous half — the pass's state lives on the httpd, and there is no
+   * back-pointer from a kbc_app to the httpd serving it. A NULL here is not a
+   * degraded mode: `anchors_run(NULL)` is a no-op, so the socketless handle
+   * simply re-indexes without judging anchors, exactly as a build with no
+   * httpd at all would. */
+  struct kbc_httpd *h;
 } req_ctx;
 
 /* (5)'s two dispatched routes, defined with the rest of the serving surface. */
@@ -1587,6 +1648,1098 @@ static kbc_status route_prometheus(kbc_app *app, const metrics_reg *m,
  * (`dispatch.rs:51-59`, `:88-96`). */
 static bool path_is_api(const char *p) {
   return strncmp(p, "/api", 4) == 0 && (p[4] == '\0' || p[4] == '/');
+}
+/* ------------------------------------------------------ the /api/links --
+ *
+ * Three read endpoints, ported from `routes/links.rs`. What they have in
+ * common is that every row they emit is a fact the graph already holds, so
+ * the whole section is built on the SAME two primitives the write path uses:
+ * `kbc_parsed_links` for extraction and `kbc_resolve_index` for resolution.
+ * That is not a convenience — it is the invariant. The original says so at
+ * links.rs:16-18 ("the SAME resolution the edge hook used, so the rendered
+ * link and the recorded edge agree"), and a read path that resolved its own
+ * way would describe links the graph does not have.
+ *
+ * The two CT-F3 endpoints of the same file, `GET …/links/suggest` and `POST
+ * …/links/apply`, are NOT here: both are pure functions of
+ * `kb_core::mentions` (find_mentions / applicability / apply_wikilink), and
+ * that engine is OUT-OF-SCOPE in INVENTORY.md:141. The routes are not half
+ * ported; their only input is a subsystem this port does not have.
+ */
+
+/* The corpus, shaped for the two consumers here.
+ *
+ * `docs` is the ladder's candidate set and `title_lower`/`base_lower` are the
+ * autocomplete's ranking keys, computed ONCE per request rather than once per
+ * keystroke. The original gets that for free from a memo keyed on
+ * (kb, index-generation) (`links_index`, links.rs:136-185); kb-c has no such
+ * memo and no field to hang one on, so the keys are recomputed per request
+ * and the set is capped at KBC_MAX_HITS. A corpus larger than that cap
+ * resolves against a PREFIX of itself, so the note-links body says so rather
+ * than answering confidently about a document the candidate set never saw.
+ *
+ * The ORDER of `arts` is the store's, and the ladder's first-wins rule
+ * (links.h:67-75) makes that order part of what a target resolves to. The
+ * write path feeds the ladder the walk manifest's order instead, so a
+ * target two documents collide on can resolve to a different one on each
+ * path; that is a real, narrow divergence and it is the ladder's, not this
+ * route's. */
+typedef struct {
+  const kbc_artifact **arts; /* KBC_ARENA, the listing, in store order */
+  kbc_resolve_doc *docs;     /* KBC_ARENA, parallel to arts */
+  const char **title_lower;  /* KBC_ARENA, parallel to arts */
+  const char **base_lower;   /* KBC_ARENA, parallel to arts */
+  size_t len;
+} link_corpus;
+
+/* ASCII case folding. The original's `to_lowercase()` is Unicode-aware
+ * (links.rs:154), so a title written in Greek matches `?q=` case-insensitively
+ * there and byte-exactly here. ASCII is what the rest of this file compares
+ * (str_ieq), and a partial case fold is a worse lie than a documented one. */
+static const char *ascii_lower(kbc_arena *a, const char *s) {
+  size_t n = strlen(s);
+  char *out = kbc_arena_alloc(a, n + 1);
+  if (out == NULL) return NULL;
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)s[i];
+    out[i] = (char)(c >= 'A' && c <= 'Z' ? c + 32u : c);
+  }
+  out[n] = '\0';
+  return out;
+}
+
+static kbc_status link_corpus_load(kbc_app *app, kbc_arena *a, const char *kb,
+                                   link_corpus *out, kbc_err *err) {
+  memset(out, 0, sizeof *out);
+  kbc_artifact *rows = NULL;
+  size_t n = 0;
+  kbc_status st = kbc_app_list_artifacts(app, a, kb, KBC_KIND__COUNT,
+                                         KBC_MAX_HITS, 0, &rows, &n, err);
+  if (kbc_failed(st)) return st;
+  /* Every parallel array is sized from the SAME n, so they cannot disagree
+   * about how long the corpus is. One allocation each, zero-initialised so a
+   * short fill is visible rather than a wild pointer. */
+  size_t slots = n > 0 ? n : 1u;
+  out->arts = kbc_arena_calloc(a, slots, sizeof *out->arts);
+  out->docs = kbc_arena_calloc(a, slots, sizeof *out->docs);
+  out->title_lower = kbc_arena_calloc(a, slots, sizeof *out->title_lower);
+  out->base_lower = kbc_arena_calloc(a, slots, sizeof *out->base_lower);
+  if (out->arts == NULL || out->docs == NULL || out->title_lower == NULL ||
+      out->base_lower == NULL) {
+    return kbc_err_set(err, KBC_ERR_NOMEM, "links: %zu candidates of %s", n, kb);
+  }
+  for (size_t i = 0; i < n; i++) {
+    const char *rel = rows[i].path != NULL ? rows[i].path : "";
+    out->arts[i] = &rows[i];
+    out->docs[i].id = rows[i].id;
+    out->docs[i].rel_path = rel;
+    out->docs[i].title = rows[i].title != NULL ? rows[i].title : "";
+    const char *base = strrchr(rel, '/');
+    out->title_lower[i] = ascii_lower(a, out->docs[i].title);
+    out->base_lower[i] = ascii_lower(a, base != NULL ? base + 1 : rel);
+    if (out->title_lower[i] == NULL || out->base_lower[i] == NULL) {
+      return kbc_err_set(err, KBC_ERR_NOMEM, "links: ranking keys for %s", rel);
+    }
+  }
+  out->len = n;
+  return KBC_OK;
+}
+
+/* The one metadata lookup a resolved id needs. Linear over the candidate set
+ * rather than hashed: a note's own link count is small, and the set is capped
+ * at KBC_MAX_HITS, so the worst case is a few thousand strcmp calls on links
+ * a human wrote. The original builds a HashMap here (links.rs:216-217)
+ * because its candidate set is the whole corpus and its link lists are
+ * generated; neither is true of this port. */
+static size_t link_index_of_id(const link_corpus *lc, const char *id) {
+  for (size_t i = 0; i < lc->len; i++) {
+    if (strcmp(lc->docs[i].id, id) == 0) return i;
+  }
+  return SIZE_MAX;
+}
+
+/* One `ResolvedLink` (links.rs:52-70), in the original's field order, with
+ * `alias` never emitted. kb-c's parser collapses a link's display text into
+ * `kbc_link.text` without recording whether it came from a `[label](target)`
+ * or a `[[target|label]]`, and it stores the RAW target in that field for the
+ * bare wikilink form — so `[[../x/y.md]]` and `[[y.md|../x/y.md]]` are
+ * indistinguishable here, and any `alias` this route invented would be a
+ * value the corpus never contained. The field is optional on the wire
+ * (`skip_serializing_if = "Option::is_none"`), so a client that reads it must
+ * already treat its absence as the normal case.
+ *
+ * `state` is the ladder's outcome spelled the original's way, and the three
+ * of them are three different facts about the corpus, not three severities:
+ * a dangling link is a "not yet created" affordance and is never an error
+ * (links.rs:45-49). */
+static kbc_status resolved_link_json(kbc_str *out, const link_corpus *lc,
+                                     const char *kb, const char *target,
+                                     const kbc_resolution *r) {
+  const char *state = "dangling";
+  size_t at = SIZE_MAX;
+  if (r->kind == KBC_RESOLVE_ONE) {
+    state = "resolved";
+    at = link_index_of_id(lc, r->ids.items[0]);
+  } else if (r->kind == KBC_RESOLVE_AMBIGUOUS) {
+    state = "ambiguous";
+  }
+  kbc_status st = kbc_str_puts(out, "{\"target\":");
+  if (kbc_failed(st)) return st;
+  st = kbc_str_append_json_string(out, target, strlen(target));
+  if (kbc_failed(st)) return st;
+  st = kbc_str_puts(out, ",\"state\":");
+  if (kbc_failed(st)) return st;
+  st = kbc_str_append_json_string(out, state, strlen(state));
+  if (kbc_failed(st)) return st;
+  if (at != SIZE_MAX) {
+    st = kbc_str_puts(out, ",\"id\":");
+    if (kbc_failed(st)) return st;
+    const kbc_artifact *art = lc->arts[at];
+    st = kbc_str_append_json_string(out, art->id, strlen(art->id));
+    if (kbc_failed(st)) return st;
+  }
+  st = kbc_str_puts(out, ",\"kb\":");
+  if (kbc_failed(st)) return st;
+  st = kbc_str_append_json_string(out, kb, strlen(kb));
+  if (kbc_failed(st)) return st;
+  /* The next three are skipped exactly where the original skips them: an
+   * ambiguous or dangling target has no document, so there is no title, no
+   * path and no kind to report, and the candidates that DO exist are dropped
+   * rather than smuggled through a field the original does not have. */
+  if (at != SIZE_MAX) {
+    const kbc_artifact *art = lc->arts[at];
+    st = kbc_str_puts(out, ",\"title\":");
+    if (kbc_failed(st)) return st;
+    const char *title = art->title != NULL ? art->title : "";
+    st = kbc_str_append_json_string(out, title, strlen(title));
+    if (kbc_failed(st)) return st;
+    st = kbc_str_puts(out, ",\"source_relative\":");
+    if (kbc_failed(st)) return st;
+    st = kbc_str_append_json_string(out, art->path, strlen(art->path));
+    if (kbc_failed(st)) return st;
+  }
+  return kbc_str_printf(out, ",\"is_note\":%s}",
+                        (at != SIZE_MAX && lc->arts[at]->kind == KBC_KIND_NOTE)
+                            ? "true"
+                            : "false");
+}
+
+/* `resolve_outgoing` (links.rs:201-264) as the `outgoing` array.
+ *
+ * THE DEDUP. The original keys its `seen` set on `normalize_target(target)` —
+ * the trimmed, fragment-stripped SPELLING (links.rs:220-224). This keys it on
+ * `kbc_link.target`, the parser's corpus-relative path, which is the same
+ * identity the write path's `edges` primary key collapses on: app.c's
+ * edge-record hook has no `seen` set at all and says why. So two spellings of
+ * one destination are two rows in the original's `outgoing` and ONE here, and
+ * one is also what the graph holds — which is the property that matters,
+ * because a route that listed a link twice would be describing a row that
+ * does not exist.
+ *
+ * THE SELF-LINK IS REPORTED, NOT SKIPPED. `[[self]]` resolves to the document
+ * itself, so it takes the ordinary ONE branch and comes back `resolved` with
+ * its own id (links.rs:196-200: "still reported as resolved so the body
+ * renders it"). The write path drops it, because a document is not a backlink
+ * of itself; the read path reports it, because the body still has to render
+ * the link. Those are one decision seen from two sides, and a read path that
+ * skipped it would leave the body unable to draw a link it drew before.
+ *
+ * Membership is a linear scan over the note's own links, not a hash set. A
+ * note has tens of links and the set dies with the request, so the original's
+ * HashSet buys nothing at this cardinality. */
+static kbc_status outgoing_json(kbc_str *out, kbc_arena *a,
+                                const kbc_resolve_index *ix,
+                                const link_corpus *lc, const kbc_links *links,
+                                const char *kb, kbc_err *err) {
+  kbc_status st = kbc_str_putc(out, '[');
+  if (kbc_failed(st)) return st;
+  kbc_strlist seen;
+  kbc_strlist_init(&seen);
+  size_t emitted = 0;
+  for (size_t i = 0; i < links->len; i++) {
+    const char *target = links->items[i].target;
+    if (target == NULL || target[0] == '\0') continue;
+    if (kbc_strlist_contains(&seen, target)) continue;
+    st = kbc_strlist_push(&seen, target);
+    if (kbc_failed(st)) break;
+    kbc_resolution r;
+    kbc_err rl;
+    kbc_err_reset(&rl);
+    /* `a` is the ladder's scratch arena (links.h:88-90): the normalised target
+     * dies at the next call, which is why the whole note shares one. */
+    kbc_status rs = kbc_resolve_index_resolve(ix, a, target, &r, &rl);
+    if (kbc_failed(rs)) {
+      (void)kbc_err_set(err, rs, "links: resolve \"%s\": %s", target,
+                        rl.msg[0] != '\0' ? rl.msg : "ladder failed");
+      break;
+    }
+    if (emitted > 0) st = kbc_str_putc(out, ',');
+    if (kbc_failed(st)) {
+      kbc_strlist_free(&r.ids);
+      break;
+    }
+    st = resolved_link_json(out, lc, kb, target, &r);
+    kbc_strlist_free(&r.ids);
+    if (kbc_failed(st)) break;
+    emitted++;
+  }
+  kbc_strlist_free(&seen);
+  if (kbc_failed(st)) return st;
+  return kbc_str_putc(out, ']');
+}
+
+/* The parent directory of a corpus-relative path, "" at the top level —
+ * `kb_core::paths::doc_folder` (paths.rs:404-411), whose `rsplit_once('/')`
+ * returning None is exactly its "foo.html" case. */
+static void doc_folder(kbc_arena *a, const char *rel, const char **out) {
+  const char *slash = strrchr(rel, '/');
+  *out = slash != NULL ? kbc_arena_strndup(a, rel, (size_t)(slash - rel)) : "";
+}
+
+/* One `BacklinkRef` (links.rs:75-82). `kb` is the corpus the LINK lives in,
+ * which is the corpus being asked about: edges are intra-kb by construction,
+ * so a backlink never crosses one. */
+static kbc_status backlink_json(kbc_str *out, kbc_arena *a, const char *kb,
+                                const kbc_artifact *art) {
+  const char *folder = NULL;
+  doc_folder(a, art->path, &folder);
+  kbc_status st = kbc_str_puts(out, "{\"id\":");
+  if (kbc_failed(st)) return st;
+  st = kbc_str_append_json_string(out, art->id, strlen(art->id));
+  if (kbc_failed(st)) return st;
+  st = kbc_str_puts(out, ",\"kb\":");
+  if (kbc_failed(st)) return st;
+  st = kbc_str_append_json_string(out, kb, strlen(kb));
+  if (kbc_failed(st)) return st;
+  st = kbc_str_puts(out, ",\"title\":");
+  if (kbc_failed(st)) return st;
+  const char *title = art->title != NULL ? art->title : "";
+  st = kbc_str_append_json_string(out, title, strlen(title));
+  if (kbc_failed(st)) return st;
+  st = kbc_str_puts(out, ",\"source_relative\":");
+  if (kbc_failed(st)) return st;
+  st = kbc_str_append_json_string(out, art->path, strlen(art->path));
+  if (kbc_failed(st)) return st;
+  st = kbc_str_puts(out, ",\"folder\":");
+  if (kbc_failed(st)) return st;
+  st = kbc_str_append_json_string(out, folder, strlen(folder));
+  if (kbc_failed(st)) return st;
+  return kbc_str_printf(out, ",\"is_note\":%s}",
+                        art->kind == KBC_KIND_NOTE ? "true" : "false");
+}
+
+/* Notes first, then alphabetical by title — `load_backlinks`'s final sort
+ * (links.rs:316-320), which is what actually orders the response; the store's
+ * row order is not. The comparison is on the STORED title, like every other
+ * title this file emits off a list row. */
+static int backlink_cmp(const void *va, const void *vb) {
+  const kbc_artifact *const *a = (const kbc_artifact *const *)va;
+  const kbc_artifact *const *b = (const kbc_artifact *const *)vb;
+  bool an = (*a)->kind == KBC_KIND_NOTE;
+  bool bn = (*b)->kind == KBC_KIND_NOTE;
+  if (an != bn) return an ? -1 : 1;
+  return strcmp((*a)->title != NULL ? (*a)->title : "",
+                (*b)->title != NULL ? (*b)->title : "");
+}
+
+/* The `backlinks` array, shared by `GET …/backlinks/{id}` and the note-links
+ * route. An empty result is `[]` and never a 404: "nothing links here" is an
+ * ordinary fact about an ordinary document (links.rs:324-325).
+ *
+ * The linkers are resolved in ONE `get_artifacts_by_path` round trip. A
+ * per-linker `get_artifact` is the same defect the edge write was bitten by,
+ * and a hub note is exactly the case that makes it expensive.
+ *
+ * `get_artifacts_by_path` takes PARALLEL corpus and path arrays of n and hands
+ * back an array of exactly n slots, a NULL slot meaning that pair has no row
+ * (store.h:56-64). The slot array is KBC_OWN and is freed here; the artifacts
+ * belong to the arena. A NULL slot is a real case, not a defensive one: an
+ * edge whose source document has since been removed stays in the table until
+ * the removal rewrites it, and such a row has no artifact to describe. */
+static kbc_status backlinks_json(kbc_str *out, kbc_app *app, kbc_arena *a,
+                                 const char *kb, const char *path,
+                                 kbc_err *err) {
+  kbc_strlist srcs;
+  kbc_strlist_init(&srcs);
+  kbc_status st =
+      kbc_store_list_backlinks(kbc_app_store(app), kb, path, &srcs, err);
+  if (kbc_failed(st)) {
+    kbc_strlist_free(&srcs);
+    return st;
+  }
+  st = kbc_str_putc(out, '[');
+  if (kbc_failed(st)) {
+    kbc_strlist_free(&srcs);
+    return st;
+  }
+  kbc_artifact **slots = NULL;
+  /* Taken BEFORE the list is freed: `kbc_strlist_free` resets len, and every
+   * bound below is a function of how many paths there were. */
+  const size_t n_src = srcs.len;
+  if (n_src > 0) {
+    const char **corpora = kbc_arena_alloc(a, n_src * sizeof(*corpora));
+    if (corpora == NULL) {
+      kbc_strlist_free(&srcs);
+      return kbc_err_set(err, KBC_ERR_NOMEM, "backlinks: %zu corpora", n_src);
+    }
+    /* One corpus, n pairs: every backlink of a document in `kb` is an edge
+     * recorded in `kb`, because edges are intra-kb by construction. */
+    for (size_t i = 0; i < n_src; i++) corpora[i] = kb;
+    st = kbc_store_get_artifacts_by_path(
+        kbc_app_store(app), a, corpora, (const char *const *)srcs.items,
+        n_src, &slots, err);
+  }
+  kbc_strlist_free(&srcs);
+  if (kbc_failed(st)) {
+    free(slots);
+    return st;
+  }
+  size_t n = 0;
+  const kbc_artifact **ordered = NULL;
+  if (n_src > 0) {
+    ordered = kbc_arena_alloc(a, n_src * sizeof *ordered);
+    if (ordered == NULL) {
+      free(slots);
+      return kbc_err_set(err, KBC_ERR_NOMEM, "backlinks: %zu slots of %s", n_src,
+                         kb);
+    }
+    for (size_t i = 0; i < n_src; i++) {
+      if (slots[i] != NULL) ordered[n++] = slots[i];
+    }
+    if (n > 1) qsort(ordered, n, sizeof *ordered, backlink_cmp);
+  }
+  free(slots);
+  for (size_t i = 0; st == KBC_OK && i < n; i++) {
+    if (i > 0) st = kbc_str_putc(out, ',');
+    if (kbc_failed(st)) break;
+    st = backlink_json(out, a, kb, ordered[i]);
+  }
+  if (kbc_failed(st)) return st;
+  return kbc_str_putc(out, ']');
+}
+
+/* `GET /api/kb/{kb}/notes/{id}/links` (notes.rs:743-772, mounted at
+ * router.rs:680) — one note's outgoing wikilinks and its backlinks.
+ *
+ * 404: the corpus is not configured, or `id` names no document.
+ * 400: the document's source will not parse.
+ * 500: anything else the store or the parser layer reports as fatal.
+ *
+ * THE NOTE ASSERTION IS DELIBERATELY ABSENT, and this is the one place this
+ * route knowingly differs from the original. `note_row` asserts
+ * `notes::is_note` before it will answer (notes.rs:305-317), so an artifact id
+ * is a 404 there. kb-c's equivalent predicate is the stored `kind`, and its
+ * ingest assigns `KBC_KIND_ARTIFACT` to EVERY document unconditionally
+ * (app.c:789) — so asserting the kind would 404 the whole corpus and make the
+ * route unanswerable rather than precise. The row's `is_note` still reports
+ * the stored kind, so the day ingest starts minting notes this route starts
+ * labelling them with no other change, and the assertion is then a single
+ * `if` away. */
+static kbc_status route_note_links(kbc_app *app, kbc_arena *a,
+                                   const kbc_config *cfg, const char *kb,
+                                   const char *id, kbc_str *out,
+                                   kbc_err *err) {
+  if (kbc_config_corpus(cfg, kb) == NULL) {
+    return kbc_err_set(err, KBC_ERR_NOTFOUND, "no corpus named \"%s\"", kb);
+  }
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  kbc_status st = kbc_app_get_artifact(app, a, id, true, &art, err);
+  if (kbc_failed(st)) return st;
+  /* The kind is reported, not enforced — see the note above. */
+  const char *src = art.source != NULL ? art.source : "";
+  kbc_parsed *p = kbc_parse(a, src, strlen(src), art.path, err);
+  if (p == NULL) return KBC_ERR_PARSE;
+
+  link_corpus lc;
+  st = link_corpus_load(app, a, kb, &lc, err);
+  if (kbc_failed(st)) return st;
+  kbc_resolve_index *ix = kbc_resolve_index_new(lc.docs, lc.len, err);
+  if (ix == NULL) return KBC_ERR_NOMEM;
+
+  st = kbc_str_printf(out, "{\"outgoing\":");
+  if (kbc_failed(st)) {
+    kbc_resolve_index_free(ix);
+    return st;
+  }
+  st = outgoing_json(out, a, ix, &lc, kbc_parsed_links(p), kb, err);
+  if (kbc_failed(st)) {
+    kbc_resolve_index_free(ix);
+    return st;
+  }
+  st = kbc_str_puts(out, ",\"backlinks\":");
+  if (kbc_failed(st)) {
+    kbc_resolve_index_free(ix);
+    return st;
+  }
+  st = backlinks_json(out, app, a, kb, art.path, err);
+  kbc_resolve_index_free(ix);
+  if (kbc_failed(st)) return st;
+  /* Additive, and not decoration: `lc.len` is the store's page size, so a
+   * corpus past KBC_MAX_HITS resolves its links against a prefix of itself.
+   * A client that cannot see that would be reading a confident answer about
+   * a document the candidate set never held. */
+  return kbc_str_printf(out, ",\"candidates\":%zu,\"candidates_truncated\":%s}",
+                        lc.len, lc.len >= KBC_MAX_HITS ? "true" : "false");
+}
+
+/* `GET /api/kb/{kb}/backlinks/{id}` (links.rs:326-338) — inbound references
+ * to ANY artifact, not only a note. 404 for an unknown corpus or an id the
+ * store does not hold; `[]` with a 200 for a document nothing links to, which
+ * is a different fact and gets a different answer. */
+static kbc_status route_backlinks(kbc_app *app, kbc_arena *a,
+                                  const kbc_config *cfg, const char *kb,
+                                  const char *id, kbc_str *out,
+                                  kbc_err *err) {
+  if (kbc_config_corpus(cfg, kb) == NULL) {
+    return kbc_err_set(err, KBC_ERR_NOTFOUND, "no corpus named \"%s\"", kb);
+  }
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  kbc_status st = kbc_app_get_artifact(app, a, id, false, &art, err);
+  if (kbc_failed(st)) return st;
+  st = kbc_str_puts(out, "{\"backlinks\":");
+  if (kbc_failed(st)) return st;
+  st = backlinks_json(out, app, a, kb, art.path, err);
+  if (kbc_failed(st)) return st;
+  return kbc_str_putc(out, '}');
+}
+
+/* The suggest ordering, as a predicate so the sort and its comment cannot
+ * drift apart: rank first, then the LOWERCASED title (links.rs:381). */
+static int suggest_cmp(const char *la, const char *lb) {
+  int c = strcmp(la, lb);
+  return c != 0 ? c : 0;
+}
+
+/* `GET /api/kb/{kb}/wikilinks/suggest?q=&limit=` (links.rs:344-395) — the
+ * composer's `[[` autocomplete.
+ *
+ * Ranking is three tiers over the LOWERCASED keys: a title prefix (0)
+ * outranks a title substring (1) outranks a basename substring (2), and
+ * within a tier the lowercased title decides (links.rs:364-381). Notes get
+ * no preference — you link research write-ups too — so `is_note` is carried
+ * for the icon and never used to order. An empty `q` lists everything, which
+ * is the original's rank-0 arm (links.rs:370) and the reason the endpoint
+ * answers without one.
+ *
+ * `?q=` is REQUIRED, and a request without it is a 400: `SuggestQuery` types
+ * it as a non-Option String (links.rs:113-118), so axum's extractor rejects
+ * the request before the handler runs. Defaulting it to "" would have made
+ * the whole corpus a legal answer to a typo.
+ *
+ * The limit defaults to 12 and clamps to 50 (links.rs:120-121). Unlike the
+ * note-links route, hitting the candidate ceiling here costs ranked rows AT
+ * THE TAIL rather than a wrong `state`, so it is logged, not reported. */
+#define KBC_SUGGEST_DEFAULT_LIMIT 12u
+#define KBC_SUGGEST_MAX_LIMIT 50u
+static kbc_status route_wikilinks_suggest(kbc_app *app, kbc_arena *a,
+                                          const char *kb, const char *query,
+                                          kbc_str *out, kbc_err *err) {
+  const char *q = NULL;
+  kbc_status st = query_get(a, query, "q", &q, err);
+  if (kbc_failed(st)) return st;
+  if (q == NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "missing required query \"q\"");
+  }
+  const char *needle = ascii_lower(a, q);
+  if (needle == NULL) return kbc_err_set(err, KBC_ERR_NOMEM, "wikilinks: q");
+  size_t nq = strlen(needle);
+  size_t limit = KBC_SUGGEST_DEFAULT_LIMIT;
+  if (query_has(query, "limit")) {
+    int64_t lim = query_int(query, "limit");
+    if (lim < 1) {
+      return kbc_err_set(err, KBC_ERR_INVALID,
+                         "limit must be an integer >= 1");
+    }
+    limit = (size_t)lim;
+  }
+  if (limit > KBC_SUGGEST_MAX_LIMIT) limit = KBC_SUGGEST_MAX_LIMIT;
+
+  link_corpus lc;
+  st = link_corpus_load(app, a, kb, &lc, err);
+  if (kbc_failed(st)) return st;
+  if (lc.len >= KBC_MAX_HITS) {
+    KBC_LOGW("wikilinks suggest for %s ranked a %zu-document prefix of the "
+             "corpus: the store page size is %u",
+             kb, lc.len, KBC_MAX_HITS);
+  }
+  typedef struct {
+    uint8_t rank;
+    const char *title_lower;
+    size_t at;
+  } scored;
+  scored *rows = kbc_arena_alloc(a, (lc.len > 0 ? lc.len : 1u) * sizeof *rows);
+  if (rows == NULL) {
+    return kbc_err_set(err, KBC_ERR_NOMEM, "wikilinks: %zu candidates", lc.len);
+  }
+  size_t n = 0;
+  for (size_t i = 0; i < lc.len; i++) {
+    const char *tl = lc.title_lower[i];
+    uint8_t rank;
+    if (nq == 0 || (strlen(tl) >= nq && strncmp(tl, needle, nq) == 0)) {
+      rank = 0;
+    } else if (strstr(tl, needle) != NULL) {
+      rank = 1;
+    } else if (strstr(lc.base_lower[i], needle) != NULL) {
+      rank = 2;
+    } else {
+      continue;
+    }
+    rows[n].rank = rank;
+    rows[n].title_lower = tl;
+    rows[n].at = i;
+    n++;
+  }
+  /* Insertion sort by (rank, lowercased title). The tie-break is the
+   * lowercased title and never the store's row order, so two runs over one
+   * corpus return the same suggestions in the same sequence — which is the
+   * property that makes an autocomplete usable at all. Insertion rather than
+   * qsort because the comparator's first key is a tiny integer and the array
+   * is capped at the page size; the original's `sort_by` is the same total
+   * order, not the same algorithm. */
+  for (size_t i = 1; i < n; i++) {
+    scored key = rows[i];
+    size_t j = i;
+    while (j > 0 && (rows[j - 1].rank > key.rank ||
+                     (rows[j - 1].rank == key.rank &&
+                      suggest_cmp(rows[j - 1].title_lower,
+                                  key.title_lower) > 0))) {
+      rows[j] = rows[j - 1];
+      j--;
+    }
+    rows[j] = key;
+  }
+  if (n > limit) n = limit;
+  st = kbc_str_puts(out, "{\"suggestions\":[");
+  if (kbc_failed(st)) return st;
+  for (size_t i = 0; st == KBC_OK && i < n; i++) {
+    const kbc_artifact *art = lc.arts[rows[i].at];
+    if (i > 0) st = kbc_str_putc(out, ',');
+    if (kbc_failed(st)) break;
+    st = kbc_str_puts(out, "{\"id\":");
+    if (kbc_failed(st)) break;
+    st = kbc_str_append_json_string(out, art->id, strlen(art->id));
+    if (kbc_failed(st)) break;
+    st = kbc_str_puts(out, ",\"title\":");
+    if (kbc_failed(st)) break;
+    const char *title = art->title != NULL ? art->title : "";
+    st = kbc_str_append_json_string(out, title, strlen(title));
+    if (kbc_failed(st)) break;
+    st = kbc_str_puts(out, ",\"source_relative\":");
+    if (kbc_failed(st)) break;
+    st = kbc_str_append_json_string(out, art->path, strlen(art->path));
+    if (kbc_failed(st)) break;
+    st = kbc_str_printf(out, ",\"is_note\":%s}",
+                        art->kind == KBC_KIND_NOTE ? "true" : "false");
+  }
+  if (kbc_failed(st)) return st;
+  return kbc_str_puts(out, "]}");
+}
+
+/* The capture section below needs this file's three path primitives, and they
+ * are defined further down beside the traversal guard they implement. They are
+ * declared here rather than moved up because they belong there, and a forward
+ * declaration is the shape this file already uses for a route defined away
+ * from its call site (see route_artifact_bytes). */
+static char *canon(const char *path);
+static char *path_join(const char *base, const char *rel);
+static bool path_within(const char *root, const char *path);
+
+/* ------------------------------------------------------------- capture ----
+ *
+ * `POST /api/kb/{kb}/capture`, ported from `routes/capture.rs`. The Rust has
+ * exactly two capture routes: this one, and `POST /capture` — the Web Share
+ * Target action, mounted OUTSIDE the /api nest because the browser's share
+ * POST hits a bare path. kb-c has no web manifest, no share target and no
+ * reader UI to redirect a shared page into, so the second route has no
+ * counterpart here and is not invented: it would be a 303 to a page this port
+ * does not serve. There is no GET on this path in the original either —
+ * capture is a write and nothing else — so there is no read surface to port.
+ *
+ * The field names are the original's and are load-bearing, because a client
+ * sends them by name: `files` (repeated), `title`, `tags`, `from`, `url`,
+ * `text`, `sanitize` (capture.rs:196-198, :240-247). `tags` splits on ','
+ * with each piece trimmed and empties dropped (:146-152). `sanitize` is read
+ * and then deliberately IGNORED, for the reason the original itself gives:
+ * it only ever affects the HTML pipeline, which is a no-op for Markdown
+ * ("Markdown ignores it either way — U1 no-op", :307) and which kb-c does not
+ * have at all — see the note on the extension gate below.
+ *
+ * THE TWO CAPS, and why both are checked rather than one. capture.rs:60
+ * `MAX_CAPTURE_FILES` is 50 and is a DoS backstop against a request made of
+ * thousands of tiny parts, each individually under every byte cap;
+ * capture.rs:38 `DEFAULT_MAX_FILE_BYTES` is 10 MiB and bounds ONE file. They
+ * are independent in the original (the U2 follow-up is entirely about a
+ * request budget sized off the wrong one), so they are independent here.
+ *
+ * A note a reader needs, because it decides which of the two a client
+ * actually meets: this port's TRANSPORT refuses a Content-Length over
+ * KBC_MAX_SNIFF_BYTES (64 KiB) before a route is chosen at all (httpd.c's
+ * req_parse), so on the wire the 64 KiB ceiling answers first and the 10 MiB
+ * per-file check below is unreachable through it. It is enforced anyway, and
+ * the reason is not optimism: it is the check that keeps the cap a property
+ * of the CAPTURE SURFACE rather than a coincidence of a buffer size in
+ * another file, and the request-level budget beside it is the one that would
+ * bite first the day that ceiling moves. Nothing in the response depends on
+ * which of the two fired; both answer 413 with a detail naming the cap.
+ */
+#define CAPTURE_MAX_FILES 50u    /* capture.rs:60 */
+#define CAPTURE_MAX_FILE_BYTES (10u * 1024u * 1024u) /* capture.rs:38 */
+#define CAPTURE_MAX_REQUEST_BYTES (64u * 1024u * 1024u) /* capture.rs:46 */
+/* The decoder counts EVERY part, the file cap counts only `files` parts, and
+ * the six named text fields travel in the same body — so the array is sized
+ * for both or a legal 50-file request with a title would be refused as a
+ * buffer overflow. */
+#define CAPTURE_MAX_PARTS (CAPTURE_MAX_FILES + 6u)
+/* The indexable Markdown spellings (app.c's is_indexable, minus the HTML
+ * ones — see below). */
+static const char *const kCaptureExts[] = {"md", "markdown"};
+
+/* capture.rs:129-137, from_default. The `X-Requested-By` header is how kb-cli
+ * and the SPA name themselves; the `kb-` prefix is stripped so the stamped
+ * tag reads `from:cli`, and a caller that sent neither gets "api" — which is
+ * a curl, and says so in the corpus rather than blaming a client that is not
+ * there. The result is KBC_ARENA: it is a lowercased copy, not the header. */
+static const char *capture_from_default(kbc_arena *a, const char *hdr) {
+  const char *v = hdr;
+  if (v != NULL) {
+    while (*v == ' ' || *v == '\t') v++;
+  }
+  size_t n = v != NULL ? strlen(v) : 0;
+  while (n > 0 && (v[n - 1] == ' ' || v[n - 1] == '\t')) n--;
+  if (n == 0) return "api";
+  static const char pfx[] = "kb-";
+  const size_t pl = sizeof pfx - 1;
+  if (n > pl && strncmp(v, pfx, pl) == 0) {
+    v += pl;
+    n -= pl;
+  }
+  /* Bounded by the header ceiling upstream; copied because the tag is stamped
+   * lowercased and the header is not. */
+  char *out = kbc_arena_alloc(a, n + 1);
+  if (out == NULL) return "api";
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)v[i];
+    out[i] = (char)(c >= 'A' && c <= 'Z' ? c + 32 : c);
+  }
+  out[n] = '\0';
+  return out[0] != '\0' ? out : "api";
+}
+
+/* capture.rs:146-152, split_tags: split on ',', trim each piece, drop the
+ * empties. The array is KBC_ARENA and parallel to nothing — kbc_capture_input
+ * takes (tags, n_tags) — so it dies with the request. The upper bound on the
+ * count is the comma count, which is why this allocates before it counts. */
+static kbc_status capture_tags(kbc_arena *a, const char *s,
+                                const char ***out, size_t *n_out,
+                                kbc_err *err) {
+  size_t commas = 0;
+  for (const char *p = s; *p != '\0'; p++) {
+    if (*p == ',') commas++;
+  }
+  const char **v = kbc_arena_alloc(a, (commas + 1) * sizeof *v);
+  if (v == NULL) {
+    return kbc_err_set(err, KBC_ERR_NOMEM, "capture: %zu tags", commas + 1);
+  }
+  size_t n = 0;
+  const char *p = s;
+  for (;;) {
+    const char *comma = strchr(p, ',');
+    const size_t seg = comma != NULL ? (size_t)(comma - p) : strlen(p);
+    size_t b = 0, e = seg;
+    while (b < e && (p[b] == ' ' || p[b] == '\t')) b++;
+    while (e > b && (p[e - 1] == ' ' || p[e - 1] == '\t')) e--;
+    if (e > b) {
+      char *piece = kbc_arena_strndup(a, p + b, e - b);
+      if (piece == NULL) {
+        return kbc_err_set(err, KBC_ERR_NOMEM, "capture: tag %zu", n);
+      }
+      v[n++] = piece;
+    }
+    if (comma == NULL) break;
+    p = comma + 1;
+  }
+  *out = v;
+  *n_out = n;
+  return KBC_OK;
+}
+
+/* The dot-less, lowercased extension of a multipart filename, or NULL when it
+ * has none. Only the FINAL component is considered and a leading dot is not
+ * an extension, which is the same rule app.c's file_stem_into uses — a
+ * filename is attacker text here, so the two must not disagree about which
+ * half of ".bashrc" is the name. */
+static const char *capture_ext_of(const char *filename) {
+  if (filename == NULL) return NULL;
+  const char *base = filename;
+  for (const char *p = filename; *p != '\0'; p++) {
+    if (*p == '/' || *p == '\\') base = p + 1;
+  }
+  const char *dot = NULL;
+  for (const char *p = base; *p != '\0'; p++) {
+    if (*p == '.') dot = p;
+  }
+  if (dot == NULL || dot == base || dot[1] == '\0') return NULL;
+  static const char *const kMap[][2] = {
+      {"md", "md"}, {"MD", "md"}, {"markdown", "markdown"},
+      {"MARKDOWN", "markdown"}, {"Markdown", "markdown"}};
+  for (size_t i = 0; i < sizeof kMap / sizeof kMap[0]; i++) {
+    if (str_ieq(dot + 1, kMap[i][0])) return kMap[i][1];
+  }
+  return NULL;
+}
+
+/* The extension gate, and the ONE place this port's capture is narrower than
+ * the original's. The original resolves every file against the corpus's
+ * extension map and 415s an unmapped one (capture.rs:340-352) so a capture
+ * can never write a file the indexer would then refuse to pick up. kb-c's
+ * indexer reads .html too, so a literal transcription would accept one — and
+ * then write it UNSTAMPED, because the capture engine here is Markdown-only:
+ * it prepends a front matter block, and front matter in an HTML file is a
+ * comment-shaped lie. The original avoids this by having a real HTML pipeline
+ * with a real sanitiser; kb-c has neither (PORT_PLAN.md §1 lists ammonia as a
+ * known gap, and app.c refuses the HTML pipeline outright for the same
+ * reason). So the gate is the Markdown pair, and a non-Markdown upload is a
+ * 415 that says why rather than a file that will not index.
+ *
+ * Checked for EVERY file BEFORE the first write, so a mixed batch fails
+ * whole: capture.rs:309-315 is explicit that only the VALIDATION is
+ * all-or-nothing, and a `good.md` left behind a 415 would be a retry that
+ * duplicates it. */
+static bool capture_ext_indexable(const char *filename) {
+  const char *e = capture_ext_of(filename);
+  if (e == NULL) return false;
+  for (size_t i = 0; i < sizeof kCaptureExts / sizeof kCaptureExts[0]; i++) {
+    if (strcmp(e, kCaptureExts[i]) == 0) return true;
+  }
+  return false;
+}
+
+/* One `{"kb","id","source_relative"}` item — the three things a caller needs
+ * to find the document it just made. The original's item also carries `title`
+ * and an echoed `url` (capture.rs:71-82); NEITHER is reproduced. The title is
+ * the indexer's own `title.or(h1).or(stem)` chain, which kbc_app already runs
+ * and which is not final until the watcher has ingested the file, so a title
+ * in this response would be a second implementation of it and a second thing
+ * to drift. The url is the request's own field, echoed back to a caller that
+ * sent it and to nobody else. */
+static kbc_status capture_item_json(kbc_str *out, const char *kb,
+                                    const kbc_capture_result *r) {
+  kbc_status st = kbc_str_puts(out, "{\"kb\":");
+  if (kbc_failed(st)) return st;
+  st = kbc_str_append_json_string(out, kb, strlen(kb));
+  if (kbc_failed(st)) return st;
+  st = kbc_str_puts(out, ",\"id\":");
+  if (kbc_failed(st)) return st;
+  st = kbc_str_append_json_string(out, r->id, strlen(r->id));
+  if (kbc_failed(st)) return st;
+  st = kbc_str_puts(out, ",\"source_relative\":");
+  if (kbc_failed(st)) return st;
+  /* Attacker-influenced: the filename is a slug of the caller's `title`, and
+   * a slug is not a guarantee of anything printable. */
+  st = kbc_str_append_json_string(out, r->path, strlen(r->path));
+  if (kbc_failed(st)) return st;
+  return kbc_str_puts(out, "}");
+}
+
+/* The write-direction containment check. capture_write composes
+ * `<corpus path>/<capture_dir>/<slug>` from a caller-supplied `title` and a
+ * caller-supplied multipart filename, and its own defences are the slug
+ * (which has no separator left to traverse with) and a `..` check on
+ * `capture_dir`. Those hold, but they are defences in ANOTHER file, and this
+ * is the first caller that can reach them from a network. So the route
+ * re-checks the composed result against the same component-wise guard the
+ * read path uses (path_within, httpd.c's own comment on why strncmp is the
+ * bug): a capture that resolved outside its corpus root is a REMOTE FILE
+ * WRITE, which is a different and worse failure than a read escaping, and
+ * nothing in the read-side traversal cases covers it.
+ *
+ * It is checked on the RESULT rather than the inputs because that is the only
+ * place the composed path exists, and the composition is exactly what a future
+ * change to the filename policy would alter. */
+static kbc_status capture_contained(const kbc_corpus_cfg *cc,
+                                    const kbc_capture_result *r,
+                                    kbc_err *err) {
+  char *root = canon(cc->path);
+  if (root == NULL) {
+    return kbc_err_set(err, KBC_ERR_NOTFOUND, "corpus %s: %s is not there",
+                       cc->name, cc->path);
+  }
+  char *joined = path_join(root, r->path);
+  if (joined == NULL) {
+    free(root);
+    return kbc_err_set(err, KBC_ERR_INVALID, "capture path over %u bytes",
+                       (unsigned)KBC_MAX_PATH_LEN);
+  }
+  /* realpath: the destination now exists, so this also resolves a symlink
+   * somebody planted inside the corpus between the write and here. */
+  char *canon_dest = canon(joined);
+  const bool within = canon_dest != NULL && path_within(root, canon_dest);
+  if (!within) {
+    kbc_err_set(err, KBC_ERR_INVALID, "capture %s resolved outside corpus %s",
+                r->path, cc->name);
+  }
+  free(canon_dest);
+  free(joined);
+  free(root);
+  return within ? KBC_OK : KBC_ERR_INVALID;
+}
+
+/* The route. `content_type` and `x_requested_by` ride on req_ctx because
+ * kbc_request is the frozen contract (httpd.h) and carries neither — the
+ * same reason the second token carrier rides there. A socketless
+ * kbc_httpd_handle leaves them "", which is not a degraded mode: a capture
+ * with no Content-Type has no boundary and is a 400, exactly as it would be
+ * over a socket. */
+static kbc_status route_capture(kbc_app *app, const kbc_config *cfg,
+                                const char *kb, const char *content_type,
+                                const char *x_requested_by, const char *body,
+                                size_t body_len, kbc_response *out,
+                                kbc_err *err) {
+  const kbc_corpus_cfg *cc = kbc_config_corpus(cfg, kb);
+  if (cc == NULL) {
+    return resp_error(out, 404, KBC_ERR_NOTFOUND, "no corpus named %s", kb);
+  }
+  if (body == NULL || body_len == 0) {
+    return resp_error(out, 400, KBC_ERR_INVALID,
+                      "capture needs a multipart/form-data body");
+  }
+  /* capture.rs:283-299, reject_oversized_request. Checked against the body
+   * as received, before any parsing, so an oversized batch is one cheap
+   * comparison rather than a parse that allocates for a request already known
+   * to be too big. */
+  if (body_len > (size_t)CAPTURE_MAX_REQUEST_BYTES) {
+    return resp_error(out, 413, KBC_ERR_INVALID,
+                      "combined upload exceeds the %u byte request budget",
+                      (unsigned)CAPTURE_MAX_REQUEST_BYTES);
+  }
+
+  /* One arena for the request: the decoded parts are copies of the body, and
+   * the body's own bytes belong to the connection buffer. */
+  kbc_arena *a = kbc_arena_new(body_len + 4096u);
+  if (a == NULL) {
+    return resp_error(out, 500, KBC_ERR_NOMEM, "capture: no arena");
+  }
+  kbc_status st = KBC_OK;
+  /* Every created document, in request order. A kbc_capture_result is ~4 KiB
+   * of path, so 50 of them is 200 KiB — an arena, never a worker stack. */
+  kbc_capture_result *items =
+      kbc_arena_alloc(a, CAPTURE_MAX_FILES * sizeof *items);
+  if (items == NULL) {
+    st = resp_error(out, 500, KBC_ERR_NOMEM, "capture: %u results",
+                    (unsigned)CAPTURE_MAX_FILES);
+    goto done;
+  }
+  size_t n_items = 0;
+
+  kbc_multipart_part *parts =
+      kbc_arena_alloc(a, CAPTURE_MAX_PARTS * sizeof *parts);
+  if (parts == NULL) {
+    st = resp_error(out, 500, KBC_ERR_NOMEM, "capture: %u parts",
+                    (unsigned)CAPTURE_MAX_PARTS);
+    goto done;
+  }
+  size_t n_parts = 0;
+  st = kbc_multipart_parse(content_type, body, body_len, parts,
+                           CAPTURE_MAX_PARTS, &n_parts, a, err);
+  if (kbc_failed(st)) {
+    /* The decoder's ONE contract about *n_out: it is the number of parts in
+     * the body on success AND on failure, and out[0..min(n,cap)) is readable
+     * either way. So an overflow names itself — a caller told "too many parts"
+     * can shrink the request, a caller told "malformed" cannot — and the two
+     * must not be conflated, because only one of them is fixable by retrying
+     * with less in it. Both are 400 here, as they are in the original
+     * (capture.rs:190-196, :223-228). */
+    const bool overflow = strstr(err_msg(err, st), "more than") != NULL;
+    (void)resp_error(out, 400, st, "multipart: %s",
+                     overflow ? "too many parts in one capture (max 56)"
+                              : err_msg(err, st));
+    st = KBC_OK;
+    goto done;
+  }
+
+  /* --- the text fields, in one pass over the parts ---------------------- */
+  const char *title = NULL, *from_field = NULL, *url = NULL, *text = NULL;
+  const char **tags = NULL;
+  size_t n_tags = 0;
+  const kbc_multipart_part *files[CAPTURE_MAX_FILES];
+  size_t n_files = 0;
+  for (size_t i = 0; i < n_parts; i++) {
+    const char *name = parts[i].name;
+    /* A part's bytes may carry NULs (rule 8), so the length travels with the
+     * string — and a text field that does is malformed, not a shorter
+     * string: `str*` on it would silently read a prefix. */
+    char *val = kbc_arena_strndup(a, parts[i].data, parts[i].len);
+    if (val == NULL) {
+      st = resp_error(out, 500, KBC_ERR_NOMEM, "capture: part %zu", i);
+      goto done;
+    }
+    if (strlen(val) != parts[i].len) {
+      st = resp_error(out, 400, KBC_ERR_INVALID,
+                       "multipart: field `%s` contains a NUL", name);
+      goto done;
+    }
+    if (strcmp(name, "files") == 0) {
+      /* capture.rs:220-222: an empty part is not a file. */
+      if (parts[i].len == 0) continue;
+      if (n_files >= CAPTURE_MAX_FILES) {
+        st = resp_error(out, 400, KBC_ERR_INVALID,
+                        "too many files in one capture (max %u)",
+                        (unsigned)CAPTURE_MAX_FILES);
+        goto done;
+      }
+      files[n_files++] = &parts[i];
+      continue;
+    }
+    char *v = trim_ws(val);
+    if (strcmp(name, "title") == 0) {
+      title = v[0] != '\0' ? v : NULL; /* non_empty, capture.rs:154-157 */
+    } else if (strcmp(name, "from") == 0) {
+      from_field = v[0] != '\0' ? v : NULL;
+    } else if (strcmp(name, "url") == 0) {
+      url = v[0] != '\0' ? v : NULL;
+    } else if (strcmp(name, "text") == 0) {
+      text = v[0] != '\0' ? v : NULL;
+    } else if (strcmp(name, "tags") == 0) {
+      st = capture_tags(a, v, &tags, &n_tags, err);
+      if (kbc_failed(st)) {
+        st = resp_error(out, 500, st, "capture: tags");
+        goto done;
+      }
+    }
+    /* `sanitize` and every unknown field are read past deliberately. The
+     * original answers `sanitize` with a bool it only spends on HTML
+     * (capture.rs:307), and there is no HTML pipeline here — see
+     * capture_ext_indexable. An unknown field is ignored there too
+     * (capture.rs:247, `_ => {}`). */
+  }
+
+  const char *from = from_field != NULL ? from_field
+                                         : capture_from_default(a,
+                                                                x_requested_by);
+
+  /* --- validate the whole batch, then write it -------------------------- */
+  for (size_t i = 0; i < n_files; i++) {
+    if (files[i]->len > (size_t)CAPTURE_MAX_FILE_BYTES) {
+      st = resp_error(out, 413, KBC_ERR_INVALID,
+                      "capture file %zu exceeds the %u byte per-file limit",
+                      i, (unsigned)CAPTURE_MAX_FILE_BYTES);
+      goto done;
+    }
+    if (!capture_ext_indexable(files[i]->filename)) {
+      st = resp_error(out, 415, KBC_ERR_INVALID,
+                      "`%s` has no indexable capture extension for this kb "
+ "(only .md and .markdown: this port has no HTML capture pipeline)",
+                      files[i]->filename != NULL ? files[i]->filename : "");
+      goto done;
+    }
+  }
+
+  if (n_files == 0) {
+    /* capture.rs:344-364: no file but a url/text share is a STUB, and no
+     * file and neither is a 400 rather than an empty success. The url is
+     * NEVER dereferenced — that is the project's SSRF ruling, not an
+     * omission, and app.h says so where a future reader will look. */
+    if (url == NULL && text == NULL) {
+      st = resp_error(out, 400, KBC_ERR_INVALID,
+                      "capture requires at least one file, or a url/text "
+                      "share");
+      goto done;
+    }
+    kbc_capture_url_input u;
+    memset(&u, 0, sizeof u);
+    u.corpus = kb;
+    /* capture_dir is NEVER taken from the request. The original resolves it
+     * from the kb's config (capture.rs:258-271); there is no config key here,
+     * so NULL is the only spelling and the field is left absent rather than
+     * offered and refused. */
+    u.capture_dir = NULL;
+    u.from = from;
+    u.title = title;
+    u.url = url;
+    u.text = text;
+    u.tags = tags;
+    u.n_tags = n_tags;
+    u.now_unix = 0; /* the wall clock; the frozen second is a test's lever */
+    kbc_capture_result r;
+    st = kbc_app_capture_url_stub(app, kb, &u, &r, err);
+    if (kbc_failed(st)) {
+      st = resp_error(out, st == KBC_ERR_NOTFOUND ? 404 : 400, st,
+                      "capture stub: %s", err_msg(err, st));
+      goto done;
+    }
+    st = capture_contained(cc, &r, err);
+    if (kbc_failed(st)) {
+      st = resp_error(out, 500, st, "capture: %s", err_msg(err, st));
+      goto done;
+    }
+    items[n_items++] = r;
+  } else {
+    for (size_t i = 0; i < n_files; i++) {
+      kbc_capture_input in;
+      memset(&in, 0, sizeof in);
+      in.corpus = kb;
+      in.capture_dir = NULL; /* as above: never request-derived */
+      in.from = from;
+      /* `title` steers the OUTPUT FILENAME and is never stamped into the
+       * document — app.h is the contract and explains why (a capture
+       * preserves the uploaded file's own authored title). */
+      in.title = title;
+      in.url = url; /* provenance only; NEVER dereferenced */
+      in.original_filename = files[i]->filename;
+      in.category = NULL;   /* -> "capture" */
+      in.session_id = NULL; /* no kb-session stamp */
+      in.tags = tags;
+      in.n_tags = n_tags;
+      in.has_expires_at = false;
+      in.body = files[i]->data;
+      in.body_len = files[i]->len;
+      in.ext = capture_ext_of(files[i]->filename);
+      in.now_unix = 0;
+      kbc_capture_result r;
+      st = kbc_app_capture(app, kb, &in, &r, err);
+      if (kbc_failed(st)) {
+        /* capture.rs:113-122, map_capture_error: a read-only corpus is a 409
+         * and not a 500, because the request was well formed and the
+         * destination is the problem — telling a client "internal error"
+         * sends it looking for a daemon bug that is not there. */
+        int status = st == KBC_ERR_CONFLICT ? 409 : st == KBC_ERR_IO ? 500 : 400;
+        st = resp_error(out, status, st, "capture: %s", err_msg(err, st));
+        goto done;
+      }
+      st = capture_contained(cc, &r, err);
+      if (kbc_failed(st)) {
+        st = resp_error(out, 500, st, "capture: %s", err_msg(err, st));
+        goto done;
+      }
+      items[n_items++] = r;
+    }
+  }
+
+  /* 201 CREATED, per capture.rs:436-440. The items array is the whole
+   * response: a caller that sent N files is told about N documents, in the
+   * order it sent them — the order of the multipart parts, not a directory
+   * listing's. */
+  st = kbc_str_puts(&out->body, "{\"items\":[");
+  for (size_t i = 0; st == KBC_OK && i < n_items; i++) {
+    if (i > 0) st = kbc_str_putc(&out->body, ',');
+    if (st == KBC_OK) st = capture_item_json(&out->body, kb, &items[i]);
+  }
+  if (kbc_failed(st)) {
+    kbc_str_clear(&out->body);
+    goto done;
+  }
+  st = kbc_str_puts(&out->body, "]}");
+  if (kbc_failed(st)) {
+    kbc_str_clear(&out->body);
+    goto done;
+  }
+  out->status = 201;
+
+done:
+  kbc_arena_free(a);
+  return st;
 }
 
 static kbc_status dispatch(kbc_app *app, const kbc_config *cfg,
@@ -1753,7 +2906,7 @@ static kbc_status dispatch(kbc_app *app, const kbc_config *cfg,
       result = method_not_allowed(out, m, p);
       goto done;
     }
-    kbc_status st = route_reindex(app, &out->body, err);
+    kbc_status st = route_reindex(app, ctx->h, &out->body, err);
     if (kbc_failed(st)) {
       result = resp_error(out, 500, st, "reindex: %s", err_msg(err, st));
       goto done;
@@ -1784,25 +2937,72 @@ static kbc_status dispatch(kbc_app *app, const kbc_config *cfg,
     out->content_type = KBC_PROM_CONTENT_TYPE;
     goto done;
   }
-  /* `/api/kb/{kb}/artifact/{id}` — the artifact's bytes on the parent origin. */
-  static const char kArt[] = "/api/kb/";
-  if (strncmp(p, kArt, sizeof kArt - 1) == 0) {
-    const char *rest = p + sizeof kArt - 1;
+  /* `/api/kb/{kb}/…` — every corpus-scoped route, split on the SECOND
+   * segment. The kb name is a path SEGMENT, copied out rather than
+   * NUL-terminated in place: `req.path` is the connection's parsed target and
+   * the fallback below still reads it. */
+  static const char kKb[] = "/api/kb/";
+  if (strncmp(p, kKb, sizeof kKb - 1) == 0) {
+    const char *rest = p + sizeof kKb - 1;
     const char *slash = strchr(rest, '/');
-    if (slash != NULL && strncmp(slash + 1, "artifact/", 9) == 0) {
-      const char *id = slash + 10;
-      /* The kb name is a path SEGMENT, copied out rather than NUL-terminated in
-       * place: `req.path` is the connection's parsed target and the fallback
-       * below still reads it. */
-      char kb[256];
+    char kb[256];
+    if (slash != NULL) {
       size_t kbl = (size_t)(slash - rest);
-      if (kbl == 0 || id[0] == '\0' || strchr(id, '/') != NULL ||
-          kbl >= sizeof kb) {
+      if (kbl == 0 || kbl >= sizeof kb) {
         result = resp_error(out, 404, KBC_ERR_NOTFOUND, "no route for %s", p);
         goto done;
       }
       memcpy(kb, rest, kbl);
       kb[kbl] = '\0';
+    }
+    const char *tail = slash != NULL ? slash + 1 : rest;
+    /* One id-shaped tail: `artifact/{id}`, `backlinks/{id}`, and the
+     * `{id}/links` of a note. Each is matched with its full template, so a
+     * path one segment short of a template falls through to the 404 below
+     * rather than being served by a longer route's prefix.
+     *
+     * The note's id is the only one that is not the tail's remainder — it is
+     * the tail minus its `/links` — so it is copied into a buffer bounded by
+     * KBC_MAX_ID_LEN and refused outright when it does not fit. Truncating it
+     * would turn a wrong id into a RIGHT id for a different document, which
+     * is the one answer a lookup must never give. */
+    const char *id = NULL;
+    char idbuf[KBC_MAX_ID_LEN + 1];
+    int link_route = 0; /* 0 artifact bytes, 1 backlinks, 2 note links */
+    if (slash != NULL) {
+      static const char kArtifact[] = "artifact/";
+      static const char kBacklinks[] = "backlinks/";
+      static const char kNotes[] = "notes/";
+      static const char kLinks[] = "/links";
+      if (strncmp(tail, kArtifact, sizeof kArtifact - 1) == 0) {
+        id = tail + sizeof kArtifact - 1;
+      } else if (strncmp(tail, kBacklinks, sizeof kBacklinks - 1) == 0) {
+        id = tail + sizeof kBacklinks - 1;
+        link_route = 1;
+      } else if (strncmp(tail, kNotes, sizeof kNotes - 1) == 0) {
+        const char *nid = tail + sizeof kNotes - 1;
+        size_t nl = strlen(nid);
+        size_t ll = sizeof kLinks - 1;
+        if (nl > ll && strcmp(nid + nl - ll, kLinks) == 0 &&
+            nl - ll <= KBC_MAX_ID_LEN) {
+          memcpy(idbuf, nid, nl - ll);
+          idbuf[nl - ll] = '\0';
+          id = idbuf;
+          link_route = 2;
+        }
+      }
+      /* An id is ONE segment. `artifact/a/b` and `backlinks/a/b` name no
+       * route, and answering them with a lookup for the whole remainder
+       * would be a store query whose 404 means something else. */
+      if (id != NULL && (id[0] == '\0' || strchr(id, '/') != NULL)) {
+        result = resp_error(out, 404, KBC_ERR_NOTFOUND, "no route for %s", p);
+        goto done;
+      }
+    }
+    if (id != NULL) {
+      /* `wikilinks/suggest` is corpus-scoped but takes no id, and it is the
+       * one kb route whose query is REQUIRED rather than filtered, so it is
+       * matched before the id shape is decided on. */
       if (!is_get) {
         result = method_not_allowed(out, m, p);
         goto done;
@@ -1812,10 +3012,11 @@ static kbc_status dispatch(kbc_app *app, const kbc_config *cfg,
         result = resp_error(out, 500, KBC_ERR_NOMEM, "no arena");
         goto done;
       }
-      kbc_status st = route_artifact_bytes(app, a, cfg, kb, id, req->query,
-                                           hdrs, &out->body, err);
-      kbc_arena_free(a);
-      if (kbc_failed(st)) {
+      kbc_status st;
+      int status = 200;
+      if (link_route == 0) {
+        st = route_artifact_bytes(app, a, cfg, kb, id, req->query, hdrs,
+                                  &out->body, err);
         /* The answers are the original's: an unknown kb or id is a 404, a
          * file that will not read is a 500 (`Io(_) => 500`), and a source that
          * cannot be rendered under a text/html label is a 400. An allocation
@@ -1823,15 +3024,74 @@ static kbc_status dispatch(kbc_app *app, const kbc_config *cfg,
          * fault it is — a render that runs out of memory is the daemon's
          * problem, not the caller's, and the renderer reports it as
          * KBC_ERR_NOMEM precisely so this mapping can be honest. */
+        status = st == KBC_ERR_NOTFOUND ? 404
+                 : st == KBC_ERR_IO || st == KBC_ERR_NOMEM ? 500
+                                                            : 400;
+        if (st == KBC_OK) out->content_type = "text/html; charset=utf-8";
+      } else if (link_route == 1) {
+        st = route_backlinks(app, a, cfg, kb, id, &out->body, err);
+        /* An unknown corpus or id is a 404; a bad `?limit=`-shaped query is
+         * the caller's error. Nothing here is a 500 the caller can act on. */
+        status = st == KBC_ERR_NOTFOUND ? 404
+                 : st == KBC_ERR_IO || st == KBC_ERR_NOMEM ? 500
+                                                            : 400;
+      } else {
+        st = route_note_links(app, a, cfg, kb, id, &out->body, err);
+        status = st == KBC_ERR_NOTFOUND ? 404
+                 : st == KBC_ERR_IO || st == KBC_ERR_NOMEM ? 500
+                                                            : 400;
+      }
+      kbc_arena_free(a);
+      if (kbc_failed(st)) {
         kbc_str_clear(hdrs);
-        int status = st == KBC_ERR_NOTFOUND ? 404
-                     : st == KBC_ERR_IO || st == KBC_ERR_NOMEM ? 500
-                                                                : 400;
         result = resp_error(out, status, st, "%s", err_msg(err, st));
         goto done;
       }
-      out->content_type = "text/html; charset=utf-8";
       goto done;
+    }
+    if (slash != NULL) {
+      static const char kSuggest[] = "wikilinks/suggest";
+      if (strcmp(tail, kSuggest) == 0) {
+        if (!is_get) {
+          result = method_not_allowed(out, m, p);
+          goto done;
+        }
+        if (kbc_config_corpus(cfg, kb) == NULL) {
+          result = resp_error(out, 404, KBC_ERR_NOTFOUND, "no corpus named %s",
+                              kb);
+          goto done;
+        }
+        kbc_arena *a = kbc_arena_new(16384);
+        if (a == NULL) {
+          result = resp_error(out, 500, KBC_ERR_NOMEM, "no arena");
+          goto done;
+        }
+        kbc_status st =
+            route_wikilinks_suggest(app, a, kb, req->query, &out->body, err);
+        kbc_arena_free(a);
+        if (kbc_failed(st)) {
+          result = resp_error(out, st == KBC_ERR_NOMEM ? 500 : 400, st, "%s",
+                              err_msg(err, st));
+          goto done;
+        }
+        goto done;
+      }
+      /* `capture` is corpus-scoped and takes no id, so it is matched here
+       * beside the other id-free kb route rather than in the id shape above.
+       * POST only: the original mounts it with `post(...)` and there is no
+       * GET on this path, so a GET is a 405 and not a read surface nobody
+       * wrote. */
+      static const char kCapture[] = "capture";
+      if (strcmp(tail, kCapture) == 0) {
+        if (!is_post) {
+          result = method_not_allowed(out, m, p);
+          goto done;
+        }
+        result = route_capture(app, cfg, kb, ctx->content_type,
+                               ctx->x_requested_by, req->body, req->body_len,
+                               out, err);
+        goto done;
+      }
     }
   }
   if (strcmp(p, "/api/events") == 0) {
@@ -1880,6 +3140,12 @@ kbc_status kbc_httpd_handle(kbc_app *app, const kbc_config *cfg,
    * counted either — there is no daemon to count it against. */
   req_ctx ctx;
   memset(&ctx, 0, sizeof ctx);
+  /* The two capture headers, stated as absent. A socketless caller has no
+   * header table, so a capture through this seam has no boundary and is a
+   * 400 — which is the same answer the socket gives a POST with no
+   * Content-Type, not a second behaviour. */
+  ctx.content_type = "";
+  ctx.x_requested_by = "";
   return dispatch(app, cfg, req, &ctx, out, err, 0);
 }
 
@@ -2010,6 +3276,16 @@ static void sse_emit_lag_locked(conn *c) {
 static void httpd_on_event(void *user, const char *type, const char *json) {
   kbc_httpd *h = (kbc_httpd *)user;
   if (h == NULL || type == NULL) return;
+  /* The anchor pass's trigger. Set on the ONE event that means "the corpus was
+   * re-read", and consumed by the worker tick rather than run here: a bus
+   * callback is forbidden from re-entering kbc_app (app.h:56-61), and this one
+   * would have to call kbc_app_get_artifact and kbc_app_publish to do its job.
+   * The flag is the whole hand-off, and a flag rather than a queue because the
+   * pass is idempotent — what matters is that it runs after the re-index, not
+   * how many notifications got there first. */
+  if (strcmp(type, "index.updated") == 0) {
+    atomic_store(&h->anchors_dirty, true);
+  }
   kbc_str f;
   kbc_str_init(&f);
   char *tcopy = NULL;
@@ -2072,6 +3348,362 @@ done:
   free(tcopy);
   free(jcopy);
   kbc_str_free(&f);
+}
+
+/* ----------------------------------------------- comment anchor events --
+ *
+ * `comment.anchor_stale` and `comment.anchor_resolved`, ported from the
+ * indexer's post-upsert pass (`indexer.rs:2990-3113`). The field names are the
+ * contract — a client subscribes to these two by name and reads these keys —
+ * so they are reproduced exactly, including the two that are easy to "tidy":
+ * `fuzzy_score` on the stale event, and `score` on the resolved one.
+ *
+ * WHEN AN ANCHOR IS EVALUATED, and why here and not on the reindex path
+ * itself. The original evaluates inside `index_one`, so the trigger is
+ * "this document was re-indexed" and the work is O(that document's open
+ * comments). kb-c's httpd cannot see that trigger: the only event the app
+ * publishes for a re-index is `index.updated`, whose payload is `{"docs":N}`
+ * and names no document, so a pass keyed on it would re-check EVERY comment
+ * in the corpus after every single-file save. The two options were therefore
+ *
+ *   (a) scan on `POST /api/reindex` only — cheap, but a save that breaks an
+ *       anchor stays silent until someone reindexes by hand, and the
+ *       watcher's single-file path would never fire the event at all;
+ *   (b) scan on every `index.updated`, which covers both, and pay for the
+ *       over-broad trigger.
+ *
+ * (b) is what this does, because the extra cost buys back almost nothing:
+ * the STALE set is what makes the pass quiet. A comment whose anchor is
+ * already stale is re-checked and emits NOTHING (indexer.rs:3083-3086), so
+ * the event volume is bounded by TRANSITIONS, not by re-indexes — the
+ * "fires events on documents nobody is watching" failure cannot happen here,
+ * because a document nobody changed cannot produce a transition. What the
+ * over-broad trigger does cost is one comment listing per document that has
+ * comments, per re-index, which is the figure store.h's comment on
+ * `kbc_store_list_comment_docs` records: the enumeration is O(documents with
+ * comments), not O(corpus).
+ *
+ * WHAT RESOLVES AN ANCHOR. kb-c's comment store holds one shape — an element
+ * id, optionally prefixed `section:` (store.h:209) — and the original has four
+ * serde-tagged scopes (review.rs:225-262) of which the other three cannot be
+ * written here at all. So `anchor_kind` is always "section": that is the
+ * original's scope for "an `<id>` or `data-kb-id` attribute"
+ * (review.rs:373-375), which is exactly what both stored forms name. The id
+ * is looked up in the document's current ANCHOR INDEX, which parse.c builds
+ * from "a heading, a fenced block, or any block that carries an explicit id"
+ * (parse.c:715-720) — the same "is this still addressable" question the
+ * original asks of `[id]` and `[data-kb-id]` in the re-rendered HTML.
+ *
+ * THE STATE IS IN-PROCESS AND IS NOT PERSISTED, matching `anchor_state`
+ * (indexer.rs:3045-3048). A daemon restart therefore re-fires `anchor_stale`
+ * for every anchor that is still stale, because the tracker no longer knows it
+ * was. That is the original's behaviour, not a leak here: a subscriber that
+ * reconnects after a restart wants to be told the state it cannot remember
+ * either.
+ */
+
+/* The element id an anchor names. `section:` is the only prefix kb-c's store
+ * accepts, and it is stripped rather than searched for: `[[section:x]]` in a
+ * document that declares `id="section:x"` is a DIFFERENT anchor from one that
+ * declares `id="x"`, and searching for the whole string would collapse them. */
+static const char *anchor_element_id(const char *anchor) {
+  static const char kSection[] = "section:";
+  if (strncmp(anchor, kSection, sizeof kSection - 1) == 0) {
+    return anchor + sizeof kSection - 1;
+  }
+  return anchor;
+}
+
+static size_t anchors_find(const kbc_httpd *h, const char *doc,
+                           const char *cid) {
+  for (size_t i = 0; i < h->anchors_len; i++) {
+    if (strcmp(h->anchors[i].doc_id, doc) == 0 &&
+        strcmp(h->anchors[i].comment_id, cid) == 0) {
+      return i;
+    }
+  }
+  return SIZE_MAX;
+}
+
+/* GROWS under `anchors_mu` by doubling, with the overflow checked: the set is
+ * one entry per stale comment, so its size is bounded by the number of
+ * comments the corpus has, and a corpus whose comment count is large enough to
+ * overflow a size_t would have exhausted the address space first. The check is
+ * here anyway because "provably in range" is the rule, not "it cannot
+ * happen". */
+static kbc_status anchors_add(kbc_httpd *h, const char *doc, const char *cid,
+                              kbc_err *err) {
+  /* Both ids are minted at KBC_MAX_ID_LEN by `mint_id`; a longer one is a row
+   * this fixed-width key cannot represent, and half-tracking it would be worse
+   * than not tracking it — so it is refused, and the caller says so. */
+  if (strlen(doc) > KBC_MAX_ID_LEN || strlen(cid) > KBC_MAX_ID_LEN) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "anchor key (%zu, %zu bytes) exceeds the %u an id has",
+                       strlen(doc), strlen(cid), KBC_MAX_ID_LEN);
+  }
+  if (h->anchors_len == h->anchors_cap) {
+    size_t want = h->anchors_cap != 0 ? h->anchors_cap * 2u : 16u;
+    if (want < h->anchors_cap || want > SIZE_MAX / sizeof(*h->anchors)) {
+      return kbc_err_set(err, KBC_ERR_NOMEM, "anchor set would exceed %zu",
+                         SIZE_MAX / sizeof(*h->anchors));
+    }
+    anchor_key *grown = realloc(h->anchors, want * sizeof(*grown));
+    if (grown == NULL) {
+      return kbc_err_set(err, KBC_ERR_NOMEM, "anchor set: %zu entries", want);
+    }
+    h->anchors = grown;
+    h->anchors_cap = want;
+  }
+  /* memcpy at the MEASURED length, not a formatted copy into a fixed buffer:
+   * both bounds were just checked against KBC_MAX_ID_LEN, which is the size of
+   * each field minus its terminator. */
+  size_t dl = strlen(doc);
+  size_t cl = strlen(cid);
+  memcpy(h->anchors[h->anchors_len].doc_id, doc, dl);
+  h->anchors[h->anchors_len].doc_id[dl] = '\0';
+  memcpy(h->anchors[h->anchors_len].comment_id, cid, cl);
+  h->anchors[h->anchors_len].comment_id[cl] = '\0';
+  h->anchors_len++;
+  return KBC_OK;
+}
+
+static void anchors_del(kbc_httpd *h, size_t at) {
+  if (at == SIZE_MAX || at >= h->anchors_len) return;
+  h->anchors[at] = h->anchors[h->anchors_len - 1u];
+  h->anchors_len--;
+}
+
+/* The `comment.anchor_stale` payload (indexer.rs:3067-3081). `fuzzy_score` is
+ * the resolver's best-tried similarity and `Resolution::Stale` is a unit
+ * variant that does not report one, so the original sends a literal 0.0 — and
+ * sends it as a FLOAT, which is why this is `0.0` and not `0`. kb-c has no
+ * fuzzy tier at all, so 0.0 is also the only value it could ever be right
+ * about. */
+static void publish_anchor_stale(kbc_app *app, const kbc_artifact *art,
+                                 const char *cid) {
+  kbc_str p;
+  kbc_str_init(&p);
+  kbc_status s = kbc_str_puts(&p, "{\"kb\":");
+  if (s == KBC_OK)
+    s = kbc_str_append_json_string(&p, art->corpus, strlen(art->corpus));
+  if (s == KBC_OK) s = kbc_str_puts(&p, ",\"artifact_id\":");
+  if (s == KBC_OK)
+    s = kbc_str_append_json_string(&p, art->id, strlen(art->id));
+  if (s == KBC_OK) s = kbc_str_puts(&p, ",\"comment_id\":");
+  if (s == KBC_OK) s = kbc_str_append_json_string(&p, cid, strlen(cid));
+  /* The anchor is corpus-controlled text: a document may declare any id it
+   * likes, so it is escaped like everything else here. */
+  if (s == KBC_OK) s = kbc_str_puts(&p, ",\"anchor_kind\":\"section\"");
+  if (s == KBC_OK) s = kbc_str_puts(&p, ",\"fuzzy_score\":0.0");
+  if (s == KBC_OK) s = kbc_str_puts(&p, ",\"source_relative\":");
+  if (s == KBC_OK)
+    s = kbc_str_append_json_string(&p, art->path, strlen(art->path));
+  if (s == KBC_OK) s = kbc_str_puts(&p, "}");
+  if (s == KBC_OK) {
+    kbc_app_publish(app, "comment.anchor_stale", p.ptr);
+  } else {
+    KBC_LOGW("comment.anchor_stale for %s/%s: no payload (%s)", art->id, cid,
+             kbc_status_str(s));
+  }
+  kbc_str_free(&p);
+}
+
+/* The `comment.anchor_resolved` payload (indexer.rs:3101-3109). `score` is
+ * `Option<f32>`: the number for a FUZZY match and `null` for an exact one
+ * (indexer.rs:3097-3100). kb-c resolves exactly or not at all, so it is
+ * always null — and it is EMITTED as null rather than dropped, because the
+ * original emits it as null and a client that found the key missing would be
+ * reading a shape the field never has. */
+static void publish_anchor_resolved(kbc_app *app, const kbc_artifact *art,
+                                    const char *cid) {
+  kbc_str p;
+  kbc_str_init(&p);
+  kbc_status s = kbc_str_puts(&p, "{\"kb\":");
+  if (s == KBC_OK)
+    s = kbc_str_append_json_string(&p, art->corpus, strlen(art->corpus));
+  if (s == KBC_OK) s = kbc_str_puts(&p, ",\"artifact_id\":");
+  if (s == KBC_OK)
+    s = kbc_str_append_json_string(&p, art->id, strlen(art->id));
+  if (s == KBC_OK) s = kbc_str_puts(&p, ",\"comment_id\":");
+  if (s == KBC_OK) s = kbc_str_append_json_string(&p, cid, strlen(cid));
+  if (s == KBC_OK) s = kbc_str_puts(&p, ",\"score\":null}");
+  if (s == KBC_OK) {
+    kbc_app_publish(app, "comment.anchor_resolved", p.ptr);
+  } else {
+    KBC_LOGW("comment.anchor_resolved for %s/%s: no payload (%s)", art->id, cid,
+             kbc_status_str(s));
+  }
+  kbc_str_free(&p);
+}
+
+/* ONE document's open comments, and the only place a transition is decided.
+ * The four arms are the original's table (indexer.rs:3049-3112) exactly:
+ *
+ *   resolves && !was_stale → nothing (a steady state, and the common one)
+ *   !resolves && !was_stale → record + `comment.anchor_stale`
+ *   !resolves && was_stale  → nothing (indexer.rs:3083-3086: the SPA already
+ *                             painted the badge)
+ *   resolves && was_stale  → forget  + `comment.anchor_resolved`
+ *
+ * A comment is visited ONCE per pass and takes ONE arm, so an anchor that
+ * flaps cannot produce two events out of one evaluation: a document edited
+ * into staleness and back within one re-index is not two observations, it is
+ * one, and the one observation is the state the re-indexed bytes leave behind.
+ *
+ * The return value is the number of EVENTS this document fired, which is what
+ * the pass logs. A key whose comment was DELETED is pruned here — the
+ * original's R5 (indexer.rs:3114-3123) — by matching the document's keys
+ * against the ids it actually still has. A comment that is merely RESOLVED
+ * keeps its key, exactly as it does there: a resolved comment is still in the
+ * file, and dropping its key would make reopening it re-fire a stale event the
+ * subscriber has already seen. */
+static size_t anchors_one_doc(kbc_httpd *h, kbc_store *store, kbc_arena *a,
+                              const kbc_artifact *art) {
+  kbc_err local;
+  kbc_comment *cs = NULL;
+  size_t n = 0;
+  kbc_err_reset(&local);
+  if (kbc_failed(kbc_store_list_comments(store, a, art->id, KBC_MAX_HITS, &cs,
+                                         &n, &local))) {
+    KBC_LOGW("anchors: comments of %s: %s", art->id, local.msg);
+    return 0;
+  }
+  const char *src = art->source != NULL ? art->source : "";
+  kbc_parsed *p = NULL;
+  size_t transitions = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (cs[i].resolved) continue; /* the original walks `c.is_open()` only */
+    if (p == NULL) {
+      kbc_err_reset(&local);
+      p = kbc_parse(a, src, strlen(src), art->path, &local);
+      if (p == NULL) {
+        /* One parse serves every open comment on this document. A document
+         * whose bytes will not parse cannot resolve any anchor, and saying so
+         * as "everything is stale" would flag every comment on it. */
+        KBC_LOGW("anchors: %s/%s will not parse, no anchor judged: %s", art->id,
+                 art->path, local.msg);
+        return transitions;
+      }
+    }
+    const char *id = anchor_element_id(cs[i].anchor);
+    bool resolves = kbc_parsed_has_anchor(p, id);
+    size_t at = anchors_find(h, art->id, cs[i].id);
+    if (!resolves && at == SIZE_MAX) {
+      kbc_err ke;
+      kbc_err_reset(&ke);
+      if (kbc_failed(anchors_add(h, art->id, cs[i].id, &ke))) {
+        KBC_LOGW("anchors: %s/%s not tracked: %s", art->id, cs[i].id, ke.msg);
+        continue;
+      }
+      publish_anchor_stale(h->app, art, cs[i].id);
+      transitions++;
+    } else if (resolves && at != SIZE_MAX) {
+      anchors_del(h, at);
+      publish_anchor_resolved(h->app, art, cs[i].id);
+      transitions++;
+    }
+  }
+  /* R5: a key whose comment no longer exists is dropped, so a deleted comment
+   * cannot leave a phantom the next re-index re-publishes. This runs after the
+   * loop, so a key added above is matched against the ids this document really
+   * has and cannot be pruned by its own addition. */
+  size_t i = 0;
+  while (i < h->anchors_len) {
+    if (strcmp(h->anchors[i].doc_id, art->id) == 0) {
+      bool still_there = false;
+      for (size_t j = 0; j < n; j++) {
+        if (strcmp(h->anchors[i].comment_id, cs[j].id) == 0) {
+          still_there = true;
+          break;
+        }
+      }
+      if (!still_there) {
+        anchors_del(h, i);
+        continue;
+      }
+    }
+    i++;
+  }
+  return transitions;
+}
+
+/* The pass. `anchors_mu` is HELD; the caller is either the reindex route or
+ * the worker tick that won the trylock. */
+static void anchors_scan_locked(kbc_httpd *h) {
+  /* Cleared FIRST, not last: a publish that lands while this runs re-sets the
+   * flag, and clearing at the end would swallow the one re-index this scan
+   * could not see. */
+  atomic_store(&h->anchors_dirty, false);
+  kbc_store *store = kbc_app_store(h->app);
+  if (store == NULL) return;
+  kbc_arena *a = kbc_arena_new(65536u);
+  if (a == NULL) {
+    KBC_LOGW("anchors: no arena, the pass is skipped this re-index");
+    return;
+  }
+  kbc_strlist docs;
+  kbc_strlist_init(&docs);
+  kbc_err local;
+  kbc_err_reset(&local);
+  kbc_status st = kbc_store_list_comment_docs(store, &docs, &local);
+  if (kbc_failed(st)) {
+    KBC_LOGW("anchors: documents with comments: %s", local.msg);
+    kbc_strlist_free(&docs);
+    kbc_arena_free(a);
+    return;
+  }
+  size_t fired = 0;
+  for (size_t i = 0; i < docs.len; i++) {
+    kbc_artifact art;
+    memset(&art, 0, sizeof art);
+    kbc_err_reset(&local);
+    if (kbc_failed(kbc_app_get_artifact(h->app, a, docs.items[i], true, &art,
+                                         &local))) {
+      /* The document is gone. Its comment rows went with it (the cascade
+       * deletes comments by foreign key, INVENTORY.md:182), so there is
+       * nothing to re-resolve and nothing to report: a comment on a deleted
+       * document is not a stale anchor, it is a deleted thread. */
+      size_t at = 0;
+      while (at < h->anchors_len) {
+        if (strcmp(h->anchors[at].doc_id, docs.items[i]) == 0) {
+          anchors_del(h, at);
+          continue;
+        }
+        at++;
+      }
+      continue;
+    }
+    fired += anchors_one_doc(h, store, a, &art);
+  }
+  if (fired > 0) {
+    KBC_LOGI("anchors: %zu stale/resolved transitions over %zu commented "
+             "documents",
+             fired, docs.len);
+  }
+  kbc_strlist_free(&docs);
+  kbc_arena_free(a);
+}
+
+/* The route's half: `POST /api/reindex` runs the pass SYNCHRONOUSLY, so the
+ * events are in the ring before the 202 is written and a client that reads
+ * them needs no sleep. The tick below covers the watcher, which has no route. */
+static void anchors_run(kbc_httpd *h) {
+  if (h == NULL || h->app == NULL) return;
+  pthread_mutex_lock(&h->anchors_mu);
+  anchors_scan_locked(h);
+  pthread_mutex_unlock(&h->anchors_mu);
+}
+
+/* The tick, from the worker's 200 ms epoll loop. `trylock` is what makes this
+ * safe with N workers: the first one to get the lock does the scan and the
+ * rest skip, so a corpus-wide pass runs once per re-index rather than once per
+ * core. A skip is not a lost pass — the winner is scanning the same state. */
+static void anchors_tick(kbc_httpd *h) {
+  if (h == NULL) return;
+  if (!atomic_load_explicit(&h->anchors_dirty, memory_order_relaxed)) return;
+  if (pthread_mutex_trylock(&h->anchors_mu) != 0) return;
+  anchors_scan_locked(h);
+  pthread_mutex_unlock(&h->anchors_mu);
 }
 
 /* The GAP half of the probe, and the decision of WHEN it fires.
@@ -4082,6 +5714,17 @@ static void serve_request(conn *c, const http_req *r) {
    * would leave it NULL, which read_presented already treats as absent, but ""
    * is stated so the field's contract matches the one on req_ctx. */
   ctx.x_kb_token = r->x_kb_token != NULL ? r->x_kb_token : "";
+  /* The capture route's two headers, off the same parsed table. Stated as ""
+   * when absent so the field's contract is the one req_ctx documents, and so
+   * a capture with no Content-Type is a 400 rather than a NULL deref. */
+  ctx.content_type = hdr_find(r, "Content-Type");
+  if (ctx.content_type == NULL) ctx.content_type = "";
+  ctx.x_requested_by = hdr_find(r, "X-Requested-By");
+  if (ctx.x_requested_by == NULL) ctx.x_requested_by = "";
+  /* The daemon itself, which the reindex route needs to reach the anchor
+   * pass's state. A socketless `kbc_httpd_handle` leaves this NULL and
+   * `anchors_run(NULL)` is a no-op. */
+  ctx.h = c->h;
   int64_t t0 = kbc_now_ns();
   kbc_status st = dispatch(c->h->app, c->h->cfg, &req, &ctx, &resp, &err,
                            (kbc_now_ns() - c->h->started_ns) / 1000000000ll);
@@ -4446,6 +6089,11 @@ static void *worker_main(void *arg) {
     }
     worker_service_sse(w);
     worker_drain_zombies(w);
+    /* The watcher's single-file re-index has no route, so the tick is what
+     * makes an anchor transition observable there. 200 ms of latency on a
+     * document a human just saved is not worth optimising away, and the flag
+     * means an idle daemon does no work at all. */
+    anchors_tick(h);
   }
   /* Drain: nothing this worker owns may outlive it, or stop() leaks fds. */
   worker_drain_zombies(w);
@@ -4553,14 +6201,16 @@ kbc_httpd *kbc_httpd_start(kbc_app *app, const kbc_config *cfg, kbc_err *err) {
   h->wake_rd = -1;
   h->wake_wr = -1;
   /* Everything kbc_httpd_stop tears down is made valid HERE, ahead of the
-   * first failure path: the two mutexes it destroys, the two atomics it
+   * first failure path: the three mutexes it destroys, the three atomics it
    * stores to, and the CORS list it frees. calloc hands back zeros, and a
    * zero is not an initialised mutex. */
   atomic_init(&h->conns, 0);
   atomic_init(&h->stopping, false);
+  atomic_init(&h->anchors_dirty, false);
   kbc_strlist_init(&h->cors);
   pthread_mutex_init(&h->conns_mu, NULL);
   pthread_mutex_init(&h->ring_mu, NULL);
+  pthread_mutex_init(&h->anchors_mu, NULL);
 
   h->bind_addr = strdup(cfg->bind_addr != NULL ? cfg->bind_addr : "127.0.0.1");
   h->listen_fd = calloc(want, sizeof *h->listen_fd);
@@ -4857,6 +6507,8 @@ void kbc_httpd_stop(kbc_httpd *h) {
   free(h->w);
   free(h->threads);
   pthread_mutex_destroy(&h->conns_mu);
+  free(h->anchors);
+  pthread_mutex_destroy(&h->anchors_mu);
   pthread_mutex_destroy(&h->ring_mu);
   free(h);
 }
@@ -4892,6 +6544,22 @@ const kbc_route KBC_ROUTES[] = {
      true},
     {"GET", "/api/kb/{kb}/artifact/{id}",
      "artifact bytes, sandboxed CSP + nosniff, ?download=1 attaches", true},
+    {"GET", "/api/kb/{kb}/notes/{id}/links",
+     "a document's outgoing wikilinks (state resolved|ambiguous|dangling, an "
+     "ambiguous one carries no ids) and its backlinks",
+     true},
+    {"GET", "/api/kb/{kb}/backlinks/{id}",
+     "documents linking to any artifact, notes first then by title; nothing "
+     "linking here is an empty array, not a 404",
+     true},
+    {"GET", "/api/kb/{kb}/wikilinks/suggest",
+     "[[ autocomplete over titles and basenames, ?q= required, ?limit= <= 50",
+     true},
+    {"POST", "/api/kb/{kb}/capture",
+     "multipart upload into the corpus: `files` parts, or a `url`/`text` share "
+     "with none; 201 with the created ids and source-relative paths, at most "
+     "50 files and 10 MiB each, and a `url` is recorded, never fetched",
+     true},
     {"POST", "/api/reindex", "synchronous full rescan, answers 202", true},
     {"GET", "/api/events",
      "server-sent event stream; Last-Event-ID replays, and an unusable cursor "

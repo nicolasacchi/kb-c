@@ -118,6 +118,23 @@ kbc_status kbc_store_edge_degrees_for(kbc_store *s, const char *corpus,
                                       uint32_t *in_deg, kbc_err *err);
 int64_t kbc_store_edge_count(kbc_store *s, const char *corpus, kbc_err *err);
 
+/* The documents that link HERE, which is the other direction of the same
+ * table. `edge_degrees_for` answers "how many" for documents the caller
+ * already named; this answers "which", and a backlinks surface cannot be built
+ * from a count.
+ *
+ * `out` receives KBC_OWN corpus-relative source paths, de-duplicated, and the
+ * caller frees it with kbc_strlist_free. NOTHING LINKING HERE IS A ZERO-LENGTH
+ * LIST AND KBC_OK, never KBC_ERR_NOTFOUND: the original is explicit that
+ * "nothing links here" is a 200 with an empty array, and turning it into a
+ * 404 would make an ordinary document look missing.
+ *
+ * One query. A round trip per backlink would be the same defect the edge
+ * write has already been bitten by. */
+kbc_status kbc_store_list_backlinks(kbc_store *s, const char *corpus,
+                                    const char *path, kbc_strlist *out,
+                                    kbc_err *err);
+
 /* ------------------------------------------------------- pending links -- */
 
 /* A link whose target did not exist when the source was ingested. This is what
@@ -204,7 +221,27 @@ kbc_status kbc_store_list_comments(kbc_store *s, kbc_arena *a,
                                    kbc_comment **out, size_t *n_out,
                                    kbc_err *err);
 kbc_status kbc_store_set_comment_resolved(kbc_store *s, const char *comment_id,
-                                          bool resolved, kbc_err *err);
+                                         bool resolved, kbc_err *err);
+
+/* The documents that HAVE comments — the distinct doc_ids the table names.
+ * `list_comments` is keyed by doc_id and has no "all comments" form, so a
+ * caller that needs to walk every commented document otherwise enumerates the
+ * corpus and issues one comment query per DOCUMENT. At the 20,000-document
+ * corpus in BENCHMARKS.md that is 40,000 prepared statements per reindex, on
+ * the watcher's single-file path, to re-check the two or three comments the
+ * corpus actually has. With this the pass is O(documents-with-comments), which
+ * is what the original pays: it walks the ONE reindexed document's own comment
+ * list (indexer.rs:3035), not the corpus's.
+ *
+ * `out` receives KBC_OWN ids and the caller frees it with kbc_strlist_free.
+ * One query, and the same posture as kbc_store_list_backlinks.
+ *
+ * NOT filtered by corpus, because the comments table carries doc_id only
+ * (schema v1) and has no corpus column to filter on. A caller that needs the
+ * corpus recovers it from the artifact row — which it needs anyway, since the
+ * anchor event's `kb` and `source_relative` both come from there. */
+kbc_status kbc_store_list_comment_docs(kbc_store *s, kbc_strlist *out,
+                                       kbc_err *err);
 
 /* ------------------------------------------------ stage 1: the rest of it --
  *
@@ -427,6 +464,108 @@ kbc_status kbc_store_add_history(kbc_store *s, const kbc_history_row *row,
 kbc_status kbc_store_list_history(kbc_store *s, kbc_arena *a, const char *user,
                                   size_t limit, kbc_history_row **out,
                                   size_t *n_out, kbc_err *err);
+
+/* Retention. Deletes HISTORY rows older than the cutoff — and nothing else.
+ *
+ * It does NOT delete documents, and that is the whole shape of it. The
+ * original is explicit that it "does NOT manage the R2-cascade tables
+ * (sessions/edges/…); those are pruned per-artifact on delete, not by age"
+ * (sqlite.rs:2357), and that `edges` "has NO timestamp column, so it CANNOT be
+ * time-pruned" (config.rs:470). A retention pass that removed documents by age
+ * would be a corpus-deleting feature the original does not have, and it would
+ * have to cascade into the index and the graph to stay coherent — which is how
+ * a maintenance job becomes the most dangerous verb in a CLI.
+ *
+ * `apply` false is a dry run: `*rows` reports what WOULD go and nothing is
+ * deleted. The original's background task has no dry-run at all, because it is
+ * a background job; a foreground command is a different thing, and a
+ * maintenance verb whose default destroys is a verb somebody runs by accident.
+ *
+ * `*rows` is the number removed, or the number that would be removed. A
+ * negative cutoff prunes nothing rather than everything. */
+kbc_status kbc_store_prune_history(kbc_store *s, int64_t started_before_unix,
+                                   bool apply, int64_t *rows, kbc_err *err);
+
+/* Reclaims the space a delete freed, by checkpointing the WAL in TRUNCATE
+ * mode. The counterpart of `kbc_store_prune_history`, and the reason that
+ * function does not do it itself: under WAL the freed pages stay invisible
+ * to the OS until something checkpoints, so without this a long-lived
+ * database keeps the file size of a corpus that shrank.
+ *
+ * BEST-EFFORT, and that is a contract rather than a caveat: the original
+ * runs it as `let _ = ... wal_checkpoint(TRUNCATE)` (sqlite.rs:2426), a
+ * deliberate discard, because a failed reclaim costs disk and rolling back
+ * the delete to make the reclaim succeed would cost the operator rows. Do
+ * NOT wire a failure path onto this. It returns KBC_OK unless the STORE
+ * itself is unusable; a refused or partial checkpoint is reported as
+ * success, because the pages are not lost either way — SQLite reuses them
+ * internally and the file shrinks at the next checkpoint that does run.
+ *
+ * TRUNCATE degrades to a partial checkpoint when a reader holds an older
+ * snapshot, which is why "did not shrink the file" is a possible outcome
+ * rather than a failure.
+ *
+ * `incremental_vacuum` is deliberately absent, and is the original's own
+ * omission in kb-c's case: the original gates it on an `auto_vacuum =
+ * INCREMENTAL` database (config.rs:506-515), and kb-c's store sets only
+ * `journal_mode` and `synchronous` (src/store.c:574) and never
+ * `auto_vacuum`. Issuing it here would be a silent no-op. */
+kbc_status kbc_store_checkpoint(kbc_store *s, kbc_err *err);
+
+/* ------------------------------------------------------------------ moves --
+ *
+ * A rename that loses its old id is a broken bookmark, so the original records
+ * the move and redirects a stale reference to its new home
+ * (sqlite.rs:5876 `moves_lookup`, :5928 `moves_suppresses_delete`, :5953
+ * `moves_list_incomplete`). Three things depend on it and none of them can be
+ * rebuilt from the bytes: a comment anchored to a document that moved, a
+ * bookmark to its old id, and a link written against its old path.
+ *
+ * The table is at migration 11. It is here, and useless, until the functions
+ * below exist — which is the shape of this port's recurring gap and the reason
+ * it is written down rather than left to be discovered as a bug report. */
+
+/* Re-keys every artifact-referencing row from one document to another, in ONE
+ * transaction: `artifacts(id, path)`, `chunks`, `comments`, `corkboard`,
+ * `pinned_memories`, `doc_first_seen`, `history`, `edges(src_path, dst_path)`
+ * and `pending_links(src_path)`.
+ *
+ * Everything is `UPDATE OR IGNORE` and then the leftovers are deleted, so the
+ * DESTINATION wins on a collision. THE EXCEPTION IS `comments`, and the
+ * exception is the whole reason this function exists: a comment row has its own
+ * `id` and `created_at`, and the only public way to write one MINTS BOTH. So an
+ * ordinary rekey would rewrite the doc_id and leave every carried comment
+ * stamped "now" — the one user-visible field a move cannot rebuild from the
+ * document's bytes. A caller doing this today has to re-derive the state by
+ * matching (anchor, author, body) and keeping a `claimed` bitmap, which is a
+ * workaround for a missing capability rather than a design. */
+kbc_status kbc_store_rekey_artifact(kbc_store *s, const char *old_id,
+                                    const char *new_id, const char *old_rel,
+                                    const char *new_rel, kbc_err *err);
+
+/* Records a move, before the rename, so a crash in between leaves an
+ * incomplete row that startup can converge rather than a lost document. */
+kbc_status kbc_store_record_move(kbc_store *s, const char *old_id,
+                                 const char *new_id, const char *old_rel,
+                                 const char *new_rel, int64_t moved_at,
+                                 kbc_err *err);
+kbc_status kbc_store_complete_move(kbc_store *s, const char *old_id,
+                                   kbc_err *err);
+
+/* Where a stale reference now lives. CHAIN-WALKED, not a single hop: a path
+ * can be renamed more than once, and the original bounds the walk at 64 hops
+ * and guards the cycle because a cycle must TERMINATE. A row whose
+ * `completed_at` is unset is an interrupted move, not a redirect — a caller
+ * that follows one would resolve a document to a name the rename never
+ * reached. No row is KBC_ERR_NOTFOUND's business: "this id never moved" is a
+ * normal answer and a caller wants the absence, not an error. */
+kbc_status kbc_store_moves_lookup(kbc_store *s, const char *id,
+                                  kbc_strlist *ids, kbc_err *err);
+kbc_status kbc_store_moves_lookup_path(kbc_store *s, const char *rel,
+                                       kbc_strlist *rels, kbc_err *err);
+/* Moves that started and never finished, so bring-up can converge them. */
+kbc_status kbc_store_list_incomplete_moves(kbc_store *s, kbc_strlist *old_ids,
+                                           kbc_strlist *old_rels, kbc_err *err);
 
 kbc_status kbc_store_add_corkboard(kbc_store *s, const char *artifact_id,
                                    int64_t created_at, kbc_err *err);

@@ -39,6 +39,13 @@ typedef struct {
                            * original; `/api/identity` reports which one was
                            * used, because a silent preference is invisible
                            * on the wire. */
+  /* Borrowed header values the socketless seam could not otherwise see.
+   * Without them `kbc_httpd_handle` cannot drive a multipart route at all —
+   * there is no boundary, so it is a 400 — which makes every test of such a
+   * route a socket test whether it wanted to be one or not. Empty when the
+   * header is absent, like `auth` above. */
+  const char *content_type;     /* "" when absent */
+  const char *x_requested_by;  /* "" when absent; the capture route's `from` */
   const char *client_addr;
 } kbc_request;
 

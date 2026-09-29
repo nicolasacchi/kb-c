@@ -93,6 +93,20 @@
 #define R_ARTIFACTS "/api/artifacts"
 #define R_REINDEX "/api/reindex"
 #define R_STATS "/api/stats" /* the counters `kbc status` prints */
+/* Prometheus text exposition 0.0.4. TOP-LEVEL, not under /api — the
+ * original mounts it on its own router (router.rs:1003-1025) so it is
+ * neither counted nor rate-limited as an API request, and the placement is
+ * load-bearing: under /api it would inherit the bearer. */
+#define R_METRICS "/metrics"
+
+/* `kbc prune` retention windows, in days. The original's `[retention]`
+ * windows are `Option<u32>` and a set one arms a daily background prune
+ * (kb-core/src/config.rs:454-536). A CLI verb is the operator-triggered
+ * equivalent, and a day window is the same unit. The ceiling is a
+ * deliberate overflow guard, not a policy: 36500 days is a century, past
+ * which `days * 86400` is not worth computing in an int and no operator
+ * meant it. */
+#define PRUNE_MAX_DAYS 36500u
 
 #define HTTP_TIMEOUT_SEC 10
 #define HTTP_MAX_RESPONSE (8u * 1024u * 1024u)
@@ -1326,6 +1340,13 @@ typedef struct {
   bool all;
   bool force;
   bool foreground;
+  bool apply;
+  /* `prune`: the retention window in days. The original's `[retention]`
+   * windows are `Option<u32>` and a set one arms a daily background sweep
+   * (kb-core/src/config.rs:454-536), so a day window is its own unit and a
+   * MISSING window is its own answer. */
+  size_t days;
+  bool has_days;
   const char *positional[4];
   int npos;
 } opts;
@@ -1471,6 +1492,17 @@ static void parse_verb(const flag_def *defs, int argc, char **argv, int start,
       o->has_seed = true;
     } else if (strcmp(s, "--foreground") == 0) {
       o->foreground = true;
+    } else if (strcmp(s, "--apply") == 0) {
+      o->apply = true;
+    } else if (strcmp(s, "--days") == 0) {
+      /* Lower bound 1, not 0, and that is the original's rule rather than a
+       * nicety: `[retention] history_days = 0` is a HARD validation error
+       * (config.rs:1932-1947) because a zero-day window sets the cutoff to
+       * `now` and would delete every row on the next tick. A CLI cannot
+       * express "off" as 0, so it refuses it here and the verb keeps the
+       * original's meaning for the one value that means the opposite. */
+      o->days = parse_bounded(value, "--days", 1, PRUNE_MAX_DAYS);
+      o->has_days = true;
     }
   }
 }
@@ -1533,6 +1565,24 @@ static const flag_def FLAGS_BENCH_INIT[] = { { "--kb", true },
                                              { "--n", true },
                                              { "--seed", true },
                                              { NULL, false } };
+
+/* `prune` — the retention window and the affirmative. `--days` names the
+ * window in the original's own unit (a day count), and `--apply` is the
+ * only thing that makes it delete. There is no third flag because there is
+ * no third choice: the original's `reading_sections_days` has no kb-c
+ * counterpart (kb-c folded that state into the history row's own columns —
+ * `last_section`, `scroll_y_max`, `active_ms` — so a section window and a
+ * history window would prune the SAME rows here), and a flag that aliases
+ * another flag is a flag that can disagree with it. */
+static const flag_def FLAGS_PRUNE[] = { { "--days", true },
+                                        { "--apply", false },
+                                        { NULL, false } };
+/* `metrics` — `--out` writes the scrape to a file instead of stdout. The
+ * Rust's `kb metrics` has no such flag (it only prints), so this is the one
+ * place the verb is larger than the original: a scrape you cannot save is
+ * not an export, and PORT_PLAN stage 6 asks for an export. */
+static const flag_def FLAGS_METRICS[] = { { "--out", true },
+                                          { NULL, false } };
 
 static int cmd_search(int argc, char **argv, int start) {
   opts o;
@@ -2143,6 +2193,240 @@ static int cmd_version(void) {
     return EXIT_OK;
   }
   printf("%s %s\n", KBC_PROJECT, KBC_VERSION);
+  return EXIT_OK;
+}
+
+/* ----------------------------------------------------------------- prune ---
+ *
+ * `kbc prune [--days N] [--apply]` — the operator-triggered retention sweep.
+ *
+ * WHAT THE ORIGINAL PRUNES, because the name invites a wrong answer.
+ * `Db::retention_prune` (kb-core/src/storage/sqlite.rs:2361) deletes rows
+ * from THREE tables, and every one of them is *history*:
+ *
+ *   DELETE FROM reading_sections WHERE last_at < cutoff
+ *   DELETE FROM reading_sections
+ *          WHERE visit_id IN (SELECT id FROM history WHERE started_at < ?)
+ *   DELETE FROM history WHERE started_at < cutoff
+ *
+ * plus `memory_recalls` rows whose artifact_id is a served-* id, sharing the
+ * history cutoff. It NEVER deletes a document. Its own doc comment says so
+ * (sqlite.rs:2357): it "deliberately does NOT manage the R2-cascade tables
+ * (sessions/edges/…); those are pruned per-artifact on delete, not by age
+ * (and `edges` has no timestamp to prune on)". The config comment says it
+ * again (config.rs:470): edges "has NO timestamp column, so it CANNOT be
+ * time-pruned and is deliberately absent here".
+ *
+ * So the store-vs-index question this verb was designed around does not
+ * arise: there is no document to remove, and therefore no store that can
+ * disagree with the index about one. `kbc_app_delete_path` is the ONE
+ * removal in this port and retention deliberately does not call it — wiring
+ * it in would invent a corpus-deleting feature the original does not have,
+ * and it is the single most dangerous line anyone could add to this file.
+ *
+ * THE THRESHOLD IS THE ORIGINAL'S. `[retention] history_days` is an
+ * `Option<u32>` in days; `None` means keep forever, so an absent window is a
+ * no-op rather than a default, and `--days 0` is refused for the reason
+ * config.rs:1932 gives. A day count is the unit and the unit is unchanged.
+ *
+ * WHY A CLI FLAG AND NOT `[retention]`: kb-c's config is frozen (kbc_config
+ * has no retention field) and the original's sweep is a background daemon
+ * task, which a one-shot binary has no way to schedule. The flag is the
+ * operator-triggered equivalent of the same window.
+ *
+ * WHY DRY RUN BY DEFAULT. The original's sweep has no dry run because it
+ * cannot be run by hand — it is armed by config and fires on a timer, so
+ * "delete on sight" was never reachable. A CLI verb puts the delete on the
+ * command line, where a typo is one keypress away, so the safety moves to
+ * the invocation: without `--apply` this reports and changes nothing. That
+ * is a deliberate divergence and the reason is stated rather than assumed.
+ */
+
+
+static int cmd_prune(int argc, char **argv, int start) {
+  opts o;
+  parse_verb(FLAGS_PRUNE, argc, argv, start, &o);
+  if (o.npos != 0) {
+    die_user("prune takes no positional argument: kbc prune --days N%s",
+             o.apply ? " --apply" : "");
+  }
+  /* An absent window is the original's `None` — keep forever — so there is
+   * nothing to do. It is a user error rather than a silent success because
+   * the operator asked a verb named `prune` to prune, and exiting 0 having
+   * removed nothing is the reading that hides a typo in the flag name. */
+  if (!o.has_days) {
+    die_user("prune needs --days N (an unset retention window means keep "
+             "forever, so there is nothing to prune)");
+  }
+
+  const kbc_config *cfg = load_config();
+  if (cfg->db_path == NULL || cfg->db_path[0] == '\0') {
+    die_user("no database configured: pass --config PATH or set HOME");
+  }
+  if (!kbc_path_exists(cfg->db_path)) {
+    die_user("prune: no store at %s — run `kbc add <dir> --kb NAME` first",
+             cfg->db_path);
+  }
+
+  /* The cutoff, exactly as the original computes it: `now - window`, with
+   * the window in seconds. `days` is already capped at PRUNE_MAX_DAYS, so
+   * the product cannot overflow int64 — the cap is load-bearing here and not
+   * only a tidiness bound. */
+  int64_t now = (int64_t)time(NULL);
+  int64_t window = (int64_t)o.days * 86400;
+  int64_t cutoff = now - window;
+  if (cutoff < 0) {
+    /* A window longer than the epoch itself: nothing that exists is older
+     * than a date before 1970, so the answer is zero rather than a wrapped
+     * negative cutoff that would match every row. The original's
+     * `saturating_sub` lands in the same place for the same reason. */
+    cutoff = 0;
+  }
+
+  /* The store is the ONLY writer, so the DELETE goes through it and under its
+   * mutex. An earlier draft of this verb opened its own sqlite3 connection
+   * and ran the statement here, on the reasoning that `backup` already does
+   * something similar for VACUUM INTO. That reasoning does not hold now that
+   * `kbc_store_prune_history` exists: a second connection to the same file is
+   * a second writer outside the mutex, and a retention pass is exactly the
+   * operation where racing another writer matters. The vacuum_into precedent
+   * is a read plus a whole-file copy; this is a row delete.
+   *
+   * A live daemon holding the same db is not a conflict: the store runs WAL
+   * with a 5s busy_timeout (src/store.c:552), so the two serialise. Same
+   * posture `comments` takes, and the reason it can. */
+  kbc_err e;
+  kbc_err_reset(&e);
+  kbc_store *store = kbc_store_open(cfg, &e);
+  if (store == NULL) {
+    fail_status(e.status != KBC_OK ? e.status : KBC_ERR_IO, &e, "prune",
+                NULL);
+  }
+  int64_t rows = 0;
+  kbc_status st = kbc_store_prune_history(store, cutoff, o.apply, &rows, &e);
+  if (kbc_failed(st)) {
+    kbc_store_close(store);
+    fail_status(st, &e, "prune", NULL);
+  }
+  /* Reclaim the freed pages, best-effort, exactly as the original does
+   * (sqlite.rs:2426: `let _ = ... wal_checkpoint(TRUNCATE)`). Under WAL the
+   * file does not shrink until something checkpoints, so without this a
+   * long-lived database keeps the file size of a corpus that shrank — the
+   * database stops growing but the disk is never given back. The status is
+   * discarded deliberately and the reason is in store.h: a failed reclaim
+   * costs disk, and rolling the delete back to make the reclaim succeed
+   * would cost the operator rows.
+   *
+   * AFTER the delete, and never inside it: the delete is already committed,
+   * so the worst case here is a large file, not lost history. */
+  if (o.apply) {
+    (void)kbc_store_checkpoint(store, &e);
+  }
+  kbc_store_close(store);
+
+  if (g_json) {
+    kbc_str out;
+    kbc_str_init(&out);
+    (void)kbc_str_printf(&out,
+                         "{\"ok\":true,\"apply\":%s,\"days\":%zu,"
+                         "\"cutoff\":%lld,\"rows\":%lld}\n",
+                         o.apply ? "true" : "false", o.days,
+                         (long long)cutoff, (long long)rows);
+    emit_line(&out);
+  } else if (o.apply) {
+    printf("pruned %lld history row%s older than %zu day%s\n",
+           (long long)rows, rows == 1 ? "" : "s", o.days,
+           o.days == 1 ? "" : "s");
+  } else if (rows == 0) {
+    printf("no history rows older than %zu day%s; nothing to prune\n", o.days,
+           o.days == 1 ? "" : "s");
+  } else {
+    printf("would prune %lld history row%s older than %zu day%s\n",
+           (long long)rows, rows == 1 ? "" : "s", o.days,
+           o.days == 1 ? "" : "s");
+    printf("  re-run with --apply to delete them\n");
+  }
+  return EXIT_OK;
+}
+
+/* --------------------------------------------------------------- metrics ---
+ *
+ * `kbc metrics [--out PATH]` — print (or save) the daemon's Prometheus text
+ * exposition.
+ *
+ * WHAT THE ORIGINAL IS, because PORT_PLAN's phrase "metrics export" does not
+ * settle it. `kb metrics` (kb-cli/src/commands/metrics.rs:1-2) is "print the
+ * daemon's `GET /api/metrics` snapshot" — a CLIENT. It fetches, it
+ * pretty-prints, and it writes to stdout. There is no push to a collector,
+ * no offline dump, and no scrape-to-file anywhere in it. So this is not a
+ * network feature: it is one GET against a route kb-c already serves, and
+ * the endpoint being already built is what makes it nearly free.
+ *
+ * The one divergence is `--out`, and it is the one PORT_PLAN's word
+ * "export" asks for: the Rust's verb cannot save its scrape, so `kb metrics
+ * > file` is the only way to keep one, and a shell redirect is not something
+ * a verb can be tested through.
+ *
+ * NO LOCAL FALLBACK, unlike `search`/`reindex`/`get`/`list`. Every counter
+ * this endpoint renders lives in the running daemon's `metrics_reg`; an
+ * in-process app has no daemon, so a fallback would print a full exposition
+ * of zeroes that reads exactly like a healthy idle daemon. `kbc status` sets
+ * the precedent and its reason: no fallback, exit 2 when no daemon answers.
+ */
+/* Defined in the backup section below, which is where the tar/destination
+ * path rules already live. Declared rather than moved: `--out` on a metrics
+ * scrape is the same "a path the user typed" problem, and it must go through
+ * the same bounded check, not a second one written to suit its caller. */
+static char *bounded_path(const char *what, const char *p);
+
+static int cmd_metrics(int argc, char **argv, int start) {
+  opts o;
+  parse_verb(FLAGS_METRICS, argc, argv, start, &o);
+  if (o.npos != 0) {
+    die_user("metrics takes no positional argument");
+  }
+  int status = 0;
+  kbc_str resp;
+  kbc_err e;
+  kbc_err_reset(&e);
+  kbc_status s = http_call("GET", R_METRICS, NULL, 0, &status, &resp, &e);
+  if (kbc_failed(s)) {
+    return call_failed(s, &e, "metrics");
+  }
+  if (status < 200 || status >= 300) {
+    kbc_str_free(&resp);
+    die_io("metrics: HTTP %d", status);
+  }
+  if (o.out != NULL) {
+    /* The same shape `restore` uses for a path the user typed: expand
+     * `~`, then bound-check. Assembled with an explicit length check rather
+     * than a snprintf into a fixed buffer, because `-Werror=format-
+     * truncation` is on and a truncated path is a DIFFERENT path — it would
+     * write the scrape somewhere the operator did not name. */
+    char *expanded = expand_tilde(o.out);
+    char *path = bounded_path("metrics --out", expanded);
+    free(expanded);
+    kbc_err_reset(&e);
+    if (kbc_failed(kbc_str_write_file_atomic(path, resp.ptr, resp.len, &e))) {
+      int rc = fail_status(e.status != KBC_OK ? e.status : KBC_ERR_IO, &e,
+                           "metrics --out", NULL);
+      free(path);
+      kbc_str_free(&resp);
+      return rc;
+    }
+    if (!g_json) {
+      printf("wrote %zu bytes of metrics to %s\n", resp.len, path);
+    }
+    free(path);
+    kbc_str_free(&resp);
+    return EXIT_OK;
+  }
+  /* `--json` is deliberately NOT honoured. The body is Prometheus text
+   * exposition, not JSON, and wrapping it in a JSON string would give a
+   * scraper something it cannot parse and an operator something that is not
+   * what `curl /metrics` returned. */
+  print_body(&resp);
+  kbc_str_free(&resp);
   return EXIT_OK;
 }
 
@@ -4482,9 +4766,16 @@ static void usage(FILE *out) {
           "  backup <kb> [--out PATH]\n"
           "  backup --all            (one tarball per corpus; no --out)\n"
           "  restore <tarball> --kb NAME [--force]\n"
+          "  prune --days N [--apply]  (retention; a DRY RUN without --apply)\n"
+          "  metrics [--out PATH]      (the daemon's Prometheus exposition)\n"
           "  config show\n"
           "  token generate\n"
           "  version\n"
+          "\n"
+          "prune removes READING HISTORY rows older than the window, exactly\n"
+          "as the original's retention sweep does. It never removes a\n"
+          "document: the original's `retention_prune` deliberately leaves the\n"
+          "artifact tables alone, so there is no corpus for it to lose.\n"
           "\n"
           "comments verbs read the store directly: kb-c has no review-file\n"
           "routes, so its comments are table rows, not daemon-side state.\n"
@@ -4639,6 +4930,10 @@ int main(int argc, char **argv) {
     rc = cmd_backup(argc, argv, start);
   } else if (strcmp(verb, "restore") == 0) {
     rc = cmd_restore(argc, argv, start);
+  } else if (strcmp(verb, "prune") == 0) {
+    rc = cmd_prune(argc, argv, start);
+  } else if (strcmp(verb, "metrics") == 0) {
+    rc = cmd_metrics(argc, argv, start);
   } else if (strcmp(verb, "version") == 0) {
     rc = cmd_version();
   } else if (strcmp(verb, "help") == 0) {

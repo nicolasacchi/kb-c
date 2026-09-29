@@ -54,6 +54,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <strings.h>
+#include <time.h>
 
 #include "kbc/app.h"
 #include "kbc/chunk.h"
@@ -3960,6 +3962,1320 @@ kbc_status kbc_app_delete_path(kbc_app *app, const char *corpus,
 }
 
 
+/* ========================================================== capture ===== */
+
+/* Stage 4's capture engine, ported from kb-core/src/capture.rs.
+ *
+ * WHAT IS HERE AND WHAT IS NOT, because the boundary is not a preference:
+ *
+ *   here    the multipart DECODER (kbc_multipart_parse), the frontmatter
+ *           stamp, the filename policy and the atomic write.
+ *   NOT     the ROUTE. kb-c has no capture route, and httpd.c — where a route
+ *           belongs, and where another agent is working right now — is not
+ *           this file's to touch. The seam is the pair below: the route
+ *           decodes a request, calls kbc_app_capture, answers. Nothing here
+ *           opens a socket, reads a header or knows what an HTTP status is.
+ *
+ * THE STAMP IS BYTE-COMPARABLE with the original's, and that is the whole
+ * reason this file bothers with a key ORDER. The same bytes through either
+ * implementation must produce the same file, so the order below is a
+ * compatibility contract, not a style choice: a capture that wrote the same
+ * seven keys in a different order is a DIFFERENT file, and the diff that
+ * proves parity would fail for a reason nobody can see in the bytes.
+ *
+ * The order is the original's — one call per key, left to right, each on the
+ * running document (capture.rs:517, 518, 523, 529, 531, 541, 545):
+ *
+ *   1 kb-category          517   "capture" unless overridden; never empty
+ *   2 kb-tags              518   the resolved tag list, ", " joined
+ *   3 kb-capture-original  523   the multipart filename, when it has one
+ *   4 kb-capture-url       529   the shared/saved-page URL, when it has one
+ *   5 kb-capture-at        531   the capture's unix seconds, ALWAYS
+ *   6 kb-session           541   only when absent from the UPLOADED content
+ *   7 kb-expires-at        545   only when a display-only expiry was given
+ *
+ * `title` is deliberately not one of them. A capture preserves the uploaded
+ * file's own authored title; the caller's title steers the OUTPUT FILENAME
+ * and nothing else (capture.rs:80-85). Stamping it would overwrite a
+ * document's title with the name of the button that uploaded it.
+ *
+ * Each key goes through the original's own line-oriented setter
+ * (markdown.rs:327 set_frontmatter_field), and THAT is what decides where a
+ * key lands: a key the document already carries is EDITED IN PLACE, and a key
+ * it does not is APPENDED to the end of the block (markdown.rs:384-413). So
+ * the order above is the order of first insertion, not a layout — a document
+ * that arrived with `kb-category` already set keeps it first and grows the
+ * other six after it. The setter rewrites the whole document per key, seven
+ * times, exactly as the original does; that is O(7n) over a body the caller
+ * has already capped, and matching the reference's algorithm is worth more
+ * here than saving six copies would be.
+ *
+ * WHAT IS DELIBERATELY ABSENT: the HTML pipeline. capture.rs stamps an HTML
+ * capture by splicing <meta> tags into <head> and, opt-in, running ammonia
+ * over the page. kb-c has no sanitiser (PORT_PLAN.md §1 lists ammonia as a
+ * known gap, "writes captures un-sanitised"), and a head-splice without one
+ * is a way to persist attacker markup into a trusted origin. Markdown only,
+ * until the sanitiser exists. */
+
+/* The per-kb capture subfolder (capture.rs:27). kb-c's frozen config has no
+ * `[server.capture].capture_dir` override, so the default is the only
+ * spelling; the field on the input is there so the seam can change. */
+#define CAPTURE_DIR_DEFAULT "capture"
+/* capture.rs:38 DEFAULT_MAX_FILE_BYTES. This is ONE file; the per-request
+ * budget on top of it belongs to the route. */
+#define CAPTURE_MAX_FILE_BYTES (10u * 1024u * 1024u)
+/* capture.rs:376 unique_filename, and the slug cap at capture.rs:322. */
+#define CAPTURE_SLUG_MAX 60u
+/* The collision loop's backstop. The original has no ceiling, which on a
+ * directory of a million same-second captures is a spin; this many probes
+ * means something is wrong that a report will say out loud. */
+#define CAPTURE_NAME_PROBES 10000u
+/* capture.rs:60 MAX_CAPTURE_FILES. */
+#define MULTIPART_MAX_PARTS 50u
+/* RFC 2046 caps a boundary at 70 characters. */
+#define MULTIPART_MAX_BOUNDARY 70u
+
+/* The capture surface — the four entry points and the four types they take —
+ * is app.h's, and app.h is the ONLY place it is written. This file is its
+ * definition, and the header comment there is the contract, the key order
+ * with the Rust line behind each key, and the reasons a capture carries no
+ * title and never fetches its url. */
+
+/* The shared write path of both public entry points, with `tags` already
+ * resolved: the original's two public functions resolve their own tag lists
+ * and then call one private writer (capture.rs:154, 166, 201), because the
+ * url-stub's raw `kind:url-stub` provenance tag must not be slugified — the
+ * transform would collapse its colon to a dash. */
+static kbc_status capture_write(kbc_app *app, const kbc_corpus_cfg *cc,
+                                const kbc_capture_input *in,
+                                const char *tags_joined, kbc_capture_result *out,
+                                kbc_err *err);
+
+/* The original's `parser::slugify_tag` (parser.rs:668-684): ASCII
+ * alphanumerics kept and lowercased, every other byte — a colon included —
+ * collapsed to a single dash, no dash leading and none trailing. It is
+ * deliberately NOT kbc_slugify, which folds diacritics and would turn "café"
+ * into "cafe" where the original drops the bytes: a tag is compared byte for
+ * byte by the overlay, so these must not be two different functions. */
+static kbc_status slug_tag_into(kbc_str *out, const char *s, size_t b,
+                                size_t e) {
+  bool pending = false, any = false;
+  for (size_t i = b; i < e; i++) {
+    unsigned char c = (unsigned char)s[i];
+    /* The original iterates chars() of a trimmed string. A multi-byte char is
+     * a run of non-alphanumerics here, and its first byte decides it, so the
+     * bytes are walked one at a time and the result is the same. */
+    const bool alnum = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                       (c >= 'A' && c <= 'Z');
+    if (!alnum) {
+      pending = true;
+      continue;
+    }
+    if (pending && any) {
+      kbc_status st = kbc_str_putc(out, '-');
+      if (kbc_failed(st)) return st;
+    }
+    pending = false;
+    any = true;
+    kbc_status st = kbc_str_putc(out, (char)(c >= 'A' && c <= 'Z' ? c + 32 : c));
+    if (kbc_failed(st)) return st;
+  }
+  return KBC_OK;
+}
+
+static void trim_span(const char *s, size_t *b, size_t *e) {
+  while (*b < *e && chunk_space(s[*b])) (*b)++;
+  while (*e > *b && chunk_space(s[*e - 1])) (*e)--;
+}
+
+/* capture.rs:310-329, capture_slug_checked. A dash is only ever emitted
+ * AHEAD of an alphanumeric, so the output never leads or trails one — except
+ * after the 60-character cap cuts in the middle of a run, which is the
+ * second trim the original does. NULL (empty) rather than the "capture"
+ * fallback; base_stem applies that. */
+static kbc_status capture_slug_into(kbc_str *out, const char *s, size_t b,
+                                    size_t e) {
+  kbc_str tmp;
+  kbc_str_init(&tmp);
+  kbc_status st = slug_tag_into(&tmp, s, b, e);
+  if (kbc_failed(st)) {
+    kbc_str_free(&tmp);
+    return st;
+  }
+  size_t take = tmp.len < (size_t)CAPTURE_SLUG_MAX ? tmp.len
+                                                   : (size_t)CAPTURE_SLUG_MAX;
+  while (take > 0 && tmp.ptr[take - 1] == '-') take--;
+  if (take > 0) st = kbc_str_append(out, tmp.ptr, take);
+  kbc_str_free(&tmp);
+  return st;
+}
+
+/* The same policy with the "capture" fallback the filename path uses
+ * (capture.rs:301-303). */
+static kbc_status capture_slug_or_default(kbc_str *out, const char *s, size_t b,
+                                         size_t e) {
+  kbc_status st = capture_slug_into(out, s, b, e);
+  if (kbc_failed(st)) return st;
+  if (out->len == 0) st = kbc_str_puts(out, "capture");
+  return st;
+}
+
+/* `Path::file_stem` (capture.rs:341-344) over the FINAL path component. A
+ * leading dot is not an extension, so ".bashrc" stems to itself. This runs
+ * before the slug collapses the dots anyway; it is here because the original
+ * has it, and a name like "report.2024.md" must stem to "report.2024" and
+ * slug to "report-2024", not to "report". */
+static kbc_status file_stem_into(kbc_str *out, const char *name) {
+  const char *base = name;
+  for (const char *p = name; *p != '\0'; p++) {
+    if (*p == '/' || *p == '\\') base = p + 1;
+  }
+  size_t n = strlen(base);
+  for (size_t i = n; i > 0; i--) {
+    if (base[i - 1] == '.') {
+      if (base + i - 1 != base) n = i - 1;
+      break;
+    }
+  }
+  return kbc_str_append(out, base, n);
+}
+
+/* Title wins when non-empty, else the original filename's stem, else
+ * "capture" (capture.rs:336-348). A traversal attempt in the filename has
+ * nothing left to traverse WITH by this point: every separator and dot is a
+ * dash in the slug. */
+static kbc_status base_stem(kbc_str *out, const char *title,
+                            const char *original_filename) {
+  if (title != NULL) {
+    size_t b = 0, e = strlen(title);
+    trim_span(title, &b, &e);
+    if (e > b) return capture_slug_or_default(out, title, b, e);
+  }
+  if (original_filename != NULL) {
+    kbc_str stem;
+    kbc_str_init(&stem);
+    kbc_status st = file_stem_into(&stem, original_filename);
+    if (kbc_failed(st)) {
+      kbc_str_free(&stem);
+      return st;
+    }
+    st = capture_slug_or_default(out, stem.ptr != NULL ? stem.ptr : "",
+                                 0, stem.len);
+    kbc_str_free(&stem);
+    return st;
+  }
+  return kbc_str_puts(out, "capture");
+}
+
+/* capture.rs:356-363. The caller's extension map has already validated the
+ * shape; this is defence in depth, because a broken value here would
+ * otherwise land a trailing-dot filename on disk. */
+static kbc_status capture_ext(char out[16], const char *ext) {
+  const char *b = ext != NULL ? ext : "";
+  size_t s = 0, e = strlen(b);
+  trim_span(b, &s, &e);
+  while (s < e && b[s] == '.') s++;
+  size_t n = 0;
+  for (size_t i = s; i < e && n < 15u; i++, n++) {
+    char c = b[i];
+    if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z'))) {
+      n = 0; /* one non-alphanumeric and the whole value is refused */
+      break;
+    }
+    out[n] = c;
+  }
+  if (n == 0) {
+    memcpy(out, "md", 3);
+  } else {
+    out[n] = '\0';
+  }
+  return KBC_OK;
+}
+
+/* ----------------------------------------------------------------- fence */
+
+/* markdown.rs:373-381's `is_match`, verbatim in behaviour: a blank line and
+ * a `#` comment are never a key, and a line matches only when the text
+ * before its first colon trims to exactly `key`. `n` includes the trailing
+ * newline, which no amount of trimming can reach. */
+static bool fm_key_is(const char *line, size_t n, const char *key) {
+  size_t b = 0, e = n;
+  trim_span(line, &b, &e);
+  if (b == e || line[b] == '#') return false;
+  const size_t klen = strlen(key);
+  for (size_t i = b; i < e; i++) {
+    if (line[i] != ':') continue;
+    size_t kb = b, ke = i;
+    trim_span(line, &kb, &ke);
+    return (ke - kb) == klen && memcmp(line + kb, key, klen) == 0;
+  }
+  return false;
+}
+
+/* markdown.rs:372-415, edit_keys_region. Non-matching lines (other keys,
+ * comments, blanks) ride through verbatim; a DUPLICATE key line collapses to
+ * the single edited one, so the value the reader gets — last-wins — is
+ * unambiguous. A key the block does not carry is appended after the last
+ * line, in the block's own line ending. */
+static kbc_status fm_edit_keys(kbc_str *out, const char *region, size_t rlen,
+                               const char *key, const char *val, bool crlf) {
+  bool emitted = false;
+  size_t i = 0;
+  while (i < rlen) {
+    size_t j = i;
+    while (j < rlen && region[j] != '\n') j++;
+    const size_t line_end = (j < rlen) ? j + 1 : rlen;
+    const size_t linelen = line_end - i;
+    if (fm_key_is(region + i, linelen, key)) {
+      if (val != NULL && !emitted) {
+        /* The line's OWN ending, or none at all when it has none
+         * (markdown.rs:386-393) — a rewritten key must not gain a newline the
+         * document did not have. */
+        const char *eol = "";
+        if (linelen >= 2 && region[i + linelen - 2] == '\r' &&
+            region[i + linelen - 1] == '\n') {
+          eol = "\r\n";
+        } else if (linelen >= 1 && region[i + linelen - 1] == '\n') {
+          eol = "\n";
+        }
+        kbc_status st = kbc_str_printf(out, "%s: %s%s", key, val, eol);
+        if (kbc_failed(st)) return st;
+        emitted = true;
+      }
+    } else {
+      kbc_status st = kbc_str_append(out, region + i, linelen);
+      if (kbc_failed(st)) return st;
+    }
+    i = line_end;
+ }
+  if (val != NULL && !emitted) {
+    const char *eol = crlf ? "\r\n" : "\n";
+    if (out->len > 0 && out->ptr[out->len - 1] != '\n') {
+      kbc_status st = kbc_str_puts(out, eol);
+      if (kbc_failed(st)) return st;
+    }
+    kbc_status st = kbc_str_printf(out, "%s: %s%s", key, val, eol);
+    if (kbc_failed(st)) return st;
+  }
+  return KBC_OK;
+}
+
+/* markdown.rs:327-366, set_frontmatter_field. ONE thing this file relies on:
+ * `out` is always a fresh buffer and `src` is only ever READ, so a caller
+ * may pass a document that lives in the buffer it is replacing. `val` must
+ * NOT alias `src` — the values here are always built separately.
+ *
+ * A leading "---" with no closing fence is NOT front matter
+ * (markdown.rs:359-360): the block is prepended fresh and the "---" stays a
+ * thematic break in the body, which is what the shared fence predicate
+ * (kbc_fm_fence) says about the same document. */
+static kbc_status fm_set_field(kbc_str *out, const char *src, size_t n,
+                               const char *key, const char *val) {
+  size_t bom = 0, start = 0, end = 0, body = 0;
+  kbc_str work;
+  kbc_str_init(&work);
+  kbc_status st;
+  if (kbc_fm_fence(src, n, &bom, &start, &end, &body)) {
+    size_t open = 0;
+    bool crlf = false;
+    if (n - bom >= 5 && src[bom + 3] == '\r' && src[bom + 4] == '\n') {
+      open = 5;
+      crlf = true;
+    } else {
+      open = 4;
+    }
+    st = kbc_str_append(&work, src, bom);
+    if (kbc_failed(st)) goto done;
+    st = kbc_str_append(&work, src + bom, open);
+    if (kbc_failed(st)) goto done;
+    st = fm_edit_keys(&work, src + start, end - start, key, val, crlf);
+    if (kbc_failed(st)) goto done;
+    st = kbc_str_append(&work, src + end, n - end); /* fence + body, verbatim */
+    if (kbc_failed(st)) goto done;
+  } else if (val == NULL) {
+    st = kbc_str_append(&work, src, n);
+    if (kbc_failed(st)) goto done;
+  } else {
+    st = kbc_str_printf(&work, "---\n%s: %s\n---\n", key, val);
+    if (st == KBC_OK) st = kbc_str_append(&work, src + bom, n - bom);
+    if (kbc_failed(st)) goto done;
+ }
+  *out = work;
+  return KBC_OK;
+done:
+  kbc_str_free(&work);
+  return st;
+}
+
+/* capture.rs:539-540: is `key` already in the UPLOADED content? The original
+ * asks its own parser; this is the same question over the same block, which
+ * is why the fence predicate is shared rather than re-derived. */
+static bool fm_src_has_key(const char *src, size_t n, const char *key) {
+  size_t bom = 0, start = 0, end = 0, body = 0;
+  if (!kbc_fm_fence(src, n, &bom, &start, &end, &body)) return false;
+  size_t i = start;
+  while (i < end) {
+    size_t j = i;
+    while (j < end && src[j] != '\n') j++;
+    const size_t line_end = (j < end) ? j + 1 : end;
+    if (fm_key_is(src + i, line_end - i, key)) return true;
+    i = line_end;
+  }
+  return false;
+}
+
+/* The one-call form the stamp uses: edit a key in the document `doc` already
+ * holds and swap the result in. Seven of these is seven full rewrites, which
+ * is what the original does too (each set_frontmatter_field returns a new
+ * String) — see the note on the key order at the top of this section. */
+static kbc_status fm_apply(kbc_str *doc, const char *key, const char *val) {
+  kbc_str next;
+  kbc_str_init(&next);
+  kbc_status st =
+      fm_set_field(&next, doc->ptr != NULL ? doc->ptr : "", doc->len, key, val);
+  if (kbc_failed(st)) {
+    kbc_str_free(&next);
+    return st;
+  }
+  kbc_str_free(doc);
+  *doc = next;
+  return KBC_OK;
+}
+
+/* capture.rs:465-467, sanitize_frontmatter_value. The writer is
+ * line-oriented, so a newline inside an attacker-controlled value — the
+ * multipart filename, a shared URL — would inject a frontmatter line, and a
+ * line reading `---` would close the fence early and splice arbitrary
+ * "frontmatter" into the document. Every newline becomes a space, which
+ * makes that unreachable. */
+static kbc_status fm_value_clean(kbc_str *out, const char *s) {
+  size_t b = 0, e = strlen(s);
+  trim_span(s, &b, &e);
+  for (size_t i = b; i < e; i++) {
+    const char c = (s[i] == '\r' || s[i] == '\n') ? ' ' : s[i];
+    kbc_status st = kbc_str_putc(out, c);
+    if (kbc_failed(st)) return st;
+  }
+  return KBC_OK;
+}
+
+/* capture.rs:441-454, build_tag_list. `source:upload` always; `from:<slug>`
+ * when the caller named a source that slugifies to something; then every
+ * caller tag through slugify_tag, skipping the ones that slugify to empty.
+ * The two provenance tags keep their colon — the original writes them
+ * literally, and only the VALUE of `from` is slugified. */
+static kbc_status build_tag_list(kbc_str *out, const char *from,
+                                 const char *const *tags, size_t n_tags) {
+  kbc_status st = kbc_str_puts(out, "source:upload");
+  if (kbc_failed(st)) return st;
+  if (from != NULL) {
+    kbc_str slug;
+    kbc_str_init(&slug);
+    size_t b = 0, e = strlen(from);
+    trim_span(from, &b, &e);
+    st = slug_tag_into(&slug, from, b, e);
+    if (st == KBC_OK && slug.len > 0) {
+      st = kbc_str_puts(out, ", from:");
+      if (st == KBC_OK) st = kbc_str_append(out, slug.ptr, slug.len);
+    }
+    kbc_str_free(&slug);
+    if (kbc_failed(st)) return st;
+ }
+  for (size_t i = 0; i < n_tags; i++) {
+    kbc_str slug;
+    kbc_str_init(&slug);
+    size_t b = 0, e = strlen(tags[i]);
+    trim_span(tags[i], &b, &e);
+    st = slug_tag_into(&slug, tags[i], b, e);
+    if (st == KBC_OK && slug.len > 0) {
+      st = kbc_str_puts(out, ", ");
+      if (st == KBC_OK) st = kbc_str_append(out, slug.ptr, slug.len);
+    }
+    kbc_str_free(&slug);
+    if (kbc_failed(st)) return st;
+ }
+  return KBC_OK;
+}
+
+/* The stamp, in the order documented at the top of this section. */
+static kbc_status stamp_capture(kbc_str *out, const char *src, size_t n,
+                                const kbc_capture_input *in,
+                                const char *tags_joined, int64_t ts) {
+  kbc_str doc, val;
+  kbc_str_init(&doc);
+  kbc_str_init(&val);
+  kbc_status st = kbc_str_append(&doc, src, n);
+  if (kbc_failed(st)) goto done;
+
+  /* 1 kb-category — capture.rs:511-517. Sanitised, and empty falls back to
+   * "capture" rather than writing a bare `kb-category:`. */
+  kbc_str_clear(&val);
+  st = fm_value_clean(&val, in->category != NULL ? in->category : "");
+  if (st == KBC_OK && val.len == 0) st = kbc_str_puts(&val, "capture");
+  if (st != KBC_OK) goto done;
+  st = fm_apply(&doc, "kb-category", val.ptr);
+  if (kbc_failed(st)) goto done;
+
+  /* 2 kb-tags — capture.rs:518. Always present, even empty: a capture with
+   * no tags and no `from` still declares where it came from. */
+  st = fm_apply(&doc, "kb-tags", tags_joined);
+  if (kbc_failed(st)) goto done;
+
+  /* 3 kb-capture-original — capture.rs:519-524. */
+  kbc_str_clear(&val);
+  st = fm_value_clean(&val, in->original_filename != NULL
+                                   ? in->original_filename
+                                   : "");
+  if (kbc_failed(st)) goto done;
+  if (val.len > 0) {
+    st = fm_apply(&doc, "kb-capture-original", val.ptr);
+    if (kbc_failed(st)) goto done;
+  }
+
+  /* 4 kb-capture-url — capture.rs:525-530.
+   *
+   * THE URL IS INERT TEXT. The daemon NEVER fetches it: that is the
+   * project's SSRF ruling (capture.rs:16-18, "enrichment is agent-layer
+   * work, later"), not an omission and not a TODO. A capture records where
+   * something came from; resolving it is the agent's job on a machine that
+   * is allowed to reach the internet. If you are reading this while adding
+   * a fetch, stop: you are adding a server-side request forgery to a daemon
+   * that binds to a network. */
+  kbc_str_clear(&val);
+  st = fm_value_clean(&val, in->url != NULL ? in->url : "");
+  if (kbc_failed(st)) goto done;
+  if (val.len > 0) {
+    st = fm_apply(&doc, "kb-capture-url", val.ptr);
+    if (kbc_failed(st)) goto done;
+  }
+
+  /* 5 kb-capture-at — capture.rs:531. The only unconditional stamp after the
+   * category: a capture without a clock is not provenance. */
+  kbc_str_clear(&val);
+  st = kbc_str_printf(&val, "%lld", (long long)ts);
+  if (kbc_failed(st)) goto done;
+  st = fm_apply(&doc, "kb-capture-at", val.ptr);
+  if (kbc_failed(st)) goto done;
+
+  /* 6 kb-session — capture.rs:532-543. Never overwrites a session marker
+   * the UPLOADED content already carries: the check is against the SOURCE,
+   * not against the document this loop has been editing, or a capture
+   * would stamp a second kb-session on every retry. */
+  kbc_str_clear(&val);
+  st = fm_value_clean(&val, in->session_id != NULL ? in->session_id : "");
+  if (kbc_failed(st)) goto done;
+  if (val.len > 0 && !fm_src_has_key(src, n, "kb-session")) {
+    st = fm_apply(&doc, "kb-session", val.ptr);
+    if (kbc_failed(st)) goto done;
+  }
+
+  /* 7 kb-expires-at — capture.rs:544-546. Display-only; there is no sweeper,
+   * and an absent expiry is byte-identical to not stamping one at all. */
+  if (in->has_expires_at) {
+    kbc_str_clear(&val);
+    st = kbc_str_printf(&val, "%lld", (long long)in->expires_at);
+    if (kbc_failed(st)) goto done;
+    st = fm_apply(&doc, "kb-expires-at", val.ptr);
+    if (kbc_failed(st)) goto done;
+  }
+
+  *out = doc;
+  kbc_str_init(&doc); /* ownership moved; the free below is a no-op */
+done:
+  kbc_str_free(&doc);
+  kbc_str_free(&val);
+  return st;
+}
+
+static kbc_status capture_taken(const char *dir_abs, const char *name) {
+  kbc_str p;
+  kbc_str_init(&p);
+  bool taken = false;
+  if (kbc_str_printf(&p, "%s/%s", dir_abs, name) == KBC_OK) {
+    taken = kbc_path_exists(p.ptr);
+  }
+  kbc_str_free(&p);
+  return taken ? KBC_OK : KBC_ERR_NOTFOUND;
+}
+
+/* capture.rs:376-384, unique_filename. Two same-name captures in the same
+ * second land on distinct paths, and since the id is minted from the path
+ * (ids.c) that means distinct ids, so nothing silently overwrites. */
+static kbc_status capture_filename(kbc_str *out, const char *dir_abs,
+                                   const char *base, const char *ext,
+                                   int64_t ts, kbc_err *err) {
+  kbc_status st =
+      kbc_str_printf(out, "%s-%lld.%s", base, (long long)ts, ext);
+  if (kbc_failed(st)) return st;
+  for (unsigned n = 1; n <= CAPTURE_NAME_PROBES; n++) {
+    if (capture_taken(dir_abs, out->ptr) != KBC_OK) return KBC_OK;
+    kbc_str_clear(out);
+    st = kbc_str_printf(out, "%s-%lld-%u.%s", base, (long long)ts, n, ext);
+    if (kbc_failed(st)) return st;
+  }
+  return kbc_err_set(err, KBC_ERR_CONFLICT,
+                     "%s-%lld: %u captures already share this name", base,
+                     (long long)ts, CAPTURE_NAME_PROBES);
+}
+
+/* ------------------------------------------------------------------ write */
+
+static kbc_status capture_write(kbc_app *app, const kbc_corpus_cfg *cc,
+                                const kbc_capture_input *in,
+                                const char *tags_joined, kbc_capture_result *out,
+                                kbc_err *err) {
+  const char *dir_rel =
+      (in->capture_dir != NULL && in->capture_dir[0] != '\0')
+          ? in->capture_dir
+          : CAPTURE_DIR_DEFAULT;
+  /* Rule 9: this joins onto a corpus root and is caller-supplied. */
+  if (strstr(dir_rel, "..") != NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "capture: capture_dir %s may not contain '..'",
+                       dir_rel);
+ }
+  char ext[16];
+  capture_ext(ext, in->ext);
+
+  kbc_str dir_abs, name, rel, stamped;
+  kbc_str_init(&dir_abs);
+  kbc_str_init(&name);
+  kbc_str_init(&rel);
+  kbc_str_init(&stamped);
+  kbc_status st = kbc_str_printf(&dir_abs, "%s/%s", cc->path, dir_rel);
+  /* The mutex is taken once, halfway down, and released once at `done` — the
+   * shape reindex_one uses, because a function with this many exits takes a
+   * lock in as many places otherwise. */
+  bool locked = false;
+  if (kbc_failed(st)) {
+    st = kbc_err_set(err, KBC_ERR_NOMEM, "capture dir for %s/%s", cc->name,
+                     dir_rel);
+    goto done;
+  }
+  if (dir_abs.len > (size_t)KBC_MAX_PATH_LEN) {
+    st = kbc_err_set(err, KBC_ERR_INVALID,
+                     "%s: capture dir over the %u byte path cap", dir_abs.ptr,
+                     (unsigned)KBC_MAX_PATH_LEN);
+    goto done;
+  }
+
+  const int64_t ts = in->now_unix > 0 ? in->now_unix : (int64_t)time(NULL);
+  kbc_str base;
+  kbc_str_init(&base);
+  st = base_stem(&base, in->title, in->original_filename);
+  if (kbc_failed(st)) {
+    kbc_str_free(&base);
+    goto done;
+  }
+  /* The collision probe and the write are one window, so it runs under the
+   * one-writer mutex. The original probes `.exists()` and then writes too
+   * (capture.rs:379), so it has the same race; holding the lock here is what
+   * makes "two same-second captures land on distinct paths" true rather than
+   * usually true. Nothing below re-enters a reindex entry point. */
+  pthread_mutex_lock(&app->reindex_mu);
+  locked = true;
+  st = capture_filename(&name, dir_abs.ptr, base.ptr, ext, ts, err);
+  kbc_str_free(&base);
+  if (kbc_failed(st)) goto done;
+
+  st = kbc_str_printf(&rel, "%s/%s", dir_rel, name.ptr);
+  if (kbc_failed(st)) {
+    st = kbc_err_set(err, KBC_ERR_NOMEM, "capture path for %s", name.ptr);
+    goto done;
+  }
+  if (rel.len > (size_t)KBC_MAX_PATH_LEN) {
+    st = kbc_err_set(err, KBC_ERR_INVALID, "%s: over the %u byte path cap",
+                     rel.ptr, (unsigned)KBC_MAX_PATH_LEN);
+    goto done;
+  }
+
+  st = stamp_capture(&stamped, in->body, in->body_len, in, tags_joined, ts);
+  if (kbc_failed(st)) {
+    st = kbc_err_set(err, KBC_ERR_NOMEM, "capture stamp for %s", rel.ptr);
+    goto done;
+  }
+
+  /* The directory before the file: a capture into a corpus that has never
+ * had one is the normal first run, not an error. */
+  st = kbc_mkdir_p(dir_abs.ptr, err);
+  if (kbc_failed(st)) goto done;
+
+  kbc_str abs;
+  kbc_str_init(&abs);
+  st = kbc_str_printf(&abs, "%s/%s", dir_abs.ptr, name.ptr);
+  if (kbc_failed(st)) {
+    kbc_str_free(&abs);
+    st = kbc_err_set(err, KBC_ERR_NOMEM, "capture path for %s", name.ptr);
+    goto done;
+  }
+  /* Atomic: a reader of the corpus sees the whole file or the old one, and
+   * a capture that crashes mid-write leaves no half-stamped provenance. */
+  st = kbc_str_write_file_atomic(abs.ptr, stamped.ptr, stamped.len, err);
+  kbc_str_free(&abs);
+  if (kbc_failed(st)) goto done;
+
+  kbc_id_for_artifact(out->id, cc->name, rel.ptr);
+  memcpy(out->path, rel.ptr, rel.len);
+  out->path[rel.len] = '\0';
+  out->bytes = stamped.len;
+
+done:
+  if (locked) pthread_mutex_unlock(&app->reindex_mu);
+  kbc_str_free(&dir_abs);
+  kbc_str_free(&name);
+  kbc_str_free(&rel);
+  kbc_str_free(&stamped);
+  return st;
+}
+
+kbc_status kbc_app_capture(kbc_app *app, const char *corpus,
+                           const kbc_capture_input *in, kbc_capture_result *out,
+                           kbc_err *err) {
+  if (app == NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "capture: app is NULL");
+  }
+  if (corpus == NULL || in == NULL || out == NULL || in->body == NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "capture: corpus, input, result and body are all "
+                       "required");
+  }
+  if (in->body_len > (size_t)CAPTURE_MAX_FILE_BYTES) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "capture: %zu bytes is over the %u byte per-file cap",
+                       in->body_len, (unsigned)CAPTURE_MAX_FILE_BYTES);
+  }
+  if (in->n_tags > 0 && in->tags == NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "capture: %zu tags with a NULL tag array", in->n_tags);
+  }
+  const kbc_corpus_cfg *cc = kbc_config_corpus(app->cfg, corpus);
+  if (cc == NULL) {
+    return kbc_err_set(err, KBC_ERR_NOTFOUND, "corpus %s is not configured",
+                       corpus);
+  }
+  memset(out, 0, sizeof *out);
+
+  kbc_str tags;
+  kbc_str_init(&tags);
+  kbc_status st = build_tag_list(&tags, in->from, in->tags, in->n_tags);
+  if (kbc_failed(st)) {
+    kbc_str_free(&tags);
+    return kbc_err_set(err, KBC_ERR_NOMEM, "capture tag list for %s", corpus);
+  }
+  st = capture_write(app, cc, in, tags.ptr, out, err);
+  kbc_str_free(&tags);
+  return st;
+}
+
+/* capture.rs:281-290, build_url_stub. The body is an H1, the URL as a
+ * Markdown autolink when there is one, and the shared text as a paragraph.
+ * No escaping beyond what Markdown authoring already implies: this is the
+ * artifact's own content, not attacker markup spliced into a trusted
+ * document. */
+static kbc_status build_url_stub(kbc_str *out, const char *title,
+                                 const char *url, const char *text) {
+  kbc_status st = kbc_str_printf(out, "# %s\n", title);
+  if (kbc_failed(st)) return st;
+  if (url != NULL) {
+    size_t b = 0, e = strlen(url);
+    trim_span(url, &b, &e);
+    if (e > b) {
+      st = kbc_str_putc(out, '\n');
+      if (st == KBC_OK) st = kbc_str_putc(out, '<');
+      if (st == KBC_OK) st = kbc_str_append(out, url + b, e - b);
+      if (st == KBC_OK) st = kbc_str_puts(out, ">\n");
+      if (kbc_failed(st)) return st;
+ }
+  }
+  if (text != NULL) {
+    size_t b = 0, e = strlen(text);
+    trim_span(text, &b, &e);
+    if (e > b) {
+      st = kbc_str_putc(out, '\n');
+      if (st == KBC_OK) st = kbc_str_append(out, text + b, e - b);
+      if (st == KBC_OK) st = kbc_str_putc(out, '\n');
+      if (kbc_failed(st)) return st;
+    }
+  }
+  return KBC_OK;
+}
+
+kbc_status kbc_app_capture_url_stub(kbc_app *app, const char *corpus,
+                                    const kbc_capture_url_input *in,
+                                    kbc_capture_result *out, kbc_err *err) {
+  if (app == NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "capture_url_stub: app is NULL");
+  }
+  if (corpus == NULL || in == NULL || out == NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "capture_url_stub: corpus, input and result are all "
+                       "required");
+  }
+  if (in->n_tags > 0 && in->tags == NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "capture_url_stub: %zu tags with a NULL tag array",
+                       in->n_tags);
+  }
+  const kbc_corpus_cfg *cc = kbc_config_corpus(app->cfg, corpus);
+  if (cc == NULL) {
+    return kbc_err_set(err, KBC_ERR_NOTFOUND, "corpus %s is not configured",
+                       corpus);
+  }
+
+  /* capture.rs:167-171: an empty title is "Untitled capture", not a bare
+ * "#" that the indexer would read as an h1 with no text. */
+  const char *title = in->title;
+  if (title != NULL) {
+    size_t b = 0, e = strlen(title);
+    trim_span(title, &b, &e);
+    if (e == b) title = NULL;
+  }
+  if (title == NULL) title = "Untitled capture";
+
+  kbc_str body, tags;
+  kbc_str_init(&body);
+  kbc_str_init(&tags);
+  kbc_status st = build_url_stub(&body, title, in->url, in->text);
+  if (st == KBC_OK) st = build_tag_list(&tags, in->from, in->tags, in->n_tags);
+  /* The raw provenance tag, appended AFTER the slugify so its colon
+ * survives (capture.rs:174-175, and slugify_tag's own doc: a colon would
+ * collapse to a dash). */
+  if (st == KBC_OK && tags.len > 0) st = kbc_str_puts(&tags, ", ");
+  if (st == KBC_OK) st = kbc_str_puts(&tags, "kind:url-stub");
+  if (kbc_failed(st)) {
+    kbc_str_free(&body);
+    kbc_str_free(&tags);
+    return kbc_err_set(err, KBC_ERR_NOMEM, "url stub for %s", corpus);
+  }
+
+  kbc_capture_input cap;
+  memset(&cap, 0, sizeof cap);
+  cap.corpus = corpus;
+  cap.capture_dir = in->capture_dir;
+  cap.from = in->from;
+  cap.title = title;
+  cap.url = in->url;
+  cap.body = body.ptr;
+  cap.body_len = body.len;
+  cap.ext = "md";
+  cap.now_unix = in->now_unix;
+  st = capture_write(app, cc, &cap, tags.ptr, out, err);
+  kbc_str_free(&body);
+  kbc_str_free(&tags);
+  return st;
+}
+
+/* ------------------------------------------------------------- multipart */
+
+/* Byte-exact search for a short needle; SIZE_MAX when absent. The multipart
+ * splitter cannot use strstr: a body is a byte string that may carry NULs
+ * (rule 8 — lengths travel with strings). */
+static size_t find_bytes(const char *hay, size_t hlen, const char *needle,
+                         size_t nlen, size_t from) {
+  if (nlen == 0 || hlen < nlen || from > hlen - nlen) return SIZE_MAX;
+  for (size_t i = from; i + nlen <= hlen; i++) {
+    if (hay[i] == needle[0] && memcmp(hay + i, needle, nlen) == 0) return i;
+  }
+  return SIZE_MAX;
+}
+
+static bool ascii_lower_eq(const char *s, size_t n, const char *lit) {
+  return strlen(lit) == n && strncasecmp(s, lit, n) == 0;
+}
+
+/* The `boundary` parameter of a Content-Type, quoted or bare
+ * (RFC 2046 §5.1.1). Returns the boundary with no dashes — the delimiter
+ * adds them — and refuses the shapes a real body cannot contain. */
+static kbc_status ct_boundary(kbc_str *out, const char *ct, kbc_err *err) {
+  static const char key[] = "boundary=";
+  const size_t keylen = sizeof key - 1;
+  size_t n = strlen(ct);
+  for (size_t i = 0; i + keylen <= n; i++) {
+    if (!ascii_lower_eq(ct + i, keylen, "boundary=")) continue;
+    size_t j = i + keylen;
+    while (j < n && (ct[j] == ' ' || ct[j] == '\t')) j++;
+    if (j >= n) break;
+    if (ct[j] == '"') {
+      j++;
+      while (j < n && ct[j] != '"') {
+        if ((unsigned char)ct[j] < 0x20u) {
+          return kbc_err_set(err, KBC_ERR_INVALID,
+                             "content-type: control byte in the boundary");
+        }
+        kbc_status st = kbc_str_putc(out, ct[j]);
+        if (kbc_failed(st)) return st;
+        j++;
+      }
+      if (j >= n) {
+        return kbc_err_set(err, KBC_ERR_INVALID,
+                           "content-type: unterminated quoted boundary");
+      }
+    } else {
+      while (j < n && ct[j] != ';' && ct[j] != ' ' && ct[j] != '\t') {
+        if ((unsigned char)ct[j] < 0x20u) {
+          return kbc_err_set(err, KBC_ERR_INVALID,
+                             "content-type: control byte in the boundary");
+        }
+        kbc_status st = kbc_str_putc(out, ct[j]);
+        if (kbc_failed(st)) return st;
+        j++;
+      }
+    }
+    if (out->len == 0) {
+      return kbc_err_set(err, KBC_ERR_INVALID, "content-type: empty boundary");
+ }
+    if (out->len > (size_t)MULTIPART_MAX_BOUNDARY) {
+      return kbc_err_set(err, KBC_ERR_INVALID,
+                         "content-type: boundary over the %u byte cap",
+                         (unsigned)MULTIPART_MAX_BOUNDARY);
+    }
+    return KBC_OK;
+  }
+  return kbc_err_set(err, KBC_ERR_INVALID,
+                     "content-type: no boundary parameter");
+}
+
+/* One parameter out of a Content-Disposition header, quoted or bare
+ * (RFC 7578 §4.2). Found only at a parameter boundary, so a field named
+ * "xname" is not a "name". The quoted form honours the backslash escape the
+ * grammar allows and nothing else: a filename is bytes, and a filename is
+ * not a security boundary here — it is provenance text and a slug source,
+ * and both are sanitised downstream. */
+static void cd_param(kbc_str *out, const char *hdr, size_t hlen,
+                     const char *key) {
+  const size_t klen = strlen(key);
+  for (size_t i = 0; i + klen + 1 <= hlen; i++) {
+    if (i != 0 && hdr[i - 1] != ';' && hdr[i - 1] != ' ') continue;
+    if (!ascii_lower_eq(hdr + i, klen, key) || hdr[i + klen] != '=') {
+      continue;
+    }
+    size_t j = i + klen + 1;
+    if (j < hlen && hdr[j] == '"') {
+      j++;
+      while (j < hlen && hdr[j] != '"') {
+        if (hdr[j] == '\\' && j + 1 < hlen) j++;
+        (void)kbc_str_putc(out, hdr[j]);
+        j++;
+      }
+      return;
+    }
+    while (j < hlen && hdr[j] != ';' && hdr[j] != ' ') {
+      (void)kbc_str_putc(out, hdr[j]);
+      j++;
+    }
+    return;
+  }
+}
+/* THE COUNT IS ALWAYS RIGHT, and that is the whole contract. `*n_out` is the
+ * number of parts in the body — on success AND on every failure — and
+ * `out[0..*n_out)` is the first min(*n_out, out_cap) of them, written and
+ * readable. The STATUS says why the parse stopped:
+ *
+ *   KBC_OK                  the body was consumed and every part fitted.
+ *   KBC_ERR_INVALID, "N parts, more than the M this array holds"
+ *                           the body is well formed and LONGER than the
+ *                           array. Resize to *n_out and call again.
+ *   KBC_ERR_INVALID, other  the body is malformed. Resizing will not help.
+ *   KBC_ERR_NOMEM           the arena ran out mid-part; *n_out counts only
+ *                           the parts fully built, and out[0..*n_out) is
+ *                           still readable.
+ *
+ * A caller therefore gets two facts at once — what went wrong, and how big
+ * its array needs to be — and the second is the one a caller that IGNORED
+ * the status is still holding, which is what stops "silently truncated
+ * upload" from needing a second thing to go right. */
+kbc_status kbc_multipart_parse(const char *content_type, const char *body,
+                               size_t body_len, kbc_multipart_part *out,
+                               size_t out_cap, size_t *n_out, kbc_arena *a,
+                               kbc_err *err) {
+  if (content_type == NULL || body == NULL || out == NULL || n_out == NULL ||
+      a == NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "multipart_parse: content_type, body, out, n_out and "
+                       "arena are all required");
+  }
+  /* Parts FOUND, not parts stored: the two differ once the array fills, and
+   * the number a caller needs is the first. `overflow` records that they
+   * have, so the scan can finish and the message can name the real total. */
+  size_t found = 0;
+  bool overflow = false;
+  *n_out = 0;
+
+  kbc_str bnd;
+  kbc_str_init(&bnd);
+  kbc_status st = ct_boundary(&bnd, content_type, err);
+  if (kbc_failed(st)) {
+    kbc_str_free(&bnd);
+    return st;
+  }
+  kbc_str dash;
+  kbc_str_init(&dash);
+  st = kbc_str_printf(&dash, "--%s", bnd.ptr);
+  kbc_str_free(&bnd);
+  if (kbc_failed(st)) {
+    kbc_str_free(&dash);
+    return kbc_err_set(err, KBC_ERR_NOMEM, "multipart delimiter");
+  }
+
+  /* The preamble before the first delimiter is legal and ignored, so the
+   * scan starts wherever the first one is. */
+  size_t pos = find_bytes(body, body_len, dash.ptr, dash.len, 0);
+  while (pos != SIZE_MAX) {
+    size_t after = pos + dash.len;
+    if (after + 1 < body_len && body[after] == '-' && body[after + 1] == '-') {
+      break; /* the closing delimiter; the epilogue is not a part */
+ }
+    if (after + 1 >= body_len || body[after] != '\r' || body[after + 1] != '\n') {
+      st = kbc_err_set(err, KBC_ERR_INVALID,
+                       "multipart: delimiter at byte %zu is not followed by "
+                       "CRLF", pos);
+      goto done;
+ }
+    const size_t start = after + 2;
+    const size_t next = find_bytes(body, body_len, dash.ptr, dash.len, start);
+    if (next == SIZE_MAX) {
+      st = kbc_err_set(err, KBC_ERR_INVALID,
+                       "multipart: unterminated body, no closing delimiter");
+ goto done;
+ }
+    /* The CRLF in front of a delimiter belongs to the delimiter, not to the
+ * part's content (RFC 2046 §5.1.1). */
+    const size_t end =
+        (next >= 2) ? next - 2 : next;
+    const size_t hdr_end_rel = find_bytes(body + start, end - start, "\r\n\r\n", 4, 0);
+    if (hdr_end_rel == SIZE_MAX) {
+      st = kbc_err_set(err, KBC_ERR_INVALID,
+                       "multipart: part at byte %zu has no header terminator",
+                       start);
+      goto done;
+    }
+    const size_t hdr_end = start + hdr_end_rel;
+
+    /* Past the array's end the part is COUNTED but not stored, and the scan
+     * carries on to the end of the body. Counting is the point: the caller
+     * learns the true total (in *n_out, set on the way out whatever the
+     * status) AND the fact that its array was too small, which is the only
+     * way it can size a retry without guessing. Stopping at the cap would
+     * report a number that is a property of the caller's buffer rather than
+     * of the body, and a caller that grew and retried would have to guess how
+     * much to grow by.
+     *
+     * Nothing is written to `out` past out_cap, so a caller that IGNORES the
+     * status still cannot read a slot that was never filled: *n_out is the
+     * number of parts in the body, and `out` holds the first min(that,
+     * out_cap) of them. A truncated array with a success status would be the
+     * failure the cap exists to prevent, and forgetting one check is exactly
+     * how it would happen. */
+    if (found >= out_cap) {
+      overflow = true;
+      found++;
+      pos = next;
+      continue;
+    }
+
+    kbc_str name, filename;
+    kbc_str_init(&name);
+    kbc_str_init(&filename);
+    cd_param(&name, body + start, hdr_end - start, "name");
+    cd_param(&filename, body + start, hdr_end - start, "filename");
+
+    kbc_multipart_part *part = &out[found];
+    part->name =
+        kbc_arena_strndup(a, name.ptr != NULL ? name.ptr : "", name.len);
+    part->filename = filename.len > 0
+                         ? kbc_arena_strndup(a, filename.ptr, filename.len)
+                         : NULL;
+    const size_t data_len = (hdr_end + 4 <= end) ? end - (hdr_end + 4) : 0;
+    part->data = kbc_arena_strndup(a, body + hdr_end + 4, data_len);
+    part->len = data_len;
+    kbc_str_free(&name);
+    kbc_str_free(&filename);
+    if (part->name == NULL || part->data == NULL) {
+      /* The count names only parts that were FULLY materialised, so
+       * out[0..*n_out) is always readable. This one is not: it is half-built
+       * and is left unwritten rather than pointed at a hole. */
+      part->name = NULL;
+      part->filename = NULL;
+      part->data = NULL;
+      part->len = 0;
+      st = kbc_err_set(err, KBC_ERR_NOMEM, "multipart part %zu", found);
+      goto done;
+    }
+    found++;
+    pos = next;
+  }
+  /* A MALFORMED body outranks an overflow: resizing the array will not fix a
+   * truncated upload, and saying "your buffer was too small" to a caller
+   * whose problem is a cut-off request sends it down the wrong road. */
+  if (overflow) {
+    st = kbc_err_set(err, KBC_ERR_INVALID,
+                     "multipart: %zu parts, more than the %zu this array holds",
+                     found, out_cap);
+  } else {
+    st = KBC_OK;
+  }
+done:
+  kbc_str_free(&dash);
+  /* The one rule about *n_out: it is the number of parts found, on success
+   * and on every failure, and out[0..*n_out) is written and readable. A
+   * caller gets two facts at once — what went wrong, and how big the array
+   * needs to be — and the second one is the one a caller that ignored the
+   * first is still holding. */
+  *n_out = found;
+  return st;
+}
+
+/* =============================================================== mv ===== */
+
+/* A rename, and the one thing it has to be: a rename that loses the
+ * document's ID-KEYED STATE is a delete plus a create wearing a rename's
+ * name. kbc_app_delete_path's rule — a removal must not take a user's
+ * reading history with it — applies here with the opposite polarity: here
+ * the document did NOT go away, so nothing keyed to it may go away either.
+ *
+ * It is FOUR steps, and the third of them is ONE call:
+ *
+ *   1 record the `moves` intent row: old_id -> new_id, old_rel -> new_rel
+ *   2 rename the file on disk
+ *   3 kbc_store_rekey_artifact — every artifact-referencing row, in ONE
+ *     transaction
+ *   4 stamp the intent row complete
+ *
+ * WHY THE INTENT ROW GOES IN FIRST, and why it is stamped LAST. It is
+ * written before the rename, so a crash between the rename and the rekey
+ * leaves a durable, LISTABLE signal — kbc_store_list_incomplete_moves — and
+ * not a document that quietly vanished between two operations nobody could
+ * see. It is stamped only after the rekey committed, because
+ * kbc_store_moves_lookup deliberately refuses to follow an unstamped row: an
+ * interrupted move has to keep resolving to the name the document is
+ * actually at, not to a name the rename never reached.
+ *
+ * WHY THERE IS NO DELETE-SUPPRESSION GUARD (the original's step 4, at
+ * relocate.rs:1-15). It exists there because the watcher's debounce
+ * synthesises a Deleted event for the old path after the rename, and a
+ * delete-cascade would then take the just-migrated state with it. kb-c's
+ * watcher delete resolves the event against the STORE row for that path
+ * (watcher_cb -> reindex_one -> store_forget_path), and this function holds
+ * reindex_mu across the record, the rename, the rekey AND the completion, so
+ * by the time any watcher event can be processed the old path has no row to
+ * cascade and the new path carries the migrated one. The window the original
+ * needs a journal for does not open while the mutex is held, which is why
+ * this file wants no moves_suppresses_delete.
+ *
+ * WHAT A RENAME PRESERVES, table by table:
+ *
+ *   REBUILT from the bytes by the re-ingest at the new path: the artifacts
+ *   row's content fields, chunks, doc_metas and the document's own OUTBOUND
+ *   edges. None of them need carrying — the same bytes derive them again.
+ *
+ *   CARRIED by the rekey, because none of it can be rebuilt from a file:
+ *   every comment, with its own id AND its created_at (the rekey names only
+ *   `comments.doc_id`, so the two columns the only public writer MINTS are
+ *   never written and cannot change), the anchor, the author, the body and
+ *   the resolution flag; the corkboard entry and the pin with the timestamps
+ *   the user set; the doc_first_seen anchor; the reading history; and the
+ *   INBOUND edges and pending links, which the store rewrites on BOTH path
+ *   columns because a document that is itself a link target has its
+ *   backlinks named at the old path.
+ *
+ *   NOT CARRIED, and the only one left is `doc_metas`: that table is keyed by
+ *   (corpus, path) and the rekey works on ids, so the facets the document
+ *   wrote at its old path are dropped by kbc_store_forget_document below. It
+ *   runs AFTER the rekey and not before, so its graph half — which demotes
+ *   inbound edges to pending links and deletes the outbound ones — finds
+ *   nothing left naming this path, and its doc_metas half is the whole of
+ *   what is left to do. Before the rekey it would throw those backlinks away
+ *   and rebuild them from the demotions instead. */
+
+kbc_status kbc_app_move_path(kbc_app *app, const char *corpus,
+                             const char *old_rel, const char *new_rel,
+                             kbc_err *err) {
+  if (app == NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "move_path: app is NULL");
+  }
+  if (corpus == NULL || old_rel == NULL || new_rel == NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "move_path: corpus and both paths are required");
+  }
+  /* The same two gates reindex_one applies, for the same reason: both of
+ * these reach the filesystem, and a corpus name from a request body is
+ * hostile input like anything else. */
+  if (strstr(old_rel, "..") != NULL || strstr(new_rel, "..") != NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "move_path: '..' is not allowed");
+  }
+  if (strlen(old_rel) > (size_t)KBC_MAX_PATH_LEN ||
+      strlen(new_rel) > (size_t)KBC_MAX_PATH_LEN) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "move_path: a path is over the %u byte cap",
+                       (unsigned)KBC_MAX_PATH_LEN);
+  }
+  if (old_rel[0] == '\0' || new_rel[0] == '\0' || old_rel[0] == '/' ||
+      new_rel[0] == '/') {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "move_path: paths are corpus-relative and non-empty");
+  }
+  if (strcmp(old_rel, new_rel) == 0) return KBC_OK; /* a no-op needs no lock */
+  const kbc_corpus_cfg *cc = kbc_config_corpus(app->cfg, corpus);
+  if (cc == NULL) {
+    return kbc_err_set(err, KBC_ERR_NOTFOUND, "corpus %s is not configured",
+                       corpus);
+  }
+
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  if (a == NULL) {
+    return kbc_err_set(err, KBC_ERR_NOMEM, "move_path arena");
+  }
+  kbc_str old_abs, new_abs;
+  kbc_str_init(&old_abs);
+  kbc_str_init(&new_abs);
+  kbc_status s = kbc_str_printf(&old_abs, "%s/%s", cc->path, old_rel);
+  if (s == KBC_OK) s = kbc_str_printf(&new_abs, "%s/%s", cc->path, new_rel);
+  if (kbc_failed(s)) {
+    kbc_str_free(&old_abs);
+    kbc_str_free(&new_abs);
+    kbc_arena_free(a);
+    return kbc_err_set(err, KBC_ERR_NOMEM, "move_path paths for %s", corpus);
+  }
+
+  pthread_mutex_lock(&app->reindex_mu);
+
+  /* relocate.rs:293-311, in the original's order: the source must be a
+ * file, the target must not exist, and the source must be INDEXED. A file
+ * on disk that the store has never seen is not a document to move — moving
+   * it would silently create one, which is a write the caller did not ask
+   * for. */
+  struct stat sb;
+  if (stat(old_abs.ptr, &sb) != 0 || !S_ISREG(sb.st_mode)) {
+    s = kbc_err_set(err, KBC_ERR_NOTFOUND, "move_path: no such source %s/%s",
+                    corpus, old_rel);
+    goto out;
+  }
+  if (kbc_path_exists(new_abs.ptr)) {
+    s = kbc_err_set(err, KBC_ERR_CONFLICT, "move_path: %s/%s already exists",
+                    corpus, new_rel);
+    goto out;
+  }
+
+  kbc_artifact prev;
+  memset(&prev, 0, sizeof prev);
+  s = kbc_store_get_artifact_by_path(app->store, a, corpus, old_rel, &prev,
+                                     err);
+  if (kbc_failed(s)) {
+    kbc_err_reset(err);
+    s = kbc_err_set(err, KBC_ERR_NOTFOUND, "move_path: %s/%s is not indexed",
+                    corpus, old_rel);
+    goto out;
+  }
+  /* Rule 7: the copy below is a fixed 13 bytes, so the id is checked to be
+   * the width the store promises before it is copied rather than trusted. */
+  if (prev.id == NULL || strlen(prev.id) != (size_t)KBC_MAX_ID_LEN) {
+    s = kbc_err_set(err, KBC_ERR_IO,
+                    "move_path: %s/%s has a malformed artifact id", corpus,
+                    old_rel);
+    goto out;
+  }
+  char old_id[KBC_MAX_ID_LEN + 1];
+  char new_id[KBC_MAX_ID_LEN + 1];
+  memcpy(old_id, prev.id, KBC_MAX_ID_LEN);
+  old_id[KBC_MAX_ID_LEN] = '\0';
+  kbc_id_for_artifact(new_id, corpus, new_rel);
+  /* relocate.rs:315-321: a path-hash collision is vanishingly rare, and
+   * no-oping one would leave two paths serving one id. Refuse. */
+  if (strcmp(old_id, new_id) == 0) {
+    s = kbc_err_set(err, KBC_ERR_CONFLICT,
+                    "move_path: %s and %s hash to the same artifact id %s",
+                    old_rel, new_rel, old_id);
+    goto out;
+  }
+
+  /* Step 1: the intent row, BEFORE the rename and under the same lock. Written
+   * last, it would be a redirect to a file that had not moved yet. */
+  s = kbc_store_record_move(app->store, old_id, new_id, old_rel, new_rel,
+                            kbc_now_ns() / 1000000000LL, err);
+  if (kbc_failed(s)) goto out;
+
+  /* Step 2: the rename, still inside the mutex: see the header of this
+   * section for why holding it across the rename AND the rekey closes the
+   * watcher's delete window without a journal. A failure from here on has
+   * already moved the file, and it is reported rather than undone — the
+   * reconcile pass converges a stale row to whatever is on disk, and half of
+   * a rename is not a state the store can represent. The unstamped intent row
+   * left behind is the report: kbc_store_list_incomplete_moves names it. */
+  kbc_str parent;
+  kbc_str_init(&parent);
+  const char *slash = strrchr(new_abs.ptr, '/');
+  if (slash != NULL && slash != new_abs.ptr) {
+    kbc_str_append(&parent, new_abs.ptr, (size_t)(slash - new_abs.ptr));
+    s = kbc_mkdir_p(parent.ptr, err);
+  }
+  kbc_str_free(&parent);
+  if (kbc_failed(s)) goto out;
+  if (rename(old_abs.ptr, new_abs.ptr) != 0) {
+    s = kbc_err_set(err, KBC_ERR_IO, "rename %s -> %s: %s", old_abs.ptr,
+                    new_abs.ptr, strerror(errno));
+    goto out;
+  }
+
+  /* Step 3: the rekey. ONE call, ONE transaction, and it carries everything
+   * the document's bytes cannot rebuild — every comment with its minted id
+   * and created_at, the corkboard anchor and the pin with the timestamps the
+   * user set, the first-indexed second, the reading history, and the inbound
+   * links on both path columns. It also re-keys the artifacts row itself, so
+   * there is no delete-then-recreate here: a delete of the parent row is an
+   * ON DELETE CASCADE, and doing it while the children still named the old id
+   * would take the chunks and every comment with it.
+   *
+   * The first-indexed anchor has to be in place BEFORE the re-ingest below,
+   * and this is what puts it there: the ingest's anchor write is an
+   * INSERT OR IGNORE (store.c), so an anchor written after it would be too
+   * late and the document's true first-indexed second would be lost. The
+   * anchor does not move on a reindex (there is a test for that), and a
+   * rename is not a reindex. */
+  s = kbc_store_forget_document(app->store, corpus, old_rel, err);
+  if (kbc_failed(s)) goto out;
+  s = kbc_store_rekey_artifact(app->store, old_id, new_id, old_rel, new_rel,
+                               err);
+  if (kbc_failed(s)) goto out;
+
+  /* The store first, then the index, exactly as delete_path does it, so the
+   * index is never the side that still knows about a document the store has
+   * dropped. The re-ingest is what rebuilds the chunks, the facets and the
+   * outbound edges from the same bytes under the new id. */
+  s = reindex_one_locked(app, corpus, new_rel, err);
+  if (kbc_failed(s)) goto out;
+  if (app->index != NULL) {
+    s = index_touch_one(app, cc, old_rel, true, err);
+    if (kbc_failed(s)) goto out;
+  }
+
+  /* Step 4: the intent is fulfilled, and only now. Stamped any earlier it
+   * would tell kbc_store_moves_lookup to follow a rename that had not
+   * happened, which is the one answer a redirect must never give. */
+  s = kbc_store_complete_move(app->store, old_id, err);
+  if (kbc_failed(s)) goto out;
+
+  /* Announced AFTER the reindex, so a subscriber that reacts by searching
+   * finds the document at its new path rather than nothing at all. Only the
+   * departure is published: this codebase has no per-document arrival event
+   * (index.updated is a whole-pass event), and inventing one here would be a
+   * contract change in a file that is not this one. */
+  publish_document_gone(app, corpus, old_rel);
+
+out:
+  pthread_mutex_unlock(&app->reindex_mu);
+  if (kbc_failed(s)) {
+    KBC_LOGW("move_path %s/%s -> %s: %s", corpus, old_rel, new_rel,
+             err != NULL && err->msg[0] != '\0' ? err->msg
+                                               : kbc_status_str(s));
+  }
+  kbc_str_free(&old_abs);
+  kbc_str_free(&new_abs);
+  kbc_arena_free(a);
+  return s;
+}
+
+
 /* ---------------------------------------------------------------- search */
 /* Resolves every surviving row in ONE store round trip.
  *
@@ -4756,6 +6072,78 @@ kbc_status kbc_app_search(kbc_app *app, kbc_arena *a, const kbc_query *q,
   return KBC_OK;
 }
 
+/* The redirect for a stale id, and WHERE it lives.
+ *
+ * A rename mints a new id, so every id handed out BEFORE it — a bookmark, a
+ * URL, an id typed by a person — is a reference to a document that still
+ * exists under a name the caller does not know. kbc_store_moves_lookup walks
+ * the completed-move chain (64 hops, cycle-guarded, and it refuses to follow
+ * an UNSTAMPED row), so the answer is always a name the rename actually
+ * reached.
+ *
+ * It is HERE, at the app's id-resolution entry point, and not inside
+ * kbc_store_get_artifact, because the store cannot tell the two reasons a row
+ * is absent apart: a typo and a rename both read as "no such id", and only
+ * the caller knows which one it has. A caller that wanted the raw miss can
+ * say so — this is the app's public getter, and the store's is one layer
+ * under it.
+ *
+ * It costs one extra round trip, and only on a MISS: an id that resolves is
+ * never walked, so the hot path is the one call it already was. */
+static kbc_status get_artifact_following_moves(kbc_app *app, kbc_arena *a,
+                                               const char *id, bool with_source,
+                                               kbc_artifact *out, kbc_err *err) {
+  kbc_err local;
+  kbc_err_reset(&local);
+  kbc_status s =
+      kbc_store_get_artifact(app->store, a, id, with_source, out, &local);
+  if (s != KBC_ERR_NOTFOUND) {
+    if (kbc_failed(s)) return kbc_err_set(err, s, "get %s: %s", id, local.msg);
+    return KBC_OK;
+  }
+  /* Held, not re-derived: a chain that leads nowhere has to report the miss
+   * the caller would have seen without the redirect, because "no such
+   * document" is the honest answer for an id that never moved. */
+  kbc_err miss = local;
+
+  kbc_strlist hops;
+  kbc_strlist_init(&hops);
+  kbc_err_reset(&local);
+  s = kbc_store_moves_lookup(app->store, id, &hops, &local);
+  if (kbc_failed(s)) {
+    kbc_strlist_free(&hops);
+    return kbc_err_set(err, s, "get %s: the moves table: %s", id, local.msg);
+  }
+  if (hops.len == 0) {
+    kbc_strlist_free(&hops);
+    return kbc_err_set(err, miss.status, "%s", miss.msg);
+  }
+  /* The walk appends each hop and the chain's destination LAST, so the tail
+   * is where the document ended up: a bookmark made before TWO renames has
+   * to arrive at the second, not stop at the first. */
+  const char *home = hops.items[hops.len - 1];
+  kbc_err_reset(&local);
+  s = kbc_store_get_artifact(app->store, a, home, with_source, out, &local);
+  if (s == KBC_OK) {
+    KBC_LOGI("get %s: the document was renamed, resolving to %s", id, home);
+    kbc_strlist_free(&hops);
+    return KBC_OK;
+  }
+  /* `home` dies with the list, so the message is composed BEFORE the free.
+   * A tail that is itself absent is the same honest miss: the document was
+   * renamed again by something that did not record it, or it is gone, and
+   * neither is something a redirect may paper over. */
+  kbc_err wrapped;
+  kbc_err_reset(&wrapped);
+  if (s == KBC_ERR_NOTFOUND) {
+    kbc_err_set(&wrapped, miss.status, "%s", miss.msg);
+  } else {
+    kbc_err_set(&wrapped, s, "get %s: renamed to %s: %s", id, home, local.msg);
+  }
+  kbc_strlist_free(&hops);
+  return kbc_err_set(err, wrapped.status, "%s", wrapped.msg);
+}
+
 kbc_status kbc_app_get_artifact(kbc_app *app, kbc_arena *a, const char *id,
                                 bool with_source, kbc_artifact *out,
                                 kbc_err *err) {
@@ -4767,7 +6155,7 @@ kbc_status kbc_app_get_artifact(kbc_app *app, kbc_arena *a, const char *id,
     return kbc_err_set(err, KBC_ERR_INVALID, "%s: not a %u-hex artifact id", id,
                        (unsigned)KBC_MAX_ID_LEN);
   }
-  return kbc_store_get_artifact(app->store, a, id, with_source, out, err);
+  return get_artifact_following_moves(app, a, id, with_source, out, err);
 }
 
 kbc_status kbc_app_list_artifacts(kbc_app *app, kbc_arena *a, const char *corpus,
@@ -5013,6 +6401,13 @@ kbc_status kbc_app_stats_get(kbc_app *app, kbc_app_stats *out, kbc_err *err) {
       atomic_load_explicit(&app->st_qc_drops, memory_order_relaxed);
   return KBC_OK;
 }
+
+/* The store, for a reader that needs it. The app owns the handle and the store
+ * owns its own mutex, so handing the pointer out does not hand out authority:
+ * every store call still takes the store's lock internally. The one caller at
+ * present is the httpd's anchor re-evaluation, which needs the comments and the
+ * edge graph and has no other way to reach them. */
+kbc_store *kbc_app_store(kbc_app *app) { return app != NULL ? app->store : NULL; }
 
 /* The one query-cache number that is not a counter. Safe on NULL, so a caller
  * holding no app reads 0 rather than crashing. */

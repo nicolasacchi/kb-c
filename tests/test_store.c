@@ -13,7 +13,7 @@
  * migration that bumps it has to be a deliberate edit in both places: a
  * binary that migrates past what its tests know about is the failure this
  * pin exists to make loud. */
-#define CURRENT_SCHEMA 10
+#define CURRENT_SCHEMA 11
 
 /* include/kbc/store.h is the orchestrator's file; the pending-links contract
  * is proposed there and these are the signatures it will carry. */
@@ -1381,6 +1381,220 @@ KBC_TEST(edges_in_degrees_is_one_aggregate_over_the_graph) {
   kbc_test_rmrf(root);
 }
 
+/* The backlinks direction, and the property that is a CONTRACT rather than a
+ * convenience: nothing linking here is KBC_OK with an empty list. The original
+ * serves it as a 200 with [] (links.rs:325), so a store that answered
+ * NOTFOUND here would make an ordinary document that nobody happens to link
+ * to look like a missing one — a 404 on a document that exists.
+ *
+ * The mutation this guards: returning KBC_ERR_NOTFOUND on a zero-row answer. */
+KBC_TEST(backlinks_of_an_unlinked_document_is_empty_and_ok) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+
+  kbc_artifact a;
+  fill(&a, "aaaaaaaaaaaa", "kb", "a.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+
+  /* Links OUT and is linked to by nobody: in-degree 0, and the same must be
+   * true of a path that was never indexed at all. Neither is an error. */
+  static const char *const away[] = {"nowhere.md"};
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "a.md", away, 1, &err));
+  kbc_strlist out;
+  kbc_strlist_init(&out);
+  kbc_status st = kbc_store_list_backlinks(s, "kb", "a.md", &out, &err);
+  KBC_CHECK_MSG(st == KBC_OK, "unlinked document reported %s: %s",
+                kbc_status_str(st), err.msg);
+  KBC_CHECK_EQ_INT((long long)out.len, 0);
+  kbc_strlist_free(&out);
+
+  kbc_strlist_init(&out);
+  st = kbc_store_list_backlinks(s, "kb", "ghost.md", &out, &err);
+  KBC_CHECK_MSG(st == KBC_OK, "unknown path reported %s: %s",
+                kbc_status_str(st), err.msg);
+  KBC_CHECK_EQ_INT((long long)out.len, 0);
+  kbc_strlist_free(&out);
+
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* Which documents link HERE, in the OTHER direction from edge_degrees_for:
+ * that one answers "how many" for documents the caller already named, this
+ * answers "which", and a backlinks surface cannot be built from a count.
+ *
+ * Also pins two things a naive query gets wrong. The graph is per CORPUS, so
+ * another corpus's edge to the same path is not a backlink to this one's
+ * document. And the answer is the set of SOURCES, so a source that links out
+ * to two different targets appears once per target it points at, not twice in
+ * either list. */
+KBC_TEST(backlinks_name_the_sources_and_are_scoped_to_the_corpus) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+
+  kbc_artifact a;
+  fill(&a, "aaaaaaaaaaaa", "kb", "t.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+
+  static const char *const to_t[] = {"t.md"};
+  static const char *const to_t_too[] = {"t.md", "t.md"};
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "one.md", to_t, 1, &err));
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "two.md", to_t, 1, &err));
+  /* Another corpus links to the same path: a different graph entirely. */
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "other", "three.md", to_t, 1, &err));
+
+  kbc_strlist out;
+  kbc_strlist_init(&out);
+  KBC_CHECK_OK(kbc_store_list_backlinks(s, "kb", "t.md", &out, &err));
+  KBC_CHECK_EQ_INT((long long)out.len, 2);
+  KBC_CHECK(out.items != NULL);
+  if (out.items != NULL) {
+    KBC_CHECK_EQ_STR(out.items[0], "one.md");
+    KBC_CHECK_EQ_STR(out.items[1], "two.md");
+  }
+  kbc_strlist_free(&out);
+
+  KBC_CHECK_OK(kbc_store_list_backlinks(s, "other", "t.md", &out, &err));
+  KBC_CHECK_EQ_INT((long long)out.len, 1);
+  KBC_CHECK(out.items != NULL);
+  if (out.items != NULL) KBC_CHECK_EQ_STR(out.items[0], "three.md");
+  kbc_strlist_free(&out);
+
+  /* Deleting one source's edges removes exactly that one backlink, and leaves
+   * the other's. This is what proves the answer is read from the edges rather
+   * than from the artifact list: deleting an artifact would drop both. */
+  KBC_CHECK_OK(kbc_store_delete_edges(s, "kb", "one.md", &err));
+  kbc_strlist_init(&out);
+  KBC_CHECK_OK(kbc_store_list_backlinks(s, "kb", "t.md", &out, &err));
+  KBC_CHECK_EQ_INT((long long)out.len, 1);
+  KBC_CHECK(out.items != NULL);
+  if (out.items != NULL) KBC_CHECK_EQ_STR(out.items[0], "two.md");
+  kbc_strlist_free(&out);
+
+  /* Two.md now links to t.md AND elsewhere: it is one backlink of t.md, not
+   * two. The primary key already collapses the duplicate, so this asserts the
+   * reader reports sources and not edge rows. */
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "two.md", to_t_too, 2, &err));
+  kbc_strlist_init(&out);
+  KBC_CHECK_OK(kbc_store_list_backlinks(s, "kb", "t.md", &out, &err));
+  KBC_CHECK_EQ_INT((long long)out.len, 1);
+  kbc_strlist_free(&out);
+
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* The distinct doc_ids the comments table names — a SET, not a count, and not
+ * the corpus's document list.
+ *
+ * The mutation this guards is the expensive one: enumerating the corpus and
+ * issuing one comment query per document. At the 20,000-document corpus that
+ * is 40,000 prepared statements per reindex, on the watcher's single-file
+ * path, to re-check the two comments that exist. A distinct-doc_id query is
+ * proportional to the comments, which is what the original pays. */
+KBC_TEST(comment_docs_are_the_distinct_doc_ids_and_not_the_corpus) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+
+  /* Three documents indexed, comments on only two of them, and one of those
+ * has two comments — so three comment rows, two documents. */
+  kbc_artifact a;
+  fill(&a, "aaaaaaaaaaaa", "kb", "a.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+  fill(&a, "bbbbbbbbbbbb", "kb", "b.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+  fill(&a, "cccccccccccc", "kb", "c.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+
+  KBC_CHECK_OK(kbc_store_add_comment(s, "aaaaaaaaaaaa", "h1", "ann",
+                                     "first on a", &err));
+  KBC_CHECK_OK(kbc_store_add_comment(s, "aaaaaaaaaaaa", "h2", "bob",
+                                     "second on a", &err));
+  KBC_CHECK_OK(kbc_store_add_comment(s, "cccccccccccc", "h1", "ann",
+                                     "only on c", &err));
+
+  kbc_strlist out;
+  kbc_strlist_init(&out);
+  KBC_CHECK_MSG(kbc_store_list_comment_docs(s, &out, &err) == KBC_OK,
+                "list_comment_docs: %s", err.msg);
+  /* TWO, not three: b.md has no comments, and a.md is named twice. */
+  KBC_CHECK_EQ_INT((long long)out.len, 2);
+  KBC_CHECK(out.items != NULL);
+  if (out.items != NULL) {
+    KBC_CHECK_EQ_STR(out.items[0], "aaaaaaaaaaaa");
+    KBC_CHECK_EQ_STR(out.items[1], "cccccccccccc");
+  }
+  kbc_strlist_free(&out);
+
+  /* Deleting a document cascades its comments away (foreign key, v1), and a
+   * document with no comments left must STOP being named — otherwise this is
+   * reading the artifact list rather than the comments table. */
+  KBC_CHECK_OK(kbc_store_delete_artifact(s, "aaaaaaaaaaaa", &err));
+  kbc_strlist_init(&out);
+  KBC_CHECK_OK(kbc_store_list_comment_docs(s, &out, &err));
+  KBC_CHECK_EQ_INT((long long)out.len, 1);
+  KBC_CHECK(out.items != NULL);
+  if (out.items != NULL) KBC_CHECK_EQ_STR(out.items[0], "cccccccccccc");
+  kbc_strlist_free(&out);
+
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* A corpus with no comments at all is an empty list and KBC_OK, for the same
+ * reason backlinks is: "there is nothing here" is an answer, not a failure,
+ * and a reindex pass that treated it as an error would fail on every clean
+ * corpus. */
+KBC_TEST(comment_docs_of_a_corpus_with_none_is_empty_and_ok) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_artifact a;
+  fill(&a, "aaaaaaaaaaaa", "kb", "a.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+
+  kbc_strlist out;
+  kbc_strlist_init(&out);
+  kbc_status st = kbc_store_list_comment_docs(s, &out, &err);
+  KBC_CHECK_MSG(st == KBC_OK, "reported %s: %s", kbc_status_str(st), err.msg);
+  KBC_CHECK_EQ_INT((long long)out.len, 0);
+  kbc_strlist_free(&out);
+
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
 KBC_TEST(edges_survive_an_upgrade_from_the_previous_schema) {
   char root[KBC_TEST_PATH_MAX];
   kbc_test_tmpdir(root, sizeof root);
@@ -1785,6 +1999,102 @@ static const char *const V4_DB =
     "INSERT INTO doc_metas(corpus, path, key, value)"
     " VALUES('kb','a.md','tag','x');";
 
+/* The v10 schema — every version up to and including doc_first_seen, and NOT
+ * moves — so the upgrade fixture below is a real previous-version database
+ * rather than a guess at one. Verbatim from the store.c that wrote it.
+ *
+ * The point of writing all ten rather than reusing V4_DB is that a v4 volume
+ * exercises v5..v11 and a v10 volume exercises v11 ALONE. The migration under
+ * test is the eleventh, and a fixture three versions behind can pass while
+ * saying nothing about the eleventh step specifically. */
+static const char *const V10_DB =
+    "CREATE TABLE schema_version (version INTEGER NOT NULL);"
+    "INSERT INTO schema_version(version) VALUES(1),(2),(3),(4),(5),(6),(7),"
+    "(8),(9),(10);"
+    "CREATE TABLE artifacts ("
+    " id TEXT PRIMARY KEY, corpus TEXT NOT NULL, path TEXT NOT NULL,"
+    " title TEXT NOT NULL, kind INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,"
+    " size_bytes INTEGER NOT NULL, content_hash INTEGER NOT NULL,"
+    " heading_count INTEGER NOT NULL DEFAULT 0,"
+    " summary TEXT NOT NULL DEFAULT '', source TEXT,"
+    " UNIQUE(corpus, path));"
+    "CREATE TABLE chunks ("
+    " doc_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, text TEXT NOT NULL, PRIMARY KEY(doc_id, ord));"
+    "CREATE TABLE comments ("
+    " id TEXT PRIMARY KEY,"
+    " doc_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,"
+    " anchor TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL,"
+    " created_at TEXT NOT NULL,"
+    " resolved INTEGER NOT NULL DEFAULT 0);"
+    "CREATE INDEX artifacts_corpus ON artifacts(corpus);"
+    "CREATE INDEX artifacts_kind ON artifacts(kind);"
+    "CREATE INDEX comments_doc ON comments(doc_id);"
+    "CREATE TABLE edges ("
+    " corpus TEXT NOT NULL, src_path TEXT NOT NULL, dst_path TEXT NOT NULL,"
+    " PRIMARY KEY(corpus, src_path, dst_path));"
+    "CREATE INDEX edges_dst ON edges(corpus, dst_path);"
+    "CREATE TABLE pending_links ("
+    " corpus TEXT NOT NULL, src_path TEXT NOT NULL, dst_path TEXT NOT NULL,"
+    " PRIMARY KEY(corpus, src_path, dst_path));"
+    "CREATE INDEX pending_links_dst ON pending_links(corpus, dst_path);"
+    "CREATE TABLE doc_metas ("
+    " corpus TEXT NOT NULL, path TEXT NOT NULL, key TEXT NOT NULL,"
+    " value TEXT NOT NULL, PRIMARY KEY(corpus, path, key, value));"
+    "CREATE INDEX doc_metas_kv ON doc_metas(corpus, key, value);"
+    "CREATE TABLE sources ("
+    " slug TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE,"
+    " added_at INTEGER NOT NULL, paused INTEGER NOT NULL DEFAULT 0);"
+    "CREATE TABLE index_runs ("
+    " id TEXT PRIMARY KEY,"
+    " corpus TEXT NOT NULL REFERENCES sources(slug),"
+    " started_at INTEGER NOT NULL, finished_at INTEGER,"
+    " ok_count INTEGER NOT NULL DEFAULT 0,"
+    " err_count INTEGER NOT NULL DEFAULT 0);"
+    "CREATE TABLE errors ("
+    " id TEXT PRIMARY KEY, kind TEXT NOT NULL, corpus TEXT NOT NULL,"
+    " path TEXT NOT NULL, message TEXT NOT NULL, content_hash TEXT,"
+    " retry_count INTEGER NOT NULL DEFAULT 0,"
+    " created_at INTEGER NOT NULL,"
+    " dismissed INTEGER NOT NULL DEFAULT 0);"
+    "CREATE TABLE excluded_files ("
+    " path TEXT PRIMARY KEY, excluded_at INTEGER NOT NULL, note TEXT);"
+    "CREATE TABLE history ("
+    " id INTEGER PRIMARY KEY,"
+    " kind TEXT NOT NULL CHECK (kind IN ('open','search','comment')),"
+    " artifact_id TEXT, query TEXT, comment_id TEXT,"
+    " scroll_y INTEGER NOT NULL DEFAULT 0,"
+    " scroll_max INTEGER NOT NULL DEFAULT 0,"
+    " started_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,"
+    " scroll_y_max INTEGER NOT NULL DEFAULT 0,"
+    " active_ms INTEGER NOT NULL DEFAULT 0, last_section TEXT,"
+    " source TEXT, user TEXT NOT NULL DEFAULT '');"
+    "CREATE TABLE corkboard ("
+    " artifact_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL);"
+    "CREATE TABLE pinned_memories ("
+    " artifact_id TEXT PRIMARY KEY, pinned_at INTEGER NOT NULL);"
+    "CREATE TABLE doc_first_seen ("
+    " artifact_id TEXT PRIMARY KEY, first_indexed_unix INTEGER NOT NULL);"
+    /* one row in every table the v10 schema owned, so the upgrade has
+     * something to lose if it loses anything */
+    "INSERT INTO artifacts(id, corpus, path, title, kind, mtime_ns,"
+    " size_bytes, content_hash, heading_count, summary, source)"
+    " VALUES('old000000001','kb','a.md','A',0,1,2,3,0,'sum','body');"
+    "INSERT INTO chunks(doc_id, ord, text)"
+    " VALUES('old000000001',0,'hello');"
+    "INSERT INTO edges(corpus, src_path, dst_path)"
+    " VALUES('kb','a.md','b.md');"
+    "INSERT INTO doc_metas(corpus, path, key, value)"
+    " VALUES('kb','a.md','tag','x');"
+    "INSERT INTO sources(slug, path, added_at, paused)"
+    " VALUES('kb','/corpus',1000,0);"
+    "INSERT INTO corkboard(artifact_id, created_at)"
+    " VALUES('old000000001',1000);"
+    "INSERT INTO pinned_memories(artifact_id, pinned_at)"
+    " VALUES('old000000001',1000);"
+    "INSERT INTO doc_first_seen(artifact_id, first_indexed_unix)"
+    " VALUES('old000000001',1000);";
+
 /* The database path is assembled with a length check, never snprintf: the
  * build runs -Werror=format-truncation, and a 4096-byte root plus a leaf is a
  * warning no matter how carefully the sizes are written. A silently truncated
@@ -1841,6 +2151,24 @@ static bool table_exists(sqlite3 *h, const char *name) {
   if (sqlite3_prepare_v2(h,
                          "SELECT COUNT(*) FROM sqlite_master"
                          " WHERE type = 'table' AND name = ?1;",
+                         -1, &q, NULL) == SQLITE_OK) {
+    (void)sqlite3_bind_text(q, 1, name, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(q) == SQLITE_ROW) found = sqlite3_column_int(q, 0) > 0;
+  }
+  (void)sqlite3_finalize(q);
+  return found;
+}
+
+/* An index the migration declared, checked as an INDEX. A table created
+ * without its indexes reads back perfectly through table_exists and then
+ * answers every lookup with a full scan, which is a performance regression no
+ * functional assertion in this file would catch. */
+static bool index_exists(sqlite3 *h, const char *name) {
+  sqlite3_stmt *q = NULL;
+  bool found = false;
+  if (sqlite3_prepare_v2(h,
+                         "SELECT COUNT(*) FROM sqlite_master"
+                         " WHERE type = 'index' AND name = ?1;",
                          -1, &q, NULL) == SQLITE_OK) {
     (void)sqlite3_bind_text(q, 1, name, -1, SQLITE_TRANSIENT);
     if (sqlite3_step(q) == SQLITE_ROW) found = sqlite3_column_int(q, 0) > 0;
@@ -1958,6 +2286,615 @@ KBC_TEST(a_v4_volume_upgrades_to_the_current_schema_with_its_rows_intact) {
     KBC_CHECK_EQ_INT(raw_version_rows(raw), CURRENT_SCHEMA);
     (void)sqlite3_close(raw);
   }
+  kbc_test_rmrf(root);
+}
+
+/* Migration 11, observed on a REAL v10 volume rather than argued from the
+ * ladder array. The two halves are what a migration can get wrong in opposite
+ * directions: `moves` must EXIST afterwards, and every row the old volume had
+ * must still be there. A test that only checked the version number would pass
+ * on a step that recorded 11 and created nothing.
+ *
+ * The fixture is at the immediately previous version, so exactly one step
+ * runs — the eleventh, the one under test. */
+KBC_TEST(a_v10_volume_gains_moves_and_keeps_every_row_it_had) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  sqlite3 *raw = raw_open(root, "old.db");
+  KBC_CHECK_NOT_NULL(raw);
+  if (raw == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  raw_exec(raw, V10_DB);
+  KBC_CHECK_EQ_INT(raw_version(raw), 10);
+  /* The premise of the whole case: the old volume does NOT have moves yet. */
+  KBC_CHECK_MSG(!table_exists(raw, "moves"),
+                "fixture already has a moves table, so the upgrade proves "
+                "nothing");
+  (void)sqlite3_close(raw);
+
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "old.db", &err);
+  KBC_CHECK_MSG(s != NULL, "upgrade open failed: %s", err.msg);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  KBC_CHECK_EQ_INT(kbc_store_schema_version(s), CURRENT_SCHEMA);
+
+  /* Every row the v10 volume carried is still readable through the API that
+   * reads it. The rekey of an id-keyed table and the loss of a path-keyed one
+   * are the two ways an upgrade step can quietly drop data. */
+  kbc_arena *a = kbc_arena_new(8192);
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  KBC_CHECK_OK(kbc_store_get_artifact(s, a, "old000000001", true, &art, &err));
+  KBC_CHECK_EQ_STR(art.corpus, "kb");
+  KBC_CHECK_EQ_STR(art.path, "a.md");
+  KBC_CHECK_EQ_STR(art.source, "body");
+  kbc_block blocks[8];
+  size_t nb = 0;
+  KBC_CHECK_OK(kbc_store_list_chunks(s, a, "old000000001", blocks, &nb, &err));
+  KBC_CHECK_EQ_INT(nb, 1);
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(s, "kb", &err), 1);
+  int64_t first_seen = 0;
+  KBC_CHECK_OK(kbc_store_get_first_seen(s, "old000000001", &first_seen, &err));
+  KBC_CHECK_EQ_INT(first_seen, 1000);
+  char **paths = NULL;
+  size_t np = 0;
+  KBC_CHECK_OK(
+      kbc_store_docs_with_meta(s, "kb", "tag", "x", &paths, &np, &err));
+  KBC_CHECK_EQ_INT(np, 1);
+  free_paths(paths, np);
+  kbc_arena_free(a);
+  kbc_store_close(s);
+
+  /* moves is there, with the indexes the lookups plan against. The DDL is
+   * from V0032__moves.sql and both indexes exist for one lookup each:
+   * idx_moves_old_id for the chain-walk from a stale id, idx_moves_old_rel
+   * for the watcher delete guard keyed by the old path. */
+  raw = raw_open(root, "old.db");
+  KBC_CHECK_NOT_NULL(raw);
+  if (raw != NULL) {
+    KBC_CHECK_MSG(table_exists(raw, "moves"), "moves was not created");
+    KBC_CHECK_MSG(index_exists(raw, "idx_moves_old_id"),
+                  "the chain-walk lookup has no index to use");
+    KBC_CHECK_MSG(index_exists(raw, "idx_moves_old_rel"),
+                  "the delete guard has no index to use");
+    /* Exactly one row per version: the eleventh step ran once. */
+    KBC_CHECK_EQ_INT(raw_version(raw), CURRENT_SCHEMA);
+    KBC_CHECK_EQ_INT(raw_version_rows(raw), CURRENT_SCHEMA);
+    (void)sqlite3_close(raw);
+  }
+
+  /* Idempotent on a SECOND opener, which is the other half of the migration's
+   * contract: the step must not run twice, and `CREATE TABLE` without IF NOT
+   * EXISTS would fail the second open of an already-migrated file. */
+  kbc_err_reset(&err);
+  kbc_store *again = open_at(root, "old.db", &err);
+  KBC_CHECK_MSG(again != NULL, "second open of a migrated file failed: %s",
+                err.msg);
+  if (again != NULL) {
+    KBC_CHECK_EQ_INT(kbc_store_schema_version(again), CURRENT_SCHEMA);
+    kbc_store_close(again);
+  }
+  raw = raw_open(root, "old.db");
+  if (raw != NULL) {
+    KBC_CHECK_EQ_INT(raw_version_rows(raw), CURRENT_SCHEMA);
+    (void)sqlite3_close(raw);
+  }
+  kbc_test_rmrf(root);
+}
+
+/* The DDL of migration 11, read back out of a migrated volume, column by
+ * column. A table that merely EXISTS is not the table the original declares,
+ * and the two things most likely to be wrong — a NOT NULL dropped for
+ * convenience, and the nullable completed_at folded into a sentinel like every
+ * other nullable-in-Rust column was — are both invisible to table_exists.
+ *
+ * completed_at is asserted NULLABLE specifically because it is the ONE column
+ * here that really is null while a move is in flight: that NULL is the crash
+ * signal moves_list_incomplete reads. A NOT NULL with a sentinel would make
+ * "never stamped" and "stamped with the sentinel" indistinguishable to it. */
+KBC_TEST(moves_has_the_declared_columns_and_only_completed_at_is_nullable) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_store_close(s);
+
+  sqlite3 *raw = raw_open(root, "kb.db");
+  KBC_CHECK_NOT_NULL(raw);
+  if (raw == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  /* The Rust DDL, in order. `id` is expected NOT NULL = 0 because SQLite
+   * reports an INTEGER PRIMARY KEY that way whatever the DDL says: it is an
+   * alias for the rowid and can never be null in practice. Everything the
+   * migration actually constrains is the other five, plus the one that must
+   * stay NULLABLE. */
+  static const char *const want_name[] = {
+      "id",          "old_id",  "new_id",       "old_rel",
+      "new_rel",     "moved_at", "completed_at"};
+  static const int want_notnull[] = {0, 1, 1, 1, 1, 1, 0};
+  for (size_t i = 0; i < sizeof want_name / sizeof want_name[0]; i++) {
+    int nn = -1;
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(raw,
+                           "SELECT \"notnull\" FROM pragma_table_info('moves')"
+                           " WHERE name = ?1;",
+                           -1, &q, NULL) == SQLITE_OK) {
+      (void)sqlite3_bind_text(q, 1, want_name[i], -1, SQLITE_TRANSIENT);
+      nn = (sqlite3_step(q) == SQLITE_ROW) ? sqlite3_column_int(q, 0) : -1;
+    }
+    (void)sqlite3_finalize(q);
+    KBC_CHECK_MSG(nn == want_notnull[i], "moves.%s notnull = %d, wanted %d",
+                  want_name[i], nn, want_notnull[i]);
+  }
+
+  /* The row shape, end to end, on a real insert. */
+  raw_exec(raw,
+           "INSERT INTO moves(old_id, new_id, old_rel, new_rel, moved_at)"
+           " VALUES('aaaaaaaaaaaa','bbbbbbbbbbbb','a.md','b.md',1700000000);");
+  sqlite3_stmt *q = NULL;
+  bool got_new_id = false;
+  if (sqlite3_prepare_v2(raw,
+                         "SELECT new_id FROM moves WHERE old_id = ?1;", -1, &q,
+                         NULL) == SQLITE_OK) {
+    (void)sqlite3_bind_text(q, 1, "aaaaaaaaaaaa", -1, SQLITE_TRANSIENT);
+    const unsigned char *v = NULL;
+    if (sqlite3_step(q) == SQLITE_ROW) v = sqlite3_column_text(q, 0);
+    got_new_id = v != NULL && strcmp((const char *)v, "bbbbbbbbbbbb") == 0;
+  }
+  (void)sqlite3_finalize(q);
+  KBC_CHECK_MSG(got_new_id, "the row did not read back through old_id");
+
+  /* An in-flight move reads back as SQL NULL, not as a sentinel. */
+  bool saw_null = false;
+  if (sqlite3_prepare_v2(raw, "SELECT completed_at FROM moves;", -1, &q,
+                         NULL) == SQLITE_OK &&
+      sqlite3_step(q) == SQLITE_ROW) {
+    saw_null = sqlite3_column_type(q, 0) == SQLITE_NULL;
+  }
+  (void)sqlite3_finalize(q);
+  KBC_CHECK_MSG(saw_null,
+                "an in-flight move's completed_at is not NULL, so a crashed "
+                "move and a finished one are indistinguishable");
+
+  (void)sqlite3_close(raw);
+  kbc_test_rmrf(root);
+}
+
+/* ================================================================ moves === */
+
+/* THE test this whole function exists for. A comment carries four fields that
+ * a rename cannot rebuild from the document's bytes — id, created_at, and
+ * with them the identity of the thread — and created_at is the one that was
+ * previously lost, because the only public way to write a comment MINTS it.
+ *
+ * The rekey is done in SQL, so `created_at` is simply never written: the
+ * UPDATE names only doc_id, and a column nobody writes cannot change. The
+ * mutation that must fail this test is the app-level workaround it replaces —
+ * delete the comments and re-add them through kbc_store_add_comment, which
+ * mints a fresh id and a fresh timestamp. */
+KBC_TEST(a_rekey_carries_a_comments_id_created_at_and_resolution) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+
+  kbc_artifact a;
+  fill(&a, "aaaaaaaaaaaa", "kb", "old.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+  KBC_CHECK_OK(kbc_store_add_comment(s, "aaaaaaaaaaaa", "h1", "ann",
+                                     "the original body", &err));
+  KBC_CHECK_OK(kbc_store_add_comment(s, "aaaaaaaaaaaa", "h2", "bob",
+                                     "a second comment", &err));
+
+  kbc_arena *ar = kbc_arena_new(8192);
+  kbc_comment *before = NULL;
+  size_t n_before = 0;
+  KBC_CHECK_OK(kbc_store_list_comments(s, ar, "aaaaaaaaaaaa", 16, &before,
+                                       &n_before, &err));
+  KBC_CHECK_EQ_INT(n_before, 2);
+  /* Capture the state of whichever comment this one is, identified by its
+   * ANCHOR rather than by list position: the two rows are distinguished by
+   * which of them is resolved, and the ordering is not something this test
+   * should depend on. */
+  KBC_CHECK(before != NULL);
+  char id0[KBC_MAX_ID_LEN + 1] = {0};
+  char at0[64] = {0};
+  char anchor0[32] = {0};
+  if (before != NULL) {
+    KBC_CHECK_OK(kbc_store_set_comment_resolved(s, before[0].id, true, &err));
+    const size_t li = strlen(before[0].id);
+    if (li <= KBC_MAX_ID_LEN) memcpy(id0, before[0].id, li + 1u);
+    const size_t la = strlen(before[0].created_at);
+    if (la < sizeof at0) memcpy(at0, before[0].created_at, la + 1u);
+    const size_t lan = strlen(before[0].anchor);
+    if (lan < sizeof anchor0) memcpy(anchor0, before[0].anchor, lan + 1u);
+  }
+
+  /* The destination exists, because a rekey onto a path with no artifact row
+   * would be re-derivable by re-ingest and would not exercise the carry. */
+  kbc_artifact b;
+  fill(&b, "bbbbbbbbbbbb", "kb", "new.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &b, &err));
+
+  KBC_CHECK_OK(kbc_store_rekey_artifact(s, "aaaaaaaaaaaa", "bbbbbbbbbbbb",
+                                        "old.md", "new.md", &err));
+
+  /* The comments are on the new id, and the resolved one is still the SAME
+   * comment: same id, same created_at, same anchor, still resolved. Located
+   * by anchor, so the assertion is about identity and not about list order. */
+  kbc_comment *after = NULL;
+  size_t n_after = 0;
+  KBC_CHECK_OK(kbc_store_list_comments(s, ar, "bbbbbbbbbbbb", 16, &after,
+                                       &n_after, &err));
+  KBC_CHECK_EQ_INT(n_after, 2);
+  KBC_CHECK(after != NULL);
+  if (after != NULL) {
+    const kbc_comment *carried = NULL;
+    for (size_t i = 0; i < n_after; i++) {
+      if (strcmp(after[i].anchor, anchor0) == 0) carried = &after[i];
+    }
+    KBC_CHECK_MSG(carried != NULL,
+                  "the comment anchored at \"%s\" is gone after the rekey",
+                  anchor0);
+    if (carried != NULL) {
+      KBC_CHECK_EQ_STR(carried->id, id0);
+      KBC_CHECK_EQ_STR(carried->created_at, at0);
+      KBC_CHECK_MSG(carried->resolved,
+                    "the resolved flag did not survive the rekey, so a "
+                    "user's decision about a thread was lost by a rename");
+    }
+  }
+  /* And none are left behind on the dead id. */
+  kbc_comment *orphan = NULL;
+  size_t n_orphan = 0;
+  KBC_CHECK_OK(
+      kbc_store_list_comments(s, ar, "aaaaaaaaaaaa", 16, &orphan, &n_orphan,
+                              &err));
+  KBC_CHECK_EQ_INT(n_orphan, 0);
+
+  kbc_arena_free(ar);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* Every artifact-referencing row moves, and the parent row's id AND path move
+ * with it. The path half is not cosmetic: an artifact id is minted from
+ * (corpus, path), so leaving the path behind would leave a row whose id does
+ * not match its own path — the invariant the whole id scheme rests on. */
+KBC_TEST(a_rekey_moves_the_artifact_row_and_every_table_that_names_it) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+
+  kbc_artifact a;
+  fill(&a, "aaaaaaaaaaaa", "kb", "old.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &a, &err));
+  kbc_chunk_in ck = {"aaaaaaaaaaaa", 0, "the chunk text", 14};
+  KBC_CHECK_OK(kbc_store_replace_chunks(s, &ck, 1, &err));
+  KBC_CHECK_OK(kbc_store_add_corkboard(s, "aaaaaaaaaaaa", 1000, &err));
+  KBC_CHECK_OK(kbc_store_pin_memory(s, "aaaaaaaaaaaa", 1000, &err));
+  KBC_CHECK_OK(kbc_store_first_seen(s, "aaaaaaaaaaaa", 1000, &err));
+  kbc_history_row h = {0};
+  h.kind = "open";
+  h.artifact_id = "aaaaaaaaaaaa";
+  h.started_at = 1000;
+  h.updated_at = 1000;
+  KBC_CHECK_OK(kbc_store_add_history(s, &h, &err));
+  static const char *const out[] = {"other.md"};
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "old.md", out, 1, &err));
+  static const char *const pend[] = {"later.md"};
+  KBC_CHECK_OK(kbc_store_add_pending_links(s, "kb", "old.md", pend, 1, &err));
+  /* A link INTO the document, naming the old path, written before the move
+   * so the rekey is what has to carry it. */
+  static const char *const into[] = {"old.md"};
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "linker.md", into, 1, &err));
+
+  KBC_CHECK_OK(kbc_store_rekey_artifact(s, "aaaaaaaaaaaa", "bbbbbbbbbbbb",
+                                        "old.md", "new.md", &err));
+
+  /* The parent row, id and path together. */
+  kbc_arena *ar = kbc_arena_new(8192);
+  kbc_artifact got;
+  memset(&got, 0, sizeof got);
+  KBC_CHECK_OK(kbc_store_get_artifact(s, ar, "bbbbbbbbbbbb", false, &got, &err));
+  KBC_CHECK_EQ_STR(got.path, "new.md");
+  KBC_CHECK_EQ_STR(got.corpus, "kb");
+
+  kbc_block blocks[8];
+  size_t nb = 0;
+  KBC_CHECK_OK(kbc_store_list_chunks(s, ar, "bbbbbbbbbbbb", blocks, &nb, &err));
+  KBC_CHECK_MSG(nb == 1, "the chunk did not follow the rekey (nb=%zu)", nb);
+  if (nb == 1) KBC_CHECK_EQ_STR(blocks[0].text, "the chunk text");
+
+  int64_t first_seen = 0;
+  KBC_CHECK_OK(kbc_store_get_first_seen(s, "bbbbbbbbbbbb", &first_seen, &err));
+  KBC_CHECK_MSG(first_seen == 1000,
+                "the first-indexed anchor moved to \"now\" (%lld), so a "
+                "\"created\" sort would date the document to its rename",
+                (long long)first_seen);
+
+  kbc_corkboard_row *cork = NULL;
+  size_t nc = 0;
+  KBC_CHECK_OK(kbc_store_list_corkboard(s, ar, 16, &cork, &nc, &err));
+  KBC_CHECK_EQ_INT(nc, 1);
+  KBC_CHECK(cork != NULL);
+  if (cork != NULL) {
+    KBC_CHECK_EQ_STR(cork[0].artifact_id, "bbbbbbbbbbbb");
+    KBC_CHECK_MSG(cork[0].created_at == 1000, "the anchor lost its timestamp");
+  }
+  kbc_pin_row *pins = NULL;
+  size_t np = 0;
+  KBC_CHECK_OK(kbc_store_list_pins(s, ar, 16, &pins, &np, &err));
+  KBC_CHECK_EQ_INT(np, 1);
+  KBC_CHECK(pins != NULL);
+  if (pins != NULL) KBC_CHECK_EQ_STR(pins[0].artifact_id, "bbbbbbbbbbbb");
+
+  kbc_history_row *hist = NULL;
+  size_t nh = 0;
+  KBC_CHECK_OK(kbc_store_list_history(s, ar, NULL, 16, &hist, &nh, &err));
+  KBC_CHECK_MSG(nh == 1, "the reading visit was lost by a rename (nh=%zu)",
+                nh);
+  KBC_CHECK(hist != NULL);
+  if (hist != NULL)
+    KBC_CHECK_EQ_STR(hist[0].artifact_id, "bbbbbbbbbbbb");
+
+  /* The graph, both directions.
+   *
+   * `linker.md -> old.md` was written BEFORE the rekey, so it is an inbound
+   * edge naming the old path: a move must carry it to the new one, or every
+   * bookmarked link INTO the document breaks the moment it is renamed. */
+  kbc_strlist back;
+  kbc_strlist_init(&back);
+  KBC_CHECK_OK(kbc_store_list_backlinks(s, "kb", "new.md", &back, &err));
+  KBC_CHECK_MSG(back.len == 1 && strcmp(back.items[0], "linker.md") == 0,
+                "an inbound link to the old path did not follow the move "
+                "(len=%zu)",
+                back.len);
+  kbc_strlist_free(&back);
+
+  /* The moved document's OWN outbound edge, which is owned by its src_path
+   * and so moves with the document. */
+  kbc_strlist srcs;
+  kbc_strlist_init(&srcs);
+  KBC_CHECK_OK(kbc_store_list_backlinks(s, "kb", "other.md", &srcs, &err));
+  KBC_CHECK_MSG(srcs.len == 1 && strcmp(srcs.items[0], "new.md") == 0,
+                "the moved document's own outbound edge stayed on the old "
+                "path");
+  kbc_strlist_free(&srcs);
+  KBC_CHECK_MSG(kbc_store_pending_count(s, &err) == 1,
+                "the pending link was dropped by the rekey");
+
+  kbc_arena_free(ar);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* A stale id follows a CHAIN, not a single hop. This is the property that
+ * makes the redirect work for a document renamed twice: a bookmark made
+ * before the first rename has to end up at the third name, and answering the
+ * second would hand the caller a name that was itself renamed away.
+ *
+ * The mutation that must fail this: a single-hop lookup (LIMIT 1 with no
+ * follow-up), which would return "b" here. */
+KBC_TEST(a_stale_id_follows_a_chain_of_renames_to_its_final_home) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+
+  /* a -> b -> c, every hop completed. */
+  KBC_CHECK_OK(kbc_store_record_move(s, "aaaaaaaaaaaa", "bbbbbbbbbbbb",
+                                     "a.md", "b.md", 1000, &err));
+  KBC_CHECK_OK(kbc_store_complete_move(s, "aaaaaaaaaaaa", &err));
+  KBC_CHECK_OK(kbc_store_record_move(s, "bbbbbbbbbbbb", "cccccccccccc",
+                                     "b.md", "c.md", 2000, &err));
+  KBC_CHECK_OK(kbc_store_complete_move(s, "bbbbbbbbbbbb", &err));
+
+  kbc_strlist ids;
+  kbc_strlist_init(&ids);
+  KBC_CHECK_OK(kbc_store_moves_lookup(s, "aaaaaaaaaaaa", &ids, &err));
+  KBC_CHECK_MSG(ids.len == 2,
+                "a two-hop chain returned %zu hops; a stale id must reach its "
+                "FINAL home, not the next name along",
+                ids.len);
+  if (ids.len == 2) {
+    KBC_CHECK_EQ_STR(ids.items[0], "bbbbbbbbbbbb");
+    KBC_CHECK_MSG(strcmp(ids.items[1], "cccccccccccc") == 0,
+                  "the last hop is not the final id");
+  }
+  kbc_strlist_free(&ids);
+
+  /* The middle id also resolves, to the last hop only. */
+  kbc_strlist_init(&ids);
+  KBC_CHECK_OK(kbc_store_moves_lookup(s, "bbbbbbbbbbbb", &ids, &err));
+  KBC_CHECK_EQ_INT((long long)ids.len, 1);
+  if (ids.len == 1) KBC_CHECK_EQ_STR(ids.items[0], "cccccccccccc");
+  kbc_strlist_free(&ids);
+
+  /* An id that never moved is an EMPTY LIST AND KBC_OK, not an error: "this
+   * document was never renamed" is the common answer and the overwhelmingly
+   * more useful one. */
+  kbc_strlist_init(&ids);
+  kbc_status st = kbc_store_moves_lookup(s, "dddddddddddd", &ids, &err);
+  KBC_CHECK_MSG(st == KBC_OK, "an unmoved id reported %s: %s",
+                kbc_status_str(st), err.msg);
+  KBC_CHECK_EQ_INT((long long)ids.len, 0);
+  kbc_strlist_free(&ids);
+
+  /* And the same walk keyed by path, because a link is a name in a file. */
+  kbc_strlist rels;
+  kbc_strlist_init(&rels);
+  KBC_CHECK_OK(kbc_store_moves_lookup_path(s, "a.md", &rels, &err));
+  KBC_CHECK_EQ_INT((long long)rels.len, 2);
+  if (rels.len == 2) {
+    KBC_CHECK_EQ_STR(rels.items[0], "b.md");
+    KBC_CHECK_EQ_STR(rels.items[1], "c.md");
+  }
+  kbc_strlist_free(&rels);
+
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* An INTERRUPTED move is not a redirect. Its rename never completed, so its
+ * new_id is a name the document may never have reached; following it would
+ * resolve a bookmark to a document that does not exist, which is a worse
+ * answer than leaving the id alone.
+ *
+ * It must also show up in the incomplete list, because that is the bring-up
+ * pass's only way to learn the rename is outstanding. */
+KBC_TEST(an_interrupted_move_is_listed_for_replay_and_never_followed) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+
+  /* One completed move and one that never finished. */
+  KBC_CHECK_OK(kbc_store_record_move(s, "aaaaaaaaaaaa", "bbbbbbbbbbbb",
+                                     "a.md", "b.md", 1000, &err));
+  KBC_CHECK_OK(kbc_store_complete_move(s, "aaaaaaaaaaaa", &err));
+  KBC_CHECK_OK(kbc_store_record_move(s, "cccccccccccc", "dddddddddddd",
+                                     "c.md", "d.md", 2000, &err));
+
+  /* The interrupted one does not redirect. */
+  kbc_strlist ids;
+  kbc_strlist_init(&ids);
+  KBC_CHECK_OK(kbc_store_moves_lookup(s, "cccccccccccc", &ids, &err));
+  KBC_CHECK_MSG(ids.len == 0,
+                "an interrupted move was followed to %s — a name the rename "
+                "never reached",
+                ids.len > 0 ? ids.items[0] : "?");
+  kbc_strlist_free(&ids);
+
+  /* Both lists are parallel: entry i pairs with entry i. */
+  kbc_strlist old_ids, old_rels;
+  kbc_strlist_init(&old_ids);
+  kbc_strlist_init(&old_rels);
+  KBC_CHECK_OK(kbc_store_list_incomplete_moves(s, &old_ids, &old_rels, &err));
+  KBC_CHECK_MSG(old_ids.len == 1, "the interrupted move was not listed (%zu)",
+                old_ids.len);
+  KBC_CHECK_EQ_INT((long long)old_ids.len, (long long)old_rels.len);
+  if (old_ids.len == 1 && old_rels.len == 1) {
+    KBC_CHECK_EQ_STR(old_ids.items[0], "cccccccccccc");
+    KBC_CHECK_EQ_STR(old_rels.items[0], "c.md");
+  }
+  kbc_strlist_free(&old_ids);
+  kbc_strlist_free(&old_rels);
+
+ /* Once the rename is finished the row leaves the replay list. */
+  KBC_CHECK_OK(kbc_store_complete_move(s, "cccccccccccc", &err));
+  kbc_strlist_init(&old_ids);
+  kbc_strlist_init(&old_rels);
+  KBC_CHECK_OK(kbc_store_list_incomplete_moves(s, &old_ids, &old_rels, &err));
+  KBC_CHECK_MSG(old_ids.len == 0,
+                "a completed move is still queued for replay");
+  kbc_strlist_free(&old_ids);
+  kbc_strlist_free(&old_rels);
+
+  /* And it redirects once it is complete. */
+  kbc_strlist_init(&ids);
+  KBC_CHECK_OK(kbc_store_moves_lookup(s, "cccccccccccc", &ids, &err));
+  KBC_CHECK_EQ_INT((long long)ids.len, 1);
+  kbc_strlist_free(&ids);
+
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* The walk must TERMINATE on a cycle, and a cycle is representable: nothing
+ * in the schema forbids a -> b -> a, and a buggy writer is exactly the case
+ * the bound exists for. Without the guard this is an httpd worker that never
+ * answers and a bring-up pass that never finishes.
+ *
+ * The rows are written through raw SQL because the public API records a move
+ * in one direction at a time and the test needs both directions of a loop in
+ * one volume. */
+KBC_TEST(a_cyclic_move_chain_terminates_instead_of_hanging) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_store_close(s);
+
+  /* a -> b -> a, both completed. A single-hop lookup would return "b" and
+ * stop; an unguarded walk would go round forever. */
+  sqlite3 *raw = raw_open(root, "kb.db");
+  KBC_CHECK_NOT_NULL(raw);
+  if (raw == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  raw_exec(raw,
+           "INSERT INTO moves(old_id, new_id, old_rel, new_rel, moved_at,"
+           " completed_at) VALUES('aaaaaaaaaaaa','bbbbbbbbbbbb','a.md','b.md',"
+           "1,10);"
+           "INSERT INTO moves(old_id, new_id, old_rel, new_rel, moved_at,"
+           " completed_at) VALUES('bbbbbbbbbbbb','aaaaaaaaaaaa','b.md','a.md',"
+           "2,20);");
+  (void)sqlite3_close(raw);
+
+  s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_strlist ids;
+  kbc_strlist_init(&ids);
+  kbc_status st = kbc_store_moves_lookup(s, "aaaaaaaaaaaa", &ids, &err);
+  /* The point of the case is that this RETURNS. */
+  KBC_CHECK_MSG(st == KBC_OK, "the walk did not terminate: %s",
+                kbc_status_str(st));
+  KBC_CHECK_MSG(ids.len <= 4, "the walk did not stop; it reported %zu hops",
+                ids.len);
+  kbc_strlist_free(&ids);
+
+  kbc_store_close(s);
   kbc_test_rmrf(root);
 }
 
@@ -2779,6 +3716,230 @@ KBC_TEST(stage1_writes_reject_empty_and_oversized_values) {
   kbc_test_rmrf(root);
 }
 
+/* ------------------------------------- a rekey stays inside its own corpus -- */
+
+/* Two corpora, each with a document at the SAME relative path, each linked to
+ * by its own linker. That shape is not exotic: a config pointing two corpora
+ * at overlapping directories produces it, and `edges` is keyed
+ * (corpus, src_path, dst_path) precisely because a path is only unique within
+ * a corpus. A rekey carries one document's links, so it has to name the
+ * corpus — an unfiltered rewrite is not a wider correct rewrite, it is a
+ * rename of somebody else's edge onto a path that does not exist for them. */
+static kbc_store *two_corpora_at(char *root, const char *db, kbc_err *err) {
+  kbc_store *s = open_at(root, db, err);
+  if (s == NULL) return NULL;
+  const kbc_source kb = {"kb", "/tmp/kbc-x-kb", 1, false};
+  const kbc_source two = {"two", "/tmp/kbc-x-two", 1, false};
+  KBC_CHECK_OK(kbc_store_put_source(s, &kb, err));
+  KBC_CHECK_OK(kbc_store_put_source(s, &two, err));
+  kbc_artifact art;
+  fill(&art, "aaaaaaaaaaaa", "kb", "old.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &art, err));
+  fill(&art, "bbbbbbbbbbbb", "two", "old.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &art, err));
+  return s;
+}
+
+/* How many sources link HERE, as a set of names — the surface a reader sees,
+ * so a corruption here is not a schema curiosity. */
+static bool links_here(kbc_store *s, const char *corpus, const char *path,
+                       const char *want, kbc_err *err) {
+  kbc_strlist back;
+  kbc_strlist_init(&back);
+  kbc_store_list_backlinks(s, corpus, path, &back, err);
+  bool ok = back.len == 1 && strcmp(back.items[0], want) == 0;
+  kbc_strlist_free(&back);
+  return ok;
+}
+
+KBC_TEST(a_rekey_does_not_reach_into_a_second_corpus_at_the_same_path) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = two_corpora_at(root, "scope.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  static const char *const into[] = {"old.md"};
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "kb-linker.md", into, 1, &err));
+  KBC_CHECK_OK(
+      kbc_store_replace_edges(s, "two", "two-linker.md", into, 1, &err));
+  static const char *const pend[] = {"old.md"};
+  KBC_CHECK_OK(kbc_store_add_pending_links(s, "kb", "kb-waiter.md", pend, 1, &err));
+  KBC_CHECK_OK(
+      kbc_store_add_pending_links(s, "two", "two-waiter.md", pend, 1, &err));
+  KBC_CHECK_MSG(links_here(s, "kb", "old.md", "kb-linker.md", &err),
+                "the fixture is wrong: kb's own backlink is not at old.md");
+  KBC_CHECK_MSG(links_here(s, "two", "old.md", "two-linker.md", &err),
+                "the fixture is wrong: two's own backlink is not at old.md");
+
+  KBC_CHECK_OK(
+      kbc_store_rekey_artifact(s, "aaaaaaaaaaaa", "cccccccccccc", "old.md",
+                               "new.md", &err));
+
+  /* The moved corpus: the whole point of the rekey, and the behaviour every
+   * earlier rekey test already covers. Asserted here too so a change that
+   * over-corrects — scoping so hard the move stops carrying anything — fails
+   * in the same test that would have let the bleed through. */
+  KBC_CHECK_MSG(links_here(s, "kb", "new.md", "kb-linker.md", &err),
+                "the rekey did not carry the moved document's own inbound "
+                "link to the new path");
+  /* The corpus that was not renamed: untouched, and `new.md` in it is a path
+   * with no document. */
+  KBC_CHECK_MSG(links_here(s, "two", "old.md", "two-linker.md", &err),
+                "rekeying in corpus kb moved corpus two's backlink to the new "
+                "path, where no document by that name exists");
+  kbc_strlist stray;
+  kbc_strlist_init(&stray);
+  kbc_store_list_backlinks(s, "two", "new.md", &stray, &err);
+  KBC_CHECK_MSG(stray.len == 0,
+                "corpus two gained %zu backlink(s) to new.md from a rekey it "
+                "was not part of",
+                stray.len);
+  kbc_strlist_free(&stray);
+
+  /* pending_links is keyed the same way and was rewritten by the same six
+   * statements, so it is asserted through the table rather than through a
+   * reader: there is no public listing for a pending link's target, and
+   * draining one is destructive. */
+  sqlite3 *raw = NULL;
+  char dbp[KBC_TEST_PATH_MAX];
+  const size_t rl = strlen(root);
+  KBC_CHECK_MSG(rl + 16u < sizeof dbp, "tmpdir path too long");
+  memcpy(dbp, root, rl);
+  memcpy(dbp + rl, "/scope.db", 10);
+  if (sqlite3_open_v2(dbp, &raw, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+    sqlite3_stmt *q = NULL;
+    bool two_pending_intact = false;
+    if (sqlite3_prepare_v2(raw,
+                           "SELECT COUNT(*) FROM pending_links"
+                           " WHERE corpus = 'two' AND src_path = 'two-waiter.md'"
+                           " AND dst_path = 'old.md';",
+                           -1, &q, NULL) == SQLITE_OK &&
+        sqlite3_step(q) == SQLITE_ROW) {
+      two_pending_intact = sqlite3_column_int(q, 0) == 1;
+    }
+    (void)sqlite3_finalize(q);
+    (void)sqlite3_close(raw);
+    KBC_CHECK_MSG(two_pending_intact,
+                  "corpus two's pending link to old.md was rewritten by a "
+                  "rekey in corpus kb");
+  } else {
+    KBC_CHECK_MSG(false, "could not reopen the store's database read-only");
+  }
+
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* The same fixture with one difference that turns a wrong rename into a
+ * DESTROYED row, and it is the half that matters: `two-both.md` links to both
+ * `old.md` and `new.md`. Unfiltered, the rekey renames its `old.md` edge onto
+ * `new.md`, the primary key (two, two-both.md, new.md) collides with the edge
+ * that was already there, OR IGNORE skips the write, and the unfiltered
+ * `DELETE FROM edges WHERE dst_path = 'old.md'` then removes the row anyway.
+ * One statement's guard causes the next statement to destroy what it could
+ * not write. The function returns ok and nothing reports the loss — which is
+ * why this is its own test rather than another assertion above: a bleed is
+ * visible, a dropped edge is not. */
+KBC_TEST(a_rekey_does_not_drop_a_second_corpus_edge_to_the_new_path) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = two_corpora_at(root, "drop.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  static const char *const both[] = {"old.md", "new.md"};
+  KBC_CHECK_OK(
+      kbc_store_replace_edges(s, "two", "two-both.md", both, 2, &err));
+  static const char *const into[] = {"old.md"};
+  KBC_CHECK_OK(kbc_store_replace_edges(s, "kb", "kb-linker.md", into, 1, &err));
+
+  KBC_CHECK_OK(
+      kbc_store_rekey_artifact(s, "aaaaaaaaaaaa", "cccccccccccc", "old.md",
+                               "new.md", &err));
+
+  /* two-both.md still links to old.md, and it still links to new.md: both
+   * rows are still there. Counting one is not enough — the bleed alone
+   * produces a count of one, with the wrong row left. */
+  int64_t at_old = -1, at_new = -1;
+  kbc_strlist back;
+  kbc_strlist_init(&back);
+  kbc_err_reset(&err);
+  kbc_store_list_backlinks(s, "two", "old.md", &back, &err);
+  at_old = (int64_t)back.len;
+  bool two_both_at_old =
+      back.len == 1 && strcmp(back.items[0], "two-both.md") == 0;
+  kbc_strlist_free(&back);
+  kbc_strlist_init(&back);
+  kbc_store_list_backlinks(s, "two", "new.md", &back, &err);
+  at_new = (int64_t)back.len;
+  bool two_both_at_new =
+      back.len == 1 && strcmp(back.items[0], "two-both.md") == 0;
+  kbc_strlist_free(&back);
+  KBC_CHECK_MSG(two_both_at_old,
+                "corpus two's edge two-both.md -> old.md was DROPPED by a "
+                "rekey in corpus kb, and the rekey reported success "
+                "(old.md backlinks=%lld, new.md backlinks=%lld)",
+                (long long)at_old, (long long)at_new);
+  KBC_CHECK_MSG(two_both_at_new,
+                "corpus two's pre-existing edge two-both.md -> new.md did not "
+                "survive (new.md backlinks=%lld)",
+                (long long)at_new);
+
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* The empty-SELECT branch, which is the other half of the fix and the one with
+ * a judgement call in it: an id the store does not hold has no corpus, so the
+ * path half is skipped. Guessing one — the unfiltered behaviour — is what
+ * destroyed rows; skipping leaves the other corpus's links where they are.
+ * The observable is that a same-named path in a real corpus survives a rekey
+ * of an id this store never held. */
+KBC_TEST(a_rekey_of_an_id_this_store_does_not_hold_touches_no_path) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = two_corpora_at(root, "ghost.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  static const char *const into[] = {"old.md"};
+  KBC_CHECK_OK(
+      kbc_store_replace_edges(s, "two", "two-linker.md", into, 1, &err));
+
+  /* An id and a path that name nothing here, in a store that DOES hold
+   * `two/old.md`. The call is not an error: the id-keyed statements are
+   * no-ops without a parent row, and the trailing delete is one too. */
+  KBC_CHECK_OK(
+      kbc_store_rekey_artifact(s, "dddddddddddd", "eeeeeeeeeeee", "old.md",
+                               "renamed.md", &err));
+  KBC_CHECK_MSG(links_here(s, "two", "old.md", "two-linker.md", &err),
+                "a rekey for an id the store does not hold still rewrote a "
+                "path in a corpus it never looked up");
+  kbc_strlist stray;
+  kbc_strlist_init(&stray);
+  kbc_store_list_backlinks(s, "two", "renamed.md", &stray, &err);
+  KBC_CHECK_MSG(stray.len == 0,
+                "the guess produced %zu backlink(s) to a path it invented",
+                stray.len);
+  kbc_strlist_free(&stray);
+
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
 int main(void) {
   
 static const kbc_test_case cases[] = {
@@ -2855,6 +4016,34 @@ static const kbc_test_case cases[] = {
        stage1_writes_reject_empty_and_oversized_values},
       {"a_failing_migration_keeps_the_last_committed_version",
        a_failing_migration_keeps_the_last_committed_version},
+      {"backlinks_of_an_unlinked_document_is_empty_and_ok",
+       backlinks_of_an_unlinked_document_is_empty_and_ok},
+      {"backlinks_name_the_sources_and_are_scoped_to_the_corpus",
+       backlinks_name_the_sources_and_are_scoped_to_the_corpus},
+      {"comment_docs_are_the_distinct_doc_ids_and_not_the_corpus",
+       comment_docs_are_the_distinct_doc_ids_and_not_the_corpus},
+      {"comment_docs_of_a_corpus_with_none_is_empty_and_ok",
+       comment_docs_of_a_corpus_with_none_is_empty_and_ok},
+      {"a_v10_volume_gains_moves_and_keeps_every_row_it_had",
+       a_v10_volume_gains_moves_and_keeps_every_row_it_had},
+      {"moves_has_the_declared_columns_and_only_completed_at_is_nullable",
+       moves_has_the_declared_columns_and_only_completed_at_is_nullable},
+      {"a_rekey_carries_a_comments_id_created_at_and_resolution",
+       a_rekey_carries_a_comments_id_created_at_and_resolution},
+      {"a_rekey_moves_the_artifact_row_and_every_table_that_names_it",
+       a_rekey_moves_the_artifact_row_and_every_table_that_names_it},
+      {"a_stale_id_follows_a_chain_of_renames_to_its_final_home",
+       a_stale_id_follows_a_chain_of_renames_to_its_final_home},
+      {"an_interrupted_move_is_listed_for_replay_and_never_followed",
+       an_interrupted_move_is_listed_for_replay_and_never_followed},
+      {"a_cyclic_move_chain_terminates_instead_of_hanging",
+       a_cyclic_move_chain_terminates_instead_of_hanging},
+      {"a_rekey_does_not_reach_into_a_second_corpus_at_the_same_path",
+       a_rekey_does_not_reach_into_a_second_corpus_at_the_same_path},
+      {"a_rekey_does_not_drop_a_second_corpus_edge_to_the_new_path",
+       a_rekey_does_not_drop_a_second_corpus_edge_to_the_new_path},
+      {"a_rekey_of_an_id_this_store_does_not_hold_touches_no_path",
+       a_rekey_of_an_id_this_store_does_not_hold_touches_no_path},
       {NULL, NULL},
   };
   return kbc_test_run("store", cases);

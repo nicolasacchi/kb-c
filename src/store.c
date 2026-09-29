@@ -21,6 +21,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <sqlite3.h>
 
@@ -229,6 +230,38 @@ static const char *const SCHEMA_V10 =
     " artifact_id TEXT PRIMARY KEY,"
     " first_indexed_unix INTEGER NOT NULL);";
 
+/* v11 — the artifact relocate intent log (V0032). Append-only: a row is
+ * written BEFORE any mutation with completed_at NULL, and stamped when the
+ * storage-side rekey finishes, so a crash between the rename and the rekey
+ * leaves a durable signal rather than a half-carried thread.
+ *
+ * The DDL and both indexes are the migration file's, unchanged — including
+ * that completed_at is NULLABLE here and nowhere else in kb-c's schema,
+ * because "in flight" is a real state for this table and every other
+ * nullable-in-Rust column was folded into a sentinel back at v6
+ * (RUN_IN_FLIGHT). The index names are the Rust ones, so a database opened by
+ * either program plans the same lookups.
+ *
+ * NO READER YET, and that is a reported gap rather than an oversight: the
+ * redirect of a stale id or path handed out BEFORE the move needs
+ * moves_lookup (sqlite.rs:5876) with its chain-walk and 64-hop cycle bound,
+ * the watcher's delete guard needs moves_suppresses_delete (:5928), and
+ * startup replay needs moves_list_incomplete (:5953). None of those three is
+ * declared in store.h, and a definition with no declaration and no caller is
+ * an entry point with no contract to satisfy — see the handoff note on this
+ * function. The table itself is pure data and can land ahead of them. */
+static const char *const SCHEMA_V11 =
+    "CREATE TABLE IF NOT EXISTS moves ("
+    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " old_id TEXT NOT NULL,"
+    " new_id TEXT NOT NULL,"
+    " old_rel TEXT NOT NULL,"
+    " new_rel TEXT NOT NULL,"
+    " moved_at INTEGER NOT NULL,"
+    " completed_at INTEGER);"
+    "CREATE INDEX IF NOT EXISTS idx_moves_old_id ON moves(old_id);"
+    "CREATE INDEX IF NOT EXISTS idx_moves_old_rel ON moves(old_rel);";
+
 /* The ladder, in the shape refinery's Runner has it: an ordered list of
  * (version, sql), applied FORWARD-ONLY, one transaction per version. Rust
  * reads its binary epoch from the runner rather than from a second constant
@@ -243,7 +276,7 @@ typedef struct {
 static const kbc_migration MIGRATIONS[] = {
     {1, SCHEMA_V1},   {2, SCHEMA_V2},   {3, SCHEMA_V3},   {4, SCHEMA_V4},
     {5, SCHEMA_V5},   {6, SCHEMA_V6},   {7, SCHEMA_V7},   {8, SCHEMA_V8},
-    {9, SCHEMA_V9},   {10, SCHEMA_V10},
+    {9, SCHEMA_V9},   {10, SCHEMA_V10},  {11, SCHEMA_V11},
 };
 
 #define MIGRATION_COUNT (sizeof(MIGRATIONS) / sizeof(MIGRATIONS[0]))
@@ -1380,6 +1413,69 @@ int64_t kbc_store_edge_count(kbc_store *s, const char *corpus, kbc_err *err) {
   return kbc_failed(st) ? st : out;
 }
 
+/* The documents that link HERE: the other direction of the edges table.
+ *
+ * DISTINCT because a source that links to the same target from two places is
+ * ONE backlink, and a backlinks surface that counted paragraphs would be
+ * wrong. The primary key already makes (corpus, src_path, dst_path) unique, so
+ * this cannot collapse two DIFFERENT sources into one row — the dedup here is
+ * about one source appearing once, not about losing sources.
+ *
+ * `edges_dst` on (corpus, dst_path) is the index that makes this a seek, and
+ * a zero-row answer is the ordinary case, not a miss: nothing linking here is
+ * KBC_OK with a zero-length list, because the original serves it as a 200 with
+ * an empty array (links.rs:325) and a 404 would make an ordinary document
+ * look missing. So NOTFOUND is never returned from here. */
+kbc_status kbc_store_list_backlinks(kbc_store *s, const char *corpus,
+                                    const char *path, kbc_strlist *out,
+                                    kbc_err *err) {
+  if (s == NULL || out == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "list_backlinks: null argument");
+  kbc_status rc = require_text(err, "backlinks corpus", corpus, 255);
+  if (rc == KBC_OK)
+    rc = require_text(err, "backlinks path", path, KBC_MAX_PATH_LEN);
+  if (rc != KBC_OK) return rc;
+
+  lock(s);
+  sqlite3_stmt *st = NULL;
+  rc = prepare(err, s,
+               "SELECT DISTINCT src_path FROM edges"
+               " WHERE corpus = ?1 AND dst_path = ?2"
+               " ORDER BY src_path;",
+               &st);
+  if (rc == KBC_OK) rc = bind_text(err, s, st, 1, corpus);
+  if (rc == KBC_OK) rc = bind_text(err, s, st, 2, path);
+  if (rc != KBC_OK) {
+    (void)finalize(err, s, st, rc);
+    unlock(s);
+    return rc;
+  }
+  for (;;) {
+    int step = sqlite3_step(st);
+    if (step == SQLITE_DONE) break;
+    if (step != SQLITE_ROW) {
+      rc = sql_fail(err, s, "list backlinks: step", step);
+      break;
+    }
+    const char *src = (const char *)sqlite3_column_text(st, 0);
+    if (src == NULL) {
+      rc = kbc_err_set(err, KBC_ERR_INTERNAL, "list backlinks: null src_path");
+      break;
+    }
+    if (out->len >= KBC_MAX_CORPORA) {
+      rc = kbc_err_set(err, KBC_ERR_CONFLICT, "backlinks: more than %u",
+                       (unsigned)KBC_MAX_CORPORA);
+      break;
+    }
+    rc = kbc_strlist_push(out, src);
+    if (rc != KBC_OK) break;
+  }
+  kbc_status fin = finalize(err, s, st, rc);
+  if (rc == KBC_OK) rc = fin;
+  unlock(s);
+  return rc;
+}
+
 /* ------------------------------------------------------------- pending --- */
 
 /* Records the link targets a document named that were not indexed documents.
@@ -2187,6 +2283,62 @@ kbc_status kbc_store_set_comment_resolved(kbc_store *s, const char *comment_id,
     st = kbc_err_set(err, KBC_ERR_NOTFOUND, "comment %s: not found", comment_id);
   unlock(s);
   return st;
+}
+
+/* The documents that HAVE comments — the distinct doc_ids the comments table
+ * names, which is a set and not a count.
+ *
+ * NOT filtered by corpus, and that is forced by the schema rather than
+ * chosen: comments has carried doc_id and nothing else since v1, so there is
+ * no corpus column to filter on and pretending otherwise would mean a scan
+ * plus a per-row lookup — the very shape this function exists to remove. The
+ * caller that needs the corpus recovers it from the artifact row, which it
+ * needs anyway to name the event's `kb` and `source_relative`.
+ *
+ * `comments_doc` on doc_id makes this a loose index scan over the comment
+ * rows, so the cost is proportional to the comments that EXIST and not to the
+ * size of the corpus — the property the anchor re-evaluation pass needs. */
+kbc_status kbc_store_list_comment_docs(kbc_store *s, kbc_strlist *out,
+                                       kbc_err *err) {
+  if (s == NULL || out == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "list_comment_docs: null argument");
+
+  lock(s);
+  sqlite3_stmt *st = NULL;
+  kbc_status rc = prepare(err, s,
+                           "SELECT DISTINCT doc_id FROM comments"
+                           " ORDER BY doc_id;",
+                           &st);
+  if (rc != KBC_OK) {
+    unlock(s);
+    return rc;
+  }
+  for (;;) {
+    int step = sqlite3_step(st);
+    if (step == SQLITE_DONE) break;
+    if (step != SQLITE_ROW) {
+      rc = sql_fail(err, s, "list comment docs: step", step);
+      break;
+    }
+    const char *d = (const char *)sqlite3_column_text(st, 0);
+    if (d == NULL) {
+      rc = kbc_err_set(err, KBC_ERR_INTERNAL,
+                       "list comment docs: null doc_id");
+      break;
+    }
+    if (out->len >= KBC_MAX_HITS) {
+      rc = kbc_err_set(err, KBC_ERR_CONFLICT,
+                       "comment docs: more than %u", (unsigned)KBC_MAX_HITS);
+      break;
+    }
+    rc = kbc_strlist_push(out, d);
+    if (rc != KBC_OK) break;
+  }
+  kbc_status fin = finalize(err, s, st, rc);
+  if (rc == KBC_OK) rc = fin;
+  unlock(s);
+  return rc;
 }
 
 /* ===================================================== stage 1: the rest ==
@@ -3135,6 +3287,677 @@ kbc_status kbc_store_list_history(kbc_store *s, kbc_arena *a, const char *user,
   return KBC_OK;
 }
 
+/* Retention — see the declaration in include/kbc/store.h for the contract
+ * and the two original citations. The implementation note is the one thing
+ * the header cannot say: the DELETE runs under this store's mutex, so it
+ * serialises against every other writer on the connection rather than
+ * racing one. */
+kbc_status kbc_store_prune_history(kbc_store *s, int64_t started_before_unix,
+                                   bool apply, int64_t *rows, kbc_err *err) {
+  if (s == NULL || rows == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "prune_history: null argument");
+  *rows = 0;
+  /* A cutoff before the epoch can match nothing that exists, and a wrapped
+   * one would match every row — the header says this prunes nothing, so the
+   * clamp is the behaviour and not a guard around it. The original's
+   * `saturating_sub` lands in the same place for the same reason. */
+  if (started_before_unix < 0) started_before_unix = 0;
+
+  /* One predicate for both modes, so the number a dry run reports is by
+   * construction the number --apply removes. A dry run that could disagree
+   * with the real thing would be worse than no dry run. */
+  const char *sql =
+      apply ? "DELETE FROM history WHERE started_at < ?1;"
+            : "SELECT COUNT(*) FROM history WHERE started_at < ?1;";
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  kbc_status st = prepare(err, s, sql, &q);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 1, started_before_unix);
+  int step = SQLITE_ERROR;
+  if (st == KBC_OK) {
+    step = sqlite3_step(q);
+    if (step != SQLITE_DONE && step != SQLITE_ROW) {
+      st = sql_fail(err, s, "prune history", step);
+    }
+  }
+  /* Read on THIS connection immediately after the step, which is the only
+   * point either value is defined at — sqlite3_changes is a per-connection
+   * counter that any statement in between would have overwritten. */
+  if (st == KBC_OK) {
+    *rows = apply ? (int64_t)sqlite3_changes(s->db)
+                  : sqlite3_column_int64(q, 0);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  if (st != KBC_OK) return st != KBC_OK ? st : fin;
+  return fin;
+}
+
+/* The reclaim half of retention, and separate from the delete so that a
+ * caller cannot accidentally couple them. See the declaration for why it is
+ * best-effort and must not be given a failure path. */
+kbc_status kbc_store_checkpoint(kbc_store *s, kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "checkpoint: null store");
+  /* A scratch `err`, NOT the caller's: a refused or partial checkpoint is
+   * reported as KBC_OK by contract, and letting exec_plain write the reason
+   * into the caller's err would hand them a filled error alongside a success
+   * status — which is the exact shape of the bug the best-effort rule
+   * exists to prevent. */
+  kbc_err scratch;
+  kbc_err_reset(&scratch);
+  lock(s);
+  /* sqlite3_exec, which steps through every row even with no callback, so
+   * the pragma's result row is drained. That matters because the original
+   * is explicit about the one-shot hazard next door (sqlite.rs:2408-2412):
+   * `incremental_vacuum` frees one page per step, so a single-step exec
+   * reclaims a single page however large N is. `wal_checkpoint` is not in
+   * that class — one call does the whole checkpoint — but the drain is why
+   * exec_plain is the right helper here rather than a bare step. */
+  (void)exec_plain(&scratch, s, "PRAGMA wal_checkpoint(TRUNCATE);");
+  unlock(s);
+  return KBC_OK;
+}
+
+/* ================================================================ moves === */
+
+/* The hop bound, and it exists for exactly one reason: the walk must
+ * TERMINATE. A chain a -> b -> a is representable in this table (nothing
+ * forbids it, and a bug that writes one is precisely the case the bound is
+ * for), and an unbounded walk over a cycle hangs a request thread forever.
+ * The original bounds it at 64; the same number is used here so the two
+ * agree on what a pathological chain looks like. The bound is a guard, not a
+ * budget: a legitimate chain is two or three hops long. */
+#define MOVE_MAX_HOPS 64
+
+/* Runs one two-parameter UPDATE. `sql` names a statement that takes the old
+ * value as ?1 and the new as ?2, so every table's rekey is one call and the
+ * binding discipline is stated once instead of nine times. */
+static kbc_status rekey_two(kbc_err *err, kbc_store *s, const char *sql,
+                            const char *old_v, const char *new_v) {
+  sqlite3_stmt *q = NULL;
+  kbc_status st = prepare(err, s, sql, &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, old_v);
+  if (st == KBC_OK) st = bind_text(err, s, q, 2, new_v);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "rekey", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  return (st == KBC_OK) ? fin : st;
+}
+
+/* The delete-the-leftover half, whose statements take ONE parameter. It is a
+ * separate function rather than a NULL second bind on purpose: binding ?2 to
+ * a statement that has no ?2 is SQLITE_RANGE ("column index out of range"),
+ * so sharing one helper would mean every DELETE silently failed and the
+ * rekey reported a bind error instead of doing its work. */
+static kbc_status rekey_del(kbc_err *err, kbc_store *s, const char *sql,
+                            const char *old_v) {
+  sqlite3_stmt *q = NULL;
+  kbc_status st = prepare(err, s, sql, &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, old_v);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "rekey delete", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  return (st == KBC_OK) ? fin : st;
+}
+
+/* The same two shapes again, for the tables whose key is (corpus, path)
+ * rather than an id: the corpus binds as ?1 and the predicate it opens is
+ * part of the WHERE, not a value being written.
+ *
+ * SEPARATE functions rather than an extra parameter on the two above, on
+ * purpose. The id-keyed tables have no corpus column at all, so a shared
+ * helper would have to take a possibly-NULL corpus and branch on it — and
+ * that branch is the exact shape of the bug these exist to make impossible:
+ * one statement that rewrites a path in every corpus because the corpus was
+ * forgotten. Here the corpus is a required argument, so a call without it
+ * does not compile. */
+static kbc_status rekey_corp_two(kbc_err *err, kbc_store *s, const char *sql,
+                                 const char *corpus, const char *old_v,
+                                 const char *new_v) {
+  sqlite3_stmt *q = NULL;
+  kbc_status st = prepare(err, s, sql, &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, corpus);
+  if (st == KBC_OK) st = bind_text(err, s, q, 2, old_v);
+  if (st == KBC_OK) st = bind_text(err, s, q, 3, new_v);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "rekey", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  return (st == KBC_OK) ? fin : st;
+}
+
+static kbc_status rekey_corp_del(kbc_err *err, kbc_store *s, const char *sql,
+                                 const char *corpus, const char *old_v) {
+  sqlite3_stmt *q = NULL;
+  kbc_status st = prepare(err, s, sql, &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, corpus);
+  if (st == KBC_OK) st = bind_text(err, s, q, 2, old_v);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "rekey delete", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  return (st == KBC_OK) ? fin : st;
+}
+
+/* `artifacts` is rekeyed FIRST and the rest after, and the order is not
+ * cosmetic. `chunks` and `comments` declare a real FOREIGN KEY onto
+ * artifacts(id) and this connection runs `PRAGMA foreign_keys = ON`
+ * (src/store.c:607), so with immediate enforcement the two updates are a
+ * circular deadlock: the child cannot be rekeyed until the parent row
+ * exists under the new id, and the parent cannot be rekeyed until its
+ * children have let go. Both statements fail with SQLITE_CONSTRAINT_FOREIGNKEY
+ * and the rekey is impossible.
+ *
+ * `defer_foreign_keys` is what breaks the cycle: it moves every FK check to
+ * COMMIT, so both updates apply and the constraint is verified once, at the
+ * end, against the finished state. It is per-transaction and auto-resets —
+ * a write after this transaction commits is checked normally, which is
+ * verified by a test rather than assumed. */
+kbc_status kbc_store_rekey_artifact(kbc_store *s, const char *old_id,
+                                    const char *new_id, const char *old_rel,
+                                    const char *new_rel, kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "rekey_artifact: null store");
+  kbc_status st = require_text(err, "rekey old_id", old_id, KBC_MAX_ID_LEN);
+  if (st == KBC_OK)
+    st = require_text(err, "rekey new_id", new_id, KBC_MAX_ID_LEN);
+  if (st == KBC_OK)
+    st = require_text(err, "rekey old_rel", old_rel, KBC_MAX_PATH_LEN);
+  if (st == KBC_OK)
+    st = require_text(err, "rekey new_rel", new_rel, KBC_MAX_PATH_LEN);
+  if (st == KBC_OK && strcmp(old_id, new_id) == 0)
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "rekey_artifact: old_id and new_id are the same");
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  st = exec_plain(err, s, "BEGIN IMMEDIATE;");
+  if (st != KBC_OK) {
+    unlock(s);
+    return st;
+  }
+  /* Must be INSIDE the transaction: the pragma is a no-op outside one. */
+  st = exec_plain(err, s, "PRAGMA defer_foreign_keys = ON;");
+
+  /* `chunks`: PK(doc_id, ord), so a destination that already holds the same
+   * ordinal is a real collision. OR IGNORE keeps the destination's chunk and
+   * the delete drops the leftover — destination state wins, as in the
+   * original. */
+  if (st == KBC_OK)
+    st = rekey_two(err, s,
+                   "UPDATE OR IGNORE chunks SET doc_id = ?2 WHERE doc_id = ?1;",
+                   old_id, new_id);
+  if (st == KBC_OK)
+    st = rekey_del(err, s, "DELETE FROM chunks WHERE doc_id = ?1;", old_id);
+
+  /* `corkboard`, `pinned_memories`, `doc_first_seen`: PK on the artifact id,
+   * same OR IGNORE + delete-leftover shape. For doc_first_seen the
+   * destination's EARLIER timestamp is the one worth keeping, which is
+   * exactly what OR IGNORE gives for free. */
+  if (st == KBC_OK)
+    st = rekey_two(err, s,
+                   "UPDATE OR IGNORE corkboard SET artifact_id = ?2"
+                   " WHERE artifact_id = ?1;",
+                   old_id, new_id);
+  if (st == KBC_OK)
+    st = rekey_del(err, s, "DELETE FROM corkboard WHERE artifact_id = ?1;",
+                   old_id);
+  if (st == KBC_OK)
+    st = rekey_two(err, s,
+                   "UPDATE OR IGNORE pinned_memories SET artifact_id = ?2"
+                   " WHERE artifact_id = ?1;",
+                   old_id, new_id);
+  if (st == KBC_OK)
+    st = rekey_del(err, s,
+                   "DELETE FROM pinned_memories WHERE artifact_id = ?1;",
+                   old_id);
+  if (st == KBC_OK)
+    st = rekey_two(err, s,
+                   "UPDATE OR IGNORE doc_first_seen SET artifact_id = ?2"
+                   " WHERE artifact_id = ?1;",
+                   old_id, new_id);
+  if (st == KBC_OK)
+    st = rekey_del(err, s,
+                   "DELETE FROM doc_first_seen WHERE artifact_id = ?1;",
+                   old_id);
+
+  /* `history`: a reading visit naming the id. The column is NULLABLE and
+   * carries no uniqueness, so a plain UPDATE cannot collide and there is
+   * nothing to delete afterwards — the same shape the original gives it. The
+   * visit follows the document, which is the behaviour store.h's section
+   * banner promises: reading history outlives the document, and a moved
+   * document is not a removed one. */
+  if (st == KBC_OK)
+    st = rekey_two(err, s,
+                   "UPDATE history SET artifact_id = ?2"
+   " WHERE artifact_id IS NOT NULL AND artifact_id = ?1;",
+                   old_id, new_id);
+
+  /* `edges` and `pending_links` are keyed by (corpus, path) — the path alone
+   * is not a key — so the path half of the move is what rewrites them. BOTH
+   * columns: a document that is itself a link TARGET has its inbound edges
+   * named at the old path, and those are exactly the backlinks the move must
+   * not lose. The original rekeys both directions for the same reason.
+   *
+   * AND the corpus, read from the row being moved. A relative path is only
+   * unique WITHIN a corpus, so an unfiltered rewrite is not a wider correct
+   * rewrite — it is a wrong one, and the delete half makes it destructive.
+   * Two corpora holding a same-named document (a config pointing both at
+   * overlapping directories produces exactly that) then lose each other's
+   * links: the UPDATE renames the other corpus's edge onto a path that does
+   * not exist there, and where the renamed row collides on the primary key
+   * the OR IGNORE skips it and the unfiltered DELETE then destroys it. Both
+   * happened with the function returning ok and nothing reporting an error.
+   * A rekey is about ONE document in ONE corpus; scoping it to the corpus
+   * that document is in is the rule, not a refinement of it. */
+  char corpus[256];
+  bool have_corpus = false;
+  if (st == KBC_OK) {
+    /* Read before the `artifacts` UPDATE below, which is the statement that
+     * takes this row's old id away. The path is in the predicate as well as
+     * the id so the corpus is read off the row this call is actually about
+     * and not off a same-id row at some other path. */
+    sqlite3_stmt *q = NULL;
+    st = prepare(err, s,
+                 "SELECT corpus FROM artifacts WHERE id = ?1 AND path = ?2;",
+                 &q);
+    if (st == KBC_OK) st = bind_text(err, s, q, 1, old_id);
+    if (st == KBC_OK) st = bind_text(err, s, q, 2, old_rel);
+    if (st == KBC_OK) {
+      const int step = sqlite3_step(q);
+      if (step == SQLITE_ROW) {
+        const char *c = (const char *)sqlite3_column_text(q, 0);
+        const int nb = sqlite3_column_bytes(q, 0);
+        /* Bounded, never truncated: `sources` admits a corpus of at most 255
+         * bytes, so a longer one means the row was written outside the API
+         * and copying it into this buffer would silently rewrite the wrong
+         * prefix's edges. */
+        if (c == NULL || nb <= 0 || (size_t)nb >= sizeof corpus) {
+          st = kbc_err_set(err, KBC_ERR_INTERNAL,
+                           "rekey %s: corpus is %d bytes, and a corpus slug is"
+                           " at most 255",
+                           old_id, nb);
+        } else {
+          memcpy(corpus, c, (size_t)nb);
+          corpus[nb] = '\0';
+          have_corpus = true;
+        }
+      } else if (step == SQLITE_DONE) {
+        have_corpus = false;
+      } else {
+        st = sql_fail(err, s, "read rekey corpus", step);
+      }
+    }
+    kbc_status fin = finalize(err, s, q, st);
+    if (st == KBC_OK) st = fin;
+  }
+
+  /* No row means this call is not about a document this store holds, and the
+   * path half is SKIPPED rather than guessed. Guessing is the bug: an
+   * unfiltered rewrite is precisely a guess about which corpus owns the path,
+   * and it is the one that destroys rows. Skipping is recoverable — the
+   * re-ingest at the new path rebuilds the moved document's own outbound
+   * edges from the same bytes — and a deleted edge is not. The id-keyed
+   * statements above are left to run; they are no-ops without a parent row,
+   * and the trailing `DELETE FROM artifacts` is one too. */
+  if (st == KBC_OK && have_corpus) {
+    if (st == KBC_OK)
+      st = rekey_corp_two(err, s,
+                          "UPDATE OR IGNORE edges SET src_path = ?3"
+                          " WHERE corpus = ?1 AND src_path = ?2;",
+                          corpus, old_rel, new_rel);
+    if (st == KBC_OK)
+      st = rekey_corp_del(err, s,
+                          "DELETE FROM edges WHERE corpus = ?1 AND src_path = "
+                          "?2;",
+                          corpus, old_rel);
+    if (st == KBC_OK)
+      st = rekey_corp_two(err, s,
+                          "UPDATE OR IGNORE edges SET dst_path = ?3"
+                          " WHERE corpus = ?1 AND dst_path = ?2;",
+                          corpus, old_rel, new_rel);
+    if (st == KBC_OK)
+      st = rekey_corp_del(err, s,
+                          "DELETE FROM edges WHERE corpus = ?1 AND dst_path = "
+                          "?2;",
+                          corpus, old_rel);
+    if (st == KBC_OK)
+      st = rekey_corp_two(err, s,
+                          "UPDATE OR IGNORE pending_links SET src_path = ?3"
+                          " WHERE corpus = ?1 AND src_path = ?2;",
+                          corpus, old_rel, new_rel);
+    if (st == KBC_OK)
+      st = rekey_corp_del(err, s,
+                          "DELETE FROM pending_links WHERE corpus = ?1 AND"
+                          " src_path = ?2;",
+                          corpus, old_rel);
+    if (st == KBC_OK)
+      st = rekey_corp_two(err, s,
+                          "UPDATE OR IGNORE pending_links SET dst_path = ?3"
+                          " WHERE corpus = ?1 AND dst_path = ?2;",
+                          corpus, old_rel, new_rel);
+    if (st == KBC_OK)
+      st = rekey_corp_del(err, s,
+                          "DELETE FROM pending_links WHERE corpus = ?1 AND"
+                          " dst_path = ?2;",
+                          corpus, old_rel);
+  }
+
+  /* `comments` — THE EXCEPTION, and the reason this function exists.
+   *
+   * NOT OR IGNORE + delete-leftover. A comment's `id` is its own PRIMARY KEY
+   * and is MINTED, so two different comments never collide on it and a
+   * collision here would mean the same comment id at two documents — which
+   * deleting "the leftover" would resolve by DESTROYING a user's words. The
+   * id and `created_at` are carried across untouched, so a moved comment is
+   * the same comment: same id, same timestamp, same anchor, same author,
+   * same body, same resolved flag.
+   *
+   * `created_at` is the field this whole function is about. The only public
+   * way to write a comment is kbc_store_add_comment, which MINTS it, so a
+   * caller re-adding a carried comment to rebuild it stamped every carried
+   * comment "now" — the one user-visible field a move cannot reconstruct from
+   * the document's bytes, because a timestamp is not in the bytes. Doing the
+   * rekey HERE, in SQL, is what makes the field survive: nothing re-writes
+   * the column, so there is nothing to get wrong. */
+  if (st == KBC_OK)
+    st = rekey_two(err, s,
+                   "UPDATE comments SET doc_id = ?2 WHERE doc_id = ?1;",
+                   old_id, new_id);
+
+  /* `artifacts` LAST, after every child has let go of old_id — and the order
+   * is load-bearing, not tidy. The delete-the-leftover below is an
+   * ON DELETE CASCADE parent delete: run while the children still name
+   * old_id, it takes their rows WITH it, and a rekey that reported success
+   * would have silently deleted the document's chunks and every comment on
+   * it. That is the worst possible failure for this function, because the
+   * caller is about to re-ingest and rebuild what it can — everything it
+   * cannot rebuild is exactly what the cascade destroyed.
+   *
+   * So the children move first and the parent follows. `OR IGNORE` then
+   * delete-the-leftover, like the tables above: a destination that already
+   * occupies (corpus, new_rel) WINS on the UNIQUE index, and the orphaned
+   * source row goes — now safely, with nothing left to cascade. */
+  if (st == KBC_OK) {
+    sqlite3_stmt *q = NULL;
+    st = prepare(err, s,
+                 "UPDATE OR IGNORE artifacts SET id = ?2, path = ?3"
+                 " WHERE id = ?1 AND path = ?4;",
+                 &q);
+    if (st == KBC_OK) st = bind_text(err, s, q, 1, old_id);
+    if (st == KBC_OK) st = bind_text(err, s, q, 2, new_id);
+    if (st == KBC_OK) st = bind_text(err, s, q, 3, new_rel);
+    if (st == KBC_OK) st = bind_text(err, s, q, 4, old_rel);
+    if (st == KBC_OK) {
+      const int step = sqlite3_step(q);
+      if (step != SQLITE_DONE) st = sql_fail(err, s, "rekey artifacts", step);
+    }
+    kbc_status fin = finalize(err, s, q, st);
+    if (st == KBC_OK) st = fin;
+  }
+  if (st == KBC_OK)
+    st = rekey_del(err, s, "DELETE FROM artifacts WHERE id = ?1;", old_id);
+
+  if (st == KBC_OK) st = exec_plain(err, s, "COMMIT;");
+  /* One transaction for all of it, so a crash cannot half-carry a thread: a
+   * document either arrives at its new id with its comments intact, or it did
+   * not move at all. That atomicity is the whole point of this being in the
+   * store rather than seven calls under a mutex. */
+  if (st != KBC_OK) rollback(s);
+  unlock(s);
+  return st;
+}
+
+/* The intent row, written BEFORE the rename. `completed_at` is left NULL by
+ * this insert and only stamped by kbc_store_complete_move, so an interrupted
+ * move is a row a bring-up pass can find rather than a document that quietly
+ * vanished between two operations nobody could see. */
+kbc_status kbc_store_record_move(kbc_store *s, const char *old_id,
+                                 const char *new_id, const char *old_rel,
+                                 const char *new_rel, int64_t moved_at,
+                                 kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "record_move: null store");
+  kbc_status st = require_text(err, "move old_id", old_id, KBC_MAX_ID_LEN);
+  if (st == KBC_OK)
+    st = require_text(err, "move new_id", new_id, KBC_MAX_ID_LEN);
+  if (st == KBC_OK)
+    st = require_text(err, "move old_rel", old_rel, KBC_MAX_PATH_LEN);
+  if (st == KBC_OK)
+    st = require_text(err, "move new_rel", new_rel, KBC_MAX_PATH_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "INSERT INTO moves(old_id, new_id, old_rel, new_rel, moved_at)"
+               " VALUES(?1,?2,?3,?4,?5);",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, old_id);
+  if (st == KBC_OK) st = bind_text(err, s, q, 2, new_id);
+  if (st == KBC_OK) st = bind_text(err, s, q, 3, old_rel);
+  if (st == KBC_OK) st = bind_text(err, s, q, 4, new_rel);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 5, moved_at);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "record move", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  unlock(s);
+  return st;
+}
+
+/* Stamps EVERY in-flight row for old_id, not one of them: a document moved
+ * twice before the first stamp landed has two intent rows and both describe
+ * the same finished move. A single-row UPDATE would leave one of them
+ * incomplete forever, and an incomplete row suppresses the watcher's delete
+ * guard and shows up in the bring-up replay list for a move that completed
+ * long ago. */
+kbc_status kbc_store_complete_move(kbc_store *s, const char *old_id,
+                                   kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "complete_move: null store");
+  kbc_status st = require_text(err, "move old_id", old_id, KBC_MAX_ID_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "UPDATE moves SET completed_at = ?2"
+               " WHERE old_id = ?1 AND completed_at IS NULL;",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, old_id);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 2, (int64_t)time(NULL));
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "complete move", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  /* A move that was never recorded is NOT a failure here. The row is an
+   * intent journal, and a caller that completes a move it did not record has
+   * still finished the move; reporting NOTFOUND would make a completed rename
+   * look broken on a database opened by an older build. */
+  unlock(s);
+  return st;
+}
+
+/* Follows a chain of COMPLETED moves and appends the destination to `out`.
+ *
+ * CHAIN-WALKED, not a single hop, because a path can be renamed more than
+ * once: a -> b -> c means a bookmark made before the first rename has to end
+ * up at c, and answering "b" would hand the caller a name that was itself
+ * renamed away. The original walks the same chain (sqlite.rs:5876).
+ *
+ * An INCOMPLETE row is skipped rather than followed. Its rename never
+ * finished, so its `new_id` is a name the document may never have reached;
+ * following it would resolve a bookmark to a document that does not exist,
+ * which is worse than reporting the id unchanged.
+ *
+ * The walk is bounded twice over, and both bounds are needed. MOVE_MAX_HOPS
+ * stops a long chain, and the explicit "have I seen this id" comparison stops
+ * a CYCLE — a -> b -> a is representable in the table and an unbounded walk
+ * over one never returns, hanging the httpd worker that called it. A cycle
+ * stops with the last distinct hop as the answer: a partial redirect is a
+ * better answer than no answer, and the caller can detect the truncation
+ * because the id it passed in is not in what came back. */
+static kbc_status moves_walk(kbc_err *err, kbc_store *s, bool by_path,
+                             const char *start, kbc_strlist *out) {
+  kbc_status st = KBC_OK;
+  /* Sized for a PATH, not an id, because this one function serves both: a
+   * path is up to KBC_MAX_PATH_LEN and truncating one would send the walk
+   * off to a path that does not exist, which is the one answer a redirect
+   * must never give. `require_text` has already bounded the input. */
+  char cur[KBC_MAX_PATH_LEN + 1];
+  size_t n = strlen(start);
+  memcpy(cur, start, n + 1u);
+
+  for (int hop = 0; hop < MOVE_MAX_HOPS; hop++) {
+    /* The cycle guard lives at the BOTTOM of this loop, against the value
+     * about to be moved to. */
+    char next[KBC_MAX_PATH_LEN + 1];
+    next[0] = '\0';
+    sqlite3_stmt *q = NULL;
+    /* Two fixed statements chosen by a bool, never caller text — the only
+     * un-bound strings in this file's SQL are compile-time literals. */
+    const char *sql =
+        by_path ? "SELECT new_rel FROM moves WHERE old_rel = ?1"
+                  " AND completed_at IS NOT NULL ORDER BY id DESC LIMIT 1;"
+                : "SELECT new_id FROM moves WHERE old_id = ?1"
+                  " AND completed_at IS NOT NULL ORDER BY id DESC LIMIT 1;";
+    st = prepare(err, s, sql, &q);
+    if (st == KBC_OK) st = bind_text(err, s, q, 1, cur);
+    if (st == KBC_OK) {
+      const int step = sqlite3_step(q);
+      if (step == SQLITE_ROW) {
+        const char *v = (const char *)sqlite3_column_text(q, 0);
+        /* A NULL in a NOT NULL column is the database's problem to report,
+         * not a hop to skip quietly. */
+        if (v == NULL) {
+          st = kbc_err_set(err, KBC_ERR_INTERNAL, "moves: null %s",
+                           by_path ? "new_rel" : "new_id");
+        } else {
+          const size_t vn = strlen(v);
+          if (vn > KBC_MAX_PATH_LEN) {
+            st = kbc_err_set(err, KBC_ERR_INTERNAL,
+                             "moves: a %s in the moves table is %zu bytes",
+                             by_path ? "new_rel" : "new_id", vn);
+          } else {
+            memcpy(next, v, vn + 1u);
+          }
+        }
+      } else if (step != SQLITE_DONE) {
+        st = sql_fail(err, s, "moves walk", step);
+      }
+    }
+    kbc_status fin = finalize(err, s, q, st);
+    if (st == KBC_OK) st = fin;
+    if (st != KBC_OK) return st;
+
+    /* No completed row: either the chain ends here, or the only row is an
+     * interrupted move that must not be followed. Either way, stop. */
+    if (next[0] == '\0') break;
+    /* The CYCLE guard, and it must test the value we are ABOUT TO move TO,
+     * not the one we are leaving. Testing the current value against what has
+     * already been collected reads hop 1's own destination back on hop 2 and
+     * stops every chain at one hop — which is the single-hop bug this whole
+     * function exists to avoid, wearing a guard's clothing. */
+    if (kbc_strlist_contains(out, next)) break;
+    st = kbc_strlist_push(out, next);
+    if (st != KBC_OK) return st;
+    memcpy(cur, next, strlen(next) + 1u);
+  }
+  return KBC_OK;
+}
+
+/* Where a stale id now lives. `ids` receives the chain's destinations in
+ * order, the FINAL one last, and is EMPTY AND KBC_OK when this id never
+ * moved: "this document has not been renamed" is the common answer, and a
+ * caller wants the absence, not an error. A single hop would be wrong for a
+ * document renamed twice, so the walk is the contract and the empty answer
+ * is not a failure. */
+kbc_status kbc_store_moves_lookup(kbc_store *s, const char *id,
+                                  kbc_strlist *ids, kbc_err *err) {
+  if (s == NULL || ids == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "moves_lookup: null argument");
+  kbc_status st = require_text(err, "moves_lookup id", id, KBC_MAX_ID_LEN);
+  if (st != KBC_OK) return st;
+  lock(s);
+  st = moves_walk(err, s, false, id, ids);
+  unlock(s);
+  return st;
+}
+
+/* The same walk keyed by path, for a link written against the old path. */
+kbc_status kbc_store_moves_lookup_path(kbc_store *s, const char *rel,
+                                       kbc_strlist *rels, kbc_err *err) {
+  if (s == NULL || rels == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "moves_lookup_path: null "
+                       "argument");
+  kbc_status st =
+      require_text(err, "moves_lookup_path rel", rel, KBC_MAX_PATH_LEN);
+  if (st != KBC_OK) return st;
+  lock(s);
+  st = moves_walk(err, s, true, rel, rels);
+  unlock(s);
+  return st;
+}
+
+/* Moves that started and never finished, for bring-up to converge. Both
+ * lists are filled in ONE pass and are PARALLEL: entry i of `old_ids` and
+ * entry i of `old_rels` describe the same interrupted move, because a
+ * bring-up pass that has to re-query to pair them can pair them wrongly.
+ *
+ * `completed_at IS NULL` is the whole predicate — not a timestamp
+ * comparison. "Old enough" would be a second, different question (the
+ * watcher's 10 s grace), and folding it in here would make a caller unable
+ * to ask the first question without the second. */
+kbc_status kbc_store_list_incomplete_moves(kbc_store *s, kbc_strlist *old_ids,
+                                           kbc_strlist *old_rels,
+                                           kbc_err *err) {
+  if (s == NULL || old_ids == NULL || old_rels == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "list_incomplete_moves: null argument");
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  kbc_status st =
+      prepare(err, s,
+              "SELECT old_id, old_rel FROM moves WHERE completed_at IS NULL"
+              " ORDER BY id;",
+              &q);
+  for (;;) {
+    const int step = (st == KBC_OK) ? sqlite3_step(q) : SQLITE_DONE;
+    if (step == SQLITE_DONE) break;
+    if (step != SQLITE_ROW) {
+      st = sql_fail(err, s, "list incomplete moves", step);
+      break;
+    }
+    const char *id = (const char *)sqlite3_column_text(q, 0);
+    const char *rel = (const char *)sqlite3_column_text(q, 1);
+    if (id == NULL || rel == NULL) {
+      st = kbc_err_set(err, KBC_ERR_INTERNAL,
+                       "list incomplete moves: null old_id or old_rel");
+      break;
+    }
+    st = kbc_strlist_push(old_ids, id);
+    if (st != KBC_OK) break;
+    st = kbc_strlist_push(old_rels, rel);
+    if (st != KBC_OK) break;
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  unlock(s);
+  return st;
+}
+
 /* ----------------------------------------------------------- corkboard -- */
 
 /* Anchoring twice is a no-op that keeps the ORIGINAL created_at: the corkboard
@@ -3188,7 +4011,12 @@ kbc_status kbc_store_remove_corkboard(kbc_store *s, const char *artifact_id,
   return st != KBC_OK ? st : fin;
 }
 
-/* Most recently anchored first, artifact_id ascending as the tiebreak. */
+/* Most recently anchored first, artifact_id ascending as the tiebreak.
+ *
+ * A PAGE, and the ORDER BY is what makes it one: `LIMIT n` takes the n most
+ * RECENT anchors, so a document anchored early is not among them, and an id
+ * missing from this page is not evidence that it is unanchored. Anything that
+ * needs one specific document's anchor reads it by id. */
 kbc_status kbc_store_list_corkboard(kbc_store *s, kbc_arena *a, size_t limit,
                                     kbc_corkboard_row **out, size_t *n_out,
                                     kbc_err *err) {
@@ -3287,7 +4115,11 @@ kbc_status kbc_store_unpin_memory(kbc_store *s, const char *artifact_id,
   return st != KBC_OK ? st : fin;
 }
 
-/* Most recently pinned first, artifact_id ascending as the tiebreak. */
+/* Most recently pinned first, artifact_id ascending as the tiebreak.
+ *
+ * A PAGE for the same reason as the corkboard's: `LIMIT n` takes the n most
+ * RECENT pins, so a pin set early is not among them and a missing id is not
+ * evidence that it is unpinned. */
 kbc_status kbc_store_list_pins(kbc_store *s, kbc_arena *a, size_t limit,
                                kbc_pin_row **out, size_t *n_out, kbc_err *err) {
   if (s == NULL || a == NULL || out == NULL || n_out == NULL)

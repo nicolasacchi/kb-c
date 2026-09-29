@@ -181,7 +181,7 @@ typedef struct {
  * CLI will read. Returns false (after reporting) if the store would not open,
  * so a case never goes on to assert things about a world that was never
  * built. */
-static bool world_up(world *w, const char *corpus) {
+static bool world_build(world *w, const char *corpus, bool seed_artifact) {
   kbc_test_tmpdir(w->root, sizeof w->root);
   (void)path_join(w->home, sizeof w->home, w->root, "home");
   (void)path_join(w->config, sizeof w->config, w->root, "kb.toml");
@@ -226,23 +226,31 @@ static bool world_up(world *w, const char *corpus) {
     kbc_store_close(s);
     return false;
   }
-  kbc_artifact art;
-  memset(&art, 0, sizeof art);
-  art.id = "aaaaaaaaaaaa";
-  art.corpus = corpus;
-  art.path = "a.md";
-  art.title = "The Document";
-  art.kind = KBC_KIND_ARTIFACT;
-  art.mtime_ns = 1700000000123456789ll;
-  art.size_bytes = 42;
-  art.content_hash = 0xdeadbeefu;
-  art.heading_count = 1;
-  art.summary = "some backup-worthy prose.";
-  kbc_err_reset(&e);
-  if (kbc_failed(kbc_store_upsert_artifact(s, &art, &e))) {
-    kbc_test_fail(__FILE__, __LINE__, "world_up: upsert: %s", e.msg);
-    kbc_store_close(s);
-    return false;
+  /* The synthetic row is what makes the BACKUP cases cheap — a tarball of a
+   * store with a known row in it. It is also why a case that wants a real
+   * index cannot use it: the id here is a literal, not the one
+   * `kbc_id_for_artifact` mints for (corpus, a.md), so a reindex of that very
+   * file collides with this row and the reindex refuses. Hence the flag
+   * rather than a second, near-identical builder. */
+  if (seed_artifact) {
+    kbc_artifact art;
+    memset(&art, 0, sizeof art);
+    art.id = "aaaaaaaaaaaa";
+    art.corpus = corpus;
+    art.path = "a.md";
+    art.title = "The Document";
+    art.kind = KBC_KIND_ARTIFACT;
+    art.mtime_ns = 1700000000123456789ll;
+    art.size_bytes = 42;
+    art.content_hash = 0xdeadbeefu;
+    art.heading_count = 1;
+    art.summary = "some backup-worthy prose.";
+    kbc_err_reset(&e);
+    if (kbc_failed(kbc_store_upsert_artifact(s, &art, &e))) {
+      kbc_test_fail(__FILE__, __LINE__, "world_up: upsert: %s", e.msg);
+      kbc_store_close(s);
+      return false;
+    }
   }
   kbc_store_close(s);
 
@@ -255,6 +263,19 @@ static bool world_up(world *w, const char *corpus) {
   kbc_test_write_file(w->config, toml.ptr);
   kbc_str_free(&toml);
   return true;
+}
+
+/* The usual world: a store holding one KNOWN synthetic artifact, which is
+ * what the backup and restore cases assert against. */
+static bool world_up(world *w, const char *corpus) {
+  return world_build(w, corpus, true);
+}
+
+/* A world whose artifact table is EMPTY, so `kbc reindex` can ingest the
+ * corpus for real and "searchable" is a claim about a real index rather than
+ * about a row this fixture wrote. See the `seed_artifact` comment above. */
+static bool world_up_indexable(world *w, const char *corpus) {
+  return world_build(w, corpus, false);
 }
 
 static void world_down(world *w) { kbc_test_rmrf(w->root); }
@@ -1621,6 +1642,377 @@ KBC_TEST(a_second_daemon_is_refused_while_one_is_running) {
   world_down(&w);
 }
 
+/* ------------------------------------------------- prune / retention ------
+ *
+ * `kbc prune` is the operator-triggered form of the original's retention
+ * sweep (`Db::retention_prune`, kb-core/src/storage/sqlite.rs:2361). Every
+ * statement it runs there deletes from `history` / `reading_sections` /
+ * served `memory_recalls` rows — reading history, never an artifact. The
+ * cases below seed the `history` table through the frozen public API,
+ * because that table has no production writer in kb-c (store.h says so and
+ * means it) and a test that cannot put a row in cannot test a prune.
+ */
+
+/* The world's store, opened through the same public API `world_up` used. The
+ * prune under test opens its OWN connection in a separate process, so
+ * seeding and reading across this boundary is the shape an operator sees. */
+static kbc_store *world_store(world *w) {
+  kbc_config cfg;
+  memset(&cfg, 0, sizeof cfg);
+  size_t n = strlen(w->db) + 1u;
+  cfg.db_path = malloc(n);
+  if (cfg.db_path == NULL) {
+    abort();
+  }
+  memcpy(cfg.db_path, w->db, n);
+  kbc_err e;
+  kbc_err_reset(&e);
+  kbc_store *s = kbc_store_open(&cfg, &e);
+  free(cfg.db_path);
+  if (s == NULL) {
+    kbc_test_fail(__FILE__, __LINE__, "world_store: open: %s", e.msg);
+    abort();
+  }
+  return s;
+}
+
+/* One `open`-kind history row, `age_secs` old. `id` names the document the
+ * visit was to, so a prune that wrongly cascaded into the document would
+ * have something to destroy. */
+static void seed_history(world *w, const char *id, int64_t age_secs) {
+  kbc_store *s = world_store(w);
+  kbc_history_row row;
+  memset(&row, 0, sizeof row);
+  row.kind = "open";
+  row.artifact_id = id;
+  row.started_at = (int64_t)time(NULL) - age_secs;
+  row.updated_at = row.started_at;
+  kbc_err e;
+  kbc_err_reset(&e);
+  if (kbc_failed(kbc_store_add_history(s, &row, &e))) {
+    kbc_test_fail(__FILE__, __LINE__, "seed_history: %s", e.msg);
+    abort();
+  }
+  kbc_store_close(s);
+}
+
+/* How many `history` rows the world's store holds. Read through the frozen
+ * API rather than through SQL so the count is the one a caller would see,
+ * not this test's idea of the table. */
+static int64_t history_rows(world *w) {
+  kbc_store *s = world_store(w);
+  kbc_arena *a = kbc_arena_new(4096);
+  if (a == NULL) {
+    abort();
+  }
+  kbc_history_row *rows = NULL;
+  size_t n = 0;
+  kbc_err e;
+  kbc_err_reset(&e);
+  int64_t got = -1;
+  /* KBC_MAX_HITS is the cap `list_history` clamps to; asking for more is not
+   * a bigger answer, it is the same answer, so a fixture that ever grew past
+   * it would read as a prune that deleted nothing. */
+  if (kbc_failed(kbc_store_list_history(s, a, NULL, KBC_MAX_HITS, &rows, &n,
+                                        &e))) {
+    kbc_test_fail(__FILE__, __LINE__, "history_rows: %s", e.msg);
+  } else {
+    got = (int64_t)n;
+  }
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  return got;
+}
+
+/* The default must not delete. The original's sweep cannot be run by hand at
+ * all — it is armed by config and fires on a timer — so it never needed a
+ * dry run. A CLI verb puts the delete one keypress away, so the safety moves
+ * to the invocation: without --apply this reports and changes nothing.
+ *
+ * Reverting the dry-run default turns the row count red, which is the whole
+ * point of asserting it rather than the wording. */
+KBC_TEST(prune_without_apply_reports_the_window_and_deletes_nothing) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  seed_history(&w, "aaaaaaaaaaaa", 40 * 86400);
+  KBC_CHECK_EQ_INT(history_rows(&w), 1);
+
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_MSG(run_kbc_va(&w, &out, "prune", "--days", "30", NULL) == 0,
+ "a dry-run prune must succeed; got:\n%s", out.ptr);
+  KBC_CHECK_MSG(strstr(out.ptr, "would prune 1 history row") != NULL,
+          "the dry run did not report the one row it would remove; "
+           "got:\n%s", out.ptr);
+  kbc_str_free(&out);
+
+  KBC_CHECK_MSG(history_rows(&w) == 1,
+          "the dry run DELETED a row: history went from 1 to %lld without "
+           "--apply", (long long)history_rows(&w));
+  world_down(&w);
+}
+
+/* The window is the original's: rows OLDER than `now - days` go, and a row
+ * inside the window stays. Asserting only that "something was deleted" would
+ * pass a prune that deleted everything, so both sides of the boundary are
+ * pinned — and the survivor is what catches an off-by-one in the cutoff
+ * arithmetic. */
+KBC_TEST(prune_with_apply_removes_only_the_history_older_than_the_window) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  seed_history(&w, "aaaaaaaaaaaa", 40 * 86400); /* older than 30 days */
+  seed_history(&w, "aaaaaaaaaaaa", 5 * 86400);  /* inside the window */
+  KBC_CHECK_EQ_INT(history_rows(&w), 2);
+
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_MSG(run_kbc_va(&w, &out, "prune", "--days", "30", "--apply",
+         NULL) == 0,
+       "an applied prune must succeed; got:\n%s", out.ptr);
+  KBC_CHECK_MSG(strstr(out.ptr, "pruned 1 history row") != NULL,
+        "the applied prune did not report removing exactly the one "
+         "aged row; got:\n%s", out.ptr);
+  kbc_str_free(&out);
+
+  KBC_CHECK_MSG(history_rows(&w) == 1,
+                "expected the 40-day-old row to go and the 5-day-old row to "
+                "stay, leaving 1; got %lld", (long long)history_rows(&w));
+  world_down(&w);
+}
+
+/* THE load-bearing case, and the inverse of what the verb's name suggests.
+ *
+ * The original's retention sweep never removes a document. Its own doc
+ * comment (sqlite.rs:2357) says it "deliberately does NOT manage the
+ * R2-cascade tables (sessions/edges/…); those are pruned per-artifact on
+ * delete, not by age", and config.rs:470 says edges "has NO timestamp
+ * column, so it CANNOT be time-pruned and is deliberately absent here".
+ *
+ * So a prune that deleted a document would not be a half-done port — it
+ * would be a FEATURE THE ORIGINAL DOES NOT HAVE, and the most dangerous one
+ * this binary could grow: an operator who ran a retention window would come
+ * back to a corpus with documents missing from it. This case indexes a real
+ * document, ages history rows that name it, prunes, and then requires the
+ * document to still be in the store AND still be findable by search.
+ *
+ * Both halves are load-bearing. Checking the store row alone would pass a
+ * prune that dropped the artifact row but left the posting list behind, and
+ * checking search alone would pass one that left a store row search could no
+ * longer resolve. */
+KBC_TEST(a_prune_takes_no_document_with_it_out_of_the_store_or_search) {
+  world w;
+  /* The indexable world, not the usual one: this case reindexes, and the
+   * usual fixture's synthetic artifact row would collide with the real
+   * ingest of the same file and make the reindex refuse. */
+  if (!world_up_indexable(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  /* A real index, so "still searchable" is a claim about the index and not
+   * about a store row that happens to be there. */
+  KBC_CHECK_MSG(run_kbc_va(&w, NULL, "reindex", "--kb", "notes", NULL) == 0,
+        "the corpus did not reindex, so the search half of this case "
+   "would be asserting nothing");
+
+  kbc_str before;
+  kbc_str_init(&before);
+  KBC_CHECK_MSG(run_kbc_va(&w, &before, "search", "backup-worthy", NULL) == 0,
+ "the document is not searchable before the prune, so the search "
+                "half of this case would be asserting nothing; got:\n%s",
+         before.ptr);
+  KBC_CHECK_MSG(strstr(before.ptr, "id:") != NULL,
+             "the pre-prune search printed no id; got:\n%s",
+         before.ptr);
+  kbc_str_free(&before);
+
+  /* Two aged visits naming the REAL document id, minted the same way the
+   * ingest minted it. A history row pointing at an id nothing has would
+   * weaken the case: a prune that deleted documents by walking history rows
+   * would find nothing to delete and pass. */
+  char doc_id[KBC_MAX_ID_LEN + 1];
+  kbc_id_for_artifact(doc_id, "notes", "a.md");
+  seed_history(&w, doc_id, 90 * 86400);
+  seed_history(&w, doc_id, 91 * 86400);
+
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_MSG(run_kbc_va(&w, &out, "prune", "--days", "1", "--apply",
+        NULL) == 0,
+            "the applied prune failed; got:\n%s", out.ptr);
+  KBC_CHECK_MSG(strstr(out.ptr, "pruned 2 history rows") != NULL,
+       "the prune did not remove both aged history rows; got:\n%s",
+        out.ptr);
+  kbc_str_free(&out);
+
+  KBC_CHECK_MSG(history_rows(&w) == 0,
+     "the prune left history rows behind: %lld",
+                (long long)history_rows(&w));
+
+  /* Still in the store. */
+  kbc_str listing;
+  kbc_str_init(&listing);
+  KBC_CHECK_MSG(run_kbc_va(&w, &listing, "list", "--kb", "notes", NULL) == 0,
+      "`kbc list` failed after the prune; got:\n%s",
+       listing.ptr);
+  KBC_CHECK_MSG(strstr(listing.ptr, "a.md") != NULL,
+ "the prune removed the DOCUMENT from the store — the original "
+       "never prunes artifacts by age; got:\n%s", listing.ptr);
+  kbc_str_free(&listing);
+
+  /* And still findable, which is the half a store-only assertion misses. */
+  kbc_str after;
+  kbc_str_init(&after);
+  KBC_CHECK_MSG(run_kbc_va(&w, &after, "search", "backup-worthy", NULL) == 0,
+    "the document stopped being SEARCHABLE after a prune — the "
+            "index and the store now disagree; got:\n%s", after.ptr);
+  KBC_CHECK_MSG(strstr(after.ptr, "id:") != NULL,
+         "the post-prune search printed no id; got:\n%s", after.ptr);
+  kbc_str_free(&after);
+  world_down(&w);
+}
+
+/* `--days 0` is refused, and the reason is the original's: a zero-day
+ * window sets the cutoff to `now` and would delete every row on the next
+ * tick, which is why `[retention] history_days = 0` is a hard validation
+ * error in the original (config.rs:1932-1947). A CLI cannot express "off" as
+ * 0 either, so it refuses the value rather than quietly redefining it. */
+KBC_TEST(prune_refuses_a_zero_day_window) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  seed_history(&w, "aaaaaaaaaaaa", 60);
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_MSG(run_kbc_va(&w, &out, "prune", "--days", "0", "--apply",
+             NULL) == 1,
+        "a zero-day window is a user error (1); got:\n%s", out.ptr);
+  kbc_str_free(&out);
+  KBC_CHECK_MSG(history_rows(&w) == 1,
+                "the refused zero-day prune still deleted a row");
+  world_down(&w);
+}
+
+/* An absent window is the original's `None` — keep forever — so it is a
+ * usage error here rather than a silent success: exiting 0 having removed
+ * nothing is the reading that hides a typo in the flag name. */
+KBC_TEST(prune_without_a_window_is_a_user_error) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_MSG(run_kbc_va(&w, &out, "prune", NULL) == 1,
+         "`kbc prune` with no --days is a user error (1); got:\n%s",
+      out.ptr);
+  kbc_str_free(&out);
+  world_down(&w);
+}
+
+/* ------------------------------------------------------------- metrics --- */
+
+/* Every counter `/metrics` renders lives in the running daemon, so there is
+ * no in-process fallback — unlike `search`/`reindex`, which have one. A
+ * fallback would print a complete exposition of zeroes, which reads exactly
+ * like a healthy idle daemon. `kbc status` sets the precedent: no fallback,
+ * exit 2 when no daemon answers. */
+KBC_TEST(metrics_without_a_daemon_is_a_daemon_failure) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_MSG(run_kbc_va(&w, &out, "--daemon", "http://127.0.0.1:47999",
+   "metrics", NULL) == 2,
+ "`kbc metrics` with no daemon must exit 2 (daemon/IO), not 1 "
+                "and not 0; got:\n%s", out.ptr);
+  kbc_str_free(&out);
+  world_down(&w);
+}
+
+/* `--out` is the one thing this verb has that the original's `kb metrics`
+ * does not, and the reason PORT_PLAN's stage-6 line says "metrics export":
+ * the Rust's verb can only print, so keeping a scrape means a shell
+ * redirect, and a redirect is not something a verb can be tested through.
+ * The file must hold the daemon's ACTUAL exposition, which is the only way
+ * this asserts the endpoint rather than the writer. */
+KBC_TEST(metrics_writes_the_daemons_exposition_to_the_named_file) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "token", "generate", NULL), 0);
+  /* A port no other case in this file uses. The existing daemon cases pin
+   * 47311/47313/47314, and a daemon left over from any of them would make
+   * this bind fail and report a start failure that reads like a metrics
+   * defect. A pid file cannot catch it either: every case owns its own state
+   * dir, so a stranger's daemon is invisible to it. */
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "daemon", "--port", "47411", NULL), 0);
+  bool up = false;
+  for (int i = 0; i < 100 && !up; i++) {
+    up = kbc_path_exists(pidfile_path(&w));
+    if (!up) {
+      struct timespec ts = { 0, 50 * 1000 * 1000 };
+      (void)nanosleep(&ts, NULL);
+    }
+  }
+  if (!up) {
+    kbc_test_fail(__FILE__, __LINE__,
+    "the daemon never wrote its pid file, so it did not start");
+    world_down(&w);
+    return;
+  }
+
+  char out_path[KBC_TEST_PATH_MAX];
+  (void)path_join(out_path, sizeof out_path, w.root, "metrics.prom");
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_MSG(run_kbc_va(&w, &out, "--daemon", "http://127.0.0.1:47411",
+    "metrics", "--out", out_path, NULL) == 0,
+    "kbc metrics --out against a live daemon must exit 0; "
+          "got:\n%s", out.ptr);
+  kbc_str_free(&out);
+
+  kbc_str body;
+  kbc_str_init(&body);
+  kbc_err e;
+  kbc_err_reset(&e);
+  if (kbc_failed(kbc_str_read_file(out_path, &body, &e))) {
+    kbc_test_fail(__FILE__, __LINE__, "metrics --out wrote no file: %s",
+       e.msg);
+  } else {
+    /* Two families src/httpd.c always renders, so this is the daemon's
+     * exposition and not an empty file. */
+    KBC_CHECK_MSG(strstr(body.ptr, "kb_http_requests_total") != NULL,
+          "the saved scrape has no kb_http_requests_total family; "
+  "got:\n%s", body.ptr);
+    KBC_CHECK_MSG(strstr(body.ptr, "kb_route_latency_bucket") != NULL,
+          "the saved scrape has no kb_route_latency_bucket family; "
+                  "got:\n%s", body.ptr);
+    /* An exposition with no TYPE line is not text exposition 0.0.4, and the
+     * daemon labels every family it writes. */
+    KBC_CHECK_MSG(strstr(body.ptr, "# TYPE kb_http_requests_total counter")
+          != NULL,
+       "the saved scrape carries no TYPE line; got:\n%s", body.ptr);
+  }
+  kbc_str_free(&body);
+
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "daemon", "stop", NULL), 0);
+  world_down(&w);
+}
+
 
 int main(void) {
   static const kbc_test_case cases[] = {
@@ -1668,6 +2060,19 @@ int main(void) {
        a_running_daemon_is_stopped_and_leaves_no_pid_file},
       {"a_second_daemon_is_refused_while_one_is_running",
        a_second_daemon_is_refused_while_one_is_running},
+      {"prune_without_apply_reports_the_window_and_deletes_nothing",
+       prune_without_apply_reports_the_window_and_deletes_nothing},
+      {"prune_with_apply_removes_only_the_history_older_than_the_window",
+       prune_with_apply_removes_only_the_history_older_than_the_window},
+      {"a_prune_takes_no_document_with_it_out_of_the_store_or_search",
+       a_prune_takes_no_document_with_it_out_of_the_store_or_search},
+      {"prune_refuses_a_zero_day_window", prune_refuses_a_zero_day_window},
+      {"prune_without_a_window_is_a_user_error",
+       prune_without_a_window_is_a_user_error},
+      {"metrics_without_a_daemon_is_a_daemon_failure",
+       metrics_without_a_daemon_is_a_daemon_failure},
+      {"metrics_writes_the_daemons_exposition_to_the_named_file",
+       metrics_writes_the_daemons_exposition_to_the_named_file},
       {NULL, NULL},
   };
   return kbc_test_run("cli", cases);
