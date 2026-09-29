@@ -14,25 +14,46 @@ same corpus.
 
 ## Status
 
-**As of 2026-09-27 — the port is in progress. This is a pre-1.0 codebase.**
+**As of 2026-09-29 — the port is in progress. This is a pre-1.0 codebase.**
 
 Works today:
 
-- `kbc` builds from source with CMake and passes its ctest suite: 11 suites,
-  339 cases, green in the Release and `-DKBC_SANITIZE=ON` lanes.
-- Config loading (a strict `kb.toml` subset), the SQLite store and its four
-  migrations (schema v4: v1 tables, v2 `edges`, v3 `pending_links`, v4
-  `doc_metas`), the Markdown/HTML block parser with stable anchors, the
-  tokenizer and its stopword list, the mmap'd inverted index with BM25, RRF
-  fusion over the keyword and vector lanes, the mmap'd vector store, the
-  inotify watcher with debounce, the subprocess embedder client, the epoll +
-  `SO_REUSEPORT` HTTP daemon with bearer auth and an SSE stream, and a CLI
-  with eleven verbs — all specified in the frozen headers under
-  `include/kbc/` and all wired end to end.
-- The daemon serves a route banner on `/` and nine JSON routes: `/api/health`,
+- `kbc` builds from source with CMake and passes its ctest suite: 14 suites,
+  531 cases, green in the Release, `-DKBC_SANITIZE=ON` and TSan lanes (14/14 in
+  each, from clean trees, at commit `8fc54e3`).
+- Config loading (a strict `kb.toml` subset), the SQLite store and its
+  **ten** migrations — fourteen data tables at schema v10, plus the
+  `schema_version` bookkeeping table — the Markdown/HTML block parser with
+  stable anchors and `kb-*` front matter, the tokenizer and its stopword list,
+  the mmap'd inverted index with BM25, RRF fusion over the keyword and vector
+  lanes, the mmap'd vector store, the inotify watcher with debounce, the
+  subprocess embedder client, the epoll + `SO_REUSEPORT` HTTP daemon with bearer
+  auth and an SSE stream, and a CLI with thirteen verbs — all specified in the
+  frozen headers under `include/kbc/` and all wired end to end.
+- A storage volume that has been forward-migrated by a **newer** binary is
+  refused at open, before the migration run touches it, so a kb-c that cannot
+  read a volume never writes to it.
+- A document is chunked as a **280-word sliding window with 60-word overlap**,
+  chunk 0 being the title passage, rather than one row per parsed block — so a
+  single long paragraph is no longer one oversized chunk the embedder truncates
+  away. A document that fails to embed three times is **quarantined**: it stops
+  being embedded and stays keyword-searchable, and editing it — which changes
+  its content hash — is how an operator gets it out again.
+- The daemon serves a route banner on `/` and ten JSON routes: `/api/health`,
   `/api/identity`, `/api/kbs`, `/api/stats`, `/api/search`, `/api/artifacts`,
-  `/api/artifacts/{id}`, `POST /api/reindex` and `/api/events`. `reindex`,
+  `/api/artifacts/{id}`, `/api/kb/{kb}/artifact/{id}`, `POST /api/reindex` and
+  `/api/events`, plus a Prometheus text endpoint at `/metrics`. `reindex`,
   `search`, `get` and `list` work with or without a running daemon.
+- Artifact **serving**, on two origins: the bytes inline on the app origin
+  with `Content-Security-Policy: sandbox`, `nosniff` and `X-Kb-Artifact-Id`, and
+  one subdomain per artifact (`<id>.artifacts.localhost`) with a `frame-ancestors`
+  CSP instead. Both are behind a **component-wise** root guard — `strncmp`
+  containment would serve a sibling directory, and the test that catches that
+  is a sibling directory, not a `../` case. A static bundle in `KB_SPA_DIST` is
+  served on the same guard.
+- A hand-rolled Markdown renderer with **no third-party dependency** (see the
+  caveat below), a query-embedding cache keyed by `(model, query)`, and
+  `kbc backup` / `kbc restore` (`VACUUM INTO` + tar).
 - A vector lane works when `kb-embedder` is configured and healthy, verified
   against the production sidecar with `bge-small-en-v1.5`. Without one,
   `hybrid` degrades to keyword and `semantic` returns nothing, and the
@@ -52,16 +73,23 @@ Works today:
   before the documents it links to still ends up with the right in-degree, and
   the property is asserted by a test that ingests the same corpus in both
   orders and requires an identical edge set.
+- Link **resolution** the way the original's does: a target goes up a
+  four-tier ladder — id, path, title, basename — and when a title or a basename
+  matches several documents the answer is *ambiguous*, recorded as no edge
+  rather than an arbitrary one (picking by index order would be nondeterministic
+  and would flip on the next reindex). A target that matches nothing yet stays a
+  pending link and is drained when the document arrives, which is why the
+  in-degrees above do not depend on ingest order.
 - A backlink boost in ranking, read from the edge graph. It ships **disabled**:
   `graph_boost` defaults to `0.0` and the weight is unmeasured. See
   `DECISIONS.md` ADR-004 for why, and ADR-006 for the concurrency rule the
   double-free fix established.
 - Incremental index update: a file save re-indexes that one file in place and
   persists through a delta journal, so the save costs what the file costs rather
-  than what the index weighs — 33 ms at 1,000 documents and 36 ms at 20,000,
-  which is this host's fsync floor rather than a kb-c cost. The update survives a
-  restart. `BENCHMARKS.md` has the measurement and the breakdown that forced the
-  change.
+  than what the index weighs — **30.6 / 33.3 / 36.3 ms at 1,000 / 5,000 / 20,000
+  documents**, flat across a 20× range, which is this host's fsync floor rather
+  than a kb-c cost. The update survives a restart. `BENCHMARKS.md` has the
+  measurement and the breakdown that forced the change.
 - Errors are RFC 7807 `application/problem+json`. CORS is same-origin by
   default, with an exact allowlist in `KBC_CORS_ORIGINS` and no wildcard
   anywhere. Rate limiting is a per-connection fixed window, 120 req/s by
@@ -70,22 +98,34 @@ Works today:
   the literal value or the token file, so a non-loopback bind is possible. A
   `0.0.0.0` bind with a token answers 401 with no header, 403 with the wrong
   token and 200 with the right one. The token value never appears in
-  `kbc config show`.
+  `kbc config show`. `X-Kb-Token` works as a second carrier beside
+  `Authorization: Bearer`; the two do not have to agree, and disagreement is
+  not an error, because the original takes the first candidate that matches and
+  never compares. `/api/identity` reports which carrier decided.
 
 Not done:
 
 - **No date filters.** `since:` parses its value grammar but the layer that
   would apply it does not exist, so the atom is refused with a 400.
-- **The link resolution ladder is not ported.** Extraction and normalisation
-  are; the four-tier id/path/title/basename resolution in the original's
-  `links.rs` — and its *Ambiguous* outcome — is not, so a bare `[[name]]` is
-  normalised but not yet resolved to a document id.
+- **The Markdown renderer does not render pages yet.** It is built and tested,
+  but the artifact route serves a `.md` document's raw source, so
+  nothing a user sees comes out of it. When it is wired, note that it is
+  deliberately narrower than the original's comrak: reference links and link
+  reference definitions, footnotes, superscript, description lists and entity
+  references render as ordinary text. That is the cost of taking no
+  third-party dependency, and it is recorded rather than silent.
+- **A backup carries the store, not the index.** `kbc restore` gives back a
+  working SQLite snapshot; the mmap'd index and `vectors.bin` are not in the
+  tarball, so a restored corpus becomes searchable after `kbc reindex` and not
+  before.
 - **`cap:` is not capability analysis.** The original derives `svg_count`,
   `has_canvas` and `code_block_count` by inspecting the document. kb-c matches
   declared `kb-caps` metadata instead. A deliberate deviation, and the one
   place where a `cap:` query can legitimately return a different answer.
-- No web UI. The Rust repo's two React/Vite SPAs, the Claude Code plugins and
-  the Playwright e2e suite are out of scope for the C port.
+- No web UI of its own. The Rust repo's two React/Vite SPAs, the Claude Code
+  plugins and the Playwright e2e suite are out of scope for the C port — though
+  the daemon now has the three serving surfaces a UI needs (artifact bytes, the
+  artifact subdomain, a `KB_SPA_DIST` static fallback).
 - The scale ladder stops at 20,000 documents and **locates no knee**. Both
   candidate knees dissolved on measurement, and the 20,000 rung re-ingested an
   hour later into a different sandbox produced a byte-identical index. A
@@ -195,11 +235,13 @@ is required on every `/api` route except `/api/health`.
                   |                    [ searcher ]  ---> [ embedder sidecar ]
                   |                         |              (subprocess, NDJSON)
                   v                         v
-        [ HTTP daemon: epoll + SO_REUSEPORT ]  ---->  /api/*  and  SSE
-                  ^
-                  |
+        [ HTTP daemon: epoll + SO_REUSEPORT ]  ---->  /api/*, /metrics, SSE
+                  ^                                   and the artifact /
+                  |                                   subdomain / static
+                  |                                   serving surfaces
         [ kbc CLI: daemon | add | search | get | list | reindex | status
-                    | bench | config show | token generate | version ]
+                    | bench | backup | restore | config show | token
+                    | generate | version ]
 ```
 
 Request-scoped memory lives in an arena and dies with the request. The store,
@@ -251,6 +293,15 @@ blocked rather than searching. The earlier figures in that section were taken
 with a python client whose GIL saturated first; they are kept and labelled,
 because the same workload one GIL apart is the interesting comparison.
 
+On **writes** the headline is the save path, and it is the number that moved
+most in the ingest work. A single-file save used to track the size of the index
+— 251 ms / 500 ms / 1.19 s at 1,000 / 5,000 / 20,000 documents — because it
+rewrote and fsynced the whole index. It now appends to a delta journal and
+fsyncs that: **30.6 / 33.3 / 36.3 ms at the same three sizes**, flat across a
+20× range of corpus. What is left is the storage's fsync floor, not kb-c: the
+journal is ~1.9 KB after ten appends and still costs 36.3 ms, and fsync on this
+device costs 33.9 ms for 90 bytes.
+
 The harnesses are in `bench/` (`bench-kbc.sh`, `bench-rust.sh`,
 `bench-rust-concurrency.sh`, `bench-scale.sh`, `bench-vector.sh`,
 `kbcbench-client.c`) and the in-process one is
@@ -259,7 +310,7 @@ The harnesses are in `bench/` (`bench-kbc.sh`, `bench-rust.sh`,
 ## Layout
 
 ```
-include/kbc/   the frozen contract — 15 headers, read these first
+include/kbc/   the frozen contract — 18 headers, read these first
 src/           the implementation, one file per subsystem
 cli/main.c     the kbc binary
 tests/         ctest-driven, one binary per test_*.c, harness in kbc_test.h

@@ -6,10 +6,10 @@ the port exists, what is being built in what order, how the performance claim
 is measured, and what would have to be true for kb-c to be a drop-in.
 
 Scope in one line: 231,507 LOC of Rust across six crates, of which kb-c today
-claims 84,712 (36.6%) and a further 34,784 (15.0%) is scheduled below. The
-remaining 48.4% is out of scope and stays in Rust. Those three figures are the
+claims 93,545 (40.4%) and a further 23,021 (9.9%) is scheduled below. The
+remaining 49.6% is out of scope and stays in Rust. Those three figures are the
 PORTED+PARTIAL, PLANNED and OUT-OF-SCOPE row sums in `INVENTORY.md`,
-recomputed from the rows on 2026-09-27.
+recomputed from the rows on 2026-09-29.
 
 ---
 
@@ -93,7 +93,8 @@ pays it in stage 3:
    │  watcher.c  inotify per source root, debounce cfg.watcher_debounce_ms
    │             (250 ms default), per-path coalescing into one publish;
    │             extension gate, dotfile/ignore gate, exclusions.
-   │             No periodic reconcile walk yet (stage 1).
+   │             A full reindex reconciles: a file that vanished since the
+   │             last walk emits watch.delete even if its mtime never moved.
    ▼  WatchWork{kind, path}
    │  app.c      a watcher event re-indexes THAT file: read → identity →
    │             parse → store row → in-place index update. There is no
@@ -104,7 +105,7 @@ pays it in stage 3:
    │             (kbc_index_save refuses to write a file its own loader would
    │             reject — see §2.4.5.)
    ├──────────────▶ parse.c   Markdown | HTML blocks, stable element anchors,
-   │                         heading levels, title fallback
+   │                         heading levels, title fallback, kb-* front matter
    └──────────────▶ embed.c   NDJSON to `kb-embedder`:
                              {"kind":"embed","req_id":N,"texts":[…]}
                              30 s per exchange, respawn-once on transport
@@ -125,7 +126,7 @@ pays it in stage 3:
         │            (1.2 / 0.75 defaults), IDF = ln(1 + (N−n+0.5)/(n+0.5));
         │            the caller supplies the searchable text, title counted
         │            twice by convention; candidate depth = max(limit, 200)
-        ├▶ embed.c   query vector (no cache yet — stage 3)
+        ├▶ embed.c   query vector, through the (model, query) LRU
         │            └▶ cosine top-k over the mmap'd matrix;
         │               score = 1/(1+distance), ties by doc id ASC
         └▶ RRF k=60, dedup on id, score = Σ 1/(60+rank)
@@ -137,7 +138,10 @@ pays it in stage 3:
             bearer auth on every /api route but /api/health, RFC 7807
             application/problem+json errors, same-origin-only CORS with an
             exact allowlist, a per-connection request cap, a 256-entry SSE
-            ring with Last-Event-ID
+            ring with Last-Event-ID and its gap probe;
+            beside the JSON API: artifact bytes on the parent origin, one
+            artifact subdomain per artifact, a KB_SPA_DIST static fallback and
+            a Prometheus /metrics text endpoint
    cli/main.c  the same requests over a blocking socket, falling back to an
             in-process app for reindex/search/get/list when no daemon answers
 ```
@@ -196,7 +200,7 @@ originally stated:
    sequential scan.
 3. **Query scratch is thread-local**, not mutex-guarded — see §2.3.
 4. **The JSON writer and the daemon's own test suite found defects a design
-   document would not have.** The test suite is 11 ctest binaries with 339
+   document would not have.** The test suite is 14 ctest binaries with 531
    case functions, and it found 24 defects during the build, among them two
    use-after-frees, a data race across query threads, and the CLI's offline
    path. Treat a stage's acceptance gate as unproven until a test exists that
@@ -265,37 +269,122 @@ originally stated:
      connection entered the shared array at accept time, and `c->sse` is the
      only thing that makes it visible.
 
+### 2.5 What the 2026-09-28/29 work found — and the lesson worth more
+
+Four bodies of work — stage 1 storage, quarantine/chunking/backup/renderer, the
+query cache and the serving surfaces — and four defects they surfaced that are
+worth writing down because each one contradicts something this plan or the
+code believed.
+
+**A facet-injection defect, and the second copy of a scan that caused it.**
+`parse.c`'s `front_matter` skipped the first line unconditionally and then
+looked for a closing `---` *anywhere after it*. So a document that opens with
+prose, mentions `kb-tags:` anywhere, and contains a later `---` had that facet
+**indexed**, while the renderer — which had its own, correct frontmatter scan —
+treated the whole document as body. `tag:x` matched a document that never
+declared the tag. The fix is not a patched condition; it is **one predicate**,
+`kbc_fm_fence` in the frozen `parse.h`, called by both parsers. The lesson is
+the general one: a second implementation of a scan is a second bug, and the
+cheapest time to notice is when the two disagree.
+
+**A false diagnosis, chased for a session, and then disproved.** A
+`chunk <id>/0: duplicate ord` error was chased as an `ord` collision until
+48,000 attempts showed the collision is **unreachable** even between two apps
+sharing one data directory. What actually fires is a FOREIGN KEY violation
+wearing that message: the connection leaves sqlite's extended result codes off,
+so a failed step hands back the primary code 19 whatever broke — the unique
+index, the foreign key, a NOT NULL, a CHECK. `store.c` now reads the extended
+code and names the constraint. A message that is the same for four different
+causes is not a diagnosis.
+
+**A lost sidecar reply, a handshake that never ran, and an fd leak — the last
+one found while measuring the other two.** `read_line` read a whole chunk,
+appended all of it, then truncated to the first newline, destroying any
+complete line that arrived in the same read: 13 of 200 embeds timed out
+against a sidecar whose own log showed it HAD answered. `kbc_embedder_start`
+spawned and returned without handshaking, so the model was unknown on every
+fresh start, and the query lane was dead until some exchange absorbed the ready
+line — which is exactly the reply-losing path above. The two composed into the
+~10% flake the cache's tests kept hitting. Separately, `spawn` did `F_DUPFD` and
+never closed the original, so the daemon held a second write end on the child's
+stdin for life: closing `in_fd` never delivered EOF, the child never exited on
+its own, every stop burned the 2 s grace, and every restart leaked two
+descriptors. The embed suite goes 50 s to 3.4 s with that one fixed.
+
+**And the one that is a testing lesson, not a bug list entry: an uninitialised
+struct flag that survived a green release lane AND a green ASan lane.** In
+`markdown.c`, `sink.plain` was read before it was ever written. The only
+reason anyone noticed is that the **TSan build rendered differently from the
+release build** — 17 check failures under TSan, 0 under release, 0 under ASan.
+None of the three sanitizers reports uninitialised reads; the release suite was
+green by accident of that binary's stack layout. Two mistakes compounded: a
+hand-rolled sink declaration that set two of three fields and bypassed the one
+initializer that set the rest, and a lost line in that initializer when a field
+was added by editing it. It was read because a paragraph is buffered into a
+sink of its own and then rendered against the **caller's** sink, so the
+top-level body sink is what the inline renderer reads at three sites — the soft
+break, the hard break and the raw-tag passthrough, which are precisely the
+three symptoms. Proven with `gcc -ftrivial-auto-var-init=pattern` against
+`=zero` on the same `-O3` build: different pages before the fix, byte-identical
+after.
+
+So: **a sanitizer lane is evidence, not a certificate.** ASan proved memory
+safety and said nothing about this; the finding came from *two lanes of the
+same code disagreeing*, which is a signal a single-lane gate structurally
+cannot produce. The cheap generalisation is to run the suite under a different
+stack discipline and diff the output — pattern-init against zero-init is a
+one-flag version of it that needs no second toolchain.
+
 ---
 
 ## 3. Staged migration
 
-Stage 0 is built. Stage 2 is **mostly** built: the query grammar and prefix
-expansion landed, in the shape the index can answer, the `docs_query.rs` filter
-overlay is in (`tag:`, `cap:`/`caps:`, `index:`; `scope:` and `since:` stay
-refused), and link extraction — including wikilinks — is in. Stage 3 is
-**mostly** built: `problem+json`, `/api/identity`, `/api/kbs`, CORS and rate
-limiting are in, so what remains there is the route table, the identity ladder,
-the SSE gap probe and the query-embedding cache. Stages 4, 5 and 6 are
-**PLANNED** apart from stage 6's measurement half, and nothing else in them is
-in the tree. The stages that are partly in already are therefore *gaps in what
-exists*, not greenfield.
+Stage 0 is built. Stage 1 is **MOSTLY BUILT**: of its six units, five are in
+and the enrich hooks are not. Stage 2 is **mostly** built: the query grammar and
+prefix expansion landed, in the shape the index can answer, the `docs_query.rs`
+filter overlay is in (`tag:`, `cap:`/`caps:`, `index:`; `scope:` and `since:`
+stay refused), and link extraction — including wikilinks — is in. Stage 3 is
+**mostly** built: `problem+json`, `/api/identity`, `/api/kbs`, CORS, rate
+limiting, `X-Kb-Token` and the query-embedding cache are in, so what remains
+there is the route table, the identity ladder, and the verbs that depend on
+them. Stage 5's **serving** half is in — artifact bytes, the artifact
+subdomain, the static fallback, the Prometheus endpoint and the renderer — with
+the listing, the capture surface and the outbound verbs still PLANNED. Stage 6
+is built on both halves: the measurement and the `VACUUM INTO` + tar backup.
+The stages that are partly in already are therefore *gaps in what exists*, not
+greenfield.
+
+**Two units are mis-scoped rather than merely unfinished, and the reason is the
+same in both cases: the LOC column was read as the cost.** `markdown.rs` is 800
+lines of *wrapper* around comrak, so scoping it by size hid an entire Markdown
+engine underneath; taking the engine is a decision (the operator's: kb-c takes
+no third-party dependency), and the port that followed is a hand-rolled
+renderer with a stated narrower feature set — see §3 stage 5 and
+`INVENTORY.md`. `doctor.rs` is 2,930 lines about the **Claude Code provenance
+chain** — session marker files, hook probes, a recall-outcome check — and kb-c
+has no sessions, no memory/recall and no hooks to police, so it is now
+OUT-OF-SCOPE rather than stage-5 work. Neither was caught by a stage review;
+both were caught by reading what the lines are *about*.
 
 ### Stage 0 — the core (BUILT)
 
-Units, as they are in the tree: `config.c`, `store.c` + four migrations,
+Units, as they are in the tree: `config.c`, `store.c` + the migration ladder,
 `parse.c` + the tokenizer and its stopword table, `ids.c`, `index.c`
 (inverted index + BM25), `search.c` (RRF, the query grammar and the filter
 overlay), `embed.c` (sidecar client) and `kbc_vecstore`, `httpd.c` (epoll,
-SO_REUSEPORT, 9 JSON routes plus the `/` banner, bearer, SSE), `watcher.c`
-(inotify), `json.c`, `mem.c`, `log.c`, `kbc.c`, `cli/main.c`, the frozen
-headers.
+SO_REUSEPORT, the nine JSON routes stage 0 had plus the `/` banner, bearer and
+SSE — stages 3 and 5 added more, and the exported `KBC_ROUTES` table is the
+authority), `watcher.c` (inotify), `json.c`, `mem.c`, `log.c`, `kbc.c`,
+`cli/main.c`, the frozen headers.
 
-20,838 lines of C in `src/`, 1,585 of frozen header, 2,516 in the CLI.
+The tree today, which is more than stage 0: 31,392 lines of C in `src/`, 2,261
+of frozen header (18 headers), 3,648 in the CLI.
 
-Acceptance gate (met): Release and `-DKBC_SANITIZE=ON` builds clean under
+Acceptance gate (met): Release, `-DKBC_SANITIZE=ON` and TSan builds clean under
 `-Wall -Wextra -Wpedantic -Wshadow -Wcast-qual -Wstrict-prototypes
--Wmissing-prototypes -Wwrite-strings -Wvla -Wformat=2 -Werror`; `ctest` green
-in both — 11 suites, 339 case functions.
+-Wmissing-prototypes -Wwrite-strings -Wvla -Wformat=2 -Werror`; `ctest` green in
+all three — 14 suites, 531 case functions, last recorded at `8fc54e3` with
+14/14 in each lane from clean trees.
 
 Behaviour it matches, per the contracts extracted from the Rust source: BM25
 at tantivy's defaults (`k1 = 1.2`, `b = 0.75`, configurable); RRF at
@@ -311,8 +400,9 @@ it did — each is a later stage, not a stage-0 unit:
   `sha256(rel_path)[0..6]` (§2.4.1);
 - title fallback is first `h1`, else first non-empty block, else the file
   stem — there is no `"untitled"` literal;
-- chunking is **one chunk per parsed block**, not a 280-word window with
-  60-word overlap, and chunk 0 is not `title\nheadings`;
+- chunking was one chunk per parsed block, not a 280-word window with 60-word
+  overlap, and chunk 0 was not the title passage. **That is now stage 1 and it
+  is built** — see below;
 - no `since:` dates, and no phrase search — the original has neither: a quoted
   `"…"` there quotes an atom *value* (`folder:"deep notes"`), not a phrase;
 - the **title boost** is ported (`TITLE_BOOST = 0.5`, `fusion.rs:145`, applied
@@ -325,15 +415,15 @@ it did — each is a later stage, not a stage-0 unit:
 - the daemon serves RFC 7807 `application/problem+json` errors, and
   `/api/identity` and `/api/kbs` exist, both token-gated.
 
-### Stage 1 — storage completeness — MOSTLY PLANNED
+### Stage 1 — storage completeness — MOSTLY BUILT
 
-Two units' substance have landed since this was written, and they are the ones
-the acceptance gate cares about most: **the incremental in-place index update**
-and, after it, **the delta journal that makes it cheap**.
-`app.c` re-indexes a single file rather than rebuilding the corpus
-(`reindex_one`), with the store row committed before the index so a reader
-never sees an index naming an uncommitted document. That work also produced
-the first two defects in §2.4.5 and their fixes.
+Two units' substance landed before the rest, and they are the ones the
+acceptance gate cares about most: **the incremental in-place index update**
+and, after it, **the delta journal that makes it cheap**. `app.c` re-indexes a
+single file rather than rebuilding the corpus (`reindex_one`), with the store
+row committed before the index so a reader never sees an index naming an
+uncommitted document. That work also produced the first two defects in §2.4.5
+and their fixes.
 
 The in-place update alone did not deliver the property this stage is for. A
 single-file save still rewrote the whole index and fsynced it, so its cost
@@ -342,51 +432,77 @@ documents. Measurement then showed the barrier was 64.6% of that and the
 serializer only 13.1%, so a cheaper serializer could recover at most the 13% it
 was responsible for. The fix was a delta journal — a single-document update
 appends a record and fsyncs that, and `kbc_index_open` replays it — which puts
-the save at **33 ms at 1,000 documents and 36 ms at 20,000**, this host's
-fsync floor. The cost no longer scales with the corpus. `BENCHMARKS.md` has the
-breakdown and the before/after.
+the save at **30.6 / 33.3 / 36.3 ms at 1,000 / 5,000 / 20,000 documents** in a
+matched A/B, flat across a 20× range of corpus. That is this host's fsync
+floor: the journal appends ~1.9 KB after ten appends and still costs 36.3 ms,
+and fsync on this device costs 33.9 ms for 90 bytes. The cost no longer scales
+with the corpus. `BENCHMARKS.md` has the breakdown and the before/after.
 
-Unit 1 has since landed **in part**: the schema is now at **v4**, adding
-`edges` (v2), `pending_links` (v3) and `doc_metas` (v4) to the v1 tables. Those
-three are the link graph and the query overlay, and they were the reason the
-edge table exists at all. The rest of unit 1 — `sources`, `index_runs`,
-`errors`, `excluded_files`, `doc_first_seen`, `history`, `corkboard`,
-`pinned_memories`, `identity_backfill_done` — and units 2–6 are untouched: no
-reconcile pass, no quarantine, no enrich hooks, no `chunk.c`.
+**Units 1–4 and 6 are in; unit 5, the enrich hooks, is not.** They landed
+together in `5b17573` (storage, the resolution ladder, the root guard) and
+`8dc36bb` (quarantine, chunking, backup, the renderer).
 
 Units:
-1. `store.c`: the remaining tables kb-c claims — `sources`, `index_runs`,
-   `errors`, `excluded_files`, `doc_first_seen`, `history`, `corkboard`,
-   `pinned_memories`, `identity_backfill_done`. `edges`, `pending_links` and
-   `doc_metas` are already there (v2–v4). Migration list versioned the way
-   refinery's is, one transaction per version. **The epoch-ahead refusal
-   (`sibling.rs:224`) is not in stage 0** — the store records
-   `kbc_store_schema_version` and nothing more, so the refusal is built here
-   from scratch.
-2. `app.c`: the reconcile delete pass — files that vanished since the last
-   walk emit `watch.delete` even when their mtime never changed.
-3. `app.c`: quarantine. `retry_count_for_path_hash >= 3` sets
-   `embed_gated`; the document still indexes and stays BM25-searchable
-   because the embedding column is nullable by design. The error row is
-   *not* cleared on the gated success path — clearing it would un-gate the
-   document on the next pass.
-4. `app.c`: delete-by-path, cascading to chunks and comments, leaving
-   `history`, `corkboard`, pins and `reading_sections` untouched
-   (invariant 8). `kbc_store_delete_artifact` already does the artifacts →
-   chunks → comments half of this; what is missing is the by-path entry point
-   and the explicit "leave these alone" list.
-5. `app.c`: the eight `enrich.rs` hooks, in Rust's registration order.
-6. `app.c`: `chunk.c` — the 280-word window with 60-word overlap and chunk 0
-   as `title\nheadings`, replacing today's one-chunk-per-parsed-block. It
-   belongs here because it is a storage-shaped change to the `chunks` table.
+1. `store.c`: **BUILT.** The flat CREATE-TABLE array is now a versioned
+   migration list in refinery's shape — an ordered `(version, sql)` array, one
+   transaction per version, with the recorded version bumped **inside** that
+   transaction so a failure part-way leaves the last version that fully
+   committed. There is deliberately no `KBC_SCHEMA_VERSION` constant to fall
+   out of step with the last entry; `BINARY_EPOCH` is read off the list itself.
+   Eight tables landed across v5–v10 — `sources`, `index_runs`, `errors`,
+   `history`, `corkboard`, `pinned_memories`, `excluded_files`,
+   `doc_first_seen` — on top of `edges` (v2), `pending_links` (v3) and
+   `doc_metas` (v4). The partial indexes are ported as partial, because each
+   exists for exactly one query and restricting it to the rows that query can
+   match is what turns a scan into a seek. **The epoch-ahead refusal is in**
+   (`kb-core/src/sibling.rs:119` — this section used to cite
+   `storage/sibling.rs:224`, a path that does not exist and a line that is
+   wrong): a volume whose `MAX(version)` is ahead of this binary's embedded set
+   is refused before the migration run, so a refused boot never writes to a
+   volume it cannot understand. `identity_backfill_done` is deliberately NOT
+   ported — it gates a per-user read/unread backfill over list entries, and
+   kb-c has neither, so a marker with no writer and no reader is dead weight.
+2. `app.c`: the reconcile delete pass — **BUILT.** Files that vanished since
+   the last walk emit `watch.delete` even when their mtime never changed. The
+   sweep deliberately refuses to run it for a file that is merely unwalked, so
+   an unreadable file is not a deleted one.
+3. `app.c`: quarantine — **BUILT.** `retry_count_for_path_hash >= 3` sets
+   `embed_gated`; the document still indexes and stays BM25-searchable because
+   the embedding column is nullable by design. The error row is *not* cleared
+   on the gated success path — clearing it would un-gate the document on the
+   next pass, which then takes a real embed, fails, returns at count 1, and
+   oscillates forever. The gate is keyed by `(path, CONTENT HASH)`, matching
+   the original: editing a document is how an operator fixes one that failed,
+   so without the hash an edited document never leaves quarantine. Two
+   corrections to the wording above: the gate is the `errors` row, **not** a
+   `<state>/quarantine/<kb>/` directory, and the earlier `app.c` fallback of
+   embedding anyway when the gate cannot be read now logs and does exactly
+   that rather than failing the pass.
+4. `app.c`: delete-by-path — **BUILT.** `kbc_app_delete_path` cascades to
+   chunks and comments and removes `edges` and `doc_metas`, and **leaves**
+   `history`, `corkboard`, `pinned_memories` and `reading_sections` untouched
+   (invariant 8). Inbound edges are demoted to `pending_links` rather than
+   dropped, so a document that comes back finds its backlinks.
+5. `app.c`: the eight `enrich.rs` hooks, in Rust's registration order. **NOT
+   BUILT** — the only unit of this stage with nothing in the tree.
+6. `app.c` + `include/kbc/chunk.h`: **BUILT.** The 280-word window with 60-word
+   overlap and chunk 0 as the title passage, replacing one-chunk-per-parsed-
+   block. The contract is frozen because the constants are a contract; the
+   implementation lives in the ingest path because a chunk *is* a
+   storage-shaped write to the `chunks` table. The 512 cap keeps the first 512
+   and reports the ORIGINAL count, so a caller logging "N chunks" reports what
+   the document produced.
 
 Dependency order: 1 → 2 → 3 → 4 → 5 → 6. Every unit is independent of the HTTP
 layer.
 
-Acceptance gate: a corpus of N files can be indexed, one deleted from disk,
-reconciled, and re-indexed with no orphan rows in `artifacts` or
-`artifact_chunks`; a file that fails to embed three times lands in
-`<state>/quarantine/<kb>/` and remains findable by keyword.
+Acceptance gate, and how much of it is met: a corpus of N files can be indexed,
+one deleted from disk, reconciled, and re-indexed with no orphan rows in
+`artifacts` or `artifact_chunks` — **met**; a file that fails to embed three
+times is gated and remains findable by keyword — **met, but the gate is the
+`errors` row rather than a `<state>/quarantine/<kb>/` directory**, which is
+what this section used to promise. The enrich-hook ordering is still the
+outstanding half.
 
 Behaviour it must match: the four ingest constants
 (`INGEST_QUEUE_CAPACITY = 1024`, `INGEST_BATCH_MAX_DOCS = 32`,
@@ -465,8 +581,19 @@ and `[y](y.md#part)` produce the identical `y.md`. A bare `[[target]]` takes
 the target as its visible text, matching `links.rs`, which collapses
 label == url to `alias: None`. `![[embed]]` is an image, not a link.
 
-Not done: the four-tier id/path/title/basename **resolution ladder** in
-`links.rs` `resolve` / `ResolveIndex`, including its `Ambiguous` outcome.
+**The resolution ladder is built and it is on the ingest path.** The four-tier
+id/path/title/basename ladder in `links.rs` `resolve` / `ResolveIndex` is
+`src/links.c` behind a frozen `include/kbc/links.h`, including the `Ambiguous`
+outcome: tiers 1–2 (id, path) cannot be ambiguous, and when a title or a
+basename matches several documents the answer is AMBIGUOUS and never "the first
+one", because picking by index order would be nondeterministic and would flip
+on the next reindex. `app.c` builds ONE `kbc_resolve_index` over the corpus's
+candidates and resolves every raw target through it, rather than looking each
+one up by exact path — which closed the gap this section used to name: before
+it, `[[Some Title]]` and a bare `[[deploy]]` found nothing even when exactly
+one document answered. An ambiguous target is **counted, not written**: no
+edge, and no pending row either, because the corpus did not say which document
+it meant and a pending row would resolve to whichever arrived first.
 
 Acceptance gate: the port of `query.rs`'s own unit tests passes — n-ary
 `AND`/`OR` flattening, De Morgan over groups, the 64-conjunct cap with its
@@ -502,12 +629,21 @@ daemon calls it before validate/bind, so a `0.0.0.0` bind with a token works —
 no header 401, wrong token 403, correct token 200. The token value never
 appears in `kbc config show`.
 
+Also in since this section was written, on the token and event side:
+**`X-Kb-Token` as a second carrier** beside `Authorization: Bearer` (see P8 —
+the two are not required to agree, and disagreement is not an error, because
+the original returns the first candidate that matches and never compares);
+**the SSE gap probe** (`kb-core/src/events.rs`, not a kb-server file as this
+section used to imply), whose gap half is deterministically tested and whose
+lag half ships untested by decision (DECISIONS.md ADR-007); and **the
+query-embedding cache**, an LRU keyed by `(model, query)` whose linear scan is a
+measured choice — about 19 µs at capacity 1024 against a 50–100 ms sidecar
+round trip.
+
 Still to do: the router that reproduces the Rust route table (generated by
 `crates/kb-server/tests/api_docs.rs`, which regex-scans `router.rs`; kb-c
 reproduces the extractor rather than hand-transcribing), the multi-tier
-identity ladder and `X-Kb-Token` as a second carrier beside
-`Authorization: Bearer`, the SSE gap/lag probe, the query-embedding cache, and
-the verbs that depend on the above.
+identity ladder, and the verbs that depend on the above.
 
 The 226 route registrations are the scope, not 226 units. The kb-c subset is
 the `PORTED` + `PLANNED` rows in `INVENTORY.md`; the rest stay in Rust
@@ -518,10 +654,14 @@ against the running binary and exported in `KBC_ROUTES`: `GET /api/health`,
 `GET /api/identity`, `GET /api/kbs`, `GET /api/stats`, `GET /api/search`
 (`q`, `kb`, `kind`, `mode`, `limit`, `offset`; an object whose array is
 `hits[]` or `results[]`), `GET /api/artifacts` (`kb`, `kind`, `limit`,
-`offset`), `GET /api/artifacts/{id}` (`source=1`), `POST /api/reindex`
-(`{}` or `{"kb":"…"}`), and `GET /api/events` (SSE). `GET /` returns a
-plain-text route banner. There is no `/api/metrics` in the frozen contract;
-the Prometheus text endpoint is a separate top-level surface in stage 5.
+`offset`), `GET /api/artifacts/{id}` (`source=1`), `GET
+/api/kb/{kb}/artifact/{id}` (the artifact's bytes, sandboxed), `POST
+/api/reindex` (`{}` or `{"kb":"…"}`), `GET /api/events` (SSE) and `GET
+/metrics`. `GET /` returns a plain-text route banner, `GET *` falls back to
+the `KB_SPA_DIST` static handler, and `<id>.artifacts.localhost/*` is the
+artifact subdomain. The Prometheus text endpoint is a **top-level** route, not
+under `/api`, which is the placement the original has and the reason it is
+neither counted nor rate-limited as an API request.
 
 `POST /api/reindex` answers **202** with `{"docs":N,"took_us":N}` after a
 synchronous rescan — the count is there today and the CLI prints it. If a
@@ -547,29 +687,73 @@ Units that remain: multipart capture with Rust's exact frontmatter write order
 (`kb-category`, `kb-tags`, `kb-capture-original`, `kb-capture-url`,
 `kb-capture-at`, `kb-session`, `kb-expires-at` — title is never touched);
 the 60-char slug policy; URL stubs as inert text (the daemon never fetches a
-URL — that is the SSRF ruling, not an omission); the `links.rs`
-id/path/title/basename **resolution ladder** and its `Ambiguous` outcome; the
-`/api/links` routes and `links suggest/apply`; anchor re-resolution and the
+URL — that is the SSRF ruling, not an omission); the `/api/links` routes and
+`links suggest/apply`; anchor re-resolution and the
 `comment.anchor_stale` / `comment.anchor_resolved` pair; `mv` and the `moves`
 rename-race log.
 
 Acceptance gate: capture the same bytes through both implementations and
 diff the resulting file, tag list and id.
 
-### Stage 5 — serving, SPA, metrics, outbound — PLANNED
+### Stage 5 — serving, SPA, metrics, outbound — MOSTLY BUILT
 
-Units: `/docs` listing, artifact serving with `Content-Type: text/html`,
+**The serving half is built.** `GET /api/kb/{kb}/artifact/{id}` serves the
+artifact's bytes inline on the trusted app origin with
 `X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox` and
-`X-Kb-Artifact-Id` always set; the artifact subdomain with the
-`resolved.starts_with(source_root)` traversal guard; the SPA static handler
-with the same guard; the Prometheus text endpoint; backup/restore; the
-Markdown renderer; the remaining CLI verbs.
+`X-Kb-Artifact-Id` in the original's order, plus `?download=1`. The artifact
+**subdomain** is the same serve on its own origin, chosen by `Host:`, with a
+**different** header set — a `frame-ancestors` CSP instead of `sandbox`, and a
+different order — because the point of the subdomain is origin isolation, not
+a second copy of the same page. The **static fallback** serves `KB_SPA_DIST`
+behind the same root guard, and a `KB_SPA_DIST` with no `index.html` refuses
+the daemon at startup rather than 404ing everything. The **Prometheus text
+endpoint** is in, at `/metrics`, text exposition 0.0.4.
 
-Acceptance gate: the traversal suite — `..` in a segment, an absolute path, a
-symlink out of the source root, a percent-encoded `..` — each returns 404 or
-400 and never a byte outside the root.
+**The traversal guard is the security item in this stage, and the part a future
+porter gets wrong.** The original's check is `Path::starts_with`, which is
+**component-wise**: `/root/data` is a prefix of `/root/data` and of
+`/root/data/x`, and is *not* a prefix of `/root/data-secret`. A C port that
+writes `strncmp(path, root, strlen(root)) == 0` accepts the sibling directory
+and serves its bytes. `path_within()` walks both paths component by component,
+and `realpath(3)` — the same all-or-nothing operation as Rust's
+`Path::canonicalize` — resolves `..` and symlinks BEFORE the comparison, so the
+guard never runs on a raw path.
 
-### Stage 6 — measurement, backup, maintenance — PARTLY BUILT
+**And the test that catches it is a SIBLING DIRECTORY, not a `../` case**,
+because `strncmp` rejects `../` too: a traversal suite made only of `..` cases
+passes on the buggy implementation. `tests/test_httpd.c::
+no_path_outside_the_source_root_is_ever_served` pins a sibling directory that
+shares every byte of the root's name, a symlink escape, an absolute path, and
+`..` both plain and percent-encoded — and opens with a **control** case that an
+in-root sibling asset IS served, so a guard that refused everything cannot
+pass either. Replacing `path_within` with `strncmp` was run as a mutation:
+two of those cases fail with the sibling answering 200 and leaking the secret.
+
+Also in: the **Markdown renderer**, and it is the one unit in this plan that
+changed shape. The 800-line `markdown.rs` is a wrapper around comrak, so
+scoping it by LOC hid an entire engine; the operator's decision is that kb-c
+takes no third-party dependency, so `src/markdown.c` is hand-rolled and
+deliberately narrower — reference links, footnotes, superscript, description
+lists and entity references render as ordinary text. A five-lens review
+campaign took the supported-subset divergences from 2,940 to 8 across a
+4,409-document differential corpus, and CommonMark semantic divergences from
+257 to 120 of 652 spec examples, of which 75 are reference-link cases the
+header declares not supported. The divergence is written down rather than left
+for a reader to discover. **The renderer has no production caller yet**: the
+artifact route serves a `.md` document's raw source, so wiring it is the
+remaining half of this unit.
+
+Still PLANNED here: the `/docs` LISTING, multipart capture and the desk
+surface, attachment blobs, the outbound webhook URL validation, `download`,
+`metrics` as a CLI verb, log-level control, the remaining CLI verbs, and a SPA
+to point `KB_SPA_DIST` at.
+
+Acceptance gate (met): the traversal suite — sibling directory, `..` in a
+segment, an absolute path, a symlink out of the source root, a
+percent-encoded `..` — each answers 400 or 404 and never a byte outside the
+root.
+
+### Stage 6 — measurement, backup, maintenance — MOSTLY BUILT
 
 Done: the measurement half. `BENCHMARKS.md` exists and is written from runs on
 this host, and it covers the head-to-head latency comparison, a matched-corpus
@@ -580,8 +764,29 @@ that stops at 20,000 documents and **locates no knee**. `bench/` holds the
 harnesses (`bench-kbc.sh`, `bench-rust.sh`, `bench-rust-concurrency.sh`,
 `bench-scale.sh`, `bench-vector.sh`) and `kbc bench` is the in-process one.
 
-Not done: `bench init`/`discover` as CLI subcommands, the `VACUUM INTO` + tar
-backup, retention pruning, metrics export.
+Also done: the **backup**. `kbc backup <kb> [--out PATH] [--all]` stages a
+`VACUUM INTO` snapshot and tars it; `kbc restore <tarball> --kb NAME [--force]`
+extracts one member. `VACUUM INTO` rather than a file copy because tar-ing the
+live database while the daemon writes captures a torn, half-applied
+transaction. Three deliberate divergences from the Rust, each with a reason: the
+destination is a **bound parameter** rather than a literal with doubled
+apostrophes (kb-c links sqlite 3.27+, and rule 9 says all SQL is bound);
+`--` always precedes the member list (a corpus name beginning with `-` is
+otherwise read by tar as an option); and the source is opened **READONLY**,
+because rusqlite's `Connection::open` is `SQLITE_OPEN_CREATE` and a mistyped
+source silently creates an empty database — the backup then "succeeds" with
+nothing in it, which is the failure mode a backup exists to prevent. A failed
+backup leaves nothing behind. **Exit codes follow this binary's convention, not
+clap's**, so a bad flag exits the same from `search` and from `backup`.
+
+One thing a reader should know about the tarball, because it is not what the
+Rust's is: **it carries the store, not the index.** The Rust's `lance/` clause
+is its index; kb-c's index is the mmap'd postings file and `vectors.bin` beside
+it, and neither is in the archive. A restored kb-c therefore has a working
+store and no index, and `kbc reindex` rebuilds it.
+
+Not done: `bench init`/`discover` as CLI subcommands, retention pruning, metrics
+export.
 
 ---
 
@@ -776,10 +981,17 @@ response declares `Vary: Authorization, X-Kb-Token` so a shared cache cannot han
 one caller's attribution to another. If kb-c ever gains per-user tokens, this is
 the line to revisit.
 
-**P9 — No path reaches the filesystem without the guard.** Every id that
-becomes a path is checked (`..` rejected, `[A-Za-z0-9._-]` only, no leading or
-trailing dot); every resolved file must start with its root. Test: the
-traversal suite in stage 5.
+**P9 — No path reaches the filesystem without the guard, and the guard is
+component-wise.** Every id that becomes a path is checked (`..` rejected,
+`[A-Za-z0-9._-]` only, no leading or trailing dot); every resolved file must be
+**under** its root, component by component. `starts_with` in the original means
+the same thing and `strncmp(path, root, strlen(root))` does not: `/root/data`
+is a prefix of `/root/data-secret`. Both arguments are canonical before the
+comparison (`realpath(3)` ≡ `Path::canonicalize`), so `..` and symlinks are the
+filesystem's job and the component walk is the only thing the guard does. Test:
+the traversal suite in stage 5 — and it must include a **sibling directory**,
+because `..` cases pass on the `strncmp` implementation and a suite made only
+of them would certify the bug.
 
 **P10 — All SQL is bound, never formatted.** Corpus files, query strings,
 config values and HTTP bodies are attacker-influenced. Test: a corpus file
@@ -800,16 +1012,33 @@ narrowing recorded in `INVENTORY.md`:
   `tag:`/`cap:`/`index:` facet atoms), which tantivy never had; the narrowing
   is the other way round. `since:` and `scope:` are refused with a 400.
 - No `corkboard`/lists/notes/slate/session/memory/atlas/share surface. Those
-  are 48.4% of the in-scope LOC and they stay in Rust.
-- Chunking is one row per parsed block, not the 280-word window with 60-word
-  overlap. The rows are stored and listed correctly; the windowing is stage 1.
+  are 49.6% of the in-scope LOC and they stay in Rust. (The `corkboard`,
+  `pinned_memories` and `excluded_files` TABLES exist, because a removal must
+  leave the user's rows alone and the port has to be able to say so; no surface
+  writes or reads them yet.)
+- **The Markdown renderer is narrower than comrak, by decision.** kb-c takes
+  no third-party dependency, so `src/markdown.c` is hand-rolled and does not
+  support reference links and link reference definitions, footnotes,
+  superscript, description lists or entity references. Measured against the real
+  Rust renderer over a 4,409-document differential corpus, 8 supported-subset
+  documents still render differently, and 120 of the 652 CommonMark spec
+  examples — 75 of them reference-link cases this row declares not supported.
+  A document relying on reference links will look wrong, and that is the
+  documented cost of the dependency rule rather than a defect. (It is also not
+  on the serving path yet: the artifact route serves a `.md` document's source.)
 - There is no add-to-open on a frozen index, so a single changed file is
   re-indexed by rebuilding the corpus — but the *result* is then updated in
   place (`reindex_one`) and persisted through the delta journal, so a save
-  costs what the file costs: 33 ms at 1,000 documents and 36 ms at 20,000,
-  flat, because both numbers are this host's fsync floor rather than a kb-c
-  cost. There is still no batch drain: N files touched in one debounce window
-  means N single-file updates rather than one transaction (R11).
+  costs what the file costs: **30.6 / 33.3 / 36.3 ms at 1,000 / 5,000 / 20,000
+  documents**, flat across a 20× range, because all three are this host's
+  fsync floor rather than a kb-c cost. There is still no batch drain: N files
+  touched in one debounce window means N single-file updates rather than one
+  transaction (R11).
+- **A backup carries the store, not the index.** `kbc backup` tars a
+  `VACUUM INTO` snapshot; the mmap'd postings file and `vectors.bin` are not in
+  the archive, so a restored corpus is searchable after `kbc reindex` and not
+  before. Three smaller divergences from the Rust, all with reasons, are on the
+  `storage/backup.rs` row in `INVENTORY.md`.
 - Within one DNF conjunct, `tag:` atoms are ANY-OF, so `tag:a AND tag:b` means
   "has a **or** has b". This is inherited from the original, which ANDs
   predicates rather than literals, and it is a genuine trap for a user. See
@@ -914,11 +1143,11 @@ softened, Zig is the first alternative to re-evaluate.
 | R3 | Memory safety under ASan is not the same as memory safety in a long-running daemon (the sanitizer only sees what the tests run). | Corruption after days of uptime. | ASan lane is mandatory before any commit. Bounds are checked before arithmetic, not after (§`AGENTS.md` rule 7). The index's mmap'd structures are the sharp edge: they are parsed from a file, so a truncated or corrupt index must be detected and rejected, never trusted. |
 | R4 | Hand-rolling 226 routes and 7 middleware layers reproduces the behaviour but not the ergonomics; a subtle layer-order bug changes who can read what. | An auth or CORS regression. | P6 and P7 are testable invariants, tested directly. The route table is generated by the same extractor technique as the Rust one rather than transcribed. |
 | R5 | The vector lane's loss of IVF-PQ makes large corpora slower. | kb-c loses to Rust above ~20k rows. | Stated in §4 M5 as a non-claim. The crossover point is a measurement, and the honest answer may be "kb-c is a keyword-first tool". |
-| R6 | Scope creep: 48.4% of the in-scope LOC is untaken, and the pressure to "just add slate" or "just add sessions" is real. | The port never finishes and the delivered thing is neither a drop-in nor fast. | `INVENTORY.md` is the scope contract, with the reason on every OUT-OF-SCOPE row. Adding a subsystem means changing this document first, with a cost, not slipping into a stage. |
+| R6 | Scope creep: 49.6% of the in-scope LOC is untaken, and the pressure to "just add slate" or "just add sessions" is real. | The port never finishes and the delivered thing is neither a drop-in nor fast. | `INVENTORY.md` is the scope contract, with the reason on every OUT-OF-SCOPE row. Adding a subsystem means changing this document first, with a cost, not slipping into a stage. **And the cost is not the LOC column**: `doctor.rs` read as 2,930 lines of stage-5 work and turned out to be a check of the Claude Code provenance chain, which kb-c has no concept of; `markdown.rs` read as 800 lines of a renderer and hid an entire engine. A row's size is not its scope, which is the same reason R13 is a risk. |
 | R7 | The two daemons (`kb`, `kb-code`) drift further apart as kb-c diverges from kb. | A workspace with two incompatible `kb`s. | Out of scope by decision and stated as such, in both documents. When kb-c becomes production-replacement, the migration story is "run the new daemon, keep the old one for the code lane" — they never shared a store. |
 | R8 | The `kb-code-*` subtree is 240,255 LOC of Rust that nobody maintains after the port lands. | Silent bit-rot in a subsystem kb-c does not replace. | Explicitly not this project's problem, and said so rather than left implicit. |
 | R9 | Performance work is done before correctness work, because the performance claim is the reason the port exists. | A fast, wrong index ships. | The stage order in §3 puts storage completeness, grammar and HTTP parity ahead of measurement (stage 6), and the measurement stage found two severe correctness defects in the ingest path (§2.4.5) — which is the argument for the order, made by the order itself. |
-| R10 | The debounce and batching constants are tuned for the Rust daemon's latency. | kb-c either re-indexes too eagerly or too slowly. | P3-style treatment: `watcher_debounce_ms` (250 ms today, configurable) and the batch constants are in one place and listed in stage 1's gate, and are revisited once kb-c has a corpus to tune against. There is no 60 s reconcile in the tree yet — stage 1's unit 2 adds it, and the constant arrives with it. |
-| R11 | A watcher event re-indexes **that one file** in place (`reindex_one`), because the frozen index has no add-to-open operation. | Ingestion cost is a function of change size rather than corpus size, which is the point, but there is still no batch drain: N files touched in a debounce window means N single-file updates rather than one transaction. | Deliberate and measured, and the measurement corrected the design twice: the in-place update alone did NOT make the cost proportional to the file, because the save rewrote and fsynced the whole index (251 ms / 500 ms / 1.19 s at 1,000 / 5,000 / 20,000 documents). A delta journal fixed that, and a save is now 33 ms at 1,000 documents and 36 ms at 20,000 — flat, because both are the storage's fsync floor. The remaining work is stage 1's batch drain (≤32 docs / ≤8 MiB), which is now a throughput improvement rather than a correctness one. The remaining work is stage 1's batch drain (≤32 docs / ≤8 MiB). Until it lands, many small changes in one window cost more than they should — a known weakness, not a surprise. |
-| R12 | The artifact id is a pure function of `(corpus, path)`, so a **rename** is a delete plus an insert, not an update. | A renamed file loses its id, its comment threads and its chunk history unless the move is observed. | Deliberate: the alternative mints a new id on every save, which is worse. The mitigation is stage 4's `mv` and the `moves` rename-race log, plus stage 1's reconcile delete pass, which is what makes an unobserved rename disappear rather than linger. Until both land, a rename orphans a row. |
-| R13 | A design document can describe a behaviour convincingly enough that nobody tests it. | Stage 0 shipped claiming a `sha256(rel_path)` id, 280-word chunk windows and plain JSON errors — and later drafts of this plan described an embedder wire protocol the real sidecar does not speak, and quoted a 10.3 ms incremental update that was never measured clean. | The test suite is the arbiter, and it earns that position: 11 suites, 339 cases, 24 defects found during the build, including two use-after-frees and a cross-thread data race (§2.4.4). A number that no run on the current code produced does not belong in this document, even as a placeholder. Any behaviour added to §3 without a test that fails when it is wrong is not done. |
+| R10 | The debounce and batching constants are tuned for the Rust daemon's latency. | kb-c either re-indexes too eagerly or too slowly. | P3-style treatment: `watcher_debounce_ms` (250 ms today, configurable) and the batch constants are in one place and listed in stage 1's gate, and are revisited once kb-c has a corpus to tune against. The reconcile pass has landed — a full reindex sweeps and removes what vanished — but it runs **on a reindex**, not on a 60-second timer, so an unobserved removal is still only noticed when something asks for a reindex. |
+| R11 | A watcher event re-indexes **that one file** in place (`reindex_one`), because the frozen index has no add-to-open operation. | Ingestion cost is a function of change size rather than corpus size, which is the point, but there is still no batch drain: N files touched in a debounce window means N single-file updates rather than one transaction. | Deliberate and measured, and the measurement corrected the design twice: the in-place update alone did NOT make the cost proportional to the file, because the save rewrote and fsynced the whole index (251 ms / 500 ms / 1.19 s at 1,000 / 5,000 / 20,000 documents). A delta journal fixed that, and the matched A/B puts a save at 30.6 / 33.3 / 36.3 ms at 1,000 / 5,000 / 20,000 documents — flat across a 20× range, because all three are the storage's fsync floor (`BENCHMARKS.md`). The remaining work is stage 1's batch drain (≤32 docs / ≤8 MiB), which is now a throughput improvement rather than a correctness one. Until it lands, many small changes in one window cost more than they should — a known weakness, not a surprise. |
+| R12 | The artifact id is a pure function of `(corpus, path)`, so a **rename** is a delete plus an insert, not an update. | A renamed file loses its id, its comment threads and its chunk history unless the move is observed. | Deliberate: the alternative mints a new id on every save, which is worse. **Half the mitigation has landed**: stage 1's reconcile delete pass now runs, so an unobserved rename disappears rather than lingering, and the removal keeps the user's rows (`history`, pins, corkboard) and demotes inbound edges to `pending_links` so a document that comes back finds its backlinks. The other half is stage 4's `mv` and the `moves` rename-race log, which is what would carry the old id across the rename instead of dropping it. |
+| R13 | A design document can describe a behaviour convincingly enough that nobody tests it. | Stage 0 shipped claiming a `sha256(rel_path)` id, 280-word chunk windows and plain JSON errors — and later drafts of this plan described an embedder wire protocol the real sidecar does not speak, and quoted a 10.3 ms incremental update that was never measured clean. | The test suite is the arbiter, and it earns that position: 14 suites, 531 cases, 24 defects found during the build, including two use-after-frees and a cross-thread data race (§2.4.4). A number that no run on the current code produced does not belong in this document, even as a placeholder. Any behaviour added to §3 without a test that fails when it is wrong is not done. **The corollary, learned the hard way in §2.5: a green lane is not the same as a correct one.** An uninitialised struct flag passed a green release lane AND a green ASan lane, because no sanitizer reports uninitialised reads; it was caught only because the TSan build rendered differently from the release build. A test that fails intermittently is worse than no test — it trains everyone who reads CI to ignore red — so the one such case was deleted rather than tuned, with the declined alternative recorded in DECISIONS.md ADR-007. |
