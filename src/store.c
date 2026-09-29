@@ -96,10 +96,18 @@ struct kbc_store {
 /* The child column that names a violating row, per child table. Matched
  * against the table name the pragma reports and never interpolated blindly:
  * a table with no entry here is reported by rowid alone rather than by a
- * statement assembled from a name the schema chose. These three are the whole
+ * statement assembled from a name the schema chose. These four are the whole
  * of the foreign keys the ladder creates (v1's chunks and comments onto
- * artifacts, v5's index_runs onto sources), so this list and the schema are
- * two views of the same three edges. */
+ * artifacts, v5's index_runs onto sources, v13's comment_anchors onto
+ * comments), so this list and the schema are two views of the same four
+ * edges.
+ *
+ * `comment_anchors` is keyed on `comment_id` and NOT on `doc_id` on purpose.
+ * `kbc_store_rekey_artifact` rewrites `comments.doc_id` and never
+ * `comments.id` (store.c:3963 — the id is minted and a move must not remint
+ * it), so an edge on `comment_id` rides through a move untouched while an
+ * edge on `doc_id` would have to be added to that transaction and could be
+ * forgotten in it. */
 static const struct {
   const char *table;
   const char *column;
@@ -107,6 +115,7 @@ static const struct {
     {"chunks", "doc_id"},
     {"comments", "doc_id"},
     {"index_runs", "corpus"},
+    {"comment_anchors", "comment_id"},
 };
 
 /* The child row's own key value, with the COLUMN it came from, so the log
@@ -463,6 +472,111 @@ static const char *const SCHEMA_V11 =
 static const char *const SCHEMA_V12 =
     "ALTER TABLE moves ADD COLUMN abandoned_at INTEGER;";
 
+/* v13 — `comment_anchors`, the PERSISTED anchor verdict.
+ *
+ * ============================ THE STALE-SET DECISION ====================
+ *
+ * PERSIST, and REBUILD FROM THE GRAPH ON OPEN. The evidence, the argument
+ * against the alternative, and the property that makes this the right answer
+ * rather than a plausible one:
+ *
+ * WHAT THE ORIGINAL ACTUALLY DOES, because the plan's summary of it is
+ * wrong. It does NOT recompute its stale set from scratch. `kb-core/src/
+ * anchors.rs` is a PERSISTED sidecar — `.anchors-stale.json`, beside the
+ * `.review/` directory, keyed on `(artifact_id, comment_id)`, schema
+ * versioned, written atomically (tmpfile + rename + parent fsync). Its own
+ * header says the file "is safe to lose" and that a v1 sidecar "loads as
+ * empty — the set rebuilds on the next reindex". The indexer keeps the
+ * loaded set in a `HashMap` (indexer.rs:990) and rewrites the file once per
+ * artifact-reindex that changed something.
+ *
+ * WHY THE ORIGINAL PERSISTS AT ALL. Not for speed. Its comments live in
+ * per-artifact JSON review files on disk, OUTSIDE the database
+ * (`review_dir`, indexer.rs:3001), so the indexer has no database row to
+ * hang a set on and a sidecar is the only place it can go. That reason does
+ * not apply to kb-c: `comments` is a TABLE in the SAME database as the
+ * artifacts, so the set here costs a table rather than a file, and it is
+ * written in the same transaction as the verdict it describes. A set and the
+ * graph it is derived from cannot disagree across a crash if they are
+ * committed together — which is the entire failure mode the persist-vs-
+ * recompute question is about, answered by the storage engine instead of by
+ * discipline.
+ *
+ * WHY NOT RECOMPUTE. Recompute has one real virtue — no state to go stale —
+ * and it buys that virtue by destroying the only thing the set EXISTS for.
+ * The set is not a cache of the current truth; it is the memory of the
+ * PREVIOUS pass, and the previous pass is what makes a TRANSITION
+ * observable. `comment.anchor_stale` fires on the edge INTO stale and
+ * `comment.anchor_resolved` on the edge OUT of it (indexer.rs:2993-2996); a
+ * set recomputed from the current graph has no edge in it, so every pass
+ * re-fires `anchor_stale` for every stale anchor and the event volume is
+ * bounded by REINDEXES rather than by transitions. That is the exact failure
+ * the in-process set was introduced to prevent (anchors.rs:5-8: the v0.5 P4
+ * `HashSet` "died on restart, so the first reindex after a restart could
+ * never fire `comment.anchor_resolved`"). Recompute is not a cheaper
+ * persist; it is that bug, reimplemented.
+ *
+ * THE PROPERTY THAT HAS TO BE RIGHT. A persisted set can describe a graph
+ * that never committed: the pass judged a document, wrote its verdicts, and
+ * the process died before the document was re-indexed — or the document was
+ * re-indexed and the process died before the pass ran. Either way the rows
+ * on disk are a claim about bytes that are no longer the artifact's bytes.
+ * So every row carries the `artifacts.content_hash` it was judged against,
+ * and `reconcile_anchor_states` — which `kbc_store_open` runs on EVERY open
+ * — rewrites any row whose hash no longer matches into UNDECIDABLE. A row
+ * that survives an open is a row that describes the graph which EXISTS.
+ *
+ * WHY A NEW RUNG AND NOT A FOLD INTO v12, WHICH IS UNRELEASED. v12's own
+ * comment gives the reason and it applies here unchanged: a fold is safe
+ * only while NO volume anywhere has recorded the folded version, because
+ * `migrate_locked` skips every version at or below what a volume has. A
+ * volume that applied v12 would skip the folded statement and keep a
+ * `comment_anchors`-less schema whose own version number says it is current
+ * — the silent drift the epoch guard exists to make loud.
+ *
+ * WHY THIS STEP IS SAFER THAN v12's. It is a CREATE TABLE and a CREATE
+ * INDEX, both `IF NOT EXISTS`, so unlike `ALTER TABLE ... ADD COLUMN` it is
+ * re-runnable on its own and does not lean on the shared transaction for its
+ * idempotence. The FK to `comments(id)` carries the rest: a comment cannot
+ * be deleted while its verdict row names it, and `artifacts` deleting a
+ * comment cascades to the verdict, so the set is a SUBSET of the live
+ * comment set BY CONSTRUCTION rather than by a sweep somebody has to
+ * remember to run.
+ */
+static const char *const SCHEMA_V13 =
+    "CREATE TABLE IF NOT EXISTS comment_anchors ("
+    " comment_id TEXT PRIMARY KEY REFERENCES comments(id) ON DELETE CASCADE,"
+    " doc_id TEXT NOT NULL,"
+    /* The CLAIM, copied from `comments.anchor` when the row was written. A
+     * copy rather than a join, so the set still describes what was judged
+     * after the comment's own text is edited underneath it. */
+    " anchor TEXT NOT NULL,"
+    /* The heading TEXT behind `resolves_to` at the first judgement, and the
+     * thing that makes a slug COLLISION detectable at all. Empty until a
+     * pass has resolved the anchor once. */
+    " anchor_text TEXT NOT NULL DEFAULT '',"
+    /* 0 undecidable, 1 resolved, 2 unresolved. A CHECK, because the three
+     * are an invariant of the TABLE and not of every writer that reaches it
+     * — the same argument v6 makes for the history `kind`. */
+    " state INTEGER NOT NULL CHECK (state IN (0,1,2)),"
+    /* The id the claim currently resolves at, which is NOT always
+     * `anchor`: a heading that moved is FOLLOWED, and the follow is recorded
+     * here rather than by rewriting `comments.anchor`, because a user's
+     * anchor is the user's claim and a machine that edits it is the silent
+     * re-anchor this whole design exists to prevent. */
+    " resolves_to TEXT NOT NULL DEFAULT '',"
+    " resolved_ord INTEGER NOT NULL DEFAULT -1,"
+    /* The artifact's content_hash at the moment of the judgement, and the
+     * input the open-time rebuild compares against. */
+    " content_hash INTEGER NOT NULL,"
+    " judged_at INTEGER NOT NULL);"
+    /* PARTIAL, and for the same reason idx_errors_open is: it serves exactly
+     * one query — the stale set, which is everything that is not RESOLVED —
+     * and carrying the resolved rows forever to answer a query that never
+     * wants them is what turns a lookup into a scan. */
+    "CREATE INDEX IF NOT EXISTS idx_comment_anchors_stale"
+    " ON comment_anchors(state, doc_id) WHERE state <> 1;";
+
 /* The ladder, in the shape refinery's Runner has it: an ordered list of
  * (version, sql), applied FORWARD-ONLY, one transaction per version. Rust
  * reads its binary epoch from the runner rather than from a second constant
@@ -478,7 +592,7 @@ static const kbc_migration MIGRATIONS[] = {
     {1, SCHEMA_V1},   {2, SCHEMA_V2},   {3, SCHEMA_V3},   {4, SCHEMA_V4},
     {5, SCHEMA_V5},   {6, SCHEMA_V6},   {7, SCHEMA_V7},   {8, SCHEMA_V8},
     {9, SCHEMA_V9},   {10, SCHEMA_V10},  {11, SCHEMA_V11},
-    {12, SCHEMA_V12},
+    {12, SCHEMA_V12}, {13, SCHEMA_V13},
 };
 
 #define MIGRATION_COUNT (sizeof(MIGRATIONS) / sizeof(MIGRATIONS[0]))
@@ -535,6 +649,72 @@ static kbc_status refuse_if_volume_ahead(kbc_err *err, const char *db_path,
                                          int64_t volume);
 static kbc_status require_text(kbc_err *err, const char *what, const char *v,
                                size_t max);
+/* Defined with the other list plumbing, below the anchor section that uses
+ * it. Declared here so the anchor reader can share the count-then-fetch
+ * shape instead of open-coding a second one. */
+static kbc_status page_block(kbc_err *err, kbc_store *s, kbc_arena *a,
+                             const char *count_sql, const char *corpus,
+                             size_t limit, size_t elem_size, void **out,
+                             size_t *n_out);
+
+/* The anchor state machine. Its contract — the three states and why there are
+ * three, the persisted stale set, and the six functions — now lives in
+ * include/kbc/store.h, which is where a caller reads it. It was carried here
+ * as a hand-copied declaration block because the header was the orchestrator's
+ * file; that is exactly the drift a frozen header exists to prevent, and it is
+ * gone rather than reconciled. The reasoning below stays because it is about
+ * the algorithm, not the signature. */
+
+/* The three verdicts, and the reason there are three.
+ *
+ * A comment's anchor is a CLAIM about a document's headings, and the
+ * headings move. Two of the three answers are the ones a boolean has:
+ * RESOLVED (the claim still names what it named) and UNRESOLVED (the heading
+ * it named is not in the document). The third is the one a boolean cannot
+ * hold, and it is the state that makes this a state machine rather than a
+ * flag:
+ *
+ *   UNDECIDABLE — the claim cannot be settled either way, and answering
+ *   anyway is how a comment gets silently re-anchored onto a DIFFERENT
+ *   heading that happens to share a slug with the one it referred to. The
+ *   store can see that "something is at this id now" and that "it is not the
+ *   thing that was there"; it cannot see which of the two explanations is
+ *   true, and neither "resolved" nor "unresolved" is a true statement about
+ *   it. `None` and `False` collapse here, and the collapse is the bug: a
+ *   reader that treats "undecidable" as "unresolved" hides a live comment,
+ *   and a reader that treats it as "resolved" shows a comment attached to
+ *   the wrong heading.
+ *
+ * Reachable four ways, and each is a separate test:
+ *   - the document will not parse, so the caller passes `judgeable = false`;
+ *   - the anchor's id is taken over by a heading with DIFFERENT text, and the
+ *     original heading is neither at the id nor anywhere else in the
+ *     document (the slug collision, which is the failure this exists for);
+ *   - the row's verdict was recorded against a `content_hash` the artifact
+ *     no longer has, so a crash between the re-index and the pass left a
+ *     claim about bytes that are gone;
+ *   - the row exists and nothing has judged it yet.
+ *
+ * UNDECIDABLE is ABSORBING. A pass does not clear it, because a pass is the
+ * same computation that could not settle it the first time. What clears it
+ * is a human: `kbc_store_set_comment_resolved`, or a re-anchor. That is a
+ * deliberate choice against "retry until it agrees" — a store that keeps
+ * re-asking a question it has already failed to answer never reaches a fixed
+ * point, and a fixed point is the whole point of the exercise. */
+
+/* `section:` is the only prefix kb-c's store accepts on an anchor
+ * (store.h:226), and it is stripped rather than searched for: an anchor
+ * naming `section:x` and one naming `x` are different claims about a
+ * document, and comparing the whole string would collapse them. This is the
+ * same rule httpd.c applies before it looks an id up, restated here because
+ * the store is where the comparison is made and the two must not drift. */
+static const char *anchor_element_id(const char *anchor) {
+  static const char kSection[] = "section:";
+  if (strncmp(anchor, kSection, sizeof kSection - 1) == 0) {
+    return anchor + sizeof kSection - 1;
+  }
+  return anchor;
+}
 
 
 /* ------------------------------------------------------------ plumbing --- */
@@ -833,6 +1013,33 @@ kbc_store *kbc_store_open(const kbc_config *cfg, kbc_err *err) {
    * it says. It reports and returns: no status can turn a violation into a
    * failed open, and nothing here writes or repairs. */
   report_foreign_key_violations(s, cfg->db_path);
+
+  /* The stale set is rebuilt from the graph on EVERY open, not only on a
+   * version change, for the same reason the FK check above is: a volume does
+   * not have to be migrated to become inconsistent with its own documents,
+   * and "the document was re-indexed" happens on every save rather than on
+   * every upgrade. Gating this on `have < BINARY_EPOCH` would leave every
+   * install that already migrated permanently describing the graph as it was
+   * when it last passed — which is the drift SCHEMA_V13 exists to prevent.
+   *
+   * It is a REPAIR, and unlike the FK check it writes — so unlike the FK check
+   * it is allowed to fail the open. A daemon that started holding verdicts
+   * about documents that no longer exist would serve a wrong ANSWER, and
+   * "warn and continue" is the wrong posture for a wrong answer; refusing to
+   * start is the loud version of the epoch guard, and it is recoverable in a
+   * way a silently wrong anchor is not. */
+  kbc_err rebuilt_err;
+  kbc_err_reset(&rebuilt_err);
+  int64_t rebuilt = 0;
+  if (kbc_failed(kbc_store_reconcile_anchors(s, &rebuilt, &rebuilt_err))) {
+    kbc_store_close(s);
+    return NULL;
+  }
+  if (rebuilt > 0) {
+    KBC_LOGI("store: rebuilt %lld anchor verdict(s) against the current"
+             " documents in %s",
+             (long long)rebuilt, cfg->db_path);
+  }
   return s;
 }
 
@@ -2637,6 +2844,642 @@ kbc_status kbc_store_list_comment_docs(kbc_store *s, kbc_strlist *out,
   return rc;
 }
 
+/* ========================================================= anchor state ==
+ *
+ * The three-state machine, the persisted stale set it drives, and the
+ * open-time rebuild that keeps the set describing the graph that exists.
+ * SCHEMA_V13 carries the persist-vs-recompute decision and the argument for
+ * it; this is the code that implements it.
+ *
+ * WHO OWNS THE DOCUMENT'S HEADINGS. Not this file. The store has `chunks`,
+ * whose rows carry an ord and a text and NO slug (store.c:2502 says so, and
+ * `kbc_store_list_chunks` synthesises `b<ord>` for the same reason), so the
+ * store cannot see a heading slug and must not pretend to. The caller parsed
+ * the document and hands the verdict's INPUTS over as `kbc_anchor_heading[]`
+ * — the ids the document exposes, in document order, each with the heading
+ * text behind it. BORROWED for the call; nothing here retains either field.
+ *
+ * WHY THE ORDER OF THAT ARRAY IS PART OF THE CONTRACT. `resolved_ord` is a
+ * position in it, and a position only means something while the order is the
+ * document's. Feeding the same headings in a different order produces a
+ * different ord, which is the caller's bug and not a store fallback: there is
+ * no order to fall back to, because the store has never seen the document.
+ */
+
+/* "Stale" for the EVENT set, and deliberately not "state != RESOLVED is
+ * resolved". An UNDECIDABLE anchor is as un-actionable as an unresolved one —
+ * a subscriber needs to know about both — and a set that dropped it would be
+ * the two-state collapse this section exists to refuse. What the set is NOT
+ * for is deciding that a comment is fine: nothing here reads `stale` as
+ * `resolved`. */
+static bool anchor_is_stale(kbc_anchor_state st) {
+  return st != KBC_ANCHOR_RESOLVED;
+}
+
+/* Where `id` sits in the caller's heading table, or -1. The ord is the
+ * index in the array the caller passed, so "moved" means "the same id is
+ * still exposed but at a different position", which is the only sense of
+ * "moved" a caller that never told us the old order can have. */
+static int64_t anchor_ordinal(const kbc_anchor_heading *h, size_t n,
+                              const char *id) {
+  for (size_t i = 0; i < n; i++) {
+    if (h[i].id != NULL && strcmp(h[i].id, id) == 0) return (int64_t)i;
+  }
+  return -1;
+}
+
+/* The ord of the heading whose text is `text`, or -1 — and -1 for AMBIGUITY
+ * as well as for absence, which is the whole point.
+ *
+ * A slug collision leaves the original heading's text somewhere else in the
+ * document exactly ONCE if the heading merely moved, and TWICE or NINE TIMES
+ * if the text was duplicated. "Follow the heading" is only a sound
+ * conclusion when there is exactly one place it could have gone: with two
+ * candidates the store cannot tell which one the comment meant, and picking
+ * either is the silent re-anchor. So ambiguity and absence share a return
+ * value and the caller turns both into UNDECIDABLE. */
+static int64_t anchor_text_ordinal(const kbc_anchor_heading *h, size_t n,
+                                   const char *text) {
+  if (text == NULL || text[0] == '\0') return -1;
+  int64_t found = -1;
+  for (size_t i = 0; i < n; i++) {
+    const char *t = h[i].text != NULL ? h[i].text : "";
+    if (strcmp(t, text) != 0) continue;
+    if (found >= 0) return -1; /* two candidates: refuse to choose */
+    found = (int64_t)i;
+  }
+  return found;
+}
+
+/* ONE comment's verdict, from the caller's heading table and the row the
+ * last pass left behind. `prev_state` is -1 when there is no row yet, which
+ * is how "never judged" says so without a fourth state.
+ *
+ * The order of the tests is the argument, so it is worth stating:
+ *
+ *  1. NOT JUDGEABLE — the caller says the document has no trustworthy
+ *     heading table (it would not parse, or the bytes were not available).
+ *     UNDECIDABLE, always. Reporting UNRESOLVED here would flag every
+ *     comment on a document that merely failed to parse, which is the one
+ *     answer that is wrong in both directions at once.
+ *
+ *  2. THE ID IS STILL EXPOSED, and either nothing has judged this anchor
+ *     before (`prev_state < 0`, so there is no prior claim to contradict)
+ *     or the text behind it is the text the comment was made on. RESOLVED.
+ *
+ *  3. THE ID IS STILL EXPOSED but the text CHANGED. This is the slug
+ *     collision: something else now holds the id the comment named. Try to
+ *     follow the original heading by its text; if it is uniquely somewhere
+ *     else, the comment FOLLOWS it there and stays RESOLVED at the new ord.
+ *     If it is not there, or it is there more than once, the claim cannot be
+ *     settled — UNDECIDABLE. The two-state machine's answer here is
+ *     RESOLVED, and that answer is the bug.
+ *
+ *  4. THE ID IS GONE. Try to follow by text first — a renamed heading is a
+ *     MOVED heading, and the comment follows it. Unique match: RESOLVED at
+ *     the new ord. No match, or an ambiguous one: the heading the comment
+ *     referred to is not in the document, which is the one case that IS a
+ *     clean negative. UNRESOLVED.
+ *
+ * `resolves_to_out` and `ord_out` receive what a READER should point at,
+ * which is the follow target and not `anchor`. The user's claim is never
+ * rewritten; a reader that wants the new home asks the store. */
+static kbc_anchor_state anchor_judge(const kbc_anchor_heading *h, size_t n,
+                                    bool judgeable, const char *claim,
+                                    const char *prev_text, int prev_state,
+                                    const char **resolves_to_out,
+                                    int64_t *ord_out) {
+  *resolves_to_out = "";
+  *ord_out = -1;
+  if (!judgeable) return KBC_ANCHOR_UNDECIDABLE;
+
+  const char *id = anchor_element_id(claim);
+  int64_t at = anchor_ordinal(h, n, id);
+  if (at >= 0) {
+    const char *here = h[at].text != NULL ? h[at].text : "";
+    if (prev_state < 0 || prev_text == NULL || prev_text[0] == '\0' ||
+        strcmp(prev_text, here) == 0) {
+      *resolves_to_out = id;
+      *ord_out = at;
+      return KBC_ANCHOR_RESOLVED;
+    }
+    /* The id is taken over by a different heading. The original may still be
+     * in the document under a new id; a unique text match is the proof that
+     * it moved rather than vanished, and it is the ONLY proof available. */
+    int64_t moved = anchor_text_ordinal(h, n, prev_text);
+    if (moved >= 0) {
+      *resolves_to_out = h[moved].id;
+      *ord_out = moved;
+      return KBC_ANCHOR_RESOLVED;
+    }
+    return KBC_ANCHOR_UNDECIDABLE;
+  }
+
+  int64_t moved = anchor_text_ordinal(h, n, prev_text);
+  if (moved >= 0) {
+    *resolves_to_out = h[moved].id;
+    *ord_out = moved;
+    return KBC_ANCHOR_RESOLVED;
+  }
+  return KBC_ANCHOR_UNRESOLVED;
+}
+
+/* One verdict, one statement. An upsert rather than an insert-or-update pair
+ * because the two would disagree about a row that appeared between them, and
+ * because a comment is judged once per pass by definition — so "is there a
+ * row" is exactly the question the caller should not be answering. */
+static kbc_status anchor_write(kbc_err *err, kbc_store *s, const char *cid,
+                               const char *doc_id, const char *claim,
+                               kbc_anchor_state state, const char *where,
+                               int64_t ord, int64_t hash) {
+  sqlite3_stmt *q = NULL;
+  kbc_status st = prepare(
+      err, s,
+      "INSERT INTO comment_anchors(comment_id, doc_id, anchor, anchor_text,"
+      " state, resolves_to, resolved_ord, content_hash, judged_at)"
+      " VALUES(?1,?2,?3,'',?4,?5,?6,?7,?8)"
+      " ON CONFLICT(comment_id) DO UPDATE SET"
+      "  doc_id=excluded.doc_id, anchor=excluded.anchor,"
+      "  state=excluded.state, resolves_to=excluded.resolves_to,"
+      "  resolved_ord=excluded.resolved_ord,"
+      "  content_hash=excluded.content_hash, judged_at=excluded.judged_at;",
+      &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, cid);
+  if (st == KBC_OK) st = bind_text(err, s, q, 2, doc_id);
+  if (st == KBC_OK) st = bind_text(err, s, q, 3, claim);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 4, (int64_t)state);
+  if (st == KBC_OK) st = bind_text(err, s, q, 5, where);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 6, ord);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 7, hash);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 8, kbc_now_ns() / 1000000000);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "judge anchor", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  return st != KBC_OK ? st : fin;
+}
+
+/* Records the heading text behind a resolution, ONCE. The text is the
+ * identity the NEXT pass compares against, and it is written only when the
+ * row has none: overwriting it with whatever the document says now would
+ * make a collision undetectable on the very pass after it happens, which is
+ * the one pass where detecting it is the entire job. The `anchor_text = ''`
+ * in the predicate is what makes "once" a property of the row rather than a
+ * promise in a comment. */
+static kbc_status anchor_remember(kbc_err *err, kbc_store *s, const char *cid,
+                                  const char *text) {
+  sqlite3_stmt *q = NULL;
+  kbc_status st =
+      prepare(err, s,
+              "UPDATE comment_anchors SET anchor_text = ?2"
+              " WHERE comment_id = ?1 AND anchor_text = '';",
+              &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, cid);
+  if (st == KBC_OK) st = bind_text(err, s, q, 2, text != NULL ? text : "");
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "remember anchor", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  return st != KBC_OK ? st : fin;
+}
+
+/* Judges every OPEN comment on one document and writes the verdicts, in ONE
+ * transaction, and hands back the edges.
+ *
+ * ONE TRANSACTION, and that is not tidiness. The set and the graph it
+ * describes are committed together, so there is no window in which a crash
+ * can leave a verdict that no pass would ever produce — the property
+ * SCHEMA_V13 argues for and `kbc_store_reconcile_anchors` then makes
+ * checkable on reopen. The original gets the same property the hard way, by
+ * writing its sidecar once per artifact and accepting the window in between
+ * (indexer.rs:3131-3145).
+ *
+ * `c.resolved = 0` is `is_open()` (indexer.rs:3035): the original does not
+ * judge a resolved comment, and neither does this. A resolved comment keeps
+ * whatever verdict it had, which is what makes re-opening it report the
+ * state the subscriber already saw rather than a fresh stale event.
+ *
+ * `content_hash` is read from the ARTIFACT ROW inside the same transaction,
+ * never taken from the caller, so a verdict can never claim to describe
+ * bytes the store itself does not believe are current. */
+kbc_status kbc_store_judge_anchors(kbc_store *s, const char *doc_id,
+                                   const kbc_anchor_heading *headings,
+                                   size_t n, bool judgeable, kbc_arena *a,
+                                   kbc_anchor_judgement **out, size_t *n_out,
+                                   kbc_err *err) {
+  if (s == NULL || doc_id == NULL || out == NULL || n_out == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "judge_anchors: null argument");
+  if (headings == NULL && n > 0)
+    return kbc_err_set(err, KBC_ERR_INVALID, "judge_anchors: null headings");
+  *out = NULL;
+  *n_out = 0;
+  kbc_status st = require_text(err, "anchor doc id", doc_id, KBC_MAX_ID_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  st = exec_plain(err, s, "BEGIN IMMEDIATE;");
+  if (st != KBC_OK) {
+    unlock(s);
+    return st;
+  }
+
+  int64_t hash = 0;
+  int64_t at = 0;
+  kbc_status rc =
+      count_query(err, s, "SELECT content_hash FROM artifacts WHERE id = ?1;",
+                  doc_id, &hash);
+  if (rc != KBC_OK) goto done;
+  rc = count_query(err, s, "SELECT COUNT(*) FROM comments"
+                          " WHERE doc_id = ?1 AND resolved = 0;",
+                  doc_id, &at);
+  if (rc != KBC_OK) goto done;
+
+  size_t total = at > 0 ? (size_t)at : 0u;
+  size_t seen = 0;
+  kbc_anchor_judgement *judged = NULL;
+  if (total > 0) {
+    judged = kbc_arena_calloc(a, total, sizeof(*judged));
+    if (judged == NULL) {
+      rc = kbc_err_set(err, KBC_ERR_NOMEM, "judge anchors: %zu comments",
+                       total);
+      goto done;
+    }
+  }
+
+  sqlite3_stmt *q = NULL;
+  rc = prepare(err, s,
+               "SELECT c.id, c.anchor, a.anchor_text, a.state"
+               " FROM comments c"
+               " LEFT JOIN comment_anchors a ON a.comment_id = c.id"
+               " WHERE c.doc_id = ?1 AND c.resolved = 0"
+               " ORDER BY c.id;",
+               &q);
+  if (rc == KBC_OK) rc = bind_text(err, s, q, 1, doc_id);
+  if (rc == KBC_OK) {
+    for (;;) {
+      const int step = sqlite3_step(q);
+      if (step == SQLITE_DONE) break;
+      if (step != SQLITE_ROW) {
+        rc = sql_fail(err, s, "judge anchors: step", step);
+        break;
+      }
+      const char *cid = (const char *)sqlite3_column_text(q, 0);
+      const char *claim = (const char *)sqlite3_column_text(q, 1);
+      const char *prev_text = (const char *)sqlite3_column_text(q, 2);
+      /* `comments.id` is a NOT NULL PRIMARY KEY and `comments.anchor` is NOT
+       * NULL, so neither of these can be NULL on a row this SELECT produced
+       * — but the loop below binds both, and a NULL there is a bind failure
+       * halfway through a transaction rather than a statement that never
+       * ran. Refusing with the column named is the difference between a
+       * diagnosable refusal and a generic SQL error. */
+      if (cid == NULL || claim == NULL) {
+        rc = kbc_err_set(err, KBC_ERR_INTERNAL,
+                         "judge anchors: comment row on %s has a null %s",
+                         doc_id, cid == NULL ? "id" : "anchor");
+        break;
+      }
+      const int prev_state = sqlite3_column_type(q, 3) == SQLITE_NULL
+                                 ? -1
+                                 : sqlite3_column_int(q, 3);
+      const char *where = "";
+      int64_t ord = -1;
+      kbc_anchor_state ns =
+          anchor_judge(headings, n, judgeable, claim != NULL ? claim : "",
+                      prev_text, prev_state, &where, &ord);
+      const bool was_stale = prev_state >= 0 && anchor_is_stale(
+                                                  (kbc_anchor_state)prev_state);
+      rc = anchor_write(err, s, cid, doc_id, claim != NULL ? claim : "", ns,
+                        where, ord, hash);
+      if (rc != KBC_OK) break;
+      /* The remembered text is only written on the FIRST resolution. It is
+       * the identity the next pass compares against, and overwriting it with
+       * whatever the document says now is how a collision becomes invisible
+       * one pass after it happens. */
+      /* `ord < n` is not a hope: every RESOLVED path in `anchor_judge` sets
+       * it from `anchor_ordinal` or `anchor_text_ordinal`, and both return
+       * either -1 or an index they themselves produced by walking `0..n-1`.
+       * The `ord >= 0` half is what makes the index expression legal, and
+       * the two together are why this needs no range check of its own. */
+      if (rc == KBC_OK && ns == KBC_ANCHOR_RESOLVED && ord >= 0 &&
+          (prev_text == NULL || prev_text[0] == '\0')) {
+        rc = anchor_remember(err, s, cid, headings[ord].text);
+      }
+      if (rc != KBC_OK) break;
+      judged[seen].comment_id = kbc_arena_strdup(a, cid);
+      judged[seen].state = ns;
+      judged[seen].ord = ord;
+      judged[seen].transitioned = anchor_is_stale(ns) != was_stale;
+      seen++;
+      if (seen == total) break;
+    }
+  }
+  kbc_status fin = finalize(err, s, q, rc);
+  if (rc == KBC_OK) rc = fin;
+
+done:
+  if (rc == KBC_OK) rc = exec_plain(err, s, "COMMIT;");
+  else rollback(s);
+  unlock(s);
+  if (rc != KBC_OK) return rc;
+  *out = judged;
+  *n_out = seen;
+  return KBC_OK;
+}
+
+/* ONE comment's persisted verdict, or NOTFOUND — which is not the same as
+ * UNDECIDABLE and must not be read as it.
+ *
+ * NOTFOUND means no pass has ever judged this comment, which is a question
+ * that has not been asked. UNDECIDABLE means it was asked and could not be
+ * answered. A caller that maps NOTFOUND onto UNDECIDABLE is asserting that
+ * somebody tried; a caller that maps it onto RESOLVED is asserting nobody
+ * objected. Both are claims the store cannot make on the caller's behalf, so
+ * they are two different returns.
+ *
+ * The state is read back RAW, not re-checked against the artifact's current
+ * `content_hash`. That check is `kbc_store_reconcile_anchors`'s job and it
+ * runs on every open, so a row that reaches this function has already been
+ * reconciled against the graph that exists. Re-checking here as well would
+ * be a second answer to a question with one owner. */
+kbc_status kbc_store_get_anchor(kbc_store *s, kbc_arena *a,
+                                const char *comment_id, kbc_anchor_row *out,
+                                kbc_err *err) {
+  if (s == NULL || a == NULL || out == NULL || comment_id == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "get_anchor: null argument");
+  kbc_status st = require_text(err, "anchor comment id", comment_id,
+                               KBC_MAX_ID_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "SELECT doc_id, anchor, resolves_to, resolved_ord, state"
+               " FROM comment_anchors WHERE comment_id = ?1;",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, comment_id);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_ROW) {
+      out->doc_id = col_str(a, q, 0);
+      out->anchor = col_str(a, q, 1);
+      out->resolves_to = col_str(a, q, 2);
+      out->resolved_ord = (int64_t)sqlite3_column_int64(q, 3);
+      out->state = (kbc_anchor_state)sqlite3_column_int(q, 4);
+    } else if (step == SQLITE_DONE) {
+      st = kbc_err_set(err, KBC_ERR_NOTFOUND,
+                       "anchor for comment %s: never judged", comment_id);
+    } else {
+      st = sql_fail(err, s, "get anchor: step", step);
+    }
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  return st != KBC_OK ? st : fin;
+}
+
+/* The stale set, as a PAGE.
+ *
+ * `ORDER BY judged_at DESC, comment_id ASC LIMIT ?1` and the count-then-fetch
+ * shape are `kbc_store_list_corkboard`'s exactly, and for the same reason:
+ * this is the original's answer to "how many results does this page show"
+ * (sqlite.rs:2831 for the corkboard, the same `LIMIT n` over one ordered
+ * query here), and a page is a page. `LIMIT n` takes the n most RECENT
+ * verdicts, so a comment judged long ago is not among them, and its ABSENCE
+ * from this page is not evidence that it is resolved. Anything that needs
+ * one specific comment's verdict reads it by id.
+ *
+ * `doc_id` NULL is every document, which is the shape `GET /anchors/stale`
+ * wants and the shape a whole-kb dashboard wants. `stale_only` false asks
+ * for everything, which is the shape a caller reconciling its own cache
+ * wants; there is no third option, because "the resolved ones" is the
+ * complement of the same predicate and a second query would be a second
+ * place for the two to disagree. */
+kbc_status kbc_store_list_anchors(kbc_store *s, kbc_arena *a, const char *doc_id,
+                                  bool stale_only, size_t limit,
+                                  kbc_anchor_row **out, size_t *n_out,
+                                  kbc_err *err) {
+  if (s == NULL || a == NULL || out == NULL || n_out == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "list_anchors: null argument");
+  if (limit > KBC_MAX_HITS) limit = KBC_MAX_HITS;
+  *out = NULL;
+  *n_out = 0;
+  if (limit == 0) return KBC_OK;
+  if (doc_id != NULL && doc_id[0] == '\0')
+    return kbc_err_set(err, KBC_ERR_INVALID, "list_anchors: empty doc id");
+
+  /* ONE filter clause for both statements, and it is spelled out in full
+   * rather than composed from a `where` and an `and`: composing them puts
+   * `AND doc_id = ?1` after a table name whenever `stale_only` is false, and
+   * `FROM comment_anchors AND doc_id = ?1` is not a query. The two shapes
+   * below are the only two there are, and each is a literal so neither can
+   * be assembled wrongly. */
+  const char *filter;
+  if (stale_only && doc_id != NULL)
+    filter = " WHERE state <> 1 AND doc_id = ?1";
+  else if (stale_only)
+    filter = " WHERE state <> 1";
+  else if (doc_id != NULL)
+    filter = " WHERE doc_id = ?1";
+  else
+    filter = "";
+  const int limit_ord = doc_id != NULL ? 2 : 1;
+  char count_sql[128];
+  char list_sql[288];
+  (void)snprintf(count_sql, sizeof count_sql,
+                 "SELECT COUNT(*) FROM comment_anchors%s;", filter);
+  (void)snprintf(list_sql, sizeof list_sql,
+                 "SELECT comment_id, doc_id, anchor, resolves_to, resolved_ord,"
+                 " state FROM comment_anchors%s"
+                 " ORDER BY judged_at DESC, comment_id ASC LIMIT ?%d;",
+                 filter, limit_ord);
+
+  lock(s);
+  void *block = NULL;
+  size_t n = 0;
+  kbc_status st =
+      page_block(err, s, a, count_sql, doc_id, limit,
+                 sizeof(kbc_anchor_row), &block, &n);
+  sqlite3_stmt *q = NULL;
+  if (st == KBC_OK) st = prepare(err, s, list_sql, &q);
+  if (st == KBC_OK && doc_id != NULL) st = bind_text(err, s, q, 1, doc_id);
+  if (st == KBC_OK)
+    st = bind_i64(err, s, q, doc_id != NULL ? 2 : 1, (int64_t)n);
+  kbc_anchor_row *arr = block;
+  size_t i = 0;
+  while (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_DONE) break;
+    if (step != SQLITE_ROW) {
+      st = sql_fail(err, s, "list anchors: step", step);
+      break;
+    }
+    if (i >= n) {
+      st = kbc_err_set(err, KBC_ERR_INTERNAL, "list anchors: row overflow");
+      break;
+    }
+    arr[i].comment_id = col_str(a, q, 0);
+    arr[i].doc_id = col_str(a, q, 1);
+    arr[i].anchor = col_str(a, q, 2);
+    arr[i].resolves_to = col_str(a, q, 3);
+    arr[i].resolved_ord = (int64_t)sqlite3_column_int64(q, 4);
+    arr[i].state = (kbc_anchor_state)sqlite3_column_int(q, 5);
+    i++;
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  if (st != KBC_OK) return st != KBC_OK ? st : fin;
+  *out = arr;
+  *n_out = i;
+  return KBC_OK;
+}
+
+/* How big the stale set is, in one statement and no page. This is the shape
+ * a health check wants: it must not be able to answer "two" by looking at a
+ * page of two, so it counts and does not list. */
+int64_t kbc_store_count_stale_anchors(kbc_store *s, kbc_err *err) {
+  if (s == NULL) {
+    (void)kbc_err_set(err, KBC_ERR_INVALID, "count_stale_anchors: null store");
+    return -1;
+  }
+  lock(s);
+  int64_t n = 0;
+  kbc_status st = count_query(err, s,
+                              "SELECT COUNT(*) FROM comment_anchors"
+                              " WHERE state <> 1;",
+                              NULL, &n);
+  unlock(s);
+  return st == KBC_OK ? n : -1;
+}
+
+/* Drops every verdict that no longer has a live OPEN comment to describe.
+ *
+ * The foreign key already does this for a comment deleted through the store
+ * — `comment_anchors.comment_id REFERENCES comments(id) ON DELETE CASCADE`,
+ * and deleting the artifact cascades to the comment. This exists for the
+ * states the FK cannot reach, and both of them are documented elsewhere in
+ * this file rather than invented here: a writer with `foreign_keys` off (the
+ * header on the FK-checking block says any writer that was not this binary
+ * can orphan a row at any time), and a comment RESOLVED after its verdict was
+ * written, which the original prunes too — `anchors::prune_if_resolved`,
+ * anchors.rs:172-190, drops the key when a comment is resolved and does
+ * nothing on an un-resolve, because "reopening must not clear a flag the
+ * indexer still owns".
+ *
+ * So a resolved comment is dropped and an un-resolved one is not: the caller
+ * says which by asking for a prune or not asking for one. */
+kbc_status kbc_store_prune_anchors(kbc_store *s, int64_t *rows, kbc_err *err) {
+  if (s == NULL || rows == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "prune_anchors: null argument");
+  *rows = 0;
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  kbc_status st = prepare(
+      err, s,
+      "DELETE FROM comment_anchors WHERE comment_id NOT IN"
+      " (SELECT id FROM comments WHERE resolved = 0);",
+      &q);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "prune anchors", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  /* Read HERE, under the mutex, and for the reason prune_history gives: the
+   * counter is per-CONNECTION, so a statement another thread steps between
+   * the unlock and the read replaces the value this function is about to
+   * report with that thread's row count. */
+  if (st == KBC_OK) *rows = (int64_t)sqlite3_changes(s->db);
+  unlock(s);
+  if (st != KBC_OK) return st != KBC_OK ? st : fin;
+  return fin;
+}
+
+/* THE REBUILD FROM THE GRAPH, and the property the whole persist decision
+ * rests on: after this, every row in `comment_anchors` describes the graph
+ * that EXISTS.
+ *
+ * Two statements, in one transaction, and each has a reason that is not
+ * "tidiness":
+ *
+ *  1. INVALIDATE. A row whose `content_hash` is not the artifact's current
+ *     one is a verdict about bytes that are no longer this document's bytes.
+ *     It becomes UNDECIDABLE — not UNRESOLVED, because "the heading is gone"
+ *     is a claim about the document and we have not read the document — and
+ *     its remembered text is CLEARED, because a text belonging to the old
+ *     bytes is exactly what would let the next pass resolve it by following
+ *     a heading that no longer exists. This is the crash-between-passes
+ *     case: the pass judged a document, the document was re-indexed, and the
+ *     process died before the next pass. A two-state machine has nowhere to
+ *     put this verdict and so keeps asserting the old one, which is a claim
+ *     about a document that never existed in that state.
+ *
+ *     `artifacts` has no row for a vanished document, so the LEFT JOIN's
+ *     NULL invalidates those too — a verdict for a document that is not in
+ *     the store is a verdict for nothing.
+ *
+ *  2. DROP. The rows nothing can describe. The FK covers a comment deleted
+ *     through this store; this covers the rest, and the reason is the same
+ *     one the FK-checking header gives: the version table records what RAN,
+ *     not what is consistent, so a volume can be at the current version and
+ *     hold an orphan.
+ *
+ * IDEMPOTENT, and that is not a nicety: `kbc_store_open` calls this, so a
+ * fixed point here is what stops every daemon start from rewriting rows. The
+ * second run must report 0 for both halves — a rebuild that is not a fixed
+ * point is a rebuild that costs a write on every boot forever, and one that
+ * flips a row back and forth is worse than not shipping it.
+ *
+ * NOT under `foreign_keys = defer`: this is not part of a rekey, it is a
+ * repair, and the transaction is what makes the two halves visible together
+ * or not at all. */
+kbc_status kbc_store_reconcile_anchors(kbc_store *s, int64_t *rows,
+                                       kbc_err *err) {
+  if (s == NULL || rows == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "reconcile_anchors: null argument");
+  *rows = 0;
+  lock(s);
+  kbc_status st = exec_plain(err, s, "BEGIN IMMEDIATE;");
+  if (st != KBC_OK) {
+    unlock(s);
+    return st;
+  }
+  sqlite3_stmt *q = NULL;
+  int64_t touched = 0;
+  st = prepare(err, s,
+               "UPDATE comment_anchors SET state = 0, anchor_text = '',"
+               " resolves_to = '', resolved_ord = -1"
+               " WHERE state <> 0"
+               " AND content_hash IS NOT"
+               " (SELECT content_hash FROM artifacts WHERE id = doc_id);",
+               &q);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE)
+      st = sql_fail(err, s, "reconcile anchors: invalidate", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  if (st == KBC_OK) touched = (int64_t)sqlite3_changes(s->db);
+
+  if (st == KBC_OK)
+    st = exec_plain(err, s,
+                    "DELETE FROM comment_anchors WHERE comment_id NOT IN"
+                    " (SELECT id FROM comments WHERE resolved = 0);");
+  if (st == KBC_OK) {
+    /* Read on THIS connection immediately after the statement, the same
+     * reason prune_history reads sqlite3_changes where it does. */
+    touched += (int64_t)sqlite3_changes(s->db);
+  }
+
+  if (st == KBC_OK) st = exec_plain(err, s, "COMMIT;");
+  else rollback(s);
+  unlock(s);
+  if (st != KBC_OK) return st;
+  *rows = touched;
+  return KBC_OK;
+}
+
 /* ===================================================== stage 1: the rest ==
  *
  * The eight tables the Rust original keeps in sqlite beside its columnar
@@ -3593,11 +4436,23 @@ kbc_status kbc_store_prune_history(kbc_store *s, int64_t started_before_unix,
   if (s == NULL || rows == NULL)
     return kbc_err_set(err, KBC_ERR_INVALID, "prune_history: null argument");
   *rows = 0;
-  /* A cutoff before the epoch can match nothing that exists, and a wrapped
-   * one would match every row — the header says this prunes nothing, so the
-   * clamp is the behaviour and not a guard around it. The original's
-   * `saturating_sub` lands in the same place for the same reason. */
-  if (started_before_unix < 0) started_before_unix = 0;
+  /* A cutoff before the epoch prunes NOTHING, and the header says so in
+   * those words. The previous shape clamped the cutoff to 0 and then ran
+   * `started_at < 0`, which is a different predicate: `started_at` is a
+   * caller-supplied INTEGER with no lower bound anywhere on its write path
+   * (`kbc_store_add_history` validates the strings and binds the timestamps
+   * straight through), so a row at `started_at = -1` is writable and the
+   * clamp deleted it. The contract and the code disagreed, and the code was
+   * the one that destroyed rows.
+   *
+   * Returning early rather than substituting 0 is the fix: the dry run and
+   * the applied run now take the SAME branch, so the number a dry run
+   * reports is by construction the number --apply removes — including when
+   * both of them are zero. A cutoff of 0 is a real cutoff and still prunes
+   * every row before the epoch; it is a NEGATIVE cutoff that is the no-op.
+   * The original's `saturating_sub` lands in the same place for the same
+   * reason: there, `now - age` saturates at i64::MIN and matches nothing. */
+  if (started_before_unix < 0) return KBC_OK;
 
   /* One predicate for both modes, so the number a dry run reports is by
    * construction the number --apply removes. A dry run that could disagree

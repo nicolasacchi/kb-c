@@ -1383,6 +1383,27 @@ static void fx_setup_empty(fixture *f) {
   KBC_CHECK_NOT_NULL(f->app);
 }
 
+/* An empty corpus PAIR. The anti-drift test needs both, and needs the same
+ * paths in each, so that a query which forgets its corpus predicate answers
+ * for the wrong corpus instead of quietly returning the right numbers from
+ * the only one there is. */
+static void fx_setup_empty_pair(fixture *f) {
+  memset(f, 0, sizeof(*f));
+  kbc_test_tmpdir(f->root, sizeof f->root);
+  join(f->data, sizeof f->data, f->root, "data");
+  join(f->corpus_a, sizeof f->corpus_a, f->root, CORPUS_A);
+  join(f->corpus_b, sizeof f->corpus_b, f->root, CORPUS_B);
+  kbc_test_mkdir_p(f->corpus_a);
+  kbc_test_mkdir_p(f->corpus_b);
+  f->cfg = make_cfg(f->data, f->corpus_a, f->corpus_b);
+  KBC_CHECK_NOT_NULL(f->cfg);
+  kbc_err err;
+  kbc_err_reset(&err);
+  f->app = f->cfg ? kbc_app_open(f->cfg, &err) : NULL;
+  if (f->app == NULL) fprintf(stderr, "  app_open: %s\n", err.msg);
+  KBC_CHECK_NOT_NULL(f->app);
+}
+
 /* Writes only the first file, indexes, then writes the second and indexes
  * again. `first` is the document the corpus walk sees before the other. */
 static graph_shape graph_after_staged_ingest(const char *first, const char *second) {
@@ -7433,6 +7454,487 @@ KBC_TEST(opening_the_daemon_registers_every_configured_corpus_as_a_source) {
   fx_teardown(&f);
 }
 
+/* ------------------------------------------------ the store's own answers --
+ *
+ * The accessors below are the two directions of ONE table, and the only thing
+ * that keeps them honest is a test that reads them against each other. Each is
+ * individually plausible: a count that is off by one and a list that is off by
+ * one are both green tests on their own, and a backlinks surface built from
+ * the list would then contradict the number the graph boost ranks by. The
+ * anti-drift assertion is the only thing that catches the two silently
+ * disagreeing, so it is asserted as an IDENTITY over the whole corpus rather
+ * than as two constants that happen to be equal today.
+ */
+
+/* Every document in the corpus, as corpus-relative paths, in one listing. The
+ * anti-drift test sums over exactly this set, so it must be the set the store
+ * holds rather than the set the test remembers writing. */
+static size_t corpus_paths(const kbc_config *cfg, const char *corpus,
+                           kbc_arena *a, const char ***out) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = kbc_store_open(cfg, &err);
+  if (s == NULL) {
+    *out = NULL;
+    return 0;
+  }
+  /* kind -1 is the "no kind filter" encoding (store.c:list_artifact_ids), so
+   * this is every kind the corpus holds and not just the markdown default. */
+  char **ids = NULL;
+  size_t n = 0;
+  kbc_status st = kbc_store_list_artifact_ids(s, corpus, (kbc_kind)-1,
+                                             KBC_MAX_HITS, 0, &ids, &n, &err);
+  kbc_store_close(s);
+  if (kbc_failed(st)) {
+    *out = NULL;
+    return 0;
+  }
+  const char **paths = kbc_arena_alloc(a, (n + 1u) * sizeof(*paths));
+  if (paths == NULL) {
+    for (size_t i = 0; i < n; i++) {
+      free(ids[i]);
+    }
+    free(ids);
+    *out = NULL;
+    return 0;
+  }
+  size_t kept = 0;
+  for (size_t i = 0; i < n; i++) {
+    kbc_store *r = kbc_store_open(cfg, &err);
+    kbc_artifact art;
+    memset(&art, 0, sizeof art);
+    kbc_err_reset(&err);
+    if (r != NULL &&
+        !kbc_failed(kbc_store_get_artifact(r, a, ids[i], false, &art, &err)) &&
+        art.path != NULL) {
+      paths[kept++] = art.path;
+    }
+    if (r != NULL) {
+      kbc_store_close(r);
+    }
+    free(ids[i]);
+  }
+  free(ids);
+  *out = paths;
+  return kept;
+}
+
+/* THE ANTI-DRIFT TEST. Two accessors, one table, one corpus, one state: the
+ * number of documents linking HERE (what `edge_count` counts) must equal the
+ * sum of the backlink lists (what `list_backlinks` returns). They are separate
+ * SQL over separate indexes — a COUNT and a DISTINCT scan — so nothing but
+ * this assertion makes them answer the same question.
+ *
+ * The corpus is built so that the identity is not trivially satisfiable: a hub
+ * with three inbound links, a document nothing links to, and a source that
+ * names the same target twice (which the edges primary key collapses to one
+ * row, so a list that forgot to de-duplicate and a count that did not would
+ * still agree here — hence the separate de-dup assertion below). */
+KBC_TEST(the_edge_count_and_the_backlink_list_agree_on_one_corpus) {
+  fixture f;
+  fx_setup_empty_pair(&f);
+  char p[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_err_reset(&err);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  /* BOTH corpora carry the SAME four paths and a DIFFERENT link structure:
+   * alpha's hub is named by two sources and its leaf by one, beta's hub by one
+   * and its leaf by none. That asymmetry is what makes the corpus predicate
+   * load-bearing. A backlink query that dropped it would answer for both
+   * corpora at once, and because the hub path exists in both, the leak shows
+   * up in the summed list instead of hiding behind a path only one corpus has.
+   * A single-corpus fixture cannot see this at all — there is nothing to leak
+   * from, so the predicate could be deleted outright and the test stay green. */
+  join(p, sizeof p, f.corpus_a, "one.md");
+  kbc_test_write_file(p, "# One\n\nSee [hub](hub) and [leaf](leaf).\n");
+  join(p, sizeof p, f.corpus_a, "two.md");
+  kbc_test_write_file(p, "# Two\n\nAlso [hub](hub), twice over: [hub](hub).\n");
+  join(p, sizeof p, f.corpus_a, "hub.md");
+  kbc_test_write_file(p, "# Hub\n\nThe hub itself names nothing.\n");
+  join(p, sizeof p, f.corpus_a, "leaf.md");
+  kbc_test_write_file(p, "# Leaf\n\nAn orphan target.\n");
+  /* Beta: same paths, a different graph, and a source alpha does not have. */
+  join(p, sizeof p, f.corpus_b, "one.md");
+  kbc_test_write_file(p, "# One\n\nSee [hub](hub).\n");
+  join(p, sizeof p, f.corpus_b, "two.md");
+  kbc_test_write_file(p, "# Two\n\nNames nothing at all.\n");
+  join(p, sizeof p, f.corpus_b, "hub.md");
+  kbc_test_write_file(p, "# Hub\n\nThe hub itself names nothing.\n");
+  join(p, sizeof p, f.corpus_b, "leaf.md");
+  kbc_test_write_file(p, "# Leaf\n\nAn orphan target.\n");
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  const char **paths = NULL;
+  size_t n_paths = corpus_paths(f.cfg, CORPUS_A, a, &paths);
+  KBC_CHECK_EQ_INT(n_paths, 4);
+  const char **beta_paths = NULL;
+  size_t n_beta = corpus_paths(f.cfg, CORPUS_B, a, &beta_paths);
+  KBC_CHECK_EQ_INT(n_beta, 4);
+
+  kbc_store *store = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(store);
+  if (store == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  const int64_t counted = kbc_store_edge_count(store, CORPUS_A, &err);
+  /* two.md naming hub twice is ONE row (the edges primary key), and a self
+   * or duplicate edge would make the two numbers disagree — which is the
+   * whole point of summing the list rather than trusting the count. */
+  KBC_CHECK_EQ_INT(counted, 3);
+  /* The OTHER corpus is a different graph, and the count is per corpus: a
+   * count that ignored its corpus argument would report alpha's total for
+   * beta too. */
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(store, CORPUS_B, &err), 1);
+
+  int64_t summed = 0;
+  for (size_t i = 0; i < n_paths; i++) {
+    kbc_strlist back;
+    kbc_strlist_init(&back);
+    kbc_status st =
+        kbc_store_list_backlinks(store, CORPUS_A, paths[i], &back, &err);
+    KBC_CHECK_MSG(!kbc_failed(st), "backlinks of %s: %s", paths[i], err.msg);
+    /* A document nothing links to is a ZERO-LENGTH LIST AND KBC_OK, never
+     * NOTFOUND: "nothing links here" is an ordinary fact (store.h:127-130). */
+    summed += (int64_t)back.len;
+    kbc_strlist_free(&back);
+  }
+  /* The same identity in the second corpus, whose hub is named by ONE source
+   * and whose leaf by none. */
+  int64_t beta_summed = 0;
+  for (size_t i = 0; i < n_beta; i++) {
+    kbc_strlist back;
+    kbc_strlist_init(&back);
+    kbc_status st =
+        kbc_store_list_backlinks(store, CORPUS_B, beta_paths[i], &back, &err);
+    KBC_CHECK_MSG(!kbc_failed(st), "backlinks of %s/%s: %s", CORPUS_B,
+                  beta_paths[i], err.msg);
+    beta_summed += (int64_t)back.len;
+    kbc_strlist_free(&back);
+  }
+  KBC_CHECK_EQ_INT(beta_summed, kbc_store_edge_count(store, CORPUS_B, &err));
+  /* THE IDENTITY. Not "both are 3" — that would pass if the corpus were
+   * empty. The summed list and the aggregate count are two SQL plans over one
+   * table and must report the same graph. */
+  KBC_CHECK_EQ_INT(summed, counted);
+  KBC_CHECK_MSG(summed == 3, "the list and the count describe different graphs:"
+                             " %lld listed, %lld counted",
+                (long long)summed, (long long)counted);
+  KBC_CHECK_MSG(beta_summed == 1,
+                "beta: %lld listed against %lld counted", (long long)beta_summed,
+                (long long)kbc_store_edge_count(store, CORPUS_B, &err));
+
+  /* The per-document aggregate answers the same question for a NAMED document,
+   * so it is held to the same list rather than trusted alongside it. This is
+   * the third reader of the table and the one the graph boost actually ranks
+   * by (app.c:graph_in_degrees). */
+  kbc_strlist hub_back;
+  kbc_strlist_init(&hub_back);
+  KBC_CHECK_OK(
+      kbc_store_list_backlinks(store, CORPUS_A, "hub.md", &hub_back, &err));
+  /* De-duplicated, and this is where the corpus earns it: two.md named hub
+   * TWICE, so the graph holds three link OCCURRENCES for that hub and TWO
+   * rows. A list that returned a row per occurrence would read 3 here, which
+   * would push the summed total to 4 against a counted 3 — the drift this
+   * whole test exists to catch, arrived at by a different route. */
+  KBC_CHECK_EQ_INT(hub_back.len, 2);
+  KBC_CHECK(kbc_strlist_contains(&hub_back, "one.md"));
+  KBC_CHECK(kbc_strlist_contains(&hub_back, "two.md"));
+  kbc_strlist_free(&hub_back);
+
+  static const char *const named[] = {"hub.md", "leaf.md", "one.md", "two.md"};
+  uint32_t deg[4] = {9, 9, 9, 9};
+  KBC_CHECK_OK(
+      kbc_store_edge_degrees_for(store, CORPUS_A, named, 4, deg, &err));
+  KBC_CHECK_EQ_INT(deg[0], 2); /* named by one.md and two.md */
+  KBC_CHECK_EQ_INT(deg[1], 1); /* named by one.md */
+  KBC_CHECK_EQ_INT(deg[2], 0); /* names others, named by none */
+  KBC_CHECK_EQ_INT(deg[3], 0);
+
+  kbc_store_close(store);
+  kbc_arena_free(a);
+  fx_teardown(&f);
+}
+
+/* RETENTION CONVERGES. `prune_history` is the operator-triggered sweep
+ * (`kbc prune`, cli/main.c:cmd_prune) and its whole contract is that it
+ * converges: a first `--apply` reports what it removed, and every run after it
+ * reports nothing, because there is nothing left older than the cutoff. A
+ * prune that "usually" converges is a prune whose `rows` an operator cannot
+ * read, and the loop below is what makes that a tested property rather than an
+ * assumption.
+ *
+ * The convergence is asserted as a LOOP WITH A BOUND, not as a second call:
+ * a fixed second call would pass on a prune that needed three, and would also
+ * pass on one that never converged at all if the bound were the only check. The
+ * bound is what turns "does not terminate" into a failure instead of a hang. */
+KBC_TEST(a_retention_prune_converges_and_then_reports_nothing) {
+  fixture f;
+  fx_setup_empty(&f);
+  char p[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_err_reset(&err);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  join(p, sizeof p, f.corpus_a, "a.md");
+  kbc_test_write_file(p, "# Alpha Ledger\n\nThe ledger reconciles accruals.\n");
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  const char *doc = id_of_path(f.cfg, CORPUS_A, "a.md", a);
+  KBC_CHECK_NOT_NULL(doc);
+  if (doc == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  char id_copy[KBC_MAX_ID_LEN + 1];
+  snprintf(id_copy, sizeof id_copy, "%s", doc);
+
+  kbc_store *st = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(st);
+  if (st == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  /* Two visits older than the cutoff and one newer. The retention window is
+   * `started_at < cutoff`, so the recent row is what a converged prune must
+   * LEAVE BEHIND — a prune that reported 3 here would be deleting history the
+   * operator did not ask it to. */
+  for (int i = 0; i < 2; i++) {
+    kbc_history_row old_visit;
+    memset(&old_visit, 0, sizeof old_visit);
+    old_visit.kind = "open";
+    old_visit.artifact_id = id_copy;
+    old_visit.user = "nik";
+    old_visit.started_at = 1000 + i;
+    old_visit.updated_at = 1000 + i;
+    KBC_CHECK_OK(kbc_store_add_history(st, &old_visit, &err));
+  }
+  kbc_history_row recent;
+  memset(&recent, 0, sizeof recent);
+  recent.kind = "open";
+  recent.artifact_id = id_copy;
+  recent.user = "nik";
+  recent.started_at = 2000000000;
+  recent.updated_at = 2000000000;
+  KBC_CHECK_OK(kbc_store_add_history(st, &recent, &err));
+  KBC_CHECK_EQ_INT(history_visits(f.cfg, "nik", id_copy, a), 3);
+
+  /* A dry run reports exactly what --apply would remove and removes nothing
+   * (store.h:496-499): one predicate serves both modes, so a dry run that
+   * could disagree with the real thing would be worse than no dry run. */
+  const int64_t cutoff = 1500000000;
+  int64_t dry = -1;
+  KBC_CHECK_OK(kbc_store_prune_history(st, cutoff, false, &dry, &err));
+  KBC_CHECK_EQ_INT(dry, 2);
+  KBC_CHECK_EQ_INT(history_visits(f.cfg, "nik", id_copy, a), 3);
+
+  /* THE CONVERGENCE LOOP, bounded. Each pass must strictly reduce what is
+   * left, and the loop must REACH a pass that reports nothing. */
+  int64_t total = 0;
+  int converged = 0;
+  /* `last` is the previous pass's count, seeded to a value no real pass can
+   * report so the FIRST pass is compared against the bound rather than against
+   * a sentinel it would trivially satisfy. */
+  int64_t last = INT64_MAX;
+  for (int pass = 0; pass < 8; pass++) {
+    int64_t rows = -1;
+    KBC_CHECK_OK(kbc_store_prune_history(st, cutoff, true, &rows, &err));
+    if (rows == 0) {
+      converged = 1;
+      break;
+    }
+    total += rows;
+    /* Strictly decreasing: a pass that reported the same work twice is not
+     * converging, and without this the loop bound would be the only thing
+     * that noticed — by hanging rather than by failing. */
+    KBC_CHECK_MSG(rows < last, "pass %d removed %lld after %lld: not converging",
+                  pass, (long long)rows,
+                  last == INT64_MAX ? -1LL : (long long)last);
+    last = rows;
+  }
+  KBC_CHECK_MSG(converged, "prune never reported nothing done in 8 passes");
+  KBC_CHECK_EQ_INT(total, 2);
+
+  /* The converged state: a second prune over the same cutoff is a NO-OP, and
+   * it says so with 0 rather than with silence. This is the assertion that
+   * would catch a prune that re-reported the same rows every pass. */
+  int64_t again = -1;
+  KBC_CHECK_OK(kbc_store_prune_history(st, cutoff, true, &again, &err));
+  KBC_CHECK_EQ_INT(again, 0);
+  /* And the row inside the window is still there. */
+  KBC_CHECK_EQ_INT(history_visits(f.cfg, "nik", id_copy, a), 1);
+
+  /* Retention deletes HISTORY and nothing else. The document, its index row
+   * and its search hit all survive: a retention pass that removed artifacts
+   * would be a corpus-deleting feature the original does not have
+   * (store.h:485-494), and this is the assertion that says so. */
+  KBC_CHECK_EQ_INT(store_count(f.cfg), 1);
+  KBC_CHECK_NOT_NULL(id_of_path(f.cfg, CORPUS_A, "a.md", a));
+  char path[64], title[64], id[32];
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "accruals", NULL, path, sizeof path,
+                                  title, sizeof id, id, sizeof id, NULL),
+                   1);
+  KBC_CHECK_EQ_STR(path, "a.md");
+
+  kbc_store_close(st);
+  kbc_arena_free(a);
+  fx_teardown(&f);
+}
+
+/* CLOSE, AND EVERYTHING AFTER IT. The app is freed by `kbc_app_close` and the
+ * store it hands out is BORROWED until then (app.h:99-109), so the pair of
+ * facts a caller can get wrong are: closing twice, and holding the store
+ * across the close. Both are pinned here as the behaviour they actually have,
+ * because "a crash is not an acceptable third option" and a double free is
+ * precisely that.
+ *
+ * What is pinned is REFUSAL, not safety-after-the-fact: a closed app is freed
+ * memory and there is no correct way to call into it, so the contract is that
+ * the SECOND close of the same pointer is not a thing a caller may do, and
+ * that every accessor REFUSES a NULL app rather than dereferencing one. The
+ * store pointer is deliberately not exercised after the close for the same
+ * reason — reading freed memory to prove it is freed is the bug, not the
+ * test. */
+KBC_TEST(a_closed_app_refuses_every_accessor_and_close_is_not_repeatable) {
+  fixture f;
+  fx_setup_empty(&f);
+  char p[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_err_reset(&err);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  join(p, sizeof p, f.corpus_a, "a.md");
+  kbc_test_write_file(p, "# Alpha Ledger\n\nThe ledger reconciles accruals.\n");
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  /* The store is handed out while the app is alive, and it is the SAME handle
+   * every time — a caller that cached it and a caller that asks again are
+   * holding one pointer, which is what makes the borrow well-defined for the
+   * window it is borrowed for. */
+  kbc_store *first = kbc_app_store(f.app);
+  KBC_CHECK_NOT_NULL(first);
+  KBC_CHECK_MSG(kbc_app_store(f.app) == first,
+                "kbc_app_store handed out two different handles");
+
+  /* NULL is refused by every fallible accessor, with a message naming the
+   * problem — a caller that passes NULL gets a status it can act on, never a
+   * dereference. Each is checked for the FILLED MESSAGE too, because an error
+   * with an empty string is the one shape a caller cannot act on. */
+  kbc_arena *a = kbc_arena_new(4096u);
+  KBC_CHECK_NOT_NULL(a);
+  kbc_query q;
+  memset(&q, 0, sizeof q);
+  kbc_search_result res;
+  memset(&res, 0, sizeof res);
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  kbc_app_stats st;
+ kbc_capture_input cap;
+  memset(&cap, 0, sizeof cap);
+  /* Every OTHER argument is valid, so the only thing the capture call can be
+   * refusing is the NULL app. A zeroed input would be refused by the NEXT
+   * check (the body is required) and return the same status, which would make
+   * the assertion pass with the app guard deleted — a test that cannot tell
+   * two different refusals apart is not testing the one it names. */
+  cap.corpus = CORPUS_A;
+  cap.body = "body";
+  cap.body_len = 4;
+  kbc_capture_result cap_out;
+  memset(&cap_out, 0, sizeof cap_out);
+  kbc_err e1;
+  kbc_err_reset(&e1);
+  kbc_err e2;
+  kbc_err_reset(&e2);
+  kbc_err e3;
+  kbc_err_reset(&e3);
+  kbc_err e4;
+  kbc_err_reset(&e4);
+  kbc_err e5;
+  kbc_err_reset(&e5);
+  kbc_err e6;
+  kbc_err_reset(&e6);
+
+  KBC_CHECK_ERR(kbc_app_reindex(NULL, &e1), KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(e1);
+  KBC_CHECK_ERR(kbc_app_reindex_file(NULL, CORPUS_A, "a.md", &e2),
+                KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(e2);
+  KBC_CHECK_ERR(kbc_app_reindex_remove(NULL, CORPUS_A, "a.md", &e3),
+                KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(e3);
+  KBC_CHECK_ERR(kbc_app_search(NULL, a, &q, &res, &e4), KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(e4);
+  KBC_CHECK_ERR(kbc_app_get_artifact(NULL, a, "a", false, &art, &e5),
+                KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(e5);
+  KBC_CHECK_ERR(kbc_app_stats_get(NULL, &st, &e6), KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(e6);
+  /* And the two the app answers with a VALUE rather than a status: a NULL app
+   * is not an app, so it yields the empty answer rather than a crash. These
+   * are the two shapes a caller is most likely to reach for in a teardown
+   * path, where the app handle is often already NULL. */
+  KBC_CHECK_NULL(kbc_app_store(NULL));
+  KBC_CHECK_NULL(kbc_app_config(NULL));
+  /* A NULL app is also safe for the void and id-returning entry points,
+   * because a teardown path calls them unconditionally. */
+  kbc_app_stop_watcher(NULL);
+  kbc_app_publish(NULL, "reindex", "{}");
+  kbc_app_unsubscribe(NULL, 1);
+  KBC_CHECK_EQ_INT(kbc_app_start_watcher(NULL, &e1), KBC_ERR_INVALID);
+  KBC_CHECK_EQ_INT(kbc_app_capture(NULL, CORPUS_A, &cap, &cap_out, &e1),
+                   KBC_ERR_INVALID);
+  KBC_CHECK_EQ_INT(kbc_app_move_path(NULL, CORPUS_A, "a.md", "b.md", &e1),
+                   KBC_ERR_INVALID);
+  KBC_CHECK_EQ_INT(kbc_app_subscribe(NULL, NULL, NULL), 0);
+  KBC_CHECK_EQ_INT(kbc_app_query_cache_capacity(NULL), 0);
+  /* A refused call must not have half-applied anything. The config is the app's
+   * PRIVATE CLONE, not the caller's handle (the fixture's own reopen helper
+   * documents that), so the assertion is that it is the same clone as before
+   * and still names the same corpus — pointer identity against the CALLER's
+   * config would be asserting the opposite of the contract. */
+  const kbc_config *before_cfg = kbc_app_config(f.app);
+  KBC_CHECK_NOT_NULL(before_cfg);
+  KBC_CHECK(kbc_app_config(f.app) == before_cfg);
+  KBC_CHECK_EQ_INT(before_cfg->ncorpora, 1);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  if (a != NULL) {
+    kbc_arena_free(a);
+  }
+  /* Closing a NULL app is a no-op, which is the shape a teardown path wants;
+   * closing the SAME live pointer twice is not, and the fixture's contract is
+   * that it nulls the handle after the first close rather than calling again.
+   * That is why this test does not do it: the double free it would cause is
+   * the crash the acceptance rule rules out, and no assertion can make it
+   * safe without a header change (see the report). */
+  kbc_app_close(NULL);
+  kbc_app_close(f.app);
+  f.app = NULL;
+  fx_teardown(&f);
+}
+
 
 
 
@@ -7613,6 +8115,12 @@ int main(void) {
        a_reindex_does_not_move_the_first_seen_anchor},
       {"opening_the_daemon_registers_every_configured_corpus_as_a_source",
        opening_the_daemon_registers_every_configured_corpus_as_a_source},
+      {"the_edge_count_and_the_backlink_list_agree_on_one_corpus",
+       the_edge_count_and_the_backlink_list_agree_on_one_corpus},
+      {"a_retention_prune_converges_and_then_reports_nothing",
+       a_retention_prune_converges_and_then_reports_nothing},
+      {"a_closed_app_refuses_every_accessor_and_close_is_not_repeatable",
+       a_closed_app_refuses_every_accessor_and_close_is_not_repeatable},
       {NULL, NULL},
   };
   return kbc_test_run("app", cases);

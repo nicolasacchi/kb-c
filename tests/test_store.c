@@ -15,7 +15,7 @@
  * migration that bumps it has to be a deliberate edit in both places: a
  * binary that migrates past what its tests know about is the failure this
  * pin exists to make loud. */
-#define CURRENT_SCHEMA 12
+#define CURRENT_SCHEMA 13
 
 /* include/kbc/store.h is the orchestrator's file; the pending-links contract
  * is proposed there and these are the signatures it will carry. */
@@ -44,6 +44,14 @@ kbc_status kbc_store_docs_with_meta(kbc_store *s, const char *corpus,
                                     char ***paths_out, size_t *n_out,
                                     kbc_err *err);
 
+/* The anchor-state contract now lives in include/kbc/store.h. It used to be
+ * mirrored here, because that header was the orchestrator's file and this
+ * assignment could not edit it — and a hand-copied mirror of a frozen
+ * contract is the drift a frozen header exists to prevent, not the mitigation
+ * for it. The round-trip test that guarded the mirror
+ * (`anchor_states_are_three_and_only_three`) STAYS: it was never a mirror
+ * guard, it is the assertion that all three states are reachable and
+ * distinguishable, which is worth having whether or not anything is mirrored. */
 /* ------------------------------------------------------------- helpers --- */
 
 /* kbc_store_open reads exactly one field of the config — db_path — so the
@@ -5309,6 +5317,947 @@ KBC_TEST(a_rekey_of_an_id_this_store_does_not_hold_touches_no_path) {
   kbc_test_rmrf(root);
 }
 
+/* --------------------------------------- history retention and anchors --
+ *
+ * Two things are under test and they are not the same thing.
+ *
+ * RETENTION is a fixed-point property: prune, and the second prune removes
+ * nothing. That is only interesting if the first one is allowed to remove
+ * something, and only trustworthy if it cannot remove more than it says.
+ *
+ * ANCHORS are a three-state machine, and the third state is the whole
+ * subject. `anchor_states_are_three_and_only_three` asserts that all three
+ * are REACHABLE and that each is distinguishable from the other two; the two
+ * obvious states are a rounding error next to that, and a machine that only
+ * ever produces RESOLVED and UNRESOLVED passes every other test here.
+ */
+
+/* Adds `n` comments on one document and hands back their ids in the order
+ * `kbc_store_list_comments` returns them (created_at DESC, id DESC), which
+ * is the only order a caller can name an anchor by. The ids are minted, so
+ * the store is the only place they can come from. */
+static char (*comment_ids_for(kbc_store *s, kbc_arena *a, const char *doc_id,
+                              const char *const *anchors, size_t n,
+                              kbc_err *err))[KBC_MAX_ID_LEN + 1] {
+  for (size_t i = 0; i < n; i++) {
+    if (kbc_failed(kbc_store_add_comment(s, doc_id, anchors[i], "you",
+                                         "a remark", err)))
+      return NULL;
+  }
+  kbc_comment *cs = NULL;
+  size_t got = 0;
+  if (kbc_failed(kbc_store_list_comments(s, a, doc_id, KBC_MAX_HITS, &cs, &got,
+                                         err)))
+    return NULL;
+  if (got != n) {
+    (void)kbc_err_set(err, KBC_ERR_INTERNAL, "comment_ids_for: %zu of %zu",
+                      got, n);
+    return NULL;
+  }
+  char(*ids)[KBC_MAX_ID_LEN + 1] = kbc_arena_calloc(a, n, KBC_MAX_ID_LEN + 1);
+  if (ids == NULL) {
+    (void)kbc_err_set(err, KBC_ERR_NOMEM, "comment_ids_for: %zu ids", n);
+    return NULL;
+  }
+  /* Indexed by the CLAIM, not by the order the store happens to list in:
+   * `kbc_store_list_comments` is newest-first and the ids are minted from
+   * /dev/urandom, so a positional read would tie each assertion to an order
+   * nothing guarantees. Matching on the anchor text is the only stable join
+   * between "the comment I asked for" and "the row the store holds". */
+  for (size_t i = 0; i < n; i++) {
+    bool found = false;
+    for (size_t j = 0; j < got; j++) {
+      if (strcmp(cs[j].anchor, anchors[i]) != 0) continue;
+      size_t len = strlen(cs[j].id);
+      if (len > KBC_MAX_ID_LEN) len = KBC_MAX_ID_LEN;
+      memcpy(ids[i], cs[j].id, len);
+      ids[i][len] = '\0';
+      found = true;
+      break;
+    }
+    if (!found) {
+      (void)kbc_err_set(err, KBC_ERR_INTERNAL, "comment_ids_for: no row for %s",
+                        anchors[i]);
+      return NULL;
+    }
+  }
+  return ids;
+}
+
+/* One document, three comments, three anchors, and the three verdicts they
+ * must get. The three anchors are named for what they are:
+ *
+ *   "install"  — a heading the document still has, so RESOLVED.
+ *   "retired"  — a heading the document has not got, so UNRESOLVED.
+ *   "unread"   — settled by the caller saying the document is not judgeable,
+ *                which is the state a two-state machine has no way to hold.
+ *
+ * The third case is the one this whole section is about, so it is asserted
+ * FIRST in the run below and separately: a machine that answers "unresolved"
+ * for a document it could not read has told a user their comment is broken
+ * when the truth is that nobody looked. */
+KBC_TEST(anchor_states_are_three_and_only_three) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "states.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(8192);
+  kbc_artifact art;
+  fill(&art, "bbbbbbbbbbbb", "kb", "a.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &art, &err));
+
+  const char *claims[] = {"install", "retired", "unread"};
+  char(*ids)[KBC_MAX_ID_LEN + 1] =
+      comment_ids_for(s, a, art.id, claims, 3, &err);
+  KBC_CHECK_NOT_NULL(ids);
+  if (ids == NULL) {
+    kbc_arena_free(a);
+    kbc_store_close(s);
+    kbc_test_rmrf(root);
+    return;
+  }
+
+  /* A first pass with nothing judgeable: every comment lands in the state
+ * that says "nobody has an opinion", and all three verdicts are reachable
+ * from that one call. */
+  const kbc_anchor_heading none[1] = {{"", ""}};
+  kbc_anchor_judgement *js = NULL;
+  size_t nj = 0;
+  KBC_CHECK_OK(
+      kbc_store_judge_anchors(s, art.id, none, 1, false, a, &js, &nj, &err));
+  KBC_CHECK_EQ_INT(nj, 3);
+  KBC_CHECK_EQ_INT(kbc_store_count_stale_anchors(s, &err), 3);
+
+  /* Now the document is readable. "install" is there and "retired" is not;
+ * "unread" was never a heading and never will be, so it stays a clean
+ * negative rather than an excuse. */
+  const kbc_anchor_heading heads[] = {
+      {"intro", "Introduction"},
+      {"install", "Install"},
+  };
+  js = NULL;
+  nj = 0;
+  KBC_CHECK_OK(
+      kbc_store_judge_anchors(s, art.id, heads, 2, true, a, &js, &nj, &err));
+  KBC_CHECK_EQ_INT(nj, 3);
+
+  kbc_anchor_row row;
+  KBC_CHECK_OK(kbc_store_get_anchor(s, a, ids[0], &row, &err));
+  KBC_CHECK_EQ_INT(row.state, KBC_ANCHOR_RESOLVED);
+  KBC_CHECK_EQ_INT(row.resolved_ord, 1);
+  KBC_CHECK_EQ_STR(row.resolves_to, "install");
+  /* The USER'S CLAIM IS NEVER REWRITTEN. `install` is both the claim and
+ * where it resolves here, so a store that quietly rewrote the anchor would
+ * be indistinguishable in this case — which is exactly why the follow test
+ * below exists. */
+  KBC_CHECK_EQ_STR(row.anchor, "install");
+
+  KBC_CHECK_OK(kbc_store_get_anchor(s, a, ids[1], &row, &err));
+  KBC_CHECK_EQ_INT(row.state, KBC_ANCHOR_UNRESOLVED);
+  KBC_CHECK_EQ_INT(row.resolved_ord, -1);
+  KBC_CHECK_EQ_STR(row.resolves_to, "");
+
+  KBC_CHECK_OK(kbc_store_get_anchor(s, a, ids[2], &row, &err));
+  KBC_CHECK_EQ_INT(row.state, KBC_ANCHOR_UNRESOLVED);
+
+  /* One of the three is resolved, so the stale set holds TWO — and the two
+   * are of different kinds. `retired` was resolved-then-broken (it was in the
+   * set after the unjudgeable pass and stayed there), and `unread` entered
+   * the set for the first time on this pass, because a document that can now
+   * be read can now say that its heading is not there. Neither is the
+   * UNDECIDABLE state: there is none left, and a machine that could not tell
+   * those two apart from it would have no way to report that anything
+   * changed. */
+  KBC_CHECK_EQ_INT(kbc_store_count_stale_anchors(s, &err), 2);
+
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* The document will not parse. Every comment on it must read UNDECIDABLE,
+ * and NOT UNRESOLVED.
+ *
+ * This is the assertion a two-state machine fails, and it fails in the
+ * direction that costs a user something: reporting UNRESOLVED says "the
+ * heading your comment is on is gone", which is a false statement about a
+ * document nobody managed to read, and it is the input to a stale badge and
+ * to a `comment.anchor_stale` event the subscriber will act on. */
+KBC_TEST(a_document_that_will_not_parse_leaves_every_anchor_undecidable) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "unparse.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(8192);
+  kbc_artifact art;
+  fill(&art, "bbbbbbbbbbbb", "kb", "a.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &art, &err));
+
+  /* The headings are all still there. The caller simply could not read the
+   * document, which is a different fact and gets a different answer. */
+  const kbc_anchor_heading heads[] = {
+      {"intro", "Introduction"},
+      {"install", "Install"},
+  };
+  const char *claims[] = {"intro", "install"};
+  char(*ids)[KBC_MAX_ID_LEN + 1] =
+      comment_ids_for(s, a, art.id, claims, 2, &err);
+  KBC_CHECK_NOT_NULL(ids);
+  if (ids == NULL) {
+    kbc_arena_free(a);
+    kbc_store_close(s);
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_anchor_judgement *js = NULL;
+  size_t nj = 0;
+  KBC_CHECK_OK(
+      kbc_store_judge_anchors(s, art.id, heads, 2, false, a, &js, &nj, &err));
+  KBC_CHECK_EQ_INT(nj, 2);
+  for (size_t i = 0; i < 2; i++) {
+    kbc_anchor_row row;
+    KBC_CHECK_OK(kbc_store_get_anchor(s, a, ids[i], &row, &err));
+    KBC_CHECK_EQ_INT(row.state, KBC_ANCHOR_UNDECIDABLE);
+    /* An undecidable anchor points at NOTHING. Leaving a `resolves_to`
+     * behind would be a reader's cue to jump to a heading the store just
+     * said it could not vouch for. */
+    KBC_CHECK_EQ_INT(row.resolved_ord, -1);
+    KBC_CHECK_EQ_STR(row.resolves_to, "");
+  }
+  /* Both are in the stale set: a subscriber needs to be told about an
+   * undecidable anchor at least as much as about a broken one. */
+  KBC_CHECK_EQ_INT(kbc_store_count_stale_anchors(s, &err), 2);
+
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* A HEADING THAT MOVES. The comment follows it, and the follow is visible.
+ *
+ * The anchor here is an EXPLICIT element id, which is the only kind of anchor
+ * that can move in kb-c. A heading's slug is a pure function of the heading's
+ * text (src/parse.c, `p_flush`: `slug_into(p->a, text, ...)`), so a renamed
+ * heading gets a new slug and there is no identity left to follow it by — the
+ * case two tests down says so out loud rather than pretending otherwise. An
+ * explicit `{#install}` keeps its id when the block it is on moves, which is
+ * the situation a reader means by "my comment's section moved down the page".
+ *
+ * "Configuration" is inserted above, so the block that WAS at ord 1 is at
+ * ord 2. The comment follows it there, and `comments.anchor` is left exactly
+ * as the user wrote it — the store records where the claim now resolves and
+ * never edits the claim. */
+KBC_TEST(a_moved_heading_takes_its_comment_with_it) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "moved.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(8192);
+  kbc_artifact art;
+  fill(&art, "bbbbbbbbbbbb", "kb", "a.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &art, &err));
+
+  const kbc_anchor_heading before[] = {
+      {"intro", "Introduction"},
+      {"install", "Install"},
+  };
+  const char *claims[] = {"install"};
+  char(*ids)[KBC_MAX_ID_LEN + 1] =
+      comment_ids_for(s, a, art.id, claims, 1, &err);
+  KBC_CHECK_NOT_NULL(ids);
+  if (ids == NULL) {
+    kbc_arena_free(a);
+    kbc_store_close(s);
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_anchor_judgement *js = NULL;
+  size_t nj = 0;
+  KBC_CHECK_OK(
+      kbc_store_judge_anchors(s, art.id, before, 2, true, a, &js, &nj, &err));
+  KBC_CHECK_EQ_INT(nj, 1);
+  KBC_CHECK_EQ_INT(js[0].state, KBC_ANCHOR_RESOLVED);
+  KBC_CHECK_EQ_INT(js[0].ord, 1);
+  /* First observation of a healthy anchor is not a transition into the set:
+   * the set is a memory of the PREVIOUS pass, and there was none. */
+  KBC_CHECK_MSG(!js[0].transitioned,
+                "a first resolution must not fire a stale event");
+
+  const kbc_anchor_heading after[] = {
+      {"intro", "Introduction"},
+      {"configuration", "Configuration"},
+      {"install", "Install"},
+  };
+  js = NULL;
+  nj = 0;
+  KBC_CHECK_OK(
+      kbc_store_judge_anchors(s, art.id, after, 3, true, a, &js, &nj, &err));
+  KBC_CHECK_EQ_INT(nj, 1);
+  KBC_CHECK_EQ_INT(js[0].state, KBC_ANCHOR_RESOLVED);
+  /* The follow target: the same block, one position further down. */
+  KBC_CHECK_EQ_INT(js[0].ord, 2);
+  KBC_CHECK_MSG(!js[0].transitioned,
+                "following a heading is not an edge out of the stale set");
+
+  kbc_anchor_row row;
+  KBC_CHECK_OK(kbc_store_get_anchor(s, a, ids[0], &row, &err));
+  KBC_CHECK_EQ_INT(row.state, KBC_ANCHOR_RESOLVED);
+  KBC_CHECK_EQ_INT(row.resolved_ord, 2);
+  KBC_CHECK_EQ_STR(row.resolves_to, "install");
+  /* And the user's claim is untouched. */
+  KBC_CHECK_EQ_STR(row.anchor, "install");
+  KBC_CHECK_EQ_INT(kbc_store_count_stale_anchors(s, &err), 0);
+
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* THE ANCHOR ID IS TAKEN OVER BY A DIFFERENT BLOCK. This is the failure the
+ * third state exists for.
+ *
+ * The comment was written on a block whose explicit id is `install` and whose
+ * heading text is "Install". The document is edited: that block is renamed to
+ * "Installation" (so it now carries `id="installation"`), and a NEW,
+ * unrelated block is given the id `install` — "Retire the old installer" —
+ * further down the page.
+ *
+ * The id the comment named is present again, and it is now somebody else's
+ * block. A boolean says RESOLVED, and a comment written about the top of the
+ * document is attached to the bottom of it with no record that anything
+ * happened. The store can see that the text behind the id is not the text the
+ * comment was made on, and that the original text is nowhere in the document;
+ * those two facts together are exactly "cannot be decided": something is
+ * there, it is not the thing, and nothing says where the thing went. */
+KBC_TEST(a_heading_taken_over_by_another_leaves_the_anchor_undecidable) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "collide.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(8192);
+  kbc_artifact art;
+  fill(&art, "bbbbbbbbbbbb", "kb", "a.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &art, &err));
+
+  const kbc_anchor_heading before[] = {
+      {"intro", "Introduction"},
+      {"install", "Install"},
+  };
+  const char *claims[] = {"install"};
+  char(*ids)[KBC_MAX_ID_LEN + 1] =
+      comment_ids_for(s, a, art.id, claims, 1, &err);
+  KBC_CHECK_NOT_NULL(ids);
+  if (ids == NULL) {
+    kbc_arena_free(a);
+    kbc_store_close(s);
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_anchor_judgement *js = NULL;
+  size_t nj = 0;
+  KBC_CHECK_OK(
+      kbc_store_judge_anchors(s, art.id, before, 2, true, a, &js, &nj, &err));
+  KBC_CHECK_EQ_INT(js[0].state, KBC_ANCHOR_RESOLVED);
+  KBC_CHECK_EQ_INT(js[0].ord, 1);
+
+  /* THE HEADING THAT MOVED: "Install", now reading "Installation" at ord 2.
+   * THE HEADING IT COLLIDED WITH: a new block, "Retire the old installer",
+   * which took the id `install` at ord 4. */
+  const kbc_anchor_heading after[] = {
+      {"intro", "Introduction"},
+      {"configuration", "Configuration"},
+      {"installation", "Installation"},
+      {"troubleshooting", "Troubleshooting"},
+      {"install", "Retire the old installer"},
+  };
+  js = NULL;
+  nj = 0;
+  KBC_CHECK_OK(
+      kbc_store_judge_anchors(s, art.id, after, 5, true, a, &js, &nj, &err));
+  KBC_CHECK_EQ_INT(nj, 1);
+  KBC_CHECK_EQ_INT(js[0].state, KBC_ANCHOR_UNDECIDABLE);
+  KBC_CHECK_MSG(js[0].transitioned,
+                "the anchor left the resolved set and that is an event");
+
+  kbc_anchor_row row;
+  KBC_CHECK_OK(kbc_store_get_anchor(s, a, ids[0], &row, &err));
+  KBC_CHECK_EQ_INT(row.state, KBC_ANCHOR_UNDECIDABLE);
+  /* It does NOT resolve at the colliding block. Pointing it at ord 4 is
+   * precisely the silent re-anchor this state exists to prevent, and the
+   * reason `resolves_to` is empty rather than "install". */
+  KBC_CHECK_EQ_INT(row.resolved_ord, -1);
+  KBC_CHECK_EQ_STR(row.resolves_to, "");
+  KBC_CHECK_EQ_INT(kbc_store_count_stale_anchors(s, &err), 1);
+
+  /* ABSORBING, and deliberately: a pass is the same computation that already
+   * failed to settle it, so asking again would loop. A human settles it. */
+  js = NULL;
+  nj = 0;
+  KBC_CHECK_OK(
+      kbc_store_judge_anchors(s, art.id, after, 5, true, a, &js, &nj, &err));
+  KBC_CHECK_EQ_INT(js[0].state, KBC_ANCHOR_UNDECIDABLE);
+  KBC_CHECK_MSG(!js[0].transitioned,
+                "a second pass over an unchanged document fires nothing");
+
+  /* A comment that was never judged is NOT the same as one judged
+   * undecidable, and the store says so rather than guessing. */
+  KBC_CHECK_OK(kbc_store_add_comment(s, art.id, "install", "you", "later", &err));
+  kbc_comment *cs = NULL;
+  size_t nc = 0;
+  KBC_CHECK_OK(kbc_store_list_comments(s, a, art.id, KBC_MAX_HITS, &cs, &nc,
+                                       &err));
+  KBC_CHECK_EQ_INT(nc, 2);
+  bool found_new = false;
+  for (size_t i = 0; i < nc; i++) {
+    kbc_anchor_row probe;
+    kbc_err_reset(&err);
+    if (kbc_failed(kbc_store_get_anchor(s, a, cs[i].id, &probe, &err))) {
+      KBC_CHECK_EQ_INT(err.status, KBC_ERR_NOTFOUND);
+      KBC_CHECK_MSG(strstr(err.msg, "never judged") != NULL,
+                    "not-found must say the question was never asked: %s",
+                    err.msg);
+      found_new = true;
+    }
+  }
+  KBC_CHECK_MSG(found_new,
+                "the comment added after the last pass must read as never"
+                " judged, which is a different answer from undecidable");
+
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* A HEADING RENAMED, WITH NO EXPLICIT ID. The anchor's slug is a pure function
+ * of the heading's text, so "Install" and "Installation" have different ids
+ * and the store holds nothing that ties them together.
+ *
+ * It therefore answers UNRESOLVED — the heading the comment referred to, the
+ * one reading "Install", is not in this document — and NOT a confident
+ * "resolved" and NOT an undecidable. That is the honest answer for the shape
+ * kb-c stores, and it is worth a test because the tempting alternative
+ * (match the new slug by prefix and call it followed) would be the silent
+ * re-anchor with extra steps: "Installation", "Installer" and "Installing" are
+ * three different headings and one guess.
+ *
+ * The original CAN follow a rename, because its `Chapter` anchor is a
+ * heading-text PATH and its resolver is token-set Jaccard (review.rs:327-328,
+ * 0.5 threshold). kb-c has no fuzzy tier at all — src/httpd.c:3923 says so —
+ * and a store that invented one would be answering a question the wire
+ * contract has no score for. */
+KBC_TEST(a_renamed_heading_is_unresolved_and_not_silently_followed) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "rename.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(8192);
+  kbc_artifact art;
+  fill(&art, "bbbbbbbbbbbb", "kb", "a.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &art, &err));
+
+  const kbc_anchor_heading before[] = {
+      {"intro", "Introduction"},
+      {"install", "Install"},
+  };
+  const char *claims[] = {"install"};
+  char(*ids)[KBC_MAX_ID_LEN + 1] =
+      comment_ids_for(s, a, art.id, claims, 1, &err);
+  KBC_CHECK_NOT_NULL(ids);
+  if (ids == NULL) {
+    kbc_arena_free(a);
+    kbc_store_close(s);
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_anchor_judgement *js = NULL;
+  size_t nj = 0;
+  KBC_CHECK_OK(
+      kbc_store_judge_anchors(s, art.id, before, 2, true, a, &js, &nj, &err));
+  KBC_CHECK_EQ_INT(js[0].state, KBC_ANCHOR_RESOLVED);
+
+  /* "Install" is renamed "Installation"; a decoy "Installer" is added so a
+   * prefix-matching implementation would have something to grab. */
+  const kbc_anchor_heading after[] = {
+      {"intro", "Introduction"},
+      {"installer", "Installer"},
+      {"installation", "Installation"},
+  };
+  js = NULL;
+  nj = 0;
+  KBC_CHECK_OK(
+      kbc_store_judge_anchors(s, art.id, after, 3, true, a, &js, &nj, &err));
+  KBC_CHECK_EQ_INT(js[0].state, KBC_ANCHOR_UNRESOLVED);
+  KBC_CHECK_MSG(js[0].transitioned,
+                "losing the heading is an edge into the stale set");
+
+  kbc_anchor_row row;
+  KBC_CHECK_OK(kbc_store_get_anchor(s, a, ids[0], &row, &err));
+  KBC_CHECK_EQ_INT(row.state, KBC_ANCHOR_UNRESOLVED);
+  KBC_CHECK_EQ_INT(row.resolved_ord, -1);
+  KBC_CHECK_EQ_STR(row.resolves_to, "");
+  KBC_CHECK_EQ_INT(kbc_store_count_stale_anchors(s, &err), 1);
+
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* CRASH RECOVERY, for the persist decision this section implements.
+ *
+ * The sequence a crash can actually produce: a pass judges a document and
+ * writes its verdicts; the document is re-indexed, so its bytes and its
+ * `content_hash` change; the process dies BEFORE the next pass runs. The
+ * rows on disk are then a claim about bytes that are no longer the
+ * document's bytes, and a store that trusts them answers about a document
+ * that never existed in that state.
+ *
+ * So: judge, re-index with different bytes, reopen, and read. The reopened
+ * state must describe the graph that EXISTS — undecidable, because nobody
+ * has read the new document — and not the graph that WAS, which said
+ * resolved. */
+KBC_TEST(a_crash_between_a_pass_and_a_reindex_leaves_no_claim_about_old_bytes) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "crash.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(8192);
+  kbc_artifact art;
+  fill(&art, "bbbbbbbbbbbb", "kb", "a.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &art, &err));
+
+  const kbc_anchor_heading heads[] = {
+      {"intro", "Introduction"},
+      {"install", "Install"},
+  };
+  const char *claims[] = {"install"};
+  char(*ids)[KBC_MAX_ID_LEN + 1] =
+      comment_ids_for(s, a, art.id, claims, 1, &err);
+  KBC_CHECK_NOT_NULL(ids);
+  if (ids == NULL) {
+    kbc_arena_free(a);
+    kbc_store_close(s);
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_anchor_judgement *js = NULL;
+  size_t nj = 0;
+  KBC_CHECK_OK(
+      kbc_store_judge_anchors(s, art.id, heads, 2, true, a, &js, &nj, &err));
+  KBC_CHECK_EQ_INT(js[0].state, KBC_ANCHOR_RESOLVED);
+  char kept[KBC_MAX_ID_LEN + 1];
+  memcpy(kept, ids[0], sizeof kept);
+  kbc_arena_free(a);
+
+  /* The document is edited and re-indexed — the bytes and the hash move —
+ * and the process dies here, before the next pass. */
+  art.content_hash = 0x12345678u;
+  art.mtime_ns = 1700000000999999999ll;
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &art, &err));
+  kbc_store_close(s);
+
+  /* Reopen. The rebuild runs on every open, not only on a version change. */
+  s = open_at(root, "crash.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  a = kbc_arena_new(8192);
+  kbc_anchor_row row;
+  KBC_CHECK_OK(kbc_store_get_anchor(s, a, kept, &row, &err));
+  KBC_CHECK_EQ_INT(row.state, KBC_ANCHOR_UNDECIDABLE);
+  /* The claim's remembered heading text is cleared with the verdict. It
+   * belonged to the old bytes, and leaving it would let the next pass
+   * "follow" a heading that is no longer in the document. */
+  KBC_CHECK_EQ_INT(row.resolved_ord, -1);
+  KBC_CHECK_EQ_STR(row.resolves_to, "");
+  KBC_CHECK_EQ_INT(kbc_store_count_stale_anchors(s, &err), 1);
+
+  /* A reconcile on the already-rebuilt graph is a no-op, so the rebuild is a
+   * fixed point and does not rewrite rows on every daemon start. */
+  int64_t touched = 0;
+  KBC_CHECK_OK(kbc_store_reconcile_anchors(s, &touched, &err));
+  KBC_CHECK_EQ_INT(touched, 0);
+  KBC_CHECK_OK(kbc_store_get_anchor(s, a, kept, &row, &err));
+  KBC_CHECK_EQ_INT(row.state, KBC_ANCHOR_UNDECIDABLE);
+
+  /* And the pass that was interrupted can now be run: it reads the document
+   * that exists, and the verdict it writes describes that document. */
+  js = NULL;
+  nj = 0;
+  KBC_CHECK_OK(
+      kbc_store_judge_anchors(s, art.id, heads, 2, true, a, &js, &nj, &err));
+  KBC_CHECK_EQ_INT(nj, 1);
+  KBC_CHECK_EQ_INT(js[0].state, KBC_ANCHOR_RESOLVED);
+  KBC_CHECK_OK(kbc_store_get_anchor(s, a, kept, &row, &err));
+  KBC_CHECK_EQ_INT(row.state, KBC_ANCHOR_RESOLVED);
+
+  kbc_arena_free(a);
+
+  /* The OTHER half of the rebuild, and the one the foreign key cannot cover:
+   * a verdict row whose comment no longer exists. It is reachable — the
+   * header on this file's FK-checking block says any writer that was not
+   * this binary can orphan a row at any time, and `foreign_keys` is a
+   * CONNECTION setting — so the rebuild drops it, and the count afterwards
+   * describes the comments that exist rather than the ones a deleted
+   * comment used to have. */
+  sqlite3 *raw = raw_open(root, "crash.db");
+  KBC_CHECK_NOT_NULL(raw);
+  if (raw != NULL) {
+    char del[128];
+    (void)snprintf(del, sizeof del,
+                   "DELETE FROM comments WHERE id = '%s';", kept);
+    raw_exec(raw, del);
+    (void)sqlite3_close(raw);
+  }
+  kbc_store_close(s);
+  s = open_at(root, "crash.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  /* A fresh arena for the reopened store. The previous one was freed above,
+   * next to the last read out of it: every row that came back from it points
+   * into its blocks, so it cannot outlive them, and freeing it twice would
+   * be a double free rather than tidiness. */
+  a = kbc_arena_new(8192);
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_store_get_anchor(s, a, kept, &row, &err), KBC_ERR_NOTFOUND);
+  KBC_CHECK_EQ_INT(kbc_store_count_stale_anchors(s, &err), 0);
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* THE FIXED POINT, for all three passes at once: judge, prune, reconcile.
+ *
+ * The second run of each must remove nothing and fire nothing. That is the
+ * property the whole design is built for — a pass that is not idempotent
+ * turns every reindex into a fresh batch of `comment.anchor_stale` events,
+ * which is the exact failure the persisted set was introduced to prevent
+ * (anchors.rs:5-8). */
+KBC_TEST(judging_pruning_and_reconciling_all_reach_a_fixed_point) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "fixed.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(8192);
+  kbc_artifact art;
+  fill(&art, "bbbbbbbbbbbb", "kb", "a.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &art, &err));
+
+  const kbc_anchor_heading heads[] = {
+      {"intro", "Introduction"},
+      {"install", "Install"},
+  };
+  const char *claims[] = {"install", "retired", "also-retired"};
+  char(*ids)[KBC_MAX_ID_LEN + 1] =
+      comment_ids_for(s, a, art.id, claims, 3, &err);
+  KBC_CHECK_NOT_NULL(ids);
+  if (ids == NULL) {
+    kbc_arena_free(a);
+    kbc_store_close(s);
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_anchor_judgement *js = NULL;
+  size_t nj = 0;
+  KBC_CHECK_OK(
+      kbc_store_judge_anchors(s, art.id, heads, 2, true, a, &js, &nj, &err));
+  KBC_CHECK_EQ_INT(nj, 3);
+  size_t edges = 0;
+  for (size_t i = 0; i < nj; i++) {
+    if (js[i].transitioned) edges++;
+  }
+  /* Two of the three went straight into the set; one was already fine. */
+  KBC_CHECK_EQ_INT(edges, 2);
+  KBC_CHECK_EQ_INT(kbc_store_count_stale_anchors(s, &err), 2);
+
+  /* Second pass over the same bytes: no state moves, so no edge. */
+  js = NULL;
+  nj = 0;
+  KBC_CHECK_OK(
+      kbc_store_judge_anchors(s, art.id, heads, 2, true, a, &js, &nj, &err));
+  edges = 0;
+  for (size_t i = 0; i < nj; i++) {
+    if (js[i].transitioned) edges++;
+  }
+  KBC_CHECK_EQ_INT(edges, 0);
+  KBC_CHECK_EQ_INT(kbc_store_count_stale_anchors(s, &err), 2);
+
+  /* A RESOLVED comment leaves the set — the original's `prune_if_resolved`
+   * (anchors.rs:172-190). The prune keys on "is this comment still OPEN",
+   * not on whether its verdict was stale, so resolving `install` drops its
+   * row even though that row was RESOLVED: a resolved comment is not walked
+   * by the pass (`c.resolved = 0`, indexer.rs:3035) and a verdict nothing
+   * will re-read is not worth keeping. The stale COUNT is what stays put,
+   * and that is the observable that matters — the set did not grow. */
+  KBC_CHECK_OK(kbc_store_set_comment_resolved(s, ids[0], true, &err));
+  int64_t pruned = 0;
+  KBC_CHECK_OK(kbc_store_prune_anchors(s, &pruned, &err));
+  KBC_CHECK_EQ_INT(pruned, 1);
+  KBC_CHECK_EQ_INT(kbc_store_count_stale_anchors(s, &err), 2);
+  /* Resolving one of the two STALE comments is what moves the count. */
+  KBC_CHECK_OK(kbc_store_set_comment_resolved(s, ids[1], true, &err));
+  KBC_CHECK_OK(kbc_store_prune_anchors(s, &pruned, &err));
+  KBC_CHECK_EQ_INT(pruned, 1);
+  KBC_CHECK_EQ_INT(kbc_store_count_stale_anchors(s, &err), 1);
+  /* And the prune is itself a fixed point. */
+  KBC_CHECK_OK(kbc_store_prune_anchors(s, &pruned, &err));
+  KBC_CHECK_EQ_INT(pruned, 0);
+
+  int64_t touched = 0;
+  KBC_CHECK_OK(kbc_store_reconcile_anchors(s, &touched, &err));
+  KBC_CHECK_EQ_INT(touched, 0);
+
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* Retention, and the two ways it can lie. Both are fixed-point claims about
+ * a destructive verb, which is the only kind of claim worth making about
+ * one. */
+KBC_TEST(pruning_history_twice_removes_nothing_the_second_time) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "prune.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(8192);
+  kbc_artifact art;
+  fill(&art, "bbbbbbbbbbbb", "kb", "a.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &art, &err));
+
+  kbc_history_row h = {0};
+  h.kind = "open";
+  h.artifact_id = art.id;
+  h.started_at = 1000;
+  h.updated_at = 1000;
+  KBC_CHECK_OK(kbc_store_add_history(s, &h, &err));
+  h.started_at = 2000;
+  h.updated_at = 2000;
+  KBC_CHECK_OK(kbc_store_add_history(s, &h, &err));
+  h.started_at = 9000;
+  h.updated_at = 9000;
+  KBC_CHECK_OK(kbc_store_add_history(s, &h, &err));
+
+  int64_t rows = 0;
+  KBC_CHECK_OK(kbc_store_prune_history(s, 5000, false, &rows, &err));
+  KBC_CHECK_EQ_INT(rows, 2);
+  /* The dry run's number is the number --apply removes, and the row that
+   * survives proves the predicate is `<` and not `<=`. */
+  KBC_CHECK_OK(kbc_store_prune_history(s, 5000, true, &rows, &err));
+  KBC_CHECK_EQ_INT(rows, 2);
+  kbc_history_row *hist = NULL;
+  size_t nh = 0;
+  KBC_CHECK_OK(kbc_store_list_history(s, a, NULL, 10, &hist, &nh, &err));
+  KBC_CHECK_EQ_INT(nh, 1);
+  if (nh == 1) KBC_CHECK_EQ_INT(hist[0].started_at, 9000);
+
+  KBC_CHECK_OK(kbc_store_prune_history(s, 5000, false, &rows, &err));
+  KBC_CHECK_EQ_INT(rows, 0);
+  KBC_CHECK_OK(kbc_store_prune_history(s, 5000, true, &rows, &err));
+  KBC_CHECK_EQ_INT(rows, 0);
+
+  /* A NEGATIVE cutoff is the header's promised no-op, and it used not to be
+   * one: the code clamped the cutoff to 0 and then ran `started_at < 0`, and
+   * `started_at` is a caller-supplied INTEGER with no lower bound on its
+   * write path. A row below the epoch is writable, and the clamp deleted it
+   * while the header said it never would. */
+  h.started_at = -1;
+  h.updated_at = -1;
+  KBC_CHECK_OK(kbc_store_add_history(s, &h, &err));
+  KBC_CHECK_OK(kbc_store_list_history(s, a, NULL, 10, &hist, &nh, &err));
+  KBC_CHECK_EQ_INT(nh, 2);
+  KBC_CHECK_OK(kbc_store_prune_history(s, -1, false, &rows, &err));
+  KBC_CHECK_EQ_INT(rows, 0);
+  KBC_CHECK_OK(kbc_store_prune_history(s, -1, true, &rows, &err));
+  KBC_CHECK_EQ_INT(rows, 0);
+  KBC_CHECK_OK(kbc_store_list_history(s, a, NULL, 10, &hist, &nh, &err));
+  KBC_CHECK_EQ_INT(nh, 2);
+  /* A cutoff of ZERO is a real cutoff and still prunes the row below the
+   * epoch — the no-op is a NEGATIVE cutoff, not the absence of one. */
+  KBC_CHECK_OK(kbc_store_prune_history(s, 0, true, &rows, &err));
+  KBC_CHECK_EQ_INT(rows, 1);
+  KBC_CHECK_OK(kbc_store_list_history(s, a, NULL, 10, &hist, &nh, &err));
+  KBC_CHECK_EQ_INT(nh, 1);
+
+  /* Retention removed rows and NO documents. That is the whole shape of it
+   * (store.h:487): `edges` has no timestamp column, so the original cannot
+   * time-prune the graph either, and a retention pass that deleted documents
+   * would be a corpus-deleting verb the original does not have. */
+  int64_t docs = 0;
+  KBC_CHECK_OK(kbc_store_count_artifacts(s, "kb", &docs, &err));
+  KBC_CHECK_EQ_INT(docs, 1);
+  KBC_CHECK_OK(kbc_store_checkpoint(s, &err));
+
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* The stale set is a PAGE, and it is `kbc_store_list_corkboard`'s page: the
+ * ORDER BY and the `LIMIT n` are the original's answer to "how many results
+ * does this page show", so a caller that treats an absent id as "fine" is
+ * wrong here for the same reason it is wrong there. */
+KBC_TEST(the_stale_set_is_a_ordered_page_and_not_a_verdict_on_absence) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "page.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(8192);
+  kbc_artifact art;
+  fill(&art, "bbbbbbbbbbbb", "kb", "a.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &art, &err));
+
+  const kbc_anchor_heading heads[] = {{"intro", "Introduction"}};
+  const char *claims[] = {"gone-a", "gone-b", "intro"};
+  char(*ids)[KBC_MAX_ID_LEN + 1] =
+      comment_ids_for(s, a, art.id, claims, 3, &err);
+  KBC_CHECK_NOT_NULL(ids);
+  if (ids == NULL) {
+    kbc_arena_free(a);
+    kbc_store_close(s);
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_anchor_judgement *js = NULL;
+  size_t nj = 0;
+  KBC_CHECK_OK(
+      kbc_store_judge_anchors(s, art.id, heads, 1, true, a, &js, &nj, &err));
+  KBC_CHECK_EQ_INT(kbc_store_count_stale_anchors(s, &err), 2);
+
+  kbc_anchor_row *rows = NULL;
+  size_t n = 0;
+  KBC_CHECK_OK(
+      kbc_store_list_anchors(s, a, art.id, true, 10, &rows, &n, &err));
+  KBC_CHECK_EQ_INT(n, 2);
+  /* Both rows carry the whole verdict, not just a flag: a stale-anchor
+   * surface cannot show a user where their comment went without the id it
+   * resolves at. */
+  for (size_t i = 0; i < n; i++) {
+    KBC_CHECK_EQ_INT(rows[i].state, KBC_ANCHOR_UNRESOLVED);
+    KBC_CHECK_EQ_STR(rows[i].resolves_to, "");
+    KBC_CHECK_EQ_INT(rows[i].resolved_ord, -1);
+    KBC_CHECK_EQ_STR(rows[i].doc_id, art.id);
+  }
+  /* `stale_only` false asks for everything, resolved included. */
+  rows = NULL;
+  n = 0;
+  KBC_CHECK_OK(
+      kbc_store_list_anchors(s, a, art.id, false, 10, &rows, &n, &err));
+  KBC_CHECK_EQ_INT(n, 3);
+
+  /* `LIMIT n` takes the n most recent, so an id missing from the page is not
+   * evidence about it. The count still says three. */
+  rows = NULL;
+  n = 0;
+  KBC_CHECK_OK(
+      kbc_store_list_anchors(s, a, art.id, false, 1, &rows, &n, &err));
+  KBC_CHECK_EQ_INT(n, 1);
+  KBC_CHECK_EQ_INT(kbc_store_count_stale_anchors(s, &err), 2);
+
+  /* A `doc_id` that names no document is an empty page, never an error and
+   * never somebody else's rows. */
+  rows = NULL;
+  n = 0;
+  KBC_CHECK_OK(
+      kbc_store_list_anchors(s, a, "zzzzzzzzzzzz", true, 10, &rows, &n, &err));
+  KBC_CHECK_EQ_INT(n, 0);
+  KBC_CHECK_NULL(rows);
+
+  KBC_CHECK_ERR(kbc_store_list_anchors(s, a, "", true, 10, &rows, &n, &err),
+                KBC_ERR_INVALID);
+  KBC_CHECK_ERR(kbc_store_list_anchors(s, NULL, NULL, true, 10, &rows, &n,
+                                       &err),
+                KBC_ERR_INVALID);
+  kbc_anchor_row row;
+  /* The rest of the anchor surface refuses the same shapes its neighbours
+   * do. `judge_anchors` also refuses a null heading ARRAY with a non-zero
+   * length: that is the one that would otherwise read past the end of
+   * nothing and decide every anchor against uninitialised memory. */
+  KBC_CHECK_ERR(kbc_store_judge_anchors(s, NULL, heads, 1, true, a, &js, &nj,
+                                        &err),
+                KBC_ERR_INVALID);
+  KBC_CHECK_ERR(kbc_store_judge_anchors(s, art.id, NULL, 1, true, a, &js, &nj,
+                                        &err),
+                KBC_ERR_INVALID);
+  KBC_CHECK_ERR(kbc_store_judge_anchors(s, "", heads, 1, true, a, &js, &nj,
+                                        &err),
+                KBC_ERR_INVALID);
+  KBC_CHECK_ERR(kbc_store_get_anchor(s, a, "", &row, &err), KBC_ERR_INVALID);
+  KBC_CHECK_ERR(kbc_store_get_anchor(NULL, a, ids[0], &row, &err),
+                KBC_ERR_INVALID);
+  KBC_CHECK_EQ_INT(kbc_store_count_stale_anchors(NULL, &err), -1);
+  KBC_CHECK_ERR(kbc_store_prune_anchors(s, NULL, &err), KBC_ERR_INVALID);
+  KBC_CHECK_ERR(kbc_store_reconcile_anchors(s, NULL, &err), KBC_ERR_INVALID);
+  /* A zero limit is an empty page, not an error and not an unfiltered scan. */
+  rows = NULL;
+  n = 0;
+  KBC_CHECK_OK(
+      kbc_store_list_anchors(s, a, art.id, false, 0, &rows, &n, &err));
+  KBC_CHECK_EQ_INT(n, 0);
+  KBC_CHECK_NULL(rows);
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
 int main(void) {
   
 static const kbc_test_case cases[] = {
@@ -5437,6 +6386,24 @@ static const kbc_test_case cases[] = {
        a_rekey_does_not_drop_a_second_corpus_edge_to_the_new_path},
       {"a_rekey_of_an_id_this_store_does_not_hold_touches_no_path",
        a_rekey_of_an_id_this_store_does_not_hold_touches_no_path},
+      {"anchor_states_are_three_and_only_three",
+       anchor_states_are_three_and_only_three},
+      {"a_document_that_will_not_parse_leaves_every_anchor_undecidable",
+       a_document_that_will_not_parse_leaves_every_anchor_undecidable},
+      {"a_moved_heading_takes_its_comment_with_it",
+       a_moved_heading_takes_its_comment_with_it},
+      {"a_heading_taken_over_by_another_leaves_the_anchor_undecidable",
+       a_heading_taken_over_by_another_leaves_the_anchor_undecidable},
+      {"a_renamed_heading_is_unresolved_and_not_silently_followed",
+       a_renamed_heading_is_unresolved_and_not_silently_followed},
+      {"a_crash_between_a_pass_and_a_reindex_leaves_no_claim_about_old_bytes",
+       a_crash_between_a_pass_and_a_reindex_leaves_no_claim_about_old_bytes},
+      {"judging_pruning_and_reconciling_all_reach_a_fixed_point",
+       judging_pruning_and_reconciling_all_reach_a_fixed_point},
+      {"pruning_history_twice_removes_nothing_the_second_time",
+       pruning_history_twice_removes_nothing_the_second_time},
+      {"the_stale_set_is_a_ordered_page_and_not_a_verdict_on_absence",
+       the_stale_set_is_a_ordered_page_and_not_a_verdict_on_absence},
       {NULL, NULL},
   };
   return kbc_test_run("store", cases);

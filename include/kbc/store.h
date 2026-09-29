@@ -182,9 +182,12 @@ kbc_status kbc_store_forget_metas(kbc_store *s, const char *corpus,
  *
  * The asymmetry was not an oversight so much as an unbuilt consumer: nothing
  * in the daemon read a document's own key/value pairs back, so the table was
- * write-only and the parity harness had to reach into the parser to get them.
- * That is a harness working around a missing capability, and a harness that
- * works around a missing capability is a harness measuring the wrong thing.
+ * write-only and could not be checked against anything. The reason the parity
+ * harness gave for wanting it turned out to be WRONG — `tests/kbc_parity.c`
+ * went over HTTP and called no store function, so it never needed this. The
+ * function stands on its own merits; it simply has no production caller yet,
+ * which is a wiring gap and not a correctness one. Recorded here rather than
+ * left to be found by whoever greps for a symbol with exactly one caller.
  *
  * `keys` and `values` are parallel KBC_OWN lists, matching the shape
  * `kbc_store_replace_metas` already writes in — the same (key, value) pairs,
@@ -628,6 +631,115 @@ kbc_status kbc_store_first_seen(kbc_store *s, const char *artifact_id,
 kbc_status kbc_store_get_first_seen(kbc_store *s, const char *artifact_id,
                                     int64_t *out, kbc_err *err);
 
+/* --------------------------------------------------------- comment anchors --
+ *
+ * THREE STATES, and the reason there are three is the whole contract. A
+ * comment's anchor is a CLAIM about a document's headings, and the headings
+ * move. `UNDECIDABLE` is not "unknown" in the sense of "not yet looked at" —
+ * it is the answer when the store can see that something is at the id, that it
+ * is not the thing the comment was written about, and cannot see which of the
+ * explanations is true. Pointing the anchor at whatever block now holds its
+ * id would be a RESOLVED verdict and a lie. Collapsing this into a boolean is
+ * the silent re-anchor, and it is the defect this shape exists to prevent.
+ *
+ * UNDECIDABLE is ABSORBING: a pass does not clear it, because a pass is the
+ * same computation that already failed to settle it, so a store that keeps
+ * re-asking never reaches a fixed point. A human clears it.
+ *
+ * The stale set is PERSISTED (SCHEMA_V13) rather than recomputed, because it
+ * is the memory of the PREVIOUS pass and a set recomputed from the current
+ * graph has no transition in it — every pass would re-fire every event, which
+ * is the bug the original's in-process set was introduced to prevent
+ * (anchors.rs:5-8). It is rebuilt from the graph on every open, in one
+ * transaction with the verdicts it describes, so it can never describe a graph
+ * that did not commit.
+ *
+ * NOTE ON THE ORIGINAL'S SHAPE: the Rust keeps this in a `.anchors-stale.json`
+ * sidecar because its comments live in per-artifact JSON files OUTSIDE the
+ * database (indexer.rs:3001) and it has no row to hang a set on. kb-c's
+ * `comments` is a table in the same database, so the sidecar is an artifact of
+ * the original's storage, not a requirement. See DECISIONS.md.
+ */
+typedef enum {
+  KBC_ANCHOR_UNDECIDABLE = 0,
+  KBC_ANCHOR_RESOLVED = 1,
+  KBC_ANCHOR_UNRESOLVED = 2
+} kbc_anchor_state;
+
+typedef struct {
+  const char *id;   /* BORROWED — the anchor id the document exposes */
+  const char *text; /* BORROWED — the heading text behind it, "" if none */
+} kbc_anchor_heading;
+
+typedef struct {
+  const char *comment_id; /* KBC_ARENA */
+  kbc_anchor_state state;
+  int64_t ord;      /* ord the claim resolves at, -1 when at nothing */
+  bool transitioned; /* the stale/not-stale edge changed on this pass */
+} kbc_anchor_judgement;
+
+typedef struct {
+  const char *doc_id;     /* KBC_ARENA */
+  const char *comment_id; /* KBC_ARENA */
+  const char *anchor;     /* KBC_ARENA — the claim, as written */
+  const char *resolves_to; /* KBC_ARENA — "" when it resolves at nothing */
+  int64_t resolved_ord;    /* -1 when it resolves at nothing */
+  kbc_anchor_state state;
+} kbc_anchor_row;
+
+/* Judges every open comment on `doc_id` against the document's current
+ * headings. `judgeable` says whether the document could be READ at all; a
+ * document that would not parse makes every claim UNDECIDABLE rather than
+ * UNRESOLVED, because "I could not check" and "it is not there" are different
+ * answers and a reader must not get a jump target for a verdict the store will
+ * not vouch for.
+ *
+ * `*n_out` receives the judgements, in the store's order, and ONLY the ones
+ * whose stale/not-stale edge CHANGED. A first resolution is not a transition:
+ * every comment on a freshly-judged document would otherwise fire. */
+kbc_status kbc_store_judge_anchors(kbc_store *s, const char *doc_id,
+                                   const kbc_anchor_heading *headings,
+                                   size_t n, bool judgeable, kbc_arena *a,
+                                   kbc_anchor_judgement **out, size_t *n_out,
+                                   kbc_err *err);
+
+/* A PAGE, in the corkboard's shape: count-then-fetch with
+ * `ORDER BY judged_at DESC, comment_id ASC LIMIT ?n`. Absence from a page is
+ * not evidence about a row, and that is asserted. `stale_only` filters. */
+kbc_status kbc_store_list_anchors(kbc_store *s, kbc_arena *a,
+                                  const char *doc_id, bool stale_only,
+                                  size_t limit, kbc_anchor_row **out,
+                                  size_t *n_out, kbc_err *err);
+
+/* KBC_ERR_NOTFOUND with "never judged" for a comment that exists but has no
+ * row. NOTFOUND is a DIFFERENT answer from UNDECIDABLE and callers must be
+ * able to tell them apart. */
+kbc_status kbc_store_get_anchor(kbc_store *s, kbc_arena *a,
+                                const char *comment_id, kbc_anchor_row *out,
+                                kbc_err *err);
+
+int64_t kbc_store_count_stale_anchors(kbc_store *s, kbc_err *err);
+
+/* Prunes rows whose comment is no longer OPEN — keyed on openness, not on
+ * staleness, matching the original's `prune_if_resolved` (anchors.rs:172-190).
+ * A stale comment is still a live comment with a question attached. */
+kbc_status kbc_store_prune_anchors(kbc_store *s, int64_t *n_removed,
+                                   kbc_err *err);
+
+/* Runs on EVERY open, not only on a version change. Any row whose recorded
+ * content_hash no longer matches the artifact's is rewritten to UNDECIDABLE
+ * and its remembered heading text is CLEARED — that text belongs to the old
+ * bytes, and keeping it would let the next pass "follow" a heading that no
+ * longer exists. A LEFT JOIN makes a row for a vanished document invalidate
+ * too. Idempotent: a non-fixed-point rebuild would rewrite rows on every
+ * daemon start forever.
+ *
+ * THIS WRITES. It is one transaction on open, deliberately, so a crash between
+ * a reindex and a pass cannot leave a claim about bytes that no longer exist.
+ * The cost is that a contended open can now fail where it previously
+ * succeeded, which is a loud failure in place of a wrong verdict. */
+kbc_status kbc_store_reconcile_anchors(kbc_store *s, int64_t *n_reset,
+                                       kbc_err *err);
 
 #ifdef __cplusplus
 }

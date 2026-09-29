@@ -17,9 +17,11 @@ us revisit it. Newest first.
 **Decision.** Three things change at once, and they are recorded together
 because they are one decision about what kb-c is.
 
-1. **ADR-001 is REVERSED.** `kb-code-*` — 240,255 LOC across
-   `kb-code-server` and `kb-code-cli` — is now IN SCOPE. kb-c becomes a
+1. **ADR-001 is REVERSED.** `kb-code-*` is now IN SCOPE. kb-c becomes a
    replacement for the whole workspace, not for the `kb` daemon alone.
+   *(Amended 2026-09-29: the size was stated here as 240,255 LOC. Measured
+   per-file it is **278,922 LOC across 323 Rust files** — server 238,240/308,
+   CLI 40,682/15, of which `main.rs` alone is 30,643. +16.1%.)*
 2. **The SPA is ported, not replaced by a smaller one.** kb-c grows every
    endpoint `web/` calls, and the Vite build of `web/` is committed as
    static `dist/` assets that the existing static handler serves. Node is a
@@ -36,8 +38,43 @@ generated parser C per language. What changed is the question. ADR-001 was
 written to keep kb-c *replacing the `kb` daemon*; it was not written against
 "and also take the code lane". Those are different projects, and the second
 one is now wanted. The honest cost is the one ADR-001 already named, and it
-is now paid deliberately: every tree-sitter grammar is vendored, and the
-grammars are the part that rebuilds on every grammar bump.
+is now paid deliberately, and the cost has since been MEASURED rather than
+estimated, which changes the shape of the work rather than its size. The 61 MB
+figure this ADR originally carried was wrong: there is no `tree-sitter-sql` in
+the workspace at all, and `tree-sitter-json` is 1,061 lines, not 6.4 MB. What
+exists is **2,108,027 lines of generated `parser.c` across 15 grammars** — and
+those lines are parse-TABLE DATA emitted by `tree-sitter generate` at
+grammar-authoring time, not logic.
+
+**So the dependency rule is amended, in one clause.** This ADR says "no
+ammonia, no vendored C sanitiser, no dependency". That rule binds **link-time
+libraries**. The tree-sitter parse runtime — ~12,500 lines of MIT C, depending
+on libc and pthread and nothing else — is vendored into `src/` and compiled as
+first-party source, exactly as `src/markdown.c` is. The generated grammar
+tables are **opaque data files loaded at runtime with `dlopen`, never compiled
+and never linked.** `libkbc.a` gains no new link dependency, and the grammars
+stop being the thing that recompiles on every grammar bump, which is the exact
+pain this ADR named as the accepted cost.
+
+**What that makes possible, and why it is not the parser.** kb-code calls
+about **18** of the ~150 `ts_*` functions in tree-sitter's 1,525-line `api.h`
+(verified by grep across all 323 Rust files). A binding is a header and a few
+hundred lines. Reimplementing the parser would be a multi-year project whose
+output would be strictly worse than upstream-generated, upstream-tested
+incremental-parsing C. The loader must check `ts_language_abi_version` — the
+API exposes it precisely because grammars carry a versioned struct.
+
+**Two free wins the bad count had hidden.** The `markdown` INLINE grammar
+(75,709 lines) is vendored today and **never linked**: `lang.rs:384` registers
+the block grammar only, and its own doc comment says so. And HAML has no
+tree-sitter grammar at all — kb-code hand-wrote a 3,281-line indentation
+parser — so porting it is ordinary C with zero vendored bytes.
+
+**Licensing is an obligation, not a note.** The 15 grammars are under two
+licences: MIT for the tree-sitter org ones, MIT-with-attribution for the
+grammar-grammars org ones (yaml, scss, toml-ng, md), all tracked in
+`THIRD-PARTY-LICENSES.md`. The `.so` shape makes attribution *easier* —
+per-file notices — than static vendoring would be.
 
 **What would make us revisit it.** If the code lane lands as a *separate*
 daemon sharing the store rather than as routes on this one, the ADR-001
