@@ -1916,7 +1916,16 @@ static void sse_push_locked(conn *c, char *data, size_t len) {
 /* Emits the accumulated lag as one `event: lag` frame and zeroes the counter,
  * so a client that fell behind learns HOW FAR behind it was rather than
  * silently receiving a stream with a hole in it. Caller holds c->mu, and the
- * caller has just made room, so the push below cannot itself drop. */
+ * caller has just made room, so the push below cannot itself drop.
+ *
+ * NOT COVERED BY A TEST, deliberately. Provoking the precondition needs the
+ * worker's socket write to block, and a client that merely stops reading does
+ * not do it: sse_pump buffers to KBC_SSE_OUT_HIGH_WATER and the kernel then
+ * absorbs the rest, so a measured burst of 60,000 events (~4 MiB, no reads at
+ * all) still left the 64-slot queue intact often enough to be a coin flip. The
+ * only lever that would make it deterministic is bounding the send buffer,
+ * which a test cannot reach. See the note beside the SSE cases in
+ * tests/test_httpd.c. The `gap` half of the same probe IS tested. */
 static void sse_emit_lag_locked(conn *c) {
   if (c->q_dropped == 0) return;
   kbc_str body;

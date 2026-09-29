@@ -2038,8 +2038,10 @@ static void *cache_worker(void *arg) {
   }
   for (int i = 0; i < 400; i++) {
     for (int k = 0; k < 8; k++) {
-      char key[8];
-      (void)snprintf(key, sizeof key, "k%d", k);
+      /* Built by hand, not snprintf: the loop bound makes the width obvious
+       * and the build runs -Werror=format-truncation, which cannot see the
+       * bound through the int. "k0".."k7" is three bytes in a four-byte slot. */
+      char key[4] = {'k', (char)('0' + k), '\0', '\0'};
       const float *got = NULL;
       size_t dim = 0;
       if (!kbc_query_cache_get(c, "m", key, strlen(key), a, &got, &dim)) {

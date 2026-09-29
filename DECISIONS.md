@@ -10,6 +10,76 @@ us revisit it. Newest first.
 
 ---
 
+## ADR-007 — the SSE `lag` probe ships untested; bounding its send buffer is declined
+
+**Status:** accepted, 2026-09-29
+
+**Decision.** The `lag` half of the SSE gap/lag probe ships, and ships with no
+test at any layer. The obvious way to make it testable — bound the send buffer
+of an SSE connection so a stalled client provably falls behind — is declined,
+and this entry exists so the next session does not rediscover the mechanism
+from scratch to learn that the option exists and was considered.
+
+**The mechanism, which is the expensive part to rediscover.** A client that
+stops reading its socket does *not* make the daemon's per-connection queue
+overflow. `sse_pump` buffers up to `KBC_SSE_OUT_HIGH_WATER` (256 KiB) into the
+connection's write buffer, and the kernel then absorbs everything past that
+into the **server's** send buffer. The worker's `write` never returns
+`EWOULDBLOCK`, so the worker never falls behind and the 64-slot queue never
+sheds. Shrinking the *client's* `SO_RCVBUF` does not help, because the buffer
+doing the absorbing is on the other end of the connection and a test cannot
+reach it. Measured: a burst of 60,000 events (~4 MiB) with the client not
+reading a single byte still left the queue intact in 2 runs of 6. The overflow
+is a coin flip, not a difficulty to be tuned away.
+
+**Reasoning.** The probe is a faithful 20-line port of the original's
+`EventFrame::Lag { skipped }` (`kb-core/src/events.rs:272`): coalesce
+`c->q_dropped` into one `event: lag` frame carrying the true count, emit it
+ahead of the frame that caused the overflow, with no `id:` line. It is correct
+as far as it can be checked by reading, it compiles clean under the full
+`-Werror` set, and an untested-but-correct degradation notice is strictly
+better than a silent stream with a hole in it. What we cannot rule out is that
+it is untested-and-wrong, which is why the gap is recorded in `src/httpd.c` and
+`tests/test_httpd.c` rather than left to be discovered. The `gap` half of the
+same feature is deterministically tested, including the absent `id:` line and
+the suppression of a replay the cursor cannot justify.
+
+A test that fails on a correct build is worse than no test: it trains everyone
+who reads CI to ignore red. The case was deleted rather than tuned — the
+provisional version that failed 10 runs in 20 was replaced by a
+publish-and-check loop that still failed 5 in 15 under TSan, and raising the
+loop bound would only have bought a slower red.
+
+**Alternatives.** *Bound the send buffer (SO_SNDBUF) on SSE connections.*
+Declined, and this is the option worth recording. It is defensible on its own
+merits — a daemon that lets one stalled client buffer unboundedly in the
+kernel is a mild resource wart, and `c->out` is already bounded, so the kernel
+is the only unbounded buffer left in the path. It is declined *here* for three
+reasons, and the third is the one that decides it: it is a production
+behaviour change nobody asked for; it disconnects stalled clients sooner, which
+is a policy choice about what a client is entitled to buffer; and it surfaced
+while fixing a flaky test, which is the context in which a scope decision is
+least trustworthy. Making it in that context would be scope creep wearing the
+cost of a test. *Export the connection ring through `httpd.h` so a test can
+drive the overflow directly.* Rejected: the parts with teeth — the coalescing,
+the non-zero count, the absent `id:` line — all live downstream of the
+overflow, so the only thing reachable without it is the frame formatter, which
+is a `printf`; a printf test plus a widened published API is a bad trade in
+both directions. *Drop the `lag` probe entirely.* Rejected: the reconnect case
+is the common one and is covered by `gap`; a client that cannot detect that it
+fell behind mid-stream is a real limitation, and a correct 20-line notice is
+cheap to keep.
+
+**What would change this.** If anyone picks the send buffer up, it is not a
+one-line change and it wants its own ADR: a knob (which bounds, and what the
+default is), its own test, and an explicit decision about what a client is
+entitled to buffer before being cut off. With the send buffer bounded the
+deleted case comes straight back and becomes deterministic. Until then the
+honest position is the one above: the probe ships, and the gap is written
+down.
+
+---
+
 ## ADR-001 — `kb-code-*` stays in Rust; kb-c does not replace it
 
 **Status:** accepted, 2026-09-26

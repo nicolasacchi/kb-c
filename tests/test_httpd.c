@@ -1683,19 +1683,11 @@ typedef struct {
 } sse_client;
 
 /* Opens a stream with an arbitrary request head, so a test can supply a
- * Last-Event-ID. `rcvbuf` shrinks the kernel receive buffer before the
- * connect, which is what makes a stall observable at all: with the default
- * buffer the kernel absorbs the whole burst and the daemon's own queue never
- * fills, so the lag path is never taken and the test would pass on a build
- * with the probe removed. */
-static bool sse_open_head(int port, const char *last_event_id, int rcvbuf,
-                          sse_client *c) {
+ * Last-Event-ID. */
+static bool sse_open_head(int port, const char *last_event_id, sse_client *c) {
   memset(c, 0, sizeof *c);
   c->fd = socket(AF_INET, SOCK_STREAM, 0);
   if (c->fd < 0) return false;
-  if (rcvbuf > 0) {
-    (void)setsockopt(c->fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
-  }
   struct sockaddr_in a;
   memset(&a, 0, sizeof a);
   a.sin_family = AF_INET;
@@ -2005,7 +1997,7 @@ KBC_TEST(sse_gap_probe_replaces_the_replay_it_cannot_honour) {
    * assertions below would also pass on a daemon that never replays at all. */
   {
     sse_client c;
-    KBC_CHECK(sse_open_head(port, "1", 0, &c));
+    KBC_CHECK(sse_open_head(port, "1", &c));
     KBC_CHECK(sse_wait(&c, "id: 3", 16));
     KBC_CHECK_MSG(sse_saw(&c, "id: 2") && sse_saw(&c, "id: 3"),
                   "a serviceable cursor did not replay: %s", c.buf);
@@ -2018,7 +2010,7 @@ KBC_TEST(sse_gap_probe_replaces_the_replay_it_cannot_honour) {
    * client holds after the daemon restarts, since ids restart at 1. */
   {
     sse_client c;
-    KBC_CHECK(sse_open_head(port, "99999", 0, &c));
+    KBC_CHECK(sse_open_head(port, "99999", &c));
     KBC_CHECK(sse_wait(&c, "event: gap", 16));
     KBC_CHECK_MSG(sse_saw(&c, "\"requested_id\":99999"),
                   "the gap did not name the cursor: %s", c.buf);
@@ -2043,7 +2035,7 @@ KBC_TEST(sse_gap_probe_replaces_the_replay_it_cannot_honour) {
    * EventSource a spurious gap. */
   {
     sse_client c;
-    KBC_CHECK(sse_open_head(port, NULL, 0, &c));
+    KBC_CHECK(sse_open_head(port, NULL, &c));
     KBC_CHECK(sse_wait(&c, ":ok", 16));
     KBC_CHECK_MSG(!sse_saw(&c, "event: gap"),
                   "a cursorless client was probed: %s", c.buf);
