@@ -10,6 +10,79 @@ us revisit it. Newest first.
 
 ---
 
+## ADR-008 — the port takes the whole workspace, and the build is a web asset
+
+**Status:** accepted, 2026-09-29
+
+**Decision.** Three things change at once, and they are recorded together
+because they are one decision about what kb-c is.
+
+1. **ADR-001 is REVERSED.** `kb-code-*` — 240,255 LOC across
+   `kb-code-server` and `kb-code-cli` — is now IN SCOPE. kb-c becomes a
+   replacement for the whole workspace, not for the `kb` daemon alone.
+2. **The SPA is ported, not replaced by a smaller one.** kb-c grows every
+   endpoint `web/` calls, and the Vite build of `web/` is committed as
+   static `dist/` assets that the existing static handler serves. Node is a
+   BUILD-time toolchain only, never a runtime dependency.
+3. **HTML capture ships, with a sanitiser written in C.** No ammonia, no
+   vendored C sanitiser, no dependency. A strict allowlist, in this tree,
+   written for this port.
+
+**What this reverses, and why it is still the right call.** ADR-001 argued
+that `kb-code-*` is a *different product* that shares only a workspace. That
+argument has not changed: the two data models are still disjoint, and
+tree-sitter still has no C distribution kb-c could use without vendoring
+generated parser C per language. What changed is the question. ADR-001 was
+written to keep kb-c *replacing the `kb` daemon*; it was not written against
+"and also take the code lane". Those are different projects, and the second
+one is now wanted. The honest cost is the one ADR-001 already named, and it
+is now paid deliberately: every tree-sitter grammar is vendored, and the
+grammars are the part that rebuilds on every grammar bump.
+
+**What would make us revisit it.** If the code lane lands as a *separate*
+daemon sharing the store rather than as routes on this one, the ADR-001
+argument applies again in full and this should be reopened. What is being
+built instead is one daemon, and that is the whole difference.
+
+**The no-dependency rule survives, narrowed.** It was written for the
+librarian — the C library that `libkbc.a` links. It still binds there: the
+markdown renderer is hand-rolled, the sanitiser will be hand-rolled, and
+`libkbc.a` links sqlite3, libm and libpthread and nothing else. A React
+bundle served as static bytes is not a link-time dependency of anything, and
+Node never runs on a user's machine to read a corpus. The distinction is
+between a dependency the C code links and an asset the daemon serves, and
+only the first was ever the rule.
+
+---
+
+## ADR-009 — `Content-Security-Policy: sandbox` is not the whole containment story
+
+**Status:** accepted, 2026-09-29
+
+**Decision.** The artifact SUBDOMAIN keeps the original's weaker CSP —
+`frame-ancestors <parent>`, no `sandbox` — and the origin-per-hostname
+isolation is recorded as the boundary that actually holds. The parent-origin
+route keeps bare `sandbox`.
+
+**Reasoning.** The original deliberately does not sandbox the subdomain: a
+sandboxed artifact cannot be an interactive document, and the lane exists to
+render one. What contains a hostile document there is that the artifact id is
+part of the **hostname**, so each artifact is a distinct origin to a browser
+and a script in one cannot reach another's DOM.
+
+**The limit, stated because it is real.** Cookies are scoped to the
+REGISTRABLE DOMAIN, not the origin. A document served at
+`abc.artifacts.localhost` can set a cookie that `def.artifacts.localhost` will
+send. Origin isolation holds for the DOM; it does not hold for anything
+cookie-carried. Nothing authenticates on the subdomain today, so nothing is
+carried — but that is a property of the present, not of the boundary. **The
+moment a session cookie is introduced on the subdomain, this stops being an
+acceptable design** and the subdomain needs `sandbox` too. That is the line to
+revisit, and it is written here so the next person finds it before shipping
+the cookie rather than after.
+
+---
+
 ## ADR-007 — the SSE `lag` probe ships untested; bounding its send buffer is declined
 
 **Status:** accepted, 2026-09-29
