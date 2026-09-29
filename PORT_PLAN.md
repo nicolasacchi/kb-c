@@ -6,7 +6,7 @@ the port exists, what is being built in what order, how the performance claim
 is measured, and what would have to be true for kb-c to be a drop-in.
 
 Scope in one line: 231,507 LOC of Rust across six crates, of which kb-c today
-claims 93,545 (40.4%) and a further 23,021 (9.9%) is scheduled below. The
+claims 97,546 (42.1%) and a further 19,020 (8.2%) is scheduled below. The
 remaining 49.6% is out of scope and stays in Rust. Those three figures are the
 PORTED+PARTIAL, PLANNED and OUT-OF-SCOPE row sums in `INVENTORY.md`,
 recomputed from the rows on 2026-09-29.
@@ -348,10 +348,16 @@ stay refused), and link extraction — including wikilinks — is in. Stage 3 is
 limiting, `X-Kb-Token` and the query-embedding cache are in, so what remains
 there is the route-table check and the verbs that depend on the routes and the
 auth ladder.
+Stage 4 is **mostly** built: multipart capture, the three link/anchor routes
+and the move are in, and what remains there is `links suggest`/`apply` (pure
+functions of the out-of-scope `kb_core::mentions`), the anchor corkboard and
+stale-list routes, and a user-facing `mv`.
 Stage 5's **serving** half is in — artifact bytes, the artifact
-subdomain, the static fallback, the Prometheus endpoint and the renderer — with
-the listing, the capture surface and the outbound verbs still PLANNED. Stage 6
-is built on both halves: the measurement and the `VACUUM INTO` + tar backup.
+subdomain, the static fallback, the Prometheus endpoint and the renderer —
+with the listing, the desk surface and the outbound verbs still PLANNED.
+Stage 6 is **mostly** built: the measurement and the `VACUUM INTO` + tar
+backup are in, `kbc prune` and `kbc metrics` landed with them, and what is
+left is `bench discover`/`run`.
 The stages that are partly in already are therefore *gaps in what exists*, not
 greenfield.
 
@@ -453,7 +459,9 @@ Units:
    Eight tables landed across v5–v10 — `sources`, `index_runs`, `errors`,
    `history`, `corkboard`, `pinned_memories`, `excluded_files`,
    `doc_first_seen` — on top of `edges` (v2), `pending_links` (v3) and
-   `doc_metas` (v4). The partial indexes are ported as partial, because each
+   `doc_metas` (v4), and v11–v12 added `moves` and its `abandoned_at` column,
+   which is where stage 4's move keeps its state (fifteen data tables in all).
+   The partial indexes are ported as partial, because each
    exists for exactly one query and restricting it to the rows that query can
    match is what turns a scan into a seek. **The epoch-ahead refusal is in**
    (`kb-core/src/sibling.rs:119` — this section used to cite
@@ -499,11 +507,15 @@ layer.
 
 Acceptance gate, and how much of it is met: a corpus of N files can be indexed,
 one deleted from disk, reconciled, and re-indexed with no orphan rows in
-`artifacts` or `artifact_chunks` — **met**; a file that fails to embed three
-times is gated and remains findable by keyword — **met, but the gate is the
-`errors` row rather than a `<state>/quarantine/<kb>/` directory**, which is
-what this section used to promise. The enrich-hook ordering is still the
-outstanding half.
+`artifacts` or `chunks` — **met**; a file that fails to embed three times
+stops being embedded and remains findable by keyword — **met, and the thing
+that is gated is the EMBED, not the file**: `embed_gated` skips the sidecar
+call and returns, the artifact row, its chunks and its edges are written as
+usual, and the embedding column is nullable by design, so the document stays
+indexed and BM25-searchable. The gate is the `errors` row keyed by
+`(path, content hash)`, **not** a `<state>/quarantine/<kb>/` directory — which
+is what this section used to promise, and what a reader checking the tree
+will not find.
 
 Behaviour it must match: the four ingest constants
 (`INGEST_QUEUE_CAPACITY = 1024`, `INGEST_BATCH_MAX_DOCS = 32`,
@@ -706,24 +718,100 @@ and `list` run against a daemon when one answers and fall back to an
 in-process app when none does, announcing the fallback on stderr; `status`
 has no fallback and exits 2 when no daemon answers.
 
-### Stage 4 — capture, links, anchors — PARTLY BUILT
+### Stage 4 — capture, links, anchors — MOSTLY BUILT
 
-Done since this section was written: **link extraction, including
-wikilinks**, and the edge graph behind it. `[text](target)`, `<a href>`,
-`[[target]]` and `[[target|alias]]` all go through the same normaliser; the
-graph converges via `pending_links` (see §3 stage 2).
+**Capture is in.** `POST /api/kb/{kb}/capture` in `src/httpd.c`, multipart,
+answering 201 with the created ids and source-relative paths in request
+order. Both caps are checked and both refuse rather than truncate: at most 50
+files, 10 MiB per file, 64 MiB for the request as received, and a body past
+the file-count cap is a 400 that writes nothing. Only `.md`/`.markdown` is
+accepted (415 otherwise), because the capture engine is Markdown-only — the
+HTML pipeline stamps `<meta>` into `<head>` and runs ammonia, and a
+head-splice with no sanitiser is a way to persist attacker markup into a
+trusted origin.
 
-Units that remain: multipart capture with Rust's exact frontmatter write order
-(`kb-category`, `kb-tags`, `kb-capture-original`, `kb-capture-url`,
-`kb-capture-at`, `kb-session`, `kb-expires-at` — title is never touched);
-the 60-char slug policy; URL stubs as inert text (the daemon never fetches a
-URL — that is the SSRF ruling, not an omission); the `/api/links` routes and
-`links suggest/apply`; anchor re-resolution and the
-`comment.anchor_stale` / `comment.anchor_resolved` pair; `mv` and the `moves`
-rename-race log.
+**The frontmatter key ORDER is the contract, because the acceptance gate is a
+byte-diff against the original** — and the subtlety is that the order is the
+order of *first insertion*, not a layout. `kb-category`, `kb-tags`,
+`kb-capture-original`, `kb-capture-url`, `kb-capture-at`, `kb-session`,
+`kb-expires-at` (title is never stamped: the caller's title steers the output
+FILENAME and nothing else), each applied through the original's own
+line-oriented setter, which edits a key the document already carries **in
+place** and appends only the ones it lacks. A port that treats the list as a
+strict order passes every test and fails every diff. The 60-char slug policy
+is ported with it. The URL is stored and **never dereferenced** — the SSRF
+ruling, and the test binds a real listener and asserts nothing connects.
+
+**The write direction has its own traversal test, and it is the SIBLING
+case**: root `<root>/kb`, decoy `<root>/kb-secret`. A `../` test passes under
+both a `strncmp` guard and the component-wise `path_within()` one and
+separates nothing; only the sibling does.
+
+**Three of the link routes are in**, wire shapes field for field:
+`GET /api/kb/{kb}/notes/{id}/links` (outgoing wikilinks with state
+`resolved`/`ambiguous`/`dangling`, plus the backlinks), `GET
+/api/kb/{kb}/backlinks/{id}` (empty array, never a 404) and `GET
+/api/kb/{kb}/wikilinks/suggest` (`?q=` required, limit clamped to 50). The
+ladder's AMBIGUOUS answer **discards its candidate ids on the wire** because
+the original does, and the test asserts the whole row so a build that
+smuggles them through any member fails.
+
+**The anchor events are in** and fire on the TRANSITION and only on the
+transition: the pass re-checks the stale set and emits nothing for a document
+already known stale, so event volume is bounded by transitions rather than by
+reindexes.
+
+**The move is one store call rather than seven.** `kbc_store_rekey_artifact`
+rewrites every id-keyed row in ONE transaction — `chunks`, `corkboard`,
+`pinned_memories`, `doc_first_seen`, `history`, `edges` and `pending_links`
+in both directions, then `comments`, then `artifacts` LAST — with the intent
+recorded in `moves` BEFORE the rename and stamped after, so an interrupted
+move is a listable row rather than a lost document, and a stale id resolves
+to its new home through a chain-walked lookup. Three store facts made the
+transaction possible at all: `PRAGMA defer_foreign_keys` (the child FKs have
+no ON UPDATE CASCADE and the updates otherwise deadlock against each other);
+`artifacts` rekeyed last (the delete-leftover step is an ON DELETE CASCADE
+parent delete that eats children still naming the old id); and `comments`
+cannot follow the UPDATE-OR-IGNORE-then-delete pattern, because the only
+public way to write a comment MINTS its id and `created_at`, so an ordinary
+rekey would stamp every carried comment "now".
+
+**And a bring-up pass converges an interrupted rename**, in `kbc_app_open`,
+deciding from the FILESYSTEM because the corpus on disk is the authority. It
+takes no lock, triggers no reindex, and a store read that FAILS makes the
+daemon refuse to start — an empty list and an unreadable table are different
+answers. It **warns and abandons** rather than re-running the rekey: the
+function is handed `old_id` and `old_rel` and cannot recover `new_rel`,
+because `new_id` is a hash OF `new_rel`; and it cannot know the carry
+survived, since `comments` is ON DELETE CASCADE from `artifacts(id)`. That is
+the hole `abandoned_at` (migration 12) fills: a third terminal state,
+explicitly **not** a redirect, because stamping an abandoned move "completed"
+makes `moves_lookup` send a stale id to a destination that does not exist —
+a wrong answer rather than a missing one, and reachable because
+`kbc_app_get_artifact` follows the chain. It is migration 12 rather than a
+fold into 11 because the fold's safety condition is "no volume anywhere has
+recorded version 11", not "unreleased": `migrate_locked` skips every version
+at or below what a volume has, so the fold's failure is a volume that claims
+to be current and then says "no such column" — the silent drift the epoch
+guard exists to make loud. The one branch that ends nothing is the one that
+REFUSES: a row whose path is not corpus-relative stays in flight, because a
+pass that publishes a decision built out of a corrupt record is worse than a
+row that keeps warning.
+
+Units that remain: `links suggest` / `links apply`, which are pure functions
+of `kb_core::mentions` (`INVENTORY.md` marks it OUT-OF-SCOPE, so there is
+nothing to port them from); the anchor corkboard and `GET /anchors/stale`
+routes — the store table and the stale set are in, the three routes are not;
+and a user-facing `mv`. **The move has no verb and no route**: the seam is
+`kbc_app_move_path` and its bring-up pass, and both are reachable only from
+the tests today.
 
 Acceptance gate: capture the same bytes through both implementations and
-diff the resulting file, tag list and id.
+diff the resulting file, tag list and id. **Met on the C side** — the written
+bytes are asserted literally, key by key and in order, two captures of the
+same input are byte-identical, and an edited-in-place key is asserted
+separately from an appended one. The cross-implementation diff itself needs
+both binaries and is not yet run.
 
 ### Stage 5 — serving, SPA, metrics, outbound — MOSTLY BUILT
 
@@ -769,14 +857,18 @@ campaign took the supported-subset divergences from 2,940 to 8 across a
 4,409-document differential corpus, and CommonMark semantic divergences from
 257 to 120 of 652 spec examples, of which 75 are reference-link cases the
 header declares not supported. The divergence is written down rather than left
-for a reader to discover. **The renderer has no production caller yet**: the
-artifact route serves a `.md` document's raw source, so wiring it is the
-remaining half of this unit.
+for a reader to discover. **The renderer is now the artifact route's
+production path**: a `.md` is served as the rendered page on BOTH the parent
+origin and the artifact subdomain, and a render failure is a visible error
+never a silent fall back to raw bytes — a route that serves raw source when
+the renderer fails passes every test whether or not the renderer works.
+`?download=1` is the exception and stays a download: the SOURCE, with the
+`.html` name rewrite kept as the original's wire contract rather than as a
+claim that the body is HTML.
 
-Still PLANNED here: the `/docs` LISTING, multipart capture and the desk
-surface, attachment blobs, the outbound webhook URL validation, `download`,
-`metrics` as a CLI verb, log-level control, the remaining CLI verbs, and a SPA
-to point `KB_SPA_DIST` at.
+Still PLANNED here: the `/docs` LISTING, the desk surface, attachment blobs,
+the outbound webhook URL validation, `download` as its own verb, log-level
+control, the remaining CLI verbs, and a SPA to point `KB_SPA_DIST` at.
 
 Acceptance gate (met): the traversal suite — sibling directory, `..` in a
 segment, an absolute path, a symlink out of the source root, a
@@ -815,8 +907,38 @@ is its index; kb-c's index is the mmap'd postings file and `vectors.bin` beside
 it, and neither is in the archive. A restored kb-c therefore has a working
 store and no index, and `kbc reindex` rebuilds it.
 
-Not done: `bench init`/`discover` as CLI subcommands, retention pruning, metrics
-export.
+**Retention is in, and the premise it was scoped under was wrong.** `kbc prune
+--days N [--apply]` removes reading-history rows older than the window, and
+nothing else. The question this stage originally asked — does pruning touch
+the store only, or the store AND the index AND the graph? — does not arise,
+because the original never removes a document by age: `edges` has no
+timestamp column, so it CANNOT be time-pruned, and the R2-cascade tables are
+pruned per-artifact on delete. Wiring `kbc_app_delete_path` into retention
+would have invented a corpus-deleting verb the original does not have, so the
+test is the inverse of the obvious one: after a prune the document must still
+be in the store AND still be findable. The delete goes through the store
+under its own mutex (a second sqlite connection would be a second writer
+outside it), an unset `--days` is a user error rather than a silent success,
+and a WAL `TRUNCATE` checkpoint follows an applied prune on a best-effort
+basis — a failed reclaim costs disk, and rolling the delete back to make it
+succeed would cost the operator rows. **The dry-run default is kb-c's own and
+is deliberate**: the original arms a daily background task from
+`[retention]` rather than offering an operator verb, and `--apply` is the
+opt-in.
+
+**Metrics export is in as a verb.** `kbc metrics [--out PATH]` is a **client**
+of the `/metrics` route the daemon already serves, not a second
+implementation of it. There is deliberately **no in-process fallback**,
+unlike `search`/`reindex`/`get`/`list`: every counter the endpoint renders
+lives in the running daemon's registry, so a fallback would print a
+healthy-looking exposition of zeroes. `kbc status` sets the precedent and its
+reason — no fallback, exit 2 when no daemon answers. `--out` is the one
+divergence from the Rust's verb, which cannot save its scrape: `kb metrics >
+file` is the only way to keep one there, and a shell redirect is not something
+a verb can be tested through.
+
+Not done: `bench discover`/`run` as CLI subcommands, and the log-level
+control.
 
 ---
 
@@ -1179,5 +1301,5 @@ softened, Zig is the first alternative to re-evaluate.
 | R9 | Performance work is done before correctness work, because the performance claim is the reason the port exists. | A fast, wrong index ships. | The stage order in §3 puts storage completeness, grammar and HTTP parity ahead of measurement (stage 6), and the measurement stage found two severe correctness defects in the ingest path (§2.4.5) — which is the argument for the order, made by the order itself. |
 | R10 | The debounce and batching constants are tuned for the Rust daemon's latency. | kb-c either re-indexes too eagerly or too slowly. | P3-style treatment: `watcher_debounce_ms` (250 ms today, configurable) and the batch constants are in one place and listed in stage 1's gate, and are revisited once kb-c has a corpus to tune against. The reconcile pass has landed — a full reindex sweeps and removes what vanished — but it runs **on a reindex**, not on a 60-second timer, so an unobserved removal is still only noticed when something asks for a reindex. |
 | R11 | A watcher event re-indexes **that one file** in place (`reindex_one`), because the frozen index has no add-to-open operation. | Ingestion cost is a function of change size rather than corpus size, which is the point, but there is still no batch drain: N files touched in a debounce window means N single-file updates rather than one transaction. | Deliberate and measured, and the measurement corrected the design twice: the in-place update alone did NOT make the cost proportional to the file, because the save rewrote and fsynced the whole index (251 ms / 500 ms / 1.19 s at 1,000 / 5,000 / 20,000 documents). A delta journal fixed that, and the matched A/B puts a save at 30.6 / 33.3 / 36.3 ms at 1,000 / 5,000 / 20,000 documents — flat across a 20× range, because all three are the storage's fsync floor (`BENCHMARKS.md`). The remaining work is stage 1's batch drain (≤32 docs / ≤8 MiB), which is now a throughput improvement rather than a correctness one. Until it lands, many small changes in one window cost more than they should — a known weakness, not a surprise. |
-| R12 | The artifact id is a pure function of `(corpus, path)`, so a **rename** is a delete plus an insert, not an update. | A renamed file loses its id, its comment threads and its chunk history unless the move is observed. | Deliberate: the alternative mints a new id on every save, which is worse. **Half the mitigation has landed**: stage 1's reconcile delete pass now runs, so an unobserved rename disappears rather than lingering, and the removal keeps the user's rows (`history`, pins, corkboard) and demotes inbound edges to `pending_links` so a document that comes back finds its backlinks. The other half is stage 4's `mv` and the `moves` rename-race log, which is what would carry the old id across the rename instead of dropping it. |
-| R13 | A design document can describe a behaviour convincingly enough that nobody tests it. | Stage 0 shipped claiming a `sha256(rel_path)` id, 280-word chunk windows and plain JSON errors — and later drafts of this plan described an embedder wire protocol the real sidecar does not speak, and quoted a 10.3 ms incremental update that was never measured clean. | The test suite is the arbiter, and it earns that position: 14 suites, 531 cases, 24 defects found during the build, including two use-after-frees and a cross-thread data race (§2.4.4). A number that no run on the current code produced does not belong in this document, even as a placeholder. Any behaviour added to §3 without a test that fails when it is wrong is not done. **The corollary, learned the hard way in §2.5: a green lane is not the same as a correct one.** An uninitialised struct flag passed a green release lane AND a green ASan lane, because no sanitizer reports uninitialised reads; it was caught only because the TSan build rendered differently from the release build. A test that fails intermittently is worse than no test — it trains everyone who reads CI to ignore red — so the one such case was deleted rather than tuned, with the declined alternative recorded in DECISIONS.md ADR-007. |
+| R12 | The artifact id is a pure function of `(corpus, path)`, so a **rename** is a delete plus an insert, not an update. | A renamed file loses its id, its comment threads and its chunk history unless the move is observed. | **Mitigated in the store, and not yet reachable by an operator.** `kbc_store_rekey_artifact` rewrites every id-keyed row in ONE transaction, so a rename carries the id, the comments with their ids and timestamps, the corkboard entry, the pin, the first-indexed anchor and the reading history across rather than dropping them; `moves` records the intent before the rename and stamps it after, a stale id resolves through a chain-walked lookup, and a bring-up pass converges an interrupted one by warning and ABANDONING (a rekey it cannot complete would report having carried state it did not carry). The alternative the row used to weigh — minting a new id on every save — remains worse. What is missing is the last step: there is no `mv` verb and no relocate route, so the seam is reachable from the tests only. A rename the daemon does NOT observe still disappears through stage 1's reconcile pass, which keeps the user's rows and demotes inbound edges to `pending_links` |
+| R13 | A design document can describe a behaviour convincingly enough that nobody tests it. | Stage 0 shipped claiming a `sha256(rel_path)` id, 280-word chunk windows and plain JSON errors — and later drafts of this plan described an embedder wire protocol the real sidecar does not speak, and quoted a 10.3 ms incremental update that was never measured clean. | The test suite is the arbiter, and it earns that position: 14 suites, 624 cases, 24 defects found during the build, including two use-after-frees and a cross-thread data race (§2.4.4). A number that no run on the current code produced does not belong in this document, even as a placeholder. Any behaviour added to §3 without a test that fails when it is wrong is not done. **The corollary, learned the hard way in §2.5: a green lane is not the same as a correct one.** An uninitialised struct flag passed a green release lane AND a green ASan lane, because no sanitizer reports uninitialised reads; it was caught only because the TSan build rendered differently from the release build. A test that fails intermittently is worse than no test — it trains everyone who reads CI to ignore red — so the one such case was deleted rather than tuned, with the declined alternative recorded in DECISIONS.md ADR-007. |

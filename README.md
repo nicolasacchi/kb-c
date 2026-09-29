@@ -19,16 +19,16 @@ same corpus.
 Works today:
 
 - `kbc` builds from source with CMake and passes its ctest suite: 14 suites,
-  531 cases, green in the Release, `-DKBC_SANITIZE=ON` and TSan lanes (14/14 in
-  each, from clean trees, at commit `8fc54e3`).
+  624 cases, green in the Release, `-DKBC_SANITIZE=ON` and TSan lanes (14/14 in
+  each, from clean trees, at commit `c05a564`).
 - Config loading (a strict `kb.toml` subset), the SQLite store and its
-  **ten** migrations — fourteen data tables at schema v10, plus the
+  **twelve** migrations — fifteen data tables at schema v12, plus the
   `schema_version` bookkeeping table — the Markdown/HTML block parser with
   stable anchors and `kb-*` front matter, the tokenizer and its stopword list,
   the mmap'd inverted index with BM25, RRF fusion over the keyword and vector
   lanes, the mmap'd vector store, the inotify watcher with debounce, the
   subprocess embedder client, the epoll + `SO_REUSEPORT` HTTP daemon with bearer
-  auth and an SSE stream, and a CLI with thirteen verbs — all specified in the
+  auth and an SSE stream, and a CLI with sixteen verbs — all specified in the
   frozen headers under `include/kbc/` and all wired end to end.
 - A storage volume that has been forward-migrated by a **newer** binary is
   refused at open, before the migration run touches it, so a kb-c that cannot
@@ -39,21 +39,55 @@ Works today:
   away. A document that fails to embed three times is **quarantined**: it stops
   being embedded and stays keyword-searchable, and editing it — which changes
   its content hash — is how an operator gets it out again.
-- The daemon serves a route banner on `/` and ten JSON routes: `/api/health`,
-  `/api/identity`, `/api/kbs`, `/api/stats`, `/api/search`, `/api/artifacts`,
-  `/api/artifacts/{id}`, `/api/kb/{kb}/artifact/{id}`, `POST /api/reindex` and
-  `/api/events`, plus a Prometheus text endpoint at `/metrics`. `reindex`,
-  `search`, `get` and `list` work with or without a running daemon.
-- Artifact **serving**, on two origins: the bytes inline on the app origin
-  with `Content-Security-Policy: sandbox`, `nosniff` and `X-Kb-Artifact-Id`, and
-  one subdomain per artifact (`<id>.artifacts.localhost`) with a `frame-ancestors`
-  CSP instead. Both are behind a **component-wise** root guard — `strncmp`
+- The daemon serves a route banner on `/` and **fourteen** JSON routes:
+  `/api/health`, `/api/identity`, `/api/kbs`, `/api/stats`, `/api/search`,
+  `/api/artifacts`, `/api/artifacts/{id}`, `/api/kb/{kb}/artifact/{id}`,
+  `/api/kb/{kb}/notes/{id}/links`, `/api/kb/{kb}/backlinks/{id}`,
+  `/api/kb/{kb}/wikilinks/suggest`, `POST /api/kb/{kb}/capture`,
+  `POST /api/reindex` and `/api/events`, plus a Prometheus text endpoint at
+  `/metrics`. `reindex`, `search`, `get` and `list` work with or without a
+  running daemon.
+- Artifact **serving**, on two origins: the page on the app origin with
+  `Content-Security-Policy: sandbox`, `nosniff` and `X-Kb-Artifact-Id`, and one
+  subdomain per artifact (`<id>.artifacts.localhost`) with a `frame-ancestors`
+  CSP instead. **A `.md` is rendered to a page on both** rather than served as
+  source, and `?download=1` is the deliberate exception that hands back the
+  source. Both are behind a **component-wise** root guard — `strncmp`
   containment would serve a sibling directory, and the test that catches that
   is a sibling directory, not a `../` case. A static bundle in `KB_SPA_DIST` is
   served on the same guard.
 - A hand-rolled Markdown renderer with **no third-party dependency** (see the
   caveat below), a query-embedding cache keyed by `(model, query)`, and
   `kbc backup` / `kbc restore` (`VACUUM INTO` + tar).
+- **Capture**: `POST /api/kb/{kb}/capture` takes a multipart upload and answers
+  201 with the created ids. The stamped frontmatter is **byte-comparable** with
+  the original's, which is why the key order is a contract — but the order is
+  the order of *first insertion*, so a document that already carries
+  `kb-category` keeps it first and grows the rest after it. A shared `url` is
+  **recorded and never fetched** (the SSRF ruling; a test binds a real listener
+  and asserts nothing connects), and the write is checked against the corpus
+  root with the same component-wise guard the serving surfaces use.
+- **Anchor comments go stale, and say so.** After a re-index the daemon
+  re-resolves every open comment's anchor and publishes
+  `comment.anchor_stale` or `comment.anchor_resolved` — **on the transition
+  only**, so the event volume tracks state changes rather than reindexes.
+  `kbc comments list|add|resolve|unresolve` read and write the store directly.
+- **A move carries the document's state with it.** A rename rewrites every
+  id-keyed row in ONE store transaction — comments keep their ids and
+  timestamps, and the corkboard entry, the pin, the first-indexed anchor and
+  the reading history follow — records its intent before the rename and stamps
+  it after, and a stale id resolves to its new home. A rename interrupted by a
+  crash is converged at the next bring-up, which **warns and abandons** rather
+  than re-running the rekey, because a rekey it cannot complete would report
+  having carried state it did not carry. The move has no verb or route yet:
+  the seam is the app and store API, reachable from the tests only.
+- **Retention and metrics as operator verbs.** `kbc prune --days N [--apply]`
+  removes reading-history rows older than the window and **never a document**,
+  because the original never removes one by age — `edges` has no timestamp
+  column to prune on. It is a dry run without `--apply`. `kbc metrics [--out
+  PATH]` prints the daemon's Prometheus exposition; it has no in-process
+  fallback, because a fallback would print a healthy-looking exposition of
+  zeroes.
 - A vector lane works when `kb-embedder` is configured and healthy, verified
   against the production sidecar with `bge-small-en-v1.5`. Without one,
   `hybrid` degrades to keyword and `semantic` returns nothing, and the
@@ -107,13 +141,27 @@ Not done:
 
 - **No date filters.** `since:` parses its value grammar but the layer that
   would apply it does not exist, so the atom is refused with a 400.
-- **The Markdown renderer does not render pages yet.** It is built and tested,
-  but the artifact route serves a `.md` document's raw source, so
-  nothing a user sees comes out of it. When it is wired, note that it is
-  deliberately narrower than the original's comrak: reference links and link
+- **The Markdown renderer is deliberately narrower than the original's comrak.**
+  It is the artifact route's production path — a `.md` is served as a rendered
+  page on both origins — and it does not support reference links and link
   reference definitions, footnotes, superscript, description lists and entity
-  references render as ordinary text. That is the cost of taking no
+  references, which render as ordinary text. That is the cost of taking no
   third-party dependency, and it is recorded rather than silent.
+- **The move is not user-facing yet.** The store and app halves are built and
+  tested, and a crash-interrupted rename is converged at bring-up, but there is
+  no `mv` verb and no relocate route: today only the tests can call it.
+- **`links suggest` / `links apply` are not ported.** They are pure functions
+  of `kb_core::mentions`, which is out of scope for this port, so there is
+  nothing to port them from. The three routes that read the link graph —
+  note links, backlinks and `[[` autocomplete — are in.
+- **The anchor corkboard has no routes.** Stale/resolved detection and its two
+  events are in; the cross-kb list, pin, unpin and `GET /anchors/stale` are not,
+  so there is no HTTP surface for an SPA's stale-anchors dashboard to seed from.
+- **Capture is Markdown-only.** `.html` is refused with a 415, because the
+  original's HTML path splices `<meta>` into `<head>` and runs ammonia over the
+  result, and kb-c takes no sanitiser — a head-splice without one is a way to
+  persist attacker markup into a trusted origin. The Web Share Target
+  (`POST /capture`) and the desk surface are not ported either.
 - **A backup carries the store, not the index.** `kbc restore` gives back a
   working SQLite snapshot; the mmap'd index and `vectors.bin` are not in the
   tarball, so a restored corpus becomes searchable after `kbc reindex` and not
@@ -224,7 +272,7 @@ is required on every `/api` route except `/api/health`.
                   |                         ^            ^
                   v                         |            |
             [ SQLite store ]                |            |
-           artifacts / chunks               |            |
+          artifacts / chunks / moves        |            |
                   ^                         |            |
                   |                    query tokens   query vector
                   |                         |            |
@@ -240,8 +288,8 @@ is required on every `/api` route except `/api/health`.
                   |                                   subdomain / static
                   |                                   serving surfaces
         [ kbc CLI: daemon | add | search | get | list | reindex | status
-                    | bench | backup | restore | config show | token
-                    | generate | version ]
+                    | comments | bench | backup | restore | prune | metrics
+                    | config show | token generate | version ]
 ```
 
 Request-scoped memory lives in an arena and dies with the request. The store,
