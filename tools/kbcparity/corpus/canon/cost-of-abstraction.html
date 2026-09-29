@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>The Cost of Abstraction — a four-page essay</title>
+<style>
+  :root {
+    --bg: #f4ede2;
+    --panel: #ebe1ce;
+    --border: #d8cdb6;
+    --rule: #2c241c;
+    --text: #1f1813;
+    --muted: #7a6d5b;
+    --accent: oklch(0.5 0.16 30);
+    --serif: 'Fraunces', Georgia, serif;
+    --sans: 'Geist', -apple-system, sans-serif;
+    --mono: 'Geist Mono', ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: var(--serif); }
+  body {
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    height: 100vh;
+    overflow: hidden;
+    background-image: repeating-linear-gradient(0deg, transparent, transparent 23px, rgba(44,36,28,0.035) 23px, rgba(44,36,28,0.035) 24px);
+  }
+
+  /* TOC */
+  nav.toc {
+    border-right: 1px solid var(--rule);
+    padding: 36px 24px 24px;
+    overflow-y: auto;
+    background: linear-gradient(180deg, var(--bg), var(--panel));
+    display: flex; flex-direction: column;
+  }
+  .eyebrow {
+    font-family: var(--mono); font-size: 10.5px;
+    letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--muted); margin: 0 0 12px;
+  }
+  .toc-title {
+    font-family: var(--serif); font-weight: 700;
+    font-size: 30px; line-height: 1.0; letter-spacing: -0.02em;
+    margin: 0 0 6px;
+    font-variation-settings: 'opsz' 96;
+  }
+  .toc-author {
+    font-family: var(--sans); font-size: 12.5px;
+    color: var(--muted); margin: 0 0 24px;
+    font-style: italic;
+  }
+  .toc-author b { color: var(--text); font-weight: 500; font-style: normal; }
+  .toc ol { list-style: none; padding: 0; margin: 0; }
+  .toc li {
+    border-top: 1px solid var(--border);
+    padding: 0;
+  }
+  .toc li:last-child { border-bottom: 1px solid var(--border); }
+  .toc a {
+    display: grid;
+    grid-template-columns: 24px 1fr auto;
+    gap: 10px;
+    align-items: baseline;
+    padding: 12px 4px;
+    text-decoration: none; color: var(--text);
+    font-family: var(--sans);
+  }
+  .toc a:hover { background: rgba(44,36,28,0.04); }
+  .toc a.is-active { color: var(--accent); }
+  .toc a.is-active .ch-no { color: var(--accent); }
+  .ch-no { font-family: var(--mono); font-size: 11px; color: var(--muted); letter-spacing: 0.06em; }
+  .ch-name { font-size: 14px; line-height: 1.25; font-weight: 500; }
+  .ch-name small { display: block; font-family: var(--sans); font-size: 11.5px; color: var(--muted); margin-top: 3px; font-weight: 400; line-height: 1.35; }
+  .ch-pg { font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
+
+  .toc-foot {
+    margin-top: auto; padding-top: 18px;
+    font-family: var(--mono); font-size: 10.5px;
+    color: var(--muted); letter-spacing: 0.04em;
+    line-height: 1.6;
+  }
+  .toc-prog { height: 2px; background: var(--border); margin: 8px 0 6px; position: relative; overflow: hidden; }
+  .toc-prog::after { content: ''; position: absolute; inset: 0; right: var(--rest, 80%); background: var(--accent); transition: right 0.25s ease; }
+
+  /* MAIN */
+  main {
+    overflow-y: auto;
+    scroll-behavior: smooth;
+    padding: 0;
+  }
+  .page {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 88px 56px 80px;
+    border-bottom: 1px dashed var(--border);
+    min-height: 100vh;
+  }
+  .page:last-child { border-bottom: 0; }
+  .ch-eyebrow {
+    font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--accent); margin: 0 0 18px;
+  }
+  h1.ch-title {
+    font-family: var(--serif); font-weight: 700;
+    font-size: clamp(40px, 5vw, 56px);
+    line-height: 1.02; letter-spacing: -0.025em;
+    margin: 0 0 18px;
+    font-variation-settings: 'opsz' 144;
+    text-wrap: balance;
+  }
+  .lede {
+    font-family: var(--serif); font-size: 21px; line-height: 1.45;
+    color: var(--muted); font-style: italic;
+    margin: 0 0 40px; max-width: 580px;
+  }
+  h2 { font-family: var(--serif); font-size: 26px; margin: 44px 0 14px; font-weight: 600; letter-spacing: -0.012em; line-height: 1.15; }
+  p { margin: 0 0 18px; font-size: 17px; line-height: 1.65; }
+  p:first-of-type::first-letter {
+    font-family: var(--serif); font-weight: 700;
+    font-size: 64px; float: left; line-height: 0.85;
+    margin: 6px 8px 0 0; color: var(--accent);
+    font-variation-settings: 'opsz' 144;
+  }
+  pre {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    padding: 14px 16px;
+    font-family: var(--mono); font-size: 13px; line-height: 1.55;
+    overflow-x: auto; margin: 18px 0 24px;
+    border-radius: 4px;
+  }
+  code { font-family: var(--mono); font-size: 0.92em; background: var(--panel); padding: 1px 5px; border-radius: 3px; }
+  pre code { background: none; padding: 0; }
+  .pull {
+    margin: 32px -8px;
+    padding: 18px 22px;
+    border-left: 3px solid var(--accent);
+    font-family: var(--serif); font-size: 22px; line-height: 1.4;
+    font-style: italic; color: var(--text);
+    font-variation-settings: 'opsz' 60;
+  }
+  .footnote {
+    font-family: var(--sans); font-size: 13px;
+    color: var(--muted); border-top: 1px solid var(--border);
+    margin-top: 36px; padding-top: 14px;
+  }
+
+  .pageend {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-top: 56px; padding-top: 18px;
+    border-top: 1px solid var(--border);
+    font-family: var(--mono); font-size: 11px; color: var(--muted);
+    letter-spacing: 0.06em; text-transform: uppercase;
+  }
+  .pageend a { color: var(--text); text-decoration: none; padding: 6px 0; }
+  .pageend a:hover { color: var(--accent); }
+
+  /* BACKLINK CARD */
+  .xref {
+    margin: 36px 0;
+    border: 1px solid var(--rule);
+    background: var(--panel);
+    padding: 18px 20px;
+    display: grid; grid-template-columns: auto 1fr auto; gap: 16px; align-items: center;
+    text-decoration: none; color: var(--text);
+    transition: background 0.12s, border-color 0.12s;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .xref:hover { background: var(--bg); border-color: var(--accent); }
+  .xref .icon {
+    width: 36px; height: 36px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    display: grid; place-items: center;
+    font-family: var(--mono); font-size: 12px; color: var(--accent); font-weight: 500;
+  }
+  .xref .meta {
+    font-family: var(--mono); font-size: 10.5px; color: var(--muted);
+    letter-spacing: 0.1em; text-transform: uppercase;
+    margin-bottom: 4px;
+  }
+  .xref .title {
+    font-family: var(--serif); font-size: 17px; font-weight: 600;
+    line-height: 1.2; letter-spacing: -0.01em; margin: 0 0 2px;
+    color: var(--text);
+  }
+  .xref:hover .title { color: var(--accent); }
+  .xref .desc { font-family: var(--sans); font-size: 12.5px; color: var(--muted); line-height: 1.4; margin: 0; }
+  .xref .arrow { font-family: var(--serif); font-size: 22px; color: var(--muted); }
+
+  /* footer xrefs */
+  .related {
+    margin-top: 44px; padding-top: 22px;
+    border-top: 3px double var(--rule);
+  }
+  .related h3 {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.16em;
+    text-transform: uppercase; color: var(--muted); margin: 0 0 14px; font-weight: 500;
+  }
+  .related ul { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0; }
+  .related li { border-bottom: 1px dotted var(--border); padding: 10px 0; cursor: pointer; }
+  .related li:last-child { border-bottom: 0; }
+  .related a { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: baseline; text-decoration: none; color: var(--text); }
+  .related a:hover .t { color: var(--accent); }
+  .related .t { font-family: var(--serif); font-size: 16px; font-weight: 500; line-height: 1.25; }
+  .related .m { font-family: var(--mono); font-size: 10.5px; color: var(--muted); letter-spacing: 0.04em; text-transform: uppercase; }
+</style>
+</head>
+<body>
+
+<nav class="toc">
+  <p class="eyebrow">an essay · 4 pages</p>
+  <h2 class="toc-title">The Cost of Abstraction</h2>
+  <p class="toc-author">A defense of <b>writing it twice</b>, against the long shadow of DRY.</p>
+
+  <ol id="toc">
+    <li><a href="#p1" data-target="p1"><span class="ch-no">I</span><span class="ch-name">The First Lie<small>The two callers were never the same.</small></span><span class="ch-pg">p. 1</span></a></li>
+    <li><a href="#p2" data-target="p2"><span class="ch-no">II</span><span class="ch-name">The Cost of the Wrapper<small>Every shared abstraction is a coupling.</small></span><span class="ch-pg">p. 2</span></a></li>
+    <li><a href="#p3" data-target="p3"><span class="ch-no">III</span><span class="ch-name">When to Extract<small>Three honest signals, none of them DRY.</small></span><span class="ch-pg">p. 3</span></a></li>
+    <li><a href="#p4" data-target="p4"><span class="ch-no">IV</span><span class="ch-name">Notes &amp; Sources<small>Backlinks, footnotes, related artifacts.</small></span><span class="ch-pg">p. 4</span></a></li>
+  </ol>
+
+  <div class="toc-foot">
+    Reading time · ~8 min<br/>
+    <div class="toc-prog" id="prog"></div>
+    <span id="readout">page 1 of 4</span>
+  </div>
+</nav>
+
+<main id="main">
+
+  <article class="page" id="p1">
+    <p class="ch-eyebrow">Chapter I</p>
+    <h1 class="ch-title">The First Lie</h1>
+    <p class="lede">Two functions look the same. They probably aren&rsquo;t. The cost of pretending they are is the cost we keep paying.</p>
+
+    <p>The most expensive sentence in any codebase is &ldquo;I noticed these two are doing the same thing.&rdquo; It is expensive because it is, in almost every case, a misreading of the present. The two callers were not the same. They were the same on Tuesday.</p>
+
+    <p>I have spent ten years watching engineers (myself among them) take two functions, see structural similarity, and extract a third function that purports to handle both. Six months later, one of the original callers needed to do something the other did not. The shared function grew a parameter. Six months after that, another. The function signature became a list of every difference between two domains that, in retrospect, never had a reason to share an implementation.</p>
+
+    <h2>What looked the same</h2>
+    <p>Consider the canonical case: validating a user-submitted form, and validating an admin-submitted form. The fields overlap. The rules <em>look</em> the same. You write a single <code>validate(form)</code> and feel proud.</p>
+
+    <pre><code>fn validate(form: &amp;Form) -&gt; Result&lt;Valid, Vec&lt;Error&gt;&gt; {
+    let mut errors = Vec::new();
+    if form.email.is_empty() { errors.push(Error::EmailMissing); }
+    // ... 40 more rules
+    if errors.is_empty() { Ok(Valid(form.clone())) } else { Err(errors) }
+}</code></pre>
+
+    <p>Then a product manager appears. The admin form, it turns out, allows blank emails for service accounts. The function grows a flag. Then another, for the case where users can have email but admins must. Then a third, when localization changes the error messages but only for one path.</p>
+
+    <p>None of these are bugs. They are the abstraction performing exactly as designed. The design was wrong.</p>
+
+    <div class="pageend">
+      <span>Chapter I &nbsp;·&nbsp; 1 of 4</span>
+      <a href="#p2" data-target="p2">continue: The Cost of the Wrapper →</a>
+    </div>
+  </article>
+
+  <article class="page" id="p2">
+    <p class="ch-eyebrow">Chapter II</p>
+    <h1 class="ch-title">The Cost of the Wrapper</h1>
+    <p class="lede">Every shared abstraction is a coupling. The question is whether that coupling buys more than it costs.</p>
+
+    <p>Software is not free to abstract. The cost is paid in three currencies, and engineers, in our enthusiasm for the first one, almost never count the other two.</p>
+
+    <h2>Currency one: indirection</h2>
+    <p>To read shared code, you must follow references. Each call site lives elsewhere. Each test of behavior must be staged through the wrapper&rsquo;s contract. A reader who wants to know what happens when an admin submits a form must hold three layers in their head: the call site, the shared validator, the rules tables it consults. None of this is wrong. All of it is a tax.</p>
+
+    <h2>Currency two: lock-in</h2>
+    <p>The shared abstraction freezes the contract. Once two callers consume <code>validate(form, opts)</code>, changing its signature changes both. That sounds like the upside &mdash; one change, two beneficiaries &mdash; but it is the same fact described positively. When admin needs a new rule, the user-facing path is dragged along. When the user-facing path needs a faster code path, admin is dragged with it.</p>
+
+    <div class="pull">
+      &ldquo;Premature abstraction is more expensive than premature optimization, because it is harder to undo and easier to convince yourself was correct.&rdquo;
+    </div>
+
+    <h2>Currency three: epistemic</h2>
+    <p>The most insidious cost. Two functions that look alike, having been merged, can no longer teach you that they were ever different. The seam is gone. New engineers inherit a single function and assume the unification reflects a deeper truth. They reason from the abstraction, not from the cases it was made of. They become, in effect, abstraction-poisoned: they cannot see the domain through the API.</p>
+
+    <div class="pageend">
+      <span>Chapter II &nbsp;·&nbsp; 2 of 4</span>
+      <a href="#p3" data-target="p3">continue: When to Extract →</a>
+    </div>
+  </article>
+
+  <article class="page" id="p3">
+    <p class="ch-eyebrow">Chapter III</p>
+    <h1 class="ch-title">When to Extract</h1>
+    <p class="lede">There are honest reasons to share code. They are rarer than you think, and none of them are &ldquo;these two functions look similar.&rdquo;</p>
+
+    <p>Here are the three signals I have come to trust, after a decade of getting it wrong in both directions.</p>
+
+    <h2>Signal one · The third caller</h2>
+    <p>Two duplicates is data. Three duplicates is a pattern. The classic rule of three exists because it is the smallest sample that distinguishes coincidence from structure. If you are about to write the third copy, stop &mdash; that is the moment a shared abstraction earns its rent.</p>
+
+    <h2>Signal two · A real invariant</h2>
+    <p>Sometimes two callers must behave the same way because the system depends on it. Authentication checks that must agree. Serialization that must round-trip. Money calculations that must sum to a known total. These are not similar &mdash; they are tied. Sharing the implementation is not aesthetic, it is correctness.</p>
+
+    <h2>Signal three · A name that survives</h2>
+    <p>The hardest signal, and the one I wish I had learned earlier. A good abstraction has a name that you would have used even if you had been writing the second caller from scratch. <code>send_welcome_email</code> survives. <code>process_user</code> does not. If you cannot name the abstraction without referring to the callers it unifies, you are not extracting a concept &mdash; you are extracting an accident.</p>
+
+    <p>When none of the three signals is present, the cheapest, most honest, most readable thing to do is what every senior engineer eventually learns to do without flinching:</p>
+
+    <div class="pull">Write it twice.</div>
+
+    <p>Two functions, side by side, each clear about what it does. When they diverge, they diverge cleanly. When they converge for a real reason, you will recognize the third signal, and you will extract from a position of knowledge instead of one of fear.</p>
+
+    <p>For the specific case of error handling and how this principle applies to error types &mdash; particularly in Rust, where the temptation to share an <code>Error</code> enum across modules is enormous &mdash; see the companion piece below.</p>
+
+    <a class="xref" data-target="open:s02" href="#">
+      <span class="icon">↗</span>
+      <span>
+        <p class="meta">Field guide · companion essay</p>
+        <p class="title">A Field Guide to Rust Errors</p>
+        <p class="desc">Four chapters on panics, Result, and the Error trait. The DRY argument applied specifically to error enums &mdash; and why I now recommend per-module error types more often than the unified <code>thiserror</code> tree.</p>
+      </span>
+      <span class="arrow">→</span>
+    </a>
+
+    <div class="pageend">
+      <span>Chapter III &nbsp;·&nbsp; 3 of 4</span>
+      <a href="#p4" data-target="p4">continue: Notes &amp; Sources →</a>
+    </div>
+  </article>
+
+  <article class="page" id="p4">
+    <p class="ch-eyebrow">Chapter IV</p>
+    <h1 class="ch-title">Notes &amp; Sources</h1>
+    <p class="lede">Where the argument came from, and where it goes next.</p>
+
+    <p>This essay is not original. The clearest articulation I know of the &ldquo;wrong abstraction&rdquo; idea belongs to Sandi Metz, in a 2016 talk and the blog post that followed. What I have tried to add is a closer accounting of <em>which</em> currencies you pay in, and a small set of decision rules that survive contact with deadlines.</p>
+
+    <h2>Footnotes</h2>
+    <p class="footnote">
+      <b>1.</b> The &ldquo;rule of three&rdquo; is older than software. The Pragmatic Programmer attributes it to Don Roberts. It applies to refactoring as well as to extraction; both call for waiting until a pattern is unmistakable before responding to it.
+    </p>
+    <p class="footnote">
+      <b>2.</b> &ldquo;Lock-in&rdquo; here is borrowed from the API-design literature. A function shared by two callers is a one-line API; the engineering discipline you would apply to a public crate&rsquo;s API surface is the same discipline you should apply to it.
+    </p>
+
+    <div class="related">
+      <h3>Related artifacts in this kb</h3>
+      <ul>
+        <li><a data-target="open:s02" href="#"><span class="t">A Field Guide to Rust Errors</span><span class="m">cited above · 6.8k words</span></a></li>
+        <li><a data-target="open:a09" href="#"><span class="t">Type-Level Programming in Rust</span><span class="m">on naming · 2.5k words</span></a></li>
+        <li><a data-target="open:a16" href="#"><span class="t">Trait Objects vs Generics: Cost Model</span><span class="m">indirection costs · 2.1k words</span></a></li>
+        <li><a data-target="open:a07" href="#"><span class="t">Building a Job Queue from Scratch</span><span class="m">written-twice example · 6.2k words</span></a></li>
+      </ul>
+    </div>
+
+    <div class="pageend">
+      <span>End &nbsp;·&nbsp; 4 of 4</span>
+      <a href="#p1" data-target="p1">↑ back to chapter I</a>
+    </div>
+  </article>
+
+</main>
+
+<script>
+  const main = document.getElementById('main');
+  const links = document.querySelectorAll('[data-target]');
+  const tocLinks = document.querySelectorAll('.toc a[data-target]');
+  const pages = ['p1','p2','p3','p4'];
+
+  // Click handler — both nav and inline
+  links.forEach(a => a.addEventListener('click', (e) => {
+    const t = a.dataset.target;
+    if (t.startsWith('open:')) {
+      // Cross-artifact backlink — bubble up to host gallery if present
+      e.preventDefault();
+      try {
+        window.parent.postMessage({ type: 'open-artifact', id: t.slice(5) }, '*');
+      } catch (_) {}
+      return;
+    }
+    e.preventDefault();
+    const el = document.getElementById(t);
+    if (el) main.scrollTo({ top: el.offsetTop, behavior: 'smooth' });
+  }));
+
+  // Active section / progress
+  const prog = document.getElementById('prog');
+  const readout = document.getElementById('readout');
+
+  function update() {
+    const top = main.scrollTop;
+    const h = main.clientHeight;
+    let active = 0;
+    pages.forEach((id, i) => {
+      const el = document.getElementById(id);
+      if (top + h * 0.4 >= el.offsetTop) active = i;
+    });
+    tocLinks.forEach((a, i) => a.classList.toggle('is-active', i === active));
+    const pct = Math.min(1, (top + h) / main.scrollHeight);
+    prog.style.setProperty('--rest', ((1 - pct) * 100) + '%');
+    readout.textContent = `page ${active + 1} of ${pages.length}`;
+  }
+  main.addEventListener('scroll', update, { passive: true });
+  update();
+</script>
+</body>
+</html>

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<title>INC-0315 · Timeline</title>
+<link rel="stylesheet" href="style.css"/>
+</head><body data-page="1">
+
+<header class="head">
+  <span class="sev">SEV-1</span>
+  <span class="id"><b>INC-0315</b> · checkout-api · 2024-03-15</span>
+  <span class="pg">page <b>2</b> / 4</span>
+</header>
+
+<section class="hero">
+  <p class="eyebrow">Page 02 — Timeline</p>
+  <h1>Minute-by-minute</h1>
+  <p class="lede">Times in UTC. Source: pager + slack-incident-bot transcript + grafana annotations. Reviewer: <b>j.morales</b>.</p>
+</section>
+
+<section class="section">
+  <ol class="tl">
+    <li><div class="t">14:03</div><div class="body"><strong>Config push merged.</strong> PR #4128 in <code>flags-config</code>; CI green; auto-deployed to all regions in 90s.<small>author: e.tanaka · review: a.singh</small></div></li>
+    <li><div class="t">14:04</div><div class="body"><strong>Pods begin rolling pool connections.</strong> Each instance reads the flag on connection rotate; the unsafe default takes effect over a ~12-min window.</div></li>
+    <li><div class="t bad">14:14</div><div class="body"><strong>Latency p99 crosses 2s.</strong> Grafana annotation; no human-visible alert yet.<small>checkout-api · region: us-east-1, us-west-2</small></div></li>
+    <li><div class="t bad">14:14</div><div class="body"><strong>SLO burn-rate alert fires.</strong> Pages on-call (j.morales). 11 min from initial push.</div></li>
+    <li><div class="t">14:17</div><div class="body"><strong>Incident declared SEV-2.</strong> Slack channel opened; comms to <code>#status-internal</code>.</div></li>
+    <li><div class="t bad">14:21</div><div class="body"><strong>500-rate spikes to 18%.</strong> Upgraded to SEV-1; status page set to "investigating".</div></li>
+    <li><div class="t">14:26</div><div class="body"><strong>First hypothesis: DB saturation.</strong> Pulled connection-count graph; saw it inverted from normal — too few connections, not too many.</div></li>
+    <li><div class="t">14:33</div><div class="body"><strong>Pool config flagged in chat.</strong> e.tanaka recalls the morning&rsquo;s flag push; pulls the diff.<small>"wait, that&rsquo;s not how flags work"</small></div></li>
+    <li><div class="t">14:41</div><div class="body"><strong>Flag reverted.</strong> Forced reload across the cluster.</div></li>
+    <li><div class="t ok">14:48</div><div class="body"><strong>Pools refilled.</strong> p99 returns to baseline.</div></li>
+    <li><div class="t ok">14:50</div><div class="body"><strong>Resolved.</strong> Status page set to "resolved"; incident moved to review.</div></li>
+  </ol>
+
+  <div class="callout">
+    <b>note · time-to-detect</b>
+    11 minutes from push → page is roughly 4× our SLO burn-rate target on this service. The detection delay is the single biggest area for improvement; see action item P0-3.
+  </div>
+</section>
+
+<nav class="pagenav">
+  <a class="prev" href="00-summary.html"><div class="dir">← prev</div><div class="ttl">01 · Summary</div></a>
+  <a class="next" href="02-cause.html"><div class="dir">next →</div><div class="ttl">03 · Root Cause</div></a>
+</nav>
+
+<script>
+  try { window.parent.postMessage({ type: 'pm:page', page: 1, of: 4, file: '01-timeline.html' }, '*'); } catch(_) {}
+</script>
+</body></html>

@@ -511,6 +511,169 @@ KBC_TEST(title_first_h1_wins) {
   kbc_arena_free(a);
 }
 
+/* The `<title>` outranks a heading, and the reason it is not a close call is
+ * that a heading is a SECTION's name. A multi-page artifact titles its pages
+ * and heads its sections differently on purpose, and preferring the h1 did
+ * not pick a different name for those pages — it picked a name out of the
+ * wrong section, because the first `<h1>` anywhere in the file is whatever
+ * heading the author happened to reach first. Both documents below are the
+ * shape that breaks: a `<title>` that names the page, and an h1 that names
+ * something inside it. */
+KBC_TEST(title_element_outranks_the_first_h1) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p =
+      parse_doc(a, "<html><head><title>INC-0315 &middot; Root Cause</title>"
+                  "</head><body><h1>Two bugs, one trigger</h1>"
+                  "<p>Neither bug alone would have caused an outage.</p>"
+                  "</body></html>");
+  KBC_CHECK_EQ_STR(kbc_parsed_title(p), "INC-0315 · Root Cause");
+  kbc_arena_free(a);
+
+  /* And the h1 is still READ — it is a heading, with a level and a place in
+   * the outline. Only its promotion to "the document's name" went away. The
+   * `<title>` is block 0 because a title element's text is prose the reader
+   * keeps, which is what lets the no-`<title>` fallback be a paragraph. */
+  a = kbc_arena_new(4096);
+  p = parse_doc(a, "<html><head><title>Page</title></head>"
+                   "<body><h1>Two bugs, one trigger</h1></body></html>");
+  const kbc_blocks *bs = kbc_parsed_blocks(p);
+  KBC_CHECK_EQ_INT(bs->len, 2);
+  KBC_CHECK_EQ_STR(block_at(bs, 0)->text, "Page");
+  KBC_CHECK_EQ_STR(block_at(bs, 1)->text, "Two bugs, one trigger");
+  KBC_CHECK_EQ_INT(block_at(bs, 1)->heading_level, 1);
+  kbc_arena_free(a);
+}
+
+/* The first `<title>` wins over a LATER one, and a document with no
+ * `<title>` at all still gets its h1 — the precedence changed, the ladder
+ * did not lose a rung. */
+KBC_TEST(title_element_is_the_first_one_and_is_optional) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a, "<title>One</title><p>x</p><title>Two</title>");
+  KBC_CHECK_EQ_STR(kbc_parsed_title(p), "One");
+  kbc_arena_free(a);
+
+  a = kbc_arena_new(4096);
+  p = parse_doc(a, "<h1>No title element at all</h1>\n\nprose\n");
+  KBC_CHECK_EQ_STR(kbc_parsed_title(p), "No title element at all");
+  kbc_arena_free(a);
+}
+
+/* --------------------------------------------------------------- code --- */
+
+/* An inline code span is where an author QUOTES markup. `<a href>` in
+ * backticks is an example of a link, and reading it as one puts an edge in
+ * the graph that no author wrote — a phantom that the ladder then has to
+ * resolve, and a document nobody linked to shows up as `dangling`. This is
+ * the shape the parity corpus actually contains: a design document quoting
+ * the permalink template it tells the implementer to emit. */
+KBC_TEST(a_tag_inside_a_code_span_is_not_a_link) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a,
+                            "The body carries a permalink, written as\n"
+                            "`<a href=\"/a/sessions/<rel>\">` in the template.\n"
+                            "The real one is [here](ops/deploy.md).\n");
+  const kbc_links *ls = kbc_parsed_links(p);
+  KBC_CHECK_NOT_NULL(ls);
+  KBC_CHECK_EQ_INT(ls->len, 1);
+  KBC_CHECK_EQ_STR(ls->items[0].target, "notes/ops/deploy.md");
+  kbc_arena_free(a);
+}
+
+/* The same rule for the other two link syntaxes, and the delimiters are
+ * consumed rather than appended: the block's prose is what the same document
+ * reads without the syntax, which is the treatment link syntax already got
+ * (parse.c, the `[text](target)` branch). A summary is cut from that prose,
+ * so leaving the backticks in would put them in a search result. */
+KBC_TEST(a_code_span_yields_its_content_as_plain_prose) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a,
+                            "Run `kb-code --port 4747` and see\n"
+                            "`[[not-a-link]]` in the manual.\n");
+  const kbc_blocks *bs = kbc_parsed_blocks(p);
+  KBC_CHECK_EQ_INT(bs->len, 1);
+  /* The delimiters are consumed, the content is prose, and the wikilink
+   * inside the span is text — the same three things the `[text](target)`
+   * branch already did for link syntax. */
+  KBC_CHECK_EQ_STR(block_at(bs, 0)->text,
+                   "Run kb-code --port 4747 and see [[not-a-link]] in the "
+                   "manual.");
+  KBC_CHECK_EQ_INT(kbc_parsed_links(p)->len, 0);
+  kbc_arena_free(a);
+}
+
+/* A code span closes on a run of EXACTLY its own length (CommonMark §2.2),
+ * and one space is stripped from each end when both are there. A span may
+ * cross a line break, which is the case the corpus hits: the quoted `<meta>`
+ * runs onto the next line and the two halves are only a span together. */
+KBC_TEST(a_code_span_closes_on_its_own_run_and_may_cross_a_line) {
+  kbc_arena *a = kbc_arena_new(4096);
+  /* A run of two is closed by a run of two, so the backtick between them is
+   * CONTENT and survives: this is what makes ``a ` b`` readable at all. */
+  kbc_parsed *p = parse_doc(a, "before ``a ` b`` after\n");
+  KBC_CHECK_EQ_STR(block_at(kbc_parsed_blocks(p), 0)->text,
+                   "before a ` b after");
+  kbc_arena_free(a);
+
+  /* One space comes off each end when both are there (CommonMark §2.2), and
+   * a span may cross a line break — which is the case the parity corpus
+   * hits: a quoted `<meta>` runs onto the next line and the two halves are
+   * only a span together. */
+  a = kbc_arena_new(4096);
+  p = parse_doc(a, "emit `<meta name=\"kb-tags\"\ncontent=\"x\">` here\n");
+  KBC_CHECK_EQ_STR(block_at(kbc_parsed_blocks(p), 0)->text,
+                   "emit <meta name=\"kb-tags\" content=\"x\"> here");
+  kbc_arena_free(a);
+
+  /* An unclosed run is not a span at all: the backticks are text. */
+  a = kbc_arena_new(4096);
+  p = parse_doc(a, "an unclosed ` run stays\n");
+  KBC_CHECK_EQ_STR(block_at(kbc_parsed_blocks(p), 0)->text,
+                   "an unclosed ` run stays");
+  kbc_arena_free(a);
+}
+
+/* A `<meta>` an author wrote inside a code example is documentation, not a
+ * facet. A document that documents its own front matter would otherwise end
+ * up carrying the sample values as its real tags — and the sample values are
+ * `{{tags}}`-shaped placeholders, which is how a facet becomes a literal
+ * brace expression nobody can filter on. */
+KBC_TEST(a_meta_inside_code_is_not_a_facet) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a,
+                            "The template emits\n"
+                            "`<meta name=\"kb-tags\"\n"
+                            "content=\"{{tags}}\">` and a real `<title>`.\n");
+  KBC_CHECK_EQ_INT(kbc_parsed_metas(p)->len, 0);
+  kbc_arena_free(a);
+
+  /* The same construct in a FENCE, which is the other half of "code" and the
+   * half a document of examples is mostly made of. */
+  a = kbc_arena_new(4096);
+  p = parse_doc(a,
+                "```html\n"
+                "<meta name=\"kb-category\" content=\"review\">\n"
+                "```\n\n"
+                "<meta name=\"kb-index\">\n");
+  const kbc_metas *m = kbc_parsed_metas(p);
+  KBC_CHECK_EQ_INT(m->len, 1);
+  KBC_CHECK_EQ_STR(m->items[0].key, "index");
+  kbc_arena_free(a);
+}
+
+/* A fence the document never closes is a fence for the rest of the file: the
+ * last `<meta>` in a truncated paste is still inside the example, and reading
+ * it is how a document acquires a facet it never declared. */
+KBC_TEST(an_unclosed_fence_still_shields_what_follows) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a,
+                            "prose\n\n"
+                            "```\n"
+                            "<meta name=\"kb-tags\" content=\"a, b\">\n");
+  KBC_CHECK_EQ_INT(kbc_parsed_metas(p)->len, 0);
+  kbc_arena_free(a);
+}
+
 KBC_TEST(title_falls_back_to_title_element_then_prose) {
   kbc_arena *a = kbc_arena_new(4096);
   kbc_parsed *p =
@@ -1402,6 +1565,18 @@ static const kbc_test_case cases[] = {
     {"title_falls_back_to_title_element_then_prose",
      title_falls_back_to_title_element_then_prose},
     {"title_falls_back_to_filename_stem", title_falls_back_to_filename_stem},
+    {"title_element_outranks_the_first_h1", title_element_outranks_the_first_h1},
+    {"title_element_is_the_first_one_and_is_optional",
+     title_element_is_the_first_one_and_is_optional},
+    {"a_tag_inside_a_code_span_is_not_a_link",
+     a_tag_inside_a_code_span_is_not_a_link},
+    {"a_code_span_yields_its_content_as_plain_prose",
+     a_code_span_yields_its_content_as_plain_prose},
+    {"a_code_span_closes_on_its_own_run_and_may_cross_a_line",
+     a_code_span_closes_on_its_own_run_and_may_cross_a_line},
+    {"a_meta_inside_code_is_not_a_facet", a_meta_inside_code_is_not_a_facet},
+    {"an_unclosed_fence_still_shields_what_follows",
+     an_unclosed_fence_still_shields_what_follows},
     {"tokenize_content_words_with_offsets", tokenize_content_words_with_offsets},
     {"tokenize_emits_duplicates_per_occurrence",
      tokenize_emits_duplicates_per_occurrence},

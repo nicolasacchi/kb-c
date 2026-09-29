@@ -21,6 +21,7 @@
 #include "kbc_test.h"
 
 #include <signal.h>
+#include <ctype.h>
 #include <sys/wait.h>
 #include <time.h>
 
@@ -115,11 +116,24 @@ static void argv_push(argv_vec *a, const char *arg) {
  * exit status. `out`, when non-NULL, receives stdout+stderr. A spawn failure
  * is reported as -1 so a test can tell "the binary is missing" from "the
  * binary exited non-zero" — the first is a broken test run and the second is
- * usually the thing under test. */
-static int run_kbc(const char *home, const char *config_path,
-                   char *const argv[], kbc_str *out) {
-  int fds[2] = {-1, -1};
-  if (out != NULL && pipe(fds) != 0) {
+ * usually the thing under test.
+ *
+ * `errout`, when non-NULL, splits the streams instead of merging them: the
+ * verbs whose output an operator pipes (`reindex`, `metrics`) promise a
+ * machine-readable stdout, and that promise is only testable if the two
+ * streams can be told apart. Passing both keeps the merged form every other
+ * case relies on. */
+static int run_kbc_split(const char *home, const char *config_path,
+                         char *const argv[], kbc_str *out, kbc_str *errout) {
+  int ofds[2] = {-1, -1};
+  int efds[2] = {-1, -1};
+  bool split = out != NULL && errout != NULL;
+  if (out != NULL && pipe(ofds) != 0) {
+    return -1;
+  }
+  if (split && pipe(efds) != 0) {
+    (void)close(ofds[0]);
+    (void)close(ofds[1]);
     return -1;
   }
   pid_t pid = fork();
@@ -127,11 +141,18 @@ static int run_kbc(const char *home, const char *config_path,
     return -1;
   }
   if (pid == 0) {
-    if (out != NULL) {
-      (void)close(fds[0]);
-      (void)dup2(fds[1], STDOUT_FILENO);
-      (void)dup2(fds[1], STDERR_FILENO);
-      (void)close(fds[1]);
+    if (split) {
+      (void)close(ofds[0]);
+      (void)close(efds[0]);
+      (void)dup2(ofds[1], STDOUT_FILENO);
+      (void)dup2(efds[1], STDERR_FILENO);
+      (void)close(ofds[1]);
+      (void)close(efds[1]);
+    } else if (out != NULL) {
+      (void)close(ofds[0]);
+      (void)dup2(ofds[1], STDOUT_FILENO);
+      (void)dup2(ofds[1], STDERR_FILENO);
+      (void)close(ofds[1]);
     }
     /* Both HOME and KBC_CONFIG_PATH are pinned: the CLI resolves its config
      * from KBC_CONFIG_PATH, then $XDG_CONFIG_HOME, then $HOME. Setting only
@@ -144,17 +165,36 @@ static int run_kbc(const char *home, const char *config_path,
     execv(kbc_bin(), argv);
     _exit(127);
   }
-  if (out != NULL) {
-    (void)close(fds[1]);
+  /* Both pipes are drained before the wait: a child writing more than one
+   * pipe buffer to a stream nobody is reading would block forever, and the
+   * wait below would then be the hang rather than a failed assertion. */
+  if (split) {
+    (void)close(ofds[1]);
+    (void)close(efds[1]);
+    char buf[4096];
+    for (int stream = 0; stream < 2; stream++) {
+      int fd = stream == 0 ? ofds[0] : efds[0];
+      kbc_str *dst = stream == 0 ? out : errout;
+      for (;;) {
+        ssize_t n = read(fd, buf, sizeof buf);
+        if (n <= 0) {
+          break;
+        }
+        (void)kbc_str_append(dst, buf, (size_t)n);
+      }
+      (void)close(fd);
+    }
+  } else if (out != NULL) {
+    (void)close(ofds[1]);
     char buf[4096];
     for (;;) {
-      ssize_t n = read(fds[0], buf, sizeof buf);
+      ssize_t n = read(ofds[0], buf, sizeof buf);
       if (n <= 0) {
         break;
       }
       (void)kbc_str_append(out, buf, (size_t)n);
     }
-    (void)close(fds[0]);
+    (void)close(ofds[0]);
   }
   int status = 0;
   while (waitpid(pid, &status, 0) < 0) {
@@ -163,6 +203,20 @@ static int run_kbc(const char *home, const char *config_path,
     }
   }
   return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int run_kbc(const char *home, const char *config_path,
+                   char *const argv[], kbc_str *out) {
+  return run_kbc_split(home, config_path, argv, out, NULL);
+}
+
+/* A kbc_str that never received a byte has a NULL `ptr`, not an empty
+ * string, so a strstr on a stream the verb said nothing to is a NULL
+ * dereference rather than a failed assertion. Every split-stream read goes
+ * through this, so "the verb was silent" reads as the empty string and the
+ * assertion reports what it meant to report. */
+static const char *stream_text(const kbc_str *s) {
+  return (s != NULL && s->ptr != NULL) ? s->ptr : "";
 }
 
 /* A whole backup/restore world: a config, a state dir, one corpus with a
@@ -2013,6 +2067,637 @@ KBC_TEST(metrics_writes_the_daemons_exposition_to_the_named_file) {
   world_down(&w);
 }
 
+/* ================================================== the eight read verbs ===
+ *
+ * Everything above exercises a verb either against a store it opened itself
+ * or against a pid file. The verbs below are the ones whose whole job is to
+ * be a CLIENT, so a test that never starts a daemon never runs the code that
+ * matters: a search that answered from the local fallback would pass every
+ * assertion here while never having opened a socket. Each case therefore
+ * starts a real daemon on its own port and points the verb at it with an
+ * explicit --daemon, and each asserts on what came back over that socket.
+ *
+ * A PORT PER CASE, not one shared port: ctest can run these cases in any
+ * order and a second bind on a port a previous case still holds would report
+ * a start failure that reads like a defect in the verb. */
+
+/* Starts the world's daemon on `port` and waits for its pid file. Returns
+ * false after reporting, so a case never asserts against a daemon that never
+ * came up — a hang or a spurious failure is the alternative. */
+static bool daemon_up(world *w, int port) {
+  /* The daemon refuses to start without a token (cmd_daemon), so the token
+   * is generated first: this is a precondition of the verb, not part of it. */
+  if (run_kbc_va(w, NULL, "token", "generate", NULL) != 0) {
+    kbc_test_fail(__FILE__, __LINE__, "token generate failed");
+    return false;
+  }
+  char p[16];
+  (void)snprintf(p, sizeof p, "%d", port);
+  if (run_kbc_va(w, NULL, "daemon", "--port", p, NULL) != 0) {
+    kbc_test_fail(__FILE__, __LINE__, "daemon --port %s failed to start", p);
+    return false;
+  }
+  /* The child writes the pid file once its listener is bound, so the wait is
+   * for the file rather than for the parent, which has already exited. */
+  for (int i = 0; i < 200; i++) {
+    if (kbc_path_exists(pidfile_path(w))) {
+      return true;
+    }
+    struct timespec ts = { 0, 25 * 1000 * 1000 };
+    (void)nanosleep(&ts, NULL);
+  }
+  kbc_test_fail(__FILE__, __LINE__, "the daemon never wrote %s",
+                pidfile_path(w));
+  return false;
+}
+
+/* `--daemon http://127.0.0.1:<port>` as two argv words, for run_kbc_va. */
+static void daemon_argv(char *url, size_t cap, int port) {
+  (void)snprintf(url, cap, "http://127.0.0.1:%d", port);
+}
+
+/* A daemon up on `port` over a world whose corpus is genuinely indexable, so
+ * `reindex` has real work and `search` has a real hit to return. world_up
+ * seeds a synthetic row whose id is a literal; world_up_indexable leaves the
+ * artifact table empty, so the ids in play are the ones the reindex really
+ * mints. */
+static bool socket_world_up(world *w, const char *corpus, int port) {
+  if (!world_up_indexable(w, corpus)) {
+    return false;
+  }
+  return daemon_up(w, port);
+}
+
+/* `reindex` over the socket must report the document it really indexed. The
+ * count is the assertion because it is the only part of the verb that can
+ * only have come from the daemon: the local fallback would report the same
+ * number, but this case additionally pins the code path by requiring the
+ * daemon to be up first. */
+KBC_TEST(reindex_over_a_socket_reports_the_documents_it_ingested) {
+  world w;
+  if (!socket_world_up(&w, "notes", 47501)) {
+    world_down(&w);
+    return;
+  }
+  char url[64];
+  daemon_argv(url, sizeof url, 47501);
+  /* The two streams are captured apart because the split IS part of this
+   * verb's contract: the original writes the human line to stderr and keeps
+   * stdout for the machine-readable body (reindex.rs:52-53), so that
+   * `kb reindex > log` yields something a script can read. A merged capture
+   * cannot tell a verb that honours that from one that prints both to stdout,
+   * which is the exact regression this pins. */
+  argv_vec a = {NULL, 0, 0};
+  argv_push(&a, kbc_bin());
+  argv_push(&a, "--daemon");
+  argv_push(&a, url);
+  argv_push(&a, "reindex");
+  kbc_str out;
+  kbc_str_init(&out);
+  kbc_str errout;
+  kbc_str_init(&errout);
+  int rc = run_kbc_split(w.home, w.config, a.v, &out, &errout);
+  argv_free(&a);
+  KBC_CHECK_MSG(rc == 0, "reindex against a live daemon must exit 0; "
+                        "stderr was:\n%s", stream_text(&errout));
+  KBC_CHECK_MSG(strstr(stream_text(&errout), "1 documents") != NULL,
+                "reindex did not report the one document in the corpus on "
+                "stderr; got:\n%s", stream_text(&errout));
+  /* The human line must NOT be on stdout, or `kbc reindex > log` captures it
+   * and the redirect is no longer machine-readable. */
+  KBC_CHECK_MSG(strstr(stream_text(&out), "documents") == NULL,
+                "reindex wrote its human line to stdout, so a redirect "
+                "captures prose; stdout was:\n%s", stream_text(&out));
+  /* A daemon answered, so the "running locally" fallback line must be
+   * absent: a verb that silently fell back would still print a count. */
+  KBC_CHECK_MSG(strstr(stream_text(&errout), "running locally") == NULL,
+                "reindex fell back to the local app with a daemon up; "
+                "got:\n%s", stream_text(&errout));
+  kbc_str_free(&out);
+  kbc_str_free(&errout);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "daemon", "stop", NULL), 0);
+  world_down(&w);
+}
+
+/* `search` over the socket must return the document the daemon holds. The
+ * assertion is on the artifact's OWN id, read back out of the listing, so a
+ * verb that answered with a stale or synthesised row cannot pass. */
+KBC_TEST(search_over_a_socket_finds_a_document_the_daemon_indexed) {
+  world w;
+  if (!socket_world_up(&w, "notes", 47502)) {
+    world_down(&w);
+    return;
+  }
+  char url[64];
+  daemon_argv(url, sizeof url, 47502);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "--daemon", url, "reindex", NULL), 0);
+
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_MSG(run_kbc_va(&w, &out, "--daemon", url, "search", "prose",
+                           NULL) == 0,
+                "search against a live daemon must exit 0; got:\n%s",
+                out.ptr);
+  KBC_CHECK_MSG(strstr(stream_text(&out), "a.md") != NULL,
+                "search did not find the document it indexed; got:\n%s",
+                out.ptr);
+  KBC_CHECK_MSG(strstr(out.ptr, "running locally") == NULL,
+        "search fell back to the local app with a daemon up; got:\n%s",
+      out.ptr);
+  kbc_str_free(&out);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "daemon", "stop", NULL), 0);
+  world_down(&w);
+}
+
+/* A search that matches nothing is a USER error (1), not a success with an
+ * empty list: the operator asked for something and got nothing, and a script
+ * branching on the exit status must be able to see that. */
+KBC_TEST(search_over_a_socket_with_no_hit_is_a_user_error) {
+  world w;
+  if (!socket_world_up(&w, "notes", 47503)) {
+    world_down(&w);
+    return;
+  }
+  char url[64];
+  daemon_argv(url, sizeof url, 47503);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "--daemon", url, "reindex", NULL), 0);
+  KBC_CHECK_MSG(run_kbc_va(&w, NULL, "--daemon", url, "search",
+                "zzznosuchtermzzz", NULL) == 1,
+         "a search with no hit must exit 1 (user error), so a script can "
+      "see the miss; it exited 0");
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "daemon", "stop", NULL), 0);
+  world_down(&w);
+}
+
+/* `list` over the socket, and the id it prints is the one `get` then
+ * resolves. The two are asserted together because `list` and `get` are the
+ * pair an operator scripts: list to find an id, get to read the document. A
+ * `get` that could not resolve what `list` just printed would break exactly
+ * that loop. */
+KBC_TEST(list_and_get_over_a_socket_agree_on_the_artifact_id) {
+  world w;
+  if (!socket_world_up(&w, "notes", 47504)) {
+    world_down(&w);
+    return;
+  }
+  char url[64];
+  daemon_argv(url, sizeof url, 47504);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "--daemon", url, "reindex", NULL), 0);
+
+  kbc_str listed;
+  kbc_str_init(&listed);
+  KBC_CHECK_MSG(run_kbc_va(&w, &listed, "--daemon", url, "list", NULL) == 0,
+    "list against a live daemon must exit 0; got:\n%s", listed.ptr);
+  /* The id the daemon minted, taken from the listing's own text rather than
+ * recomputed here: recomputing would assert the test's own idea of the id
+ * instead of the one the verb printed. */
+  const char *at = strstr(listed.ptr, "id:");
+  KBC_CHECK_MSG(at != NULL, "list printed no id line; got:\n%s", listed.ptr);
+  if (at == NULL) {
+    kbc_str_free(&listed);
+    world_down(&w);
+    return;
+  }
+  at += 3;
+  while (*at == ' ') {
+    at++;
+  }
+  char id[16];
+  size_t idn = 0;
+  while (idn + 1u < sizeof id && isxdigit((unsigned char)at[idn])) {
+    id[idn] = at[idn];
+    idn++;
+  }
+  id[idn] = '\0';
+  KBC_CHECK_MSG(idn == 12, "list printed an id that is not 12 hex digits: %s",
+            id);
+  kbc_str_free(&listed);
+
+  if (idn == 12) {
+    kbc_str got;
+    kbc_str_init(&got);
+    KBC_CHECK_MSG(run_kbc_va(&w, &got, "--daemon", url, "get", id, NULL) == 0,
+  "get of an id list just printed must exit 0; got:\n%s",
+     got.ptr);
+    KBC_CHECK_MSG(strstr(got.ptr, id) != NULL,
+ "get did not echo the id it was asked for (%s); got:\n%s", id,
+                  got.ptr);
+    KBC_CHECK_MSG(strstr(got.ptr, "a.md") != NULL,
+                  "get resolved the id to the wrong document; got:\n%s",
+                  got.ptr);
+    kbc_str_free(&got);
+  }
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "daemon", "stop", NULL), 0);
+  world_down(&w);
+}
+
+/* An id the daemon never issued is a user error (1), and a MALFORMED id is
+ * the same class: the operator named something that cannot exist. Both are
+ * checked because they are refused at two different places — one before a
+ * socket is opened, one after — and a verb that got the second wrong would
+ * answer 1 by accident rather than by decision. */
+KBC_TEST(get_over_a_socket_refuses_an_unknown_and_a_malformed_id) {
+  world w;
+  if (!socket_world_up(&w, "notes", 47505)) {
+    world_down(&w);
+    return;
+  }
+  char url[64];
+  daemon_argv(url, sizeof url, 47505);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "--daemon", url, "reindex", NULL), 0);
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_MSG(run_kbc_va(&w, &out, "--daemon", url, "get", "ffffffffffff",
+                           NULL) == 1,
+                "get of an id the daemon never issued must exit 1 (user "
+                "error); got:\n%s", stream_text(&out));
+  /* The exit code alone is not enough to tell this refusal from any other
+   * 1: the id the operator typed has to be named back, or a wrong id and a
+   * broken daemon are indistinguishable at the prompt. */
+  KBC_CHECK_MSG(strstr(stream_text(&out), "ffffffffffff") != NULL,
+                "the refusal did not name the id that was asked for; "
+                "got:\n%s", stream_text(&out));
+  kbc_str_free(&out);
+  KBC_CHECK_MSG(run_kbc_va(&w, NULL, "--daemon", url, "get", "not-an-id",
+    NULL) == 1,
+           "get of a malformed id must exit 1 (user error), refused before "
+  "any request");
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "daemon", "stop", NULL), 0);
+
+  /* The SAME refusal with no daemon answering, which takes the other branch:
+   * `get` falls back to a local app, and it is that app's NOTFOUND — not the
+   * daemon's 404 — that has to be a user error. Two branches, two decisions,
+   * and a verb that got only one right would still look correct against a
+   * live daemon. The port is one nothing listens on. */
+  kbc_str off;
+  kbc_str_init(&off);
+  KBC_CHECK_MSG(run_kbc_va(&w, &off, "--daemon", "http://127.0.0.1:1", "get",
+                           "ffffffffffff", NULL) == 1,
+                "get of an unknown id with no daemon must still exit 1 (user "
+                "error), not the local fallback's own code; got:\n%s",
+                stream_text(&off));
+  /* The WORDING is pinned, not just the exit code and the id. The generic
+   * status formatter ALSO exits 1 and also names the id, but reads like a
+   * daemon fault (`get: not_found`) rather than the sentence an operator
+   * typed their way into — and that difference is the whole reason this
+   * refusal is a user error class rather than a fault class. */
+  KBC_CHECK_MSG(strstr(stream_text(&off), "no artifact ffffffffffff") != NULL,
+                "the local-path refusal is not the user-error sentence "
+                "(`no artifact <id>`); got:\n%s", stream_text(&off));
+  kbc_str_free(&off);
+  world_down(&w);
+}
+
+/* `status` has no local fallback BY DESIGN: it reports the counters of a
+ * running daemon, which is the whole point of asking. So the verb that must
+ * not silently succeed when no daemon answers is `status` — and the counter
+ * it prints must be the daemon's, which is why the case asserts on a value
+ * the daemon really incremented rather than on the shape of the output. */
+KBC_TEST(status_over_a_socket_prints_the_daemons_own_counters) {
+  world w;
+  if (!socket_world_up(&w, "notes", 47506)) {
+    world_down(&w);
+    return;
+  }
+  char url[64];
+  daemon_argv(url, sizeof url, 47506);
+  /* One reindex, so artifacts_indexed has a value the daemon itself set. */
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "--daemon", url, "reindex", NULL), 0);
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_MSG(run_kbc_va(&w, &out, "--daemon", url, "status", NULL) == 0,
+       "status against a live daemon must exit 0; got:\n%s", out.ptr);
+  KBC_CHECK_MSG(strstr(out.ptr, "artifacts_indexed") != NULL,
+        "status printed no artifacts_indexed counter; got:\n%s", out.ptr);
+  KBC_CHECK_MSG(strstr(out.ptr, "reindex_runs") != NULL,
+  "status printed no reindex_runs counter, so the daemon's own "
+        "counters are not what it showed; got:\n%s",
+    out.ptr);
+  kbc_str_free(&out);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "daemon", "stop", NULL), 0);
+  world_down(&w);
+}
+
+/* `add` writes the config file itself and never speaks to a daemon, so this
+ * is the one verb here whose work is on disk. The assertion is that the
+ * corpus it added is the one a LATER daemon then serves — the round trip is
+ * what makes it a test of the verb rather than of a file write. */
+KBC_TEST(add_then_a_daemon_serves_the_corpus_it_created) {
+  world w;
+  kbc_test_tmpdir(w.root, sizeof w.root);
+  (void)path_join(w.home, sizeof w.home, w.root, "home");
+  (void)path_join(w.config, sizeof w.config, w.root, "kb.toml");
+  (void)path_join(w.state, sizeof w.state, w.root, "state");
+  (void)path_join(w.corpus_dir, sizeof w.corpus_dir, w.root, "corpus");
+  (void)path_join(w.db, sizeof w.db, w.state, "kb.db");
+  (void)path_join(w.index, sizeof w.index, w.state, "index");
+  kbc_test_mkdir_p(w.home);
+  kbc_test_mkdir_p(w.state);
+  kbc_test_mkdir_p(w.corpus_dir);
+  /* `add` creates the config from NOTHING, which is its job, and the config
+   * it creates carries the DEFAULT data_dir — a path relative to the working
+   * directory. That is fine for an operator and unusable for a test: the
+   * daemon's pid file would land in whatever directory the runner happened
+   * to be in, so this case seeds a config that names the data_dir it wants
+   * and then asserts `add` ADDS a corpus to it without disturbing the rest.
+   * Re-adding a configured corpus is a partial update in the original
+   * (add.rs:57-69), so the pre-set data_dir has to survive it. */
+  kbc_str seed;
+  kbc_str_init(&seed);
+  (void)kbc_str_printf(&seed,
+                       "[daemon]\ndata_dir = \"%s\"\n\n[[corpus]]\n"
+                       "name = \"seed\"\npath = \"%s\"\n",
+                       w.state, w.corpus_dir);
+  kbc_test_write_file(w.config, seed.ptr);
+  kbc_str_free(&seed);
+
+  char doc[KBC_TEST_PATH_MAX];
+  (void)path_join(doc, sizeof doc, w.corpus_dir, "hello.md");
+  kbc_test_write_file(doc, "# Hello World\n\nzebras, here.\n");
+
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_MSG(run_kbc_va(&w, &out, "add", w.corpus_dir, "--kb", "notes",
+                           NULL) == 0,
+                "add of a new corpus must exit 0; got:\n%s",
+                stream_text(&out));
+  /* The name the operator typed is the name the corpus is reachable BY, so
+   * `kbc search --kb notes` has to find what `add --kb notes` created. An
+   * assertion on the document alone would pass for a verb that registered
+   * the corpus under any name at all. */
+  KBC_CHECK_MSG(strstr(stream_text(&out), "notes") != NULL,
+                "add did not report the corpus under the name it was given; "
+                "got:\n%s", stream_text(&out));
+  /* `add` indexes as it registers, so the document count it prints is its
+   * OWN work. The case below then lists WITHOUT a separate reindex, which is
+   * what makes this the only thing proving the indexing happened here. */
+  KBC_CHECK_MSG(strstr(stream_text(&out), "1 document") != NULL,
+                "add did not index the corpus it registered, so the daemon "
+                "would start on an empty store; got:\n%s",
+                stream_text(&out));
+  KBC_CHECK_MSG(kbc_path_exists(w.config),
+                "add exited 0 but wrote no config at %s", w.config);
+  kbc_str_free(&out);
+  if (!kbc_path_exists(w.config)) {
+    world_down(&w);
+    return;
+  }
+  /* The data_dir the daemon will use must still be the one the config named,
+   * or the pid file goes somewhere this case cannot find it. */
+  KBC_CHECK_MSG(kbc_path_exists(w.state),
+                "the seeded data_dir %s is gone, so add discarded it and "
+                "the daemon would write its pid file elsewhere",
+                w.state);
+  /* The round trip: a daemon reading that config serves the corpus `add`
+   * created AND indexed, with no second command run in between. */
+  if (!daemon_up(&w, 47507)) {
+    world_down(&w);
+    return;
+  }
+  char url[64];
+  daemon_argv(url, sizeof url, 47507);
+  kbc_str listed;
+  kbc_str_init(&listed);
+  KBC_CHECK_MSG(run_kbc_va(&w, &listed, "--daemon", url, "list", "--kb",
+                           "notes", NULL) == 0,
+                "the corpus add created must be listable over a socket; "
+                "got:\n%s", stream_text(&listed));
+  KBC_CHECK_MSG(strstr(listed.ptr, "hello.md") != NULL,
+                "the daemon did not serve the corpus `add` created; got:\n%s",
+                listed.ptr);
+  kbc_str_free(&listed);
+  /* Asked for BY the name the operator gave. A bare `list` would pass for a
+   * verb that registered the corpus under any name at all, which is exactly
+   * the defect: `kbc add --kb notes` followed by `kbc search --kb notes` is
+   * the sequence an operator actually runs, and it has to resolve. */
+  kbc_str byname;
+  kbc_str_init(&byname);
+  KBC_CHECK_MSG(run_kbc_va(&w, &byname, "--daemon", url, "search", "zebras",
+                           "--kb", "notes", NULL) == 0,
+                "the corpus is not reachable by the name `add` registered it "
+                "under; got:\n%s", stream_text(&byname));
+  KBC_CHECK_MSG(strstr(byname.ptr, "hello.md") != NULL,
+                "searching the corpus `add` created by its own name found "
+                "nothing; got:\n%s", byname.ptr);
+  kbc_str_free(&byname);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "daemon", "stop", NULL), 0);
+  world_down(&w);
+}
+
+/* `metrics` is a client of a top-level route that answers text exposition,
+ * so the assertion is on the daemon's OWN families reaching the operator's
+ * stdout — a verb that printed a header of its own would pass an exit-code
+ * test and fail this one. */
+KBC_TEST(metrics_over_a_socket_prints_the_daemons_exposition) {
+  world w;
+  if (!socket_world_up(&w, "notes", 47508)) {
+    world_down(&w);
+    return;
+  }
+  char url[64];
+  daemon_argv(url, sizeof url, 47508);
+  /* Split streams: `kbc metrics > scrape.prom` is the reason this verb exists
+   * rather than a shell redirect in the original, so the exposition has to
+   * arrive on stdout ALONE. Asserting on a merged capture would let a verb
+   * that interleaved a stderr notice into the scrape pass. */
+  argv_vec a = {NULL, 0, 0};
+  argv_push(&a, kbc_bin());
+  argv_push(&a, "--daemon");
+  argv_push(&a, url);
+  argv_push(&a, "metrics");
+  kbc_str out;
+  kbc_str_init(&out);
+  kbc_str errout;
+  kbc_str_init(&errout);
+  int rc = run_kbc_split(w.home, w.config, a.v, &out, &errout);
+  argv_free(&a);
+  KBC_CHECK_MSG(rc == 0, "metrics against a live daemon must exit 0; "
+                        "stderr was:\n%s", stream_text(&errout));
+  KBC_CHECK_MSG(strstr(stream_text(&out), "kb_http_requests_total") != NULL,
+                "metrics printed no kb_http_requests_total family, so this "
+                "is not the daemon's exposition; got:\n%s", stream_text(&out));
+  KBC_CHECK_MSG(strstr(stream_text(&out), "# TYPE") != NULL,
+                "metrics printed no TYPE line, so it is not text exposition "
+                "0.0.4; got:\n%s", stream_text(&out));
+  /* A scrape a scraper reads must not carry a human notice on either
+   * stream, and `kb_http_requests_total` is a family only the daemon emits. */
+  KBC_CHECK_MSG(strstr(stream_text(&errout), "kb_http_requests_total") == NULL,
+                "the exposition leaked onto stderr, so a redirect of stdout "
+                "alone would miss it; stderr was:\n%s", stream_text(&errout));
+  kbc_str_free(&out);
+  kbc_str_free(&errout);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "daemon", "stop", NULL), 0);
+  world_down(&w);
+}
+
+/* `version` is the one verb with no dependency at all: no config, no
+ * daemon, no store. It is here because a verb that could be broken by an
+ * unrelated failure — a bad config path, a dead daemon — is a version
+ * command an operator cannot trust to tell them what is installed. */
+KBC_TEST(version_needs_no_config_and_no_daemon) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  /* Point at a config that does not exist: `version` must not read one. */
+  char missing[KBC_TEST_PATH_MAX];
+  (void)path_join(missing, sizeof missing, w.root, "no-such-config.toml");
+  argv_vec a = {NULL, 0, 0};
+  argv_push(&a, kbc_bin());
+  argv_push(&a, "--config");
+  argv_push(&a, missing);
+  argv_push(&a, "--daemon");
+  argv_push(&a, "http://127.0.0.1:1");
+  argv_push(&a, "version");
+  kbc_str out;
+  kbc_str_init(&out);
+  int rc = run_kbc(w.home, missing, a.v, &out);
+  argv_free(&a);
+  KBC_CHECK_MSG(rc == 0,
+ "version must exit 0 with no config and no daemon; got %d:\n%s", rc,
+   out.ptr);
+  KBC_CHECK_MSG(strstr(out.ptr, KBC_PROJECT) != NULL,
+"version printed no project name; got:\n%s", out.ptr);
+  kbc_str_free(&out);
+  world_down(&w);
+}
+
+/* ------------------------------------------- global flags, both positions ---
+ *
+ * The usage text promises that a global may be given before OR after the
+ * verb, and that a repeated global takes its last value. Both halves are
+ * asserted here, and the two positions are compared against EACH OTHER
+ * rather than against a golden string: the contract is that the position does
+ * not change what the verb does, and only a comparison can show that.
+ *
+ * `search` is the verb used because it answers from a live daemon over a
+ * socket, so the flags under test are the ones actually steering the request
+ * rather than being parsed and dropped. */
+KBC_TEST(a_global_flag_works_before_and_after_the_verb_alike) {
+  world w;
+  if (!socket_world_up(&w, "notes", 47509)) {
+    world_down(&w);
+    return;
+  }
+  char url[64];
+  daemon_argv(url, sizeof url, 47509);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "--daemon", url, "reindex", NULL), 0);
+
+  kbc_str before;
+  kbc_str_init(&before);
+  KBC_CHECK_MSG(run_kbc_va(&w, &before, "--json", "--daemon", url, "search",
+            "prose", NULL) == 0,
+         "--json and --daemon BEFORE the verb must exit 0; got:\n%s",
+       before.ptr);
+  kbc_str after;
+  kbc_str_init(&after);
+  KBC_CHECK_MSG(run_kbc_va(&w, &after, "search", "prose", "--json",
+    "--daemon", url, NULL) == 0,
+      "--json and --daemon AFTER the verb must exit 0; got:\n%s",
+      after.ptr);
+  /* Same verb, same daemon, same query: the two invocations must agree. The
+   * daemon reports its own `took_us`, which is a timing measurement and
+   * differs between two requests by nature, so it is the ONE field excluded
+   * from the comparison rather than the comparison being weakened to a
+   * substring. Everything else — the rows, their ids and scores — is
+   * required to be byte-identical. */
+  kbc_str b2;
+  kbc_str b3;
+  kbc_str_init(&b2);
+  kbc_str_init(&b3);
+  (void)kbc_str_append(&b2, before.ptr, before.len);
+  (void)kbc_str_append(&b3, after.ptr, after.len);
+  char *bp = strstr(b2.ptr, "took_us");
+  char *ap = strstr(b3.ptr, "took_us");
+  if (bp != NULL) {
+    *bp = '\0';
+  }
+  if (ap != NULL) {
+    *ap = '\0';
+  }
+  KBC_CHECK_MSG(strcmp(b2.ptr, b3.ptr) == 0,
+   "the same verb with the same globals gave a different answer depending "
+    "on whether they came before or after it;\nbefore: %s\nafter:  %s",
+   b2.ptr, b3.ptr);
+  kbc_str_free(&b2);
+  kbc_str_free(&b3);
+  kbc_str_free(&before);
+  kbc_str_free(&after);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "daemon", "stop", NULL), 0);
+  world_down(&w);
+}
+
+/* A global repeated in one command line takes its LAST value. Pinned with a
+ * dead endpoint FIRST and the live one LAST: an implementation that took the
+ * first would fall back to the local app (exit 0 on a different code path)
+ * and one that took neither would report a connect failure (exit 2). Only
+ * "the last value won" is exit 0 with the daemon's rows. */
+KBC_TEST(a_repeated_global_flag_takes_its_last_value) {
+  world w;
+  if (!socket_world_up(&w, "notes", 47510)) {
+    world_down(&w);
+    return;
+  }
+  char url[64];
+  daemon_argv(url, sizeof url, 47510);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "--daemon", url, "reindex", NULL), 0);
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_MSG(run_kbc_va(&w, &out, "search", "prose", "--daemon",
+   "http://127.0.0.1:1", "--daemon", url, NULL) == 0,
+     "a repeated --daemon must take its LAST value, so this must reach the "
+    "live daemon; got:\n%s",
+    out.ptr);
+  KBC_CHECK_MSG(strstr(out.ptr, "running locally") == NULL,
+  "the first --daemon won, so the verb fell back to the local app; "
+        "got:\n%s",
+   out.ptr);
+  kbc_str_free(&out);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "daemon", "stop", NULL), 0);
+  world_down(&w);
+}
+
+/* A response is framed by its Content-Length, not by the peer hanging up.
+ * The daemon answers `Connection: keep-alive` even to a `Connection: close`
+ * request, so a client that reads until EOF waits for the whole receive
+ * timeout on EVERY call — 10 seconds a verb, and a script that runs eight of
+ * them waits a minute and a half. The bound asserted here is deliberately
+ * far above the ~0.3s a real request takes and far below the 10s timeout, so
+ * it fails on the wait rather than on machine speed. */
+KBC_TEST(a_socket_verb_does_not_wait_for_the_peer_to_close) {
+  world w;
+  if (!socket_world_up(&w, "notes", 47511)) {
+    world_down(&w);
+    return;
+  }
+  char url[64];
+  daemon_argv(url, sizeof url, 47511);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "--daemon", url, "reindex", NULL), 0);
+
+  struct timespec t0;
+  struct timespec t1;
+  (void)clock_gettime(CLOCK_MONOTONIC, &t0);
+  kbc_str out;
+  kbc_str_init(&out);
+  int rc = run_kbc_va(&w, &out, "--daemon", url, "status", NULL);
+  (void)clock_gettime(CLOCK_MONOTONIC, &t1);
+  double secs = (double)(t1.tv_sec - t0.tv_sec) +
+                (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+  KBC_CHECK_MSG(rc == 0, "status against a live daemon must exit 0; got "
+         "output:\n%s",
+  out.ptr);
+  /* 3s: an order of magnitude over a local request, and a third of the
+   * 10s receive timeout the bug actually cost. */
+  KBC_CHECK_MSG(secs < 3.0,
+ "status took %.2fs against a local daemon, so the client is still "
+  "waiting for the peer to close instead of stopping at Content-Length",
+           secs);
+  kbc_str_free(&out);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "daemon", "stop", NULL), 0);
+  world_down(&w);
+}
+
 
 int main(void) {
   static const kbc_test_case cases[] = {
@@ -2073,6 +2758,30 @@ int main(void) {
        metrics_without_a_daemon_is_a_daemon_failure},
       {"metrics_writes_the_daemons_exposition_to_the_named_file",
        metrics_writes_the_daemons_exposition_to_the_named_file},
+      {"reindex_over_a_socket_reports_the_documents_it_ingested",
+       reindex_over_a_socket_reports_the_documents_it_ingested},
+      {"search_over_a_socket_finds_a_document_the_daemon_indexed",
+       search_over_a_socket_finds_a_document_the_daemon_indexed},
+      {"search_over_a_socket_with_no_hit_is_a_user_error",
+       search_over_a_socket_with_no_hit_is_a_user_error},
+      {"list_and_get_over_a_socket_agree_on_the_artifact_id",
+       list_and_get_over_a_socket_agree_on_the_artifact_id},
+      {"get_over_a_socket_refuses_an_unknown_and_a_malformed_id",
+       get_over_a_socket_refuses_an_unknown_and_a_malformed_id},
+      {"status_over_a_socket_prints_the_daemons_own_counters",
+       status_over_a_socket_prints_the_daemons_own_counters},
+      {"add_then_a_daemon_serves_the_corpus_it_created",
+       add_then_a_daemon_serves_the_corpus_it_created},
+      {"metrics_over_a_socket_prints_the_daemons_exposition",
+       metrics_over_a_socket_prints_the_daemons_exposition},
+      {"version_needs_no_config_and_no_daemon",
+       version_needs_no_config_and_no_daemon},
+      {"a_global_flag_works_before_and_after_the_verb_alike",
+       a_global_flag_works_before_and_after_the_verb_alike},
+      {"a_repeated_global_flag_takes_its_last_value",
+       a_repeated_global_flag_takes_its_last_value},
+      {"a_socket_verb_does_not_wait_for_the_peer_to_close",
+       a_socket_verb_does_not_wait_for_the_peer_to_close},
       {NULL, NULL},
   };
   return kbc_test_run("cli", cases);

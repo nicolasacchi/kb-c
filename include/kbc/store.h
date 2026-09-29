@@ -177,7 +177,24 @@ kbc_status kbc_store_replace_metas(kbc_store *s, const char *corpus,
                                    const char *const *values, size_t n,
                                    kbc_err *err);
 kbc_status kbc_store_forget_metas(kbc_store *s, const char *corpus,
-                                  const char *path, kbc_err *err);
+                                 const char *path, kbc_err *err);
+/* The READ side of replace_metas, which until now had no twin.
+ *
+ * The asymmetry was not an oversight so much as an unbuilt consumer: nothing
+ * in the daemon read a document's own key/value pairs back, so the table was
+ * write-only and the parity harness had to reach into the parser to get them.
+ * That is a harness working around a missing capability, and a harness that
+ * works around a missing capability is a harness measuring the wrong thing.
+ *
+ * `keys` and `values` are parallel KBC_OWN lists, matching the shape
+ * `kbc_store_replace_metas` already writes in — the same (key, value) pairs,
+ * SORTED BY KEY, so two daemons comparing them cannot disagree on ORDER rather
+ * than on content. A document with no facets leaves both lists EMPTY and
+ * returns KBC_OK: zero-length, because "this document declares no facets" and
+ * "the store could not be read" are different events and must not share one. */
+kbc_status kbc_store_get_metas(kbc_store *s, const char *corpus,
+                              const char *path, kbc_strlist *keys,
+                              kbc_strlist *values, kbc_err *err);
 /* Documents carrying (key, value), as KBC_OWN path strings the caller frees.
  * `value == NULL` asks for the key with ANY value. ONE query. An empty result
  * is a ZERO-LENGTH array — a filter that matches nothing must never look like

@@ -674,30 +674,38 @@ static kbc_status write_all(int fd, const char *buf, size_t n, kbc_err *err) {
   return KBC_OK;
 }
 
-static kbc_status read_all(int fd, kbc_str *out, kbc_err *err) {
+/* One recv into `out`. `*eof` is set when the peer closed the socket, which
+ * is how a response that declares no length ends. A recv timeout is not a
+ * framing signal and must not be reported as one: a socket that timed out
+ * with bytes already buffered would otherwise spin this loop forever, so the
+ * timeout is reported as eof and the caller decides whether what it has is
+ * enough. */
+static kbc_status recv_more(int fd, kbc_str *out, bool *eof, kbc_err *err) {
+  *eof = false;
   char buf[8192];
-  for (;;) {
-    ssize_t r = recv(fd, buf, sizeof buf, 0);
-    if (r < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      if (out->len > 0) {
-        return KBC_OK; /* whatever arrived before the timeout still parses */
-      }
-      return kbc_err_set(err, KBC_ERR_IO, "recv: %s", strerror(errno));
+  ssize_t r = recv(fd, buf, sizeof buf, 0);
+  if (r < 0) {
+    if (errno == EINTR) {
+      return KBC_OK; /* no bytes, no eof: the caller loops */
     }
-    if (r == 0) {
-      return KBC_OK;
+    if (out->len > 0) {
+      *eof = true;
+      return KBC_OK; /* whatever arrived before the timeout still parses */
     }
-    if (out->len + (size_t)r > HTTP_MAX_RESPONSE) {
-      return kbc_err_set(err, KBC_ERR_IO, "response over %u bytes",
-                         HTTP_MAX_RESPONSE);
-    }
-    if (kbc_failed(kbc_str_append(out, buf, (size_t)r))) {
-      return kbc_err_set(err, KBC_ERR_NOMEM, "response buffer: out of memory");
-    }
+    return kbc_err_set(err, KBC_ERR_IO, "recv: %s", strerror(errno));
   }
+  if (r == 0) {
+    *eof = true;
+    return KBC_OK;
+  }
+  if (out->len + (size_t)r > HTTP_MAX_RESPONSE) {
+    return kbc_err_set(err, KBC_ERR_IO, "response over %u bytes",
+                       HTTP_MAX_RESPONSE);
+  }
+  if (kbc_failed(kbc_str_append(out, buf, (size_t)r))) {
+    return kbc_err_set(err, KBC_ERR_NOMEM, "response buffer: out of memory");
+  }
+  return KBC_OK;
 }
 
 static const char *find_crlfcrlf(const char *p, size_t n) {
@@ -827,27 +835,40 @@ static kbc_status http_do(const char *method, const char *path, const char *body
     return s;
   }
   kbc_str_init(resp);
-  s = read_all(fd, resp, err);
-  close(fd);
-  if (kbc_failed(s)) {
-    return s;
+  /* The header block first, then exactly as many body bytes as it declares.
+   * Reading to EOF instead is what made every socket verb take the full
+   * HTTP_TIMEOUT_SEC: the daemon answers `Connection: keep-alive` even to a
+   * `Connection: close` request, so the peer never closes and the only thing
+   * that ends the wait is the recv timeout. Content-Length is the framing
+   * the response actually declares, so it is what bounds the read. */
+  bool eof = false;
+  size_t hlen = 0;
+  while (find_crlfcrlf(resp->ptr, resp->len) == NULL && !eof) {
+    s = recv_more(fd, resp, &eof, err);
+    if (kbc_failed(s)) {
+      close(fd);
+      kbc_str_free(resp);
+      return s;
+    }
   }
-
   const char *sep = find_crlfcrlf(resp->ptr, resp->len);
   if (sep == NULL) {
+    close(fd);
+    kbc_str_free(resp);
     return kbc_err_set(err, KBC_ERR_PARSE,
                        "truncated response: no header block");
   }
-  size_t hlen = (size_t)(sep - resp->ptr);
+  hlen = (size_t)(sep - resp->ptr);
   size_t line_end = 0;
   while (line_end < hlen && resp->ptr[line_end] != '\n') {
     line_end++;
   }
   s = parse_status_line(resp->ptr, line_end, status, err);
   if (kbc_failed(s)) {
+    close(fd);
+    kbc_str_free(resp);
     return s;
   }
-  const char *body_ptr = resp->ptr + hlen + 4;
   size_t have = resp->len - (hlen + 4);
   size_t vlen = 0;
   const char *cl = header_value(resp->ptr, hlen, "content-length", &vlen);
@@ -860,16 +881,38 @@ static kbc_status http_do(const char *method, const char *path, const char *body
     errno = 0;
     unsigned long long want = strtoull(num, &endp, 10);
     if (endp == num || errno != 0) {
+      close(fd);
+      kbc_str_free(resp);
       return kbc_err_set(err, KBC_ERR_PARSE, "bad Content-Length: %s", num);
     }
     if (want > HTTP_MAX_RESPONSE) {
+      close(fd);
+      kbc_str_free(resp);
       return kbc_err_set(err, KBC_ERR_IO, "Content-Length %llu over %u bytes",
                          want, HTTP_MAX_RESPONSE);
+    }
+    /* Only now is the declared length known, so only now can the body be
+     * read to exactly that many bytes. A response with no Content-Length has
+     * no other terminator than the peer closing, which eof reports. */
+    while (have < (size_t)want && !eof) {
+      s = recv_more(fd, resp, &eof, err);
+      if (kbc_failed(s)) {
+        close(fd);
+        kbc_str_free(resp);
+        return s;
+      }
+      have = resp->len - (hlen + 4);
     }
     if (have > (size_t)want) {
       have = (size_t)want;
     }
   }
+  close(fd);
+  /* Recomputed HERE, not above: every recv_more that grew the buffer may have
+   * realloc'd it, so a body pointer taken BEFORE the read loop dangles by
+   * the time the memmove below uses it. The offset is fixed; the address is
+   * not. */
+  const char *body_ptr = resp->ptr + hlen + 4;
   memmove(resp->ptr, body_ptr, have);
   resp->len = have;
   resp->ptr[have] = '\0';
@@ -1854,12 +1897,17 @@ static int cmd_reindex(int argc, char **argv, int start) {
   }
   if (dv != NULL && kbc_json_is(dv, KBC_JSON_NUM)) {
     double took = kbc_json_num(root, "took_us", 0.0);
-    printf("reindexed %.0f documents in %.0f us%s%s\n", dv->u.num, took,
-           o.has_kb ? " in " : "", o.has_kb ? o.kb : "");
+    /* stderr, not stdout: the original splits this verb's streams so that
+     * `kb reindex > log` captures machine-readable output and leaves the
+     * human line out of it (reindex.rs:52-53 in the Rust). The two verbs
+     * whose output an operator pipes -- this one and `metrics` -- both keep
+     * their payload on stdout, so a redirect stays parseable. */
+    fprintf(stderr, "reindexed %.0f documents in %.0f us%s%s\n", dv->u.num,
+            took, o.has_kb ? " in " : "", o.has_kb ? o.kb : "");
   } else if (status == 202) {
     /* The daemon accepted the work rather than running it inline. */
-    printf("reindex accepted%s%s; run `kbc status` for the counters\n",
-           o.has_kb ? " for " : "", o.has_kb ? o.kb : "");
+    fprintf(stderr, "reindex accepted%s%s; run `kbc status` for the counters\n",
+            o.has_kb ? " for " : "", o.has_kb ? o.kb : "");
   } else {
     print_body(&resp);
   }

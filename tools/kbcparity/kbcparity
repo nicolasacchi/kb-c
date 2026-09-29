@@ -1,0 +1,1669 @@
+#!/usr/bin/env python3
+"""kbcparity — the cross-implementation evidence layer for kb-c.
+
+kb-c is a C17 port of the Rust `kb` daemon. Every other gate in the port
+compares kb-c against ITSELF: its own tests, its own benchmarks, its own
+invariants. Nothing measured kb-c against the thing it is a port of, so
+"matches the original" was a claim with nothing behind it. This harness is
+the measurement: it drives the SAME pinned inputs through the Rust daemon
+and through the C daemon and diffs what each one stored.
+
+Two suites:
+
+  capture  the stored artefact, byte for byte, and the front matter each
+           daemon extracted from it, field by field
+  links    the resolved edge set, the outcome of the resolution ladder for
+           every wikilink, and the backlink count per document
+
+WHY THE ALLOWLIST IS THE DESIGN, NOT A SUPPRESSION LIST. A harness that
+reports correct behaviour as a failure within a week gets ignored, and this
+port has already had that happen twice. So every KNOWN divergence lives in
+divergences.v1.conf with a REASON (accepted trade-off, known parser
+difference, unported original behaviour) and the date it was accepted, and
+the run prints accepted divergences in a bucket of their own — never mixed
+into the pass count. A divergence with no entry is a FAILURE.
+
+The anti-absorption rule: an entry matches by (suite, field, subject-glob)
+and an entry that matches NOTHING is reported STALE and fails the run, so
+the list cannot quietly grow to cover everything and nobody can tell. The
+entry count is compared against the previous run and the growth is printed.
+
+WHY A BLOCKED RUN IS NOT A PASS. A harness that cannot tell "no divergence"
+from "no comparison happened" is worse than no harness: it is a green light
+wired to nothing. Every early exit that means the comparison did not happen
+is SKIPPED-BLOCKED (exit 77) and says, in those words, which precondition
+was missing. Exit 0 means the comparison RAN.
+
+WHY A COMPARISON NOBODY MADE IS NOT A COMPARISON THAT AGREED. Every
+declined comparison is a GAP or a STRUCTURAL gap, and they are counted,
+named and printed separately. A GAP is one this run could have made and
+did not — a precondition it did not meet — and it FAILS the run, with the
+remedy that gap's own, so a run that already passed a flag is never told
+to pass it again. A STRUCTURAL gap is a question no surface either daemon
+implements can answer: it is printed every run with its count and its
+reason, it does not fail the run, and it is never counted as a pass. The
+line can therefore go green without anything having been hidden, and
+FIELD COVERAGE prints how many documents each field was really compared on
+so a pass count cannot be read as breadth it does not have.
+
+WHAT THE FRONT MATTER IS READ FROM. The Rust document row
+(GET /api/kb/{kb}/docs/{id}), not the list rows: /docs and /notes are
+disjoint namespaces publishing different shapes, and the note row carries
+no category, no created, no severity and no summary at all. Reading them
+off the list row made a document that publishes all six front-matter
+fields look like one that publishes none.
+
+EXIT CODES
+  0   every comparison either matched or matched an allowlist entry, and
+      no comparison was left unmeasured for want of a precondition
+  1   at least one unlisted divergence, a stale allowlist entry, or a GAP
+      — a comparison this run could have made and did not
+  3   HARD STOP: a pinned input does not match its SHA256SUMS
+  77  SKIPPED-BLOCKED: the comparison could not be performed
+  2   usage error
+"""
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+EXIT_OK = 0
+EXIT_FAIL = 1
+EXIT_USAGE = 2
+EXIT_HARD_STOP = 3
+EXIT_BLOCKED = 77
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_ALLOWLIST = os.path.join(HERE, "divergences.v1.conf")
+DEFAULT_CORPUS = os.path.join(HERE, "corpus")
+DEFAULT_FIXTURES = os.path.join(HERE, "fixtures", "ladder")
+
+# The two inputs are pinned separately and reported separately, because they
+# are pinned for different reasons. corpus/ is a VERBATIM copy of the Rust
+# project's own frozen corpus plus a pinned slice of its Markdown: it is
+# other people's bytes and a rewritten byte is a different claim.
+# fixtures/ is written by this harness and exists only because the upstream
+# corpus contains no ambiguous wikilink at all — without it the ladder
+# comparison would have nothing to compare and would report a vacuous pass.
+PINNED_INPUTS = (("corpus", "upstream, vendored verbatim"),
+                 ("fixtures", "authored by this harness"))
+
+
+# --------------------------------------------------------------- reporting --
+
+class Unmeasured:
+    """One comparison the harness declined to make, and WHY.
+
+    The kind is the whole point. A `gap` is a comparison that COULD have
+    been made and was not, because a precondition was missing — the front
+    matter was not supplied, a daemon would not hand back its bytes. A gap
+    is a hole in this run's evidence and it FAILS the run, because a hole
+    is not an agreement.
+
+    A `structural` entry is a question no route either daemon implements
+    can answer: the rust notes ladder for a document that is not a note
+    there, or a front-matter field whose only published value on the far
+    side is a fallback rather than a declaration. It cannot be fixed by
+    passing a flag, it is printed with its count and its subjects every
+    run, and it does not fail — but it is ALSO never counted as a pass,
+    which is the property that matters: an unmeasured comparison must not
+    be readable as one that agreed.
+    """
+
+    __slots__ = ("kind", "suite", "field", "subject", "why", "remedy")
+
+    def __init__(self, kind, suite, field, subject, why, remedy=""):
+        self.kind = kind
+        self.suite = suite
+        self.field = field
+        self.subject = subject
+        self.why = why
+        self.remedy = remedy
+
+
+class Report:
+    """Everything the run observed, and the buckets it lands in.
+
+    `passes` counts COMPARISONS THAT MATCHED, not documents. A document with
+    six compared fields contributes six, so a run that compared less cannot
+    look better than a run that compared more — the counts are only
+    meaningful next to what was NOT compared, which is why that is tracked
+    too, and why `absent` separates "both sides published a value and the
+    values were equal" from "neither side published a value at all".
+    """
+
+    def __init__(self):
+        self.passes = 0
+        self.absent = 0             # passes of the form "both sides say no"
+        self.accepted = []          # Divergence + entry id
+        self.failures = []          # Divergence
+        self.stale = []             # entry id (a string, and so sortable)
+        self.not_measured = []      # Unmeasured
+        self.coverage = {}          # (suite, field) -> [compared, total]
+        self.notes = []
+
+    def passed(self, n=1):
+        self.passes += n
+
+    def diverged(self, div, entry):
+        if entry is None:
+            self.failures.append(div)
+        else:
+            self.accepted.append((div, entry.id))
+
+    def gap(self, suite, field, subject, why, remedy):
+        """A comparison this run COULD have made and did not."""
+        self.not_measured.append(
+            Unmeasured("gap", suite, field, subject, why, remedy))
+
+    def structural(self, suite, field, subject, why, remedy=""):
+        """A comparison no implemented surface can answer, on either side.
+
+        `remedy` is not a flag to pass — there is none — but what WOULD make
+        it measurable, so a reader can tell a permanent hole from a
+        forgotten one.
+        """
+        self.not_measured.append(
+            Unmeasured("structural", suite, field, subject, why, remedy))
+
+    def compared(self, suite, field, yes=True):
+        """One document's worth of the field, compared or not.
+
+        Both halves are counted, so the report can say "compared on 2 of 21"
+        rather than a bare number a reader has to divide by something.
+        """
+        c = self.coverage.setdefault((suite, field), [0, 0])
+        c[0] += 1 if yes else 0
+        c[1] += 1
+
+    def of_kind(self, kind):
+        return [u for u in self.not_measured if u.kind == kind]
+
+    @property
+    def gaps(self):
+        return self.of_kind("gap")
+
+    @property
+    def unmappable(self):
+        return self.of_kind("structural")
+
+
+class Div:
+    """One observed disagreement between the two daemons.
+
+    `subject` is the document the disagreement is ABOUT (a corpus-relative
+    path), and `field` is what about it. Keeping them separate is what lets
+    one allowlist entry cover a class of documents without also covering a
+    class of FIELDS it was never about.
+    """
+
+    __slots__ = ("suite", "field", "subject", "c", "r", "detail")
+
+    def __init__(self, suite, field, subject, c, r, detail=""):
+        self.suite = suite
+        self.field = field
+        self.subject = subject
+        self.c = c
+        self.r = r
+        self.detail = detail
+
+    def key(self):
+        return (self.suite, self.field, self.subject)
+
+    def __str__(self):
+        base = "%s/%s %s" % (self.suite, self.field, self.subject)
+        if self.detail:
+            base += "  [%s]" % self.detail
+        return base
+
+
+# --------------------------------------------------------------- allowlist --
+
+REASONS = ("accepted-trade-off", "known-parser-difference",
+           "unported-original-behaviour")
+
+
+class Entry:
+    """One agreed divergence, with the reason it was agreed to.
+
+    `subjects` is required and must be a glob list, never empty. An entry
+    that names no subject would match every document of its field, which is
+    exactly the silent absorption the file exists to prevent.
+    """
+
+    def __init__(self, eid, suite, field, subjects, kind, reason,
+                 accepted_on, note, detail_re):
+        self.id = eid
+        self.suite = suite
+        self.field = field
+        self.subjects = subjects
+        self.kind = kind
+        self.reason = reason
+        self.accepted_on = accepted_on
+        self.note = note
+        self.detail_re = detail_re
+        self.matched = 0
+        # Per-SUBJECT hit counts, not just the per-entry total. An entry that
+        # matched something can still name a subject that matched nothing,
+        # and that is the narrow version of the same false claim.
+        self.subjects_hit = {}
+
+    def matches(self, div):
+        if div.suite != self.suite or div.field != self.field:
+            return False
+        if not any(fnmatch.fnmatch(div.subject, g) for g in self.subjects):
+            return False
+        if self.detail_re is not None and not re.search(self.detail_re, div.detail):
+            return False
+        return True
+
+    def label(self):
+        return "%s (%s, %s)" % (self.id, self.kind, self.accepted_on)
+
+
+def load_allowlist(path):
+    """Parse the allowlist. Deliberately not a parser for a real format.
+
+    A real format would need a dependency to read it, and the dependency
+    would be the largest thing in this directory. The format is
+    line-oriented and commented, which is what makes an entry reviewable in
+    a diff — and reviewability is the entire point of the file.
+    """
+    entries, cur = [], None
+    with open(path, "r", encoding="utf-8") as fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if not line[:1].isspace() and line.strip() == "entry":
+                cur = {"_line": lineno}
+                continue
+            if not line[:1].isspace() and line.strip() == "end":
+                entries.append(make_entry(cur, path))
+                cur = None
+                continue
+            if cur is None:
+                raise SystemExit("%s:%d: setting outside an entry block"
+                                 % (path, lineno))
+            if line[:1].isspace():
+                # An INDENTED line continues the key above it. A reason
+                # runs past 80 columns, and a reason nobody can read is a
+                # reason nobody accepted on the evidence.
+                prev = cur.get("_last")
+                if prev is None:
+                    raise SystemExit("%s:%d: indented line with nothing above "
+                                     "it to continue" % (path, lineno))
+                cur[prev] = (cur[prev] + " " + line.strip()).strip()
+                continue
+            key, _, val = line.partition("=")
+            if not key.strip():
+                raise SystemExit("%s:%d: setting with no key" % (path, lineno))
+            cur[key.strip()] = val.strip()
+            cur["_last"] = key.strip()
+    if cur is not None:
+        raise SystemExit("%s: unterminated entry at line %s"
+                         % (path, cur["_line"]))
+    return entries
+
+
+def make_entry(d, path):
+    missing = [k for k in ("id", "suite", "field", "subjects", "kind",
+                           "reason", "accepted_on") if k not in d]
+    if missing:
+        raise SystemExit("%s:%d: entry missing %s"
+                         % (path, d["_line"], ", ".join(missing)))
+    if d["kind"] not in REASONS:
+        raise SystemExit("%s:%d: kind %r is not one of %s"
+                         % (path, d["_line"], d["kind"], "/".join(REASONS)))
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d["accepted_on"]):
+        raise SystemExit("%s:%d: accepted_on %r is not YYYY-MM-DD — an "
+                         "undated exception is a rumour"
+                         % (path, d["_line"], d["accepted_on"]))
+    if not d["reason"]:
+        raise SystemExit("%s:%d: entry has no reason" % (path, d["_line"]))
+    return Entry(d["id"], d["suite"], d["field"],
+                 # Stripped, because the format lets a long subject list
+                 # wrap onto indented continuation lines and the join puts
+                 # a space after every comma. An unstripped glob matches
+                 # nothing, so the entry silently fails to cover and the
+                 # divergence it was written for stays a FAILURE — the
+                 # right direction to be wrong in, but still wrong.
+                 [s.strip() for s in d["subjects"].split(",") if s.strip()],
+                 d["kind"], d["reason"], d["accepted_on"],
+                 d.get("note", ""), d.get("detail", None))
+
+
+def classify(rep, div, entries):
+    for e in entries:
+        if e.matches(div):
+            e.matched += 1
+            rep.diverged(div, e)
+            return
+    rep.diverged(div, None)
+
+
+# ------------------------------------------------------------------ inputs --
+
+def verify_pins(root, label):
+    """Re-hash every pinned input file. A mismatch is a HARD STOP.
+
+    Not a failure, not a warning: if the bytes under test are not the bytes
+    that were pinned, every number this run produces is about a corpus
+    nobody else has, and reporting divergences over it would be worse than
+    reporting nothing because it would look like evidence.
+    """
+    sums = os.path.join(root, "SHA256SUMS")
+    if not os.path.isfile(sums):
+        raise HardStop("%s: no SHA256SUMS — the pin is the claim" % label)
+    checked, bad = 0, []
+    with open(sums, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            want, _, rel = line.partition("  ")
+            path = os.path.join(root, rel)
+            if not os.path.isfile(path):
+                bad.append("%s: missing" % rel)
+                continue
+            with open(path, "rb") as bf:
+                got = hashlib.sha256(bf.read()).hexdigest()
+            checked += 1
+            if got != want:
+                bad.append("%s: sha256 %s != pinned %s" % (rel, got, want))
+    if bad:
+        raise HardStop("%s: %d of %d pinned files do not verify:\n  %s"
+                       % (label, len(bad), checked, "\n  ".join(bad)))
+    return checked
+
+
+class HardStop(Exception):
+    pass
+
+
+class Blocked(Exception):
+    pass
+
+
+# ------------------------------------------------------------------- daemons --
+
+def free_port(exclude=()):
+    """An ephemeral port the OS says is free right now.
+
+    The two daemons get two DISTINCT ports. Two consecutive calls can hand
+    back the same number, and a run that gives the second daemon the first
+    daemon's port dies at bind — a self-inflicted wound reported as a
+    blocked comparison, which is exactly the confusion this harness exists
+    to remove.
+    """
+    for _ in range(64):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        if port not in exclude:
+            return port
+    raise Blocked("no free TCP port on the loopback interface")
+
+
+class Side:
+    """One daemon under test: its binary, its base URL and its auth header."""
+
+    def __init__(self, name, base, token=None):
+        self.name = name
+        self.base = base
+        self.token = token
+        self.proc = None
+
+    def get(self, path, raw=False, timeout=60):
+        req = urllib.request.Request(self.base + path)
+        if self.token:
+            req.add_header("Authorization", "Bearer " + self.token)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read()
+        except urllib.error.HTTPError as e:
+            return (e.code, e.read())
+        except (urllib.error.URLError, OSError) as e:
+            raise Blocked("%s: %s %s — %s" % (self.name, "GET", path, e))
+        return (200, body) if raw else (200, json.loads(body.decode("utf-8")))
+
+    def post(self, path, timeout=600):
+        req = urllib.request.Request(self.base + path, data=b"",
+                                     method="POST")
+        if self.token:
+            req.add_header("Authorization", "Bearer " + self.token)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            return e.read()
+        except (urllib.error.URLError, OSError) as e:
+            raise Blocked("%s: POST %s — %s" % (self.name, path, e))
+
+    def stop(self):
+        if self.proc is None:
+            return
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=10)
+        self.proc = None
+
+
+def start_c(binary, cfg, log_path):
+    # --foreground, always. Without it `kbc daemon` forks into the
+    # background and the parent exits 0, so the harness would hold a dead
+    # Process object, wait on a daemon it did not start, and kill nothing at
+    # cleanup: a leak, and a report about a daemon it was never talking to.
+    proc = subprocess.Popen([binary, "daemon", "--config", cfg,
+                             "--foreground"],
+                            stdout=open(log_path, "wb"),
+                            stderr=subprocess.STDOUT)
+    return proc
+
+
+def start_rust(binary, cfg, sandbox, log_path):
+    env = dict(os.environ)
+    env["HOME"] = sandbox
+    env["XDG_CONFIG_HOME"] = os.path.join(sandbox, ".config")
+    env["XDG_DATA_HOME"] = os.path.join(sandbox, ".data")
+    env["XDG_CACHE_HOME"] = os.path.join(sandbox, ".cache")
+    env["XDG_STATE_HOME"] = os.path.join(sandbox, ".state")
+    for d in (env["XDG_CONFIG_HOME"], env["XDG_DATA_HOME"],
+              env["XDG_CACHE_HOME"], env["XDG_STATE_HOME"]):
+        os.makedirs(d, exist_ok=True)
+    proc = subprocess.Popen([binary, "daemon", "--config", cfg], env=env,
+                            stdout=open(log_path, "wb"),
+                            stderr=subprocess.STDOUT)
+    return proc
+
+
+def wait_ready(side, kb, timeout, what):
+    """Wait for the daemon to answer its own liveness route.
+
+    Readiness is "the daemon answers", not "the index is populated": a
+    harness that waits for the index would report a slow machine as a
+    blocked comparison, and a harness that does not wait at all would
+    measure an empty corpus and call it agreement.
+    """
+    path = ("/api/kb/%s/stats" % kb) if side.name == "rust" else "/api/health"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if side.proc is not None and side.proc.poll() is not None:
+            raise Blocked("%s daemon exited during startup (rc=%d); see %s"
+                          % (side.name, side.proc.returncode, what))
+        try:
+            code, _ = side.get(path, timeout=3)
+            if code == 200:
+                return
+        except Blocked:
+            pass
+        time.sleep(0.5)
+    raise Blocked("%s daemon never answered %s within %ds"
+                  % (side.name, path, timeout))
+
+
+def doc_count(side, kb):
+    """How many documents this daemon holds RIGHT NOW.
+
+    Per side, not one path for both: the Rust daemon answers
+    /api/kb/{kb}/stats and has no /api/health, kb-c answers /api/health and
+    has no per-kb stats. Asking the Rust path of kb-c errors on every poll,
+    which the settle loop reads as "still counting" until it times out and
+    reports zero — a ten-minute run that ends in a fabricated divergence
+    nobody can reproduce.
+    """
+    path = ("/api/kb/%s/stats" % kb) if side.name == "rust" else "/api/health"
+    key = "doc_count" if side.name == "rust" else "docs"
+    try:
+        _, body = side.get(path, timeout=5)
+        return int(body[key])
+    except (Blocked, ValueError, TypeError, KeyError, AttributeError):
+        return -1
+
+
+def wait_ingest(side, kb, expected, timeout, log):
+    """Wait for BOTH daemons to hold the whole corpus, then to hold still.
+
+    The Rust daemon's first ingest lands on a reconcile pass, which is a
+    minute away on a fresh sandbox, so a fixed sleep is a race and "the
+    doc_count stopped moving" is the only settle condition that means
+    anything. Two consecutive equal readings, or a timeout that is reported
+    as a FAILURE rather than as agreement over a half-indexed corpus.
+    """
+    deadline = time.time() + timeout
+    last, stable = -2, 0
+    while time.time() < deadline:
+        if side.proc is not None and side.proc.poll() is not None:
+            # A daemon that DIED is not a daemon that is slow. Waiting out
+            # the whole timeout on a corpse is how a run ends in "kb-c holds
+            # 0 documents" — a fabricated divergence about a daemon that is
+            # not there.
+            raise Blocked("%s daemon exited during ingest (rc=%d)"
+                          % (side.name, side.proc.returncode))
+        n = doc_count(side, kb)
+        # Settle on "the count STOPPED MOVING", never on "the count equals
+        # the number of files". Those are different questions and the daemon
+        # does not promise the second: a run observed the Rust side reporting
+        # 32 documents for a 21-file corpus while every reconcile pass it
+        # logged said files=21, so a harness that waits for equality there
+        # waits forever on a daemon that has already finished. The count is
+        # REPORTED and compared as a divergence in its own right; it is not a
+        # precondition for looking at the documents.
+        # Two conditions, because one of them alone is wrong in a different
+        # direction each time:
+        #   n >= expected  the daemon has at least everything the corpus
+        #                  holds. Below that it is still working, and settling
+        #                  on "stopped moving" alone compares 18 of 21
+        #                  documents and calls the missing three agreement.
+        #   stable         and it has stopped moving, so a daemon that
+        #                  OVER-counts (a run observed 32 for a 21-file
+        #                  corpus while every reconcile pass it logged said
+        #                  files=21) is not waited on forever. The over-count
+        #                  is reported as its own divergence; it is not a
+        #                  reason to hang.
+        if n == last and n >= 0:
+            stable += 1
+            if stable >= 3 and n >= expected:
+                return n
+        else:
+            stable = 0
+        last = n
+        time.sleep(2.0)
+    log("    %s: still at %d of %d documents after %ds"
+        % (side.name, max(last, 0), expected, timeout))
+    return max(last, 0)
+
+
+# -------------------------------------------------------------- enumeration --
+
+def pages(side, first, kb):
+    """Walk a paginated list endpoint until it returns a short page.
+
+    Both daemons cap a page, so asking once for "everything" measures the
+    cap, not the corpus. A silent truncation here would turn a real document
+    difference into a missing row on BOTH sides, which reads as agreement.
+    """
+    out, offset, limit = [], 0, 200
+    while True:
+        _, body = side.get(first + ("?limit=%d&offset=%d" % (limit, offset)))
+        page = body
+        if isinstance(body, dict):
+            page = body.get("artifacts") or body.get("docs") \
+                or body.get("notes") or body.get("edges") or []
+        out.extend(page)
+        if len(page) < limit:
+            return out
+        offset += limit
+        if offset > 100000:
+            raise Blocked("%s: list endpoint never terminates" % side.name)
+
+
+def rust_docs(side, kb):
+    """Every document the Rust daemon holds, notes included.
+
+    `kb-category: note` documents live in /notes, not /docs, on the Rust
+    side and in /artifacts on the kb-c side. Unioning both is the only way
+    to compare like with like; taking either one alone would report the
+    namespace split as a missing document on both sides.
+    """
+    # Both sides hand back a plain {path: row} map. The Rust row carries its
+    # own namespace in a `_kind` key rather than in the value's shape: two
+    # shapes for the same concept is one more thing every consumer has to
+    # unpack correctly, and the one consumer that got it wrong took the run
+    # down with a ValueError instead of a report.
+    docs = {}
+    for d in pages(side, "/api/kb/%s/docs" % kb, kb):
+        d["_kind"] = "doc"
+        docs[d["source_relative"]] = d
+    for n in pages(side, "/api/kb/%s/notes" % kb, kb):
+        n["_kind"] = "note"
+        docs[n["source_relative"]] = n
+    return docs
+
+
+def c_docs(side, kb):
+    out = {}
+    for a in pages(side, "/api/artifacts", kb):
+        if a.get("corpus") != kb:
+            continue
+        a["_kind"] = "artifact"
+        out[a["path"]] = a
+    return out
+
+
+# ------------------------------------------------------------------ capture --
+
+# The front-matter fields the two implementations can be asked the SAME
+# question about, and where each side's answer comes from.
+#
+# `kbc_key` is the name kb-c's own reader publishes. It is not the name in
+# the document: parse.c's front_matter() takes ONLY `kb-`-prefixed keys,
+# strips the prefix and lowercases the rest, so a document's
+# `kb-category: note` reaches the harness as "category". A key with no
+# `kb-` prefix is not read by kb-c's front-matter reader at all.
+#
+# `rust_keys` are the wire keys a rust ROW may carry that same answer
+# under — a list, because the row shape is not one shape. The /notes list
+# row (NoteSummary, notes.rs:243-263) publishes `status` and no category;
+# the /docs row (DocResponse, docs.rs:66-200) publishes `kb_status`,
+# `kb_category`, `kb_severity` and `created_unix`. The two list namespaces
+# are DISJOINT — a document the rust calls a note is not in /docs at all —
+# so reading front matter off the list row made category, created, status
+# and severity structurally absent from a document that publishes all
+# four. That is why `doc_row()` below asks the DOCUMENT row, the one
+# surface that carries every one of these for every kind of document.
+#
+# `derived` marks a field whose rust value is FILLED IN when the document
+# declares nothing: a title falls back through first H1 and <title>
+# (parser.rs:695-706), tags fall back to a path-derived heuristic
+# (indexer.rs:2755-2762) and created_unix falls back to the file's
+# filesystem birth time (indexer.rs:2749). A value produced by a fallback
+# is a fact about the checkout, not a declaration in the document, so
+# putting it next to a front-matter key is a category error rather than a
+# difference — those are reported as structurally unmeasurable, by name,
+# every run.
+FM_FIELDS = (
+    # name       kbc key     rust wire key(s)         derived
+    ("title",    "title",    ("title",),              True),
+    ("category", "category", ("kb_category",),        False),
+    ("tags",     "tags",     ("tags",),               True),
+    ("created",  "created",  ("created_unix",),       True),
+    ("status",   "status",   ("kb_status",),          False),
+    ("severity", "severity", ("kb_severity",),        False),
+)
+
+# The value compared when a document declares no such field and neither
+# daemon published one. Spelled out rather than left as None so the report
+# can print it and a reader can tell "both sides read the document and
+# found nothing" from "nobody looked".
+NO_DECLARATION = "(neither side: the document declares none)"
+
+
+def fm_keys(row):
+    """The front-matter fields a rust document row publishes, by name.
+
+    Every field both sides actually carry is projected, under the same
+    names kb-c's reader uses, so a field the rust publishes and this
+    function did not look at can never be reported as a field that exists
+    on one side only. A field the row genuinely does not carry is left out
+    here and reported per document by `compare_front_matter`, which is the
+    only place that can say WHY.
+    """
+    out = {}
+    for name, _kbc, wire, _derived in FM_FIELDS:
+        for key in wire:
+            # A null counts as absent. The rust omits its Option fields
+            # entirely (skip_serializing_if), so a null can only turn up if a
+            # route stops omitting one — and treating it as a published value
+            # would compare the string "None" against a document that
+            # declares nothing.
+            if key in row and row[key] is not None:
+                value = row[key]
+                if isinstance(value, list):
+                    value = ",".join(value)
+                elif not isinstance(value, str):
+                    # created_unix is a JSON number and a front-matter value
+                    # is a string. Comparing the two directly would report a
+                    # type difference on a field both sides agree about.
+                    value = str(value)
+                out[name] = value
+                break
+    return out
+
+
+# Why each derived field is not a front-matter comparison. Named per field
+# so the report says which one it is talking about, and says what would
+# make it measurable.
+DERIVED_WHY = {
+    "title": ("the rust's row title is DERIVED — front matter, else the "
+              "first H1, else <title> (parser.rs:695-706) — and kb-c's "
+              "front-matter reader publishes no title at all, because it "
+              "reads only kb-*-prefixed keys. The two DERIVED titles are "
+              "compared like for like as capture/title",
+              "a document that declares a plain `title:` front-matter key "
+              "would need kb-c's reader to publish it"),
+    "tags": ("the rust's tags here are PATH-DERIVED (indexer.rs:2755-2762), "
+             "a fact about where the file sits rather than a declaration in "
+             "the document, and kb-c publishes no path tagger to compare "
+             "them with",
+             "a document that declares `kb-tags:` can be compared on this "
+             "field, and the corpus has two"),
+    "created": ("the rust's created_unix here is the file's FILESYSTEM "
+                "BIRTH TIME (indexer.rs:2749), a fact about the checkout "
+                "rather than a declaration in the document, and kb-c "
+                "publishes nothing to compare it against",
+                "a document that declares `kb-created:` is compared on this "
+                "field; nothing in this corpus declares one"),
+}
+
+
+def compare_front_matter(rep, path, cfm, rrow):
+    """Compare kb-c's front-matter extraction against the rust's row, field
+    by field, and say out loud what could not be compared and why.
+
+    The decision for each field, which is the whole of the correctness
+    claim here:
+
+      both sides carry a value   compare them. Real values, both sides.
+      neither side carries one    compare NO_DECLARATION with itself. Both
+                                 implementations read the document and both
+                                 concluded it declares no such field; that
+                                 is a comparison that ran and agreed, and
+                                 it is counted separately from a value
+                                 comparison so the pass total cannot be
+                                 read as breadth it does not have.
+      only the document declares  STRUCTURAL, and it says so in those
+                                 words: kb-c read a declaration the rust
+                                 row has no field for. There is no value on
+                                 the far side, so this is not a mismatch.
+      only the rust carries one    STRUCTURAL when the field is derived
+                                 (a fallback standing in for a
+                                 declaration); a REAL DIVERGENCE when it is
+                                 not, because then the rust is reporting a
+                                 field the document does not declare.
+    """
+    rfm = fm_keys(rrow)
+    for name, kbc_key, _wire, derived in FM_FIELDS:
+        rust_has = name in rfm
+        if rust_has and kbc_key in cfm:
+            rep.compared("capture", "frontmatter." + name)
+            compare(rep, "capture", "frontmatter." + name, path,
+                    cfm[kbc_key], rfm[name])
+        elif rust_has:
+            if derived:
+                rep.compared("capture", "frontmatter." + name, yes=False)
+                rep.structural("capture", "frontmatter." + name, path,
+                               DERIVED_WHY[name][0], DERIVED_WHY[name][1])
+            else:
+                # The rust reports a field the document does not declare.
+                # That is a disagreement about the document, not a surface
+                # gap, so it is a divergence and it is allowed to fail.
+                rep.compared("capture", "frontmatter." + name)
+                compare(rep, "capture", "frontmatter." + name, path,
+                        NO_DECLARATION, rfm[name],
+                        detail="the rust reports a %s this document does not "
+                               "declare" % name)
+        elif kbc_key in cfm:
+            rep.compared("capture", "frontmatter." + name, yes=False)
+            rep.structural("capture", "frontmatter." + name, path,
+                           "kb-c read a declared `%s`, and the rust document "
+                           "row publishes no %s field for it, so there is no "
+                           "value on the far side to compare against"
+                           % (kbc_key, name))
+        else:
+            rep.compared("capture", "frontmatter." + name)
+            compare(rep, "capture", "frontmatter." + name, path,
+                    NO_DECLARATION, NO_DECLARATION)
+            rep.absent += 1
+    # A key kb-c's reader extracted that is not in the table above: the
+    # rust has no field for it, which is a statement about its SURFACE, not
+    # a disagreement about the document.
+    mapped = {kbc for _n, kbc, _w, _d in FM_FIELDS}
+    for kbc_key in sorted(set(cfm) - mapped):
+        rep.compared("capture", "frontmatter." + kbc_key, yes=False)
+        rep.structural("capture", "frontmatter." + kbc_key, path,
+                       EXTRA_KEY_WHY.get(kbc_key, EXTRA_KEY_WHY[""]))
+
+
+EXTRA_KEY_WHY = {
+    "summary": ("kb-c read a declared front-matter summary, and the rust's "
+                "`summary` is an EXCERPT OF THE RENDERED BODY, not the "
+                "document's declaration (parser.rs:540-544) — two different "
+                "things under one name. The summaries are compared like for "
+                "like as capture/summary, row against row"),
+    "": ("kb-c's reader extracted this declared key, and the rust document "
+         "row publishes no field for it: the rust parses and stores the key "
+         "without surfacing it, so there is no value on the far side to "
+         "compare against"),
+}
+
+
+def doc_row(side, kb, list_row, path):
+    """The DOCUMENT row for one document, merged over its list row.
+
+    The rust publishes two row shapes and they are not the same shape.
+    `/docs` gives a DocResponse (docs.rs:66-200): title, kb_category,
+    created_unix, tags, kb_status, kb_severity, summary. `/notes` gives a
+    NoteSummary (notes.rs:243-263): title, tags, status, and no category,
+    no severity, no created and no summary at all. The two LIST namespaces
+    are disjoint, so a document the rust calls a note is simply not in
+    `/docs` — the harness had no document row for it and read its front
+    matter off the note row, which is a surface artefact, not a
+    difference.
+
+    `GET /api/kb/{kb}/docs/{id}` answers for BOTH kinds and carries every
+    field, so the row it returns is the one the front-matter and summary
+    comparisons read. The list row is kept underneath so `_kind` and any
+    field only the list publishes survive, and a 404 leaves the list row
+    untouched — the field-level report then says what is missing rather
+    than this silently inventing an absence.
+    """
+    code, body = side.get("/api/kb/%s/docs/%s" % (kb, list_row["id"]))
+    if code != 200 or not isinstance(body, dict):
+        return list_row
+    merged = dict(list_row)
+    merged.update(body)
+    return merged
+
+
+def c_source(side, ident):
+    code, body = side.get("/api/artifacts/%s?source=1" % ident)
+    if code != 200 or not isinstance(body, dict):
+        return None
+    return body.get("source")
+
+
+def run_capture(rep, c, r, kb, fm_override):
+    cdocs, rdocs = c_docs(c, kb), rust_docs(r, kb)
+    subjects = sorted(set(cdocs) | set(rdocs))
+    print("    capture: %d documents in the union of both daemons" % len(subjects))
+
+    for path in subjects:
+        ca, ra = cdocs.get(path), rdocs.get(path)
+        if ca is None or ra is None:
+            # The document SET is the comparison here; the per-field
+            # columns below it are not reached, so they are counted as not
+            # compared rather than silently left out of the denominator.
+            rep.compared("capture", "document_set")
+            for f in ("title", "summary", "store_bytes", "render_bytes"):
+                rep.compared("capture", f, yes=False)
+            side = "kb-c only" if ra is None else "rust only"
+            classify(rep, Div("capture", "document_set", path,
+                              "present" if ca else "absent",
+                              "present" if ra else "absent",
+                              "held by the %s daemon only" % side), ENTRIES)
+            continue
+        # The LIST rows enumerate; the DOCUMENT row is what the front
+        # matter and the summary are read from. /docs and /notes are
+        # DISJOINT namespaces (a document the rust calls a note is not in
+        # /docs at all), and the note row publishes `status` but no
+        # category, no severity and no summary. Reading those fields off
+        # the list row made a document that publishes all of them look
+        # like a document that publishes none.
+        rrow = doc_row(r, kb, ra, path)
+
+        rep.compared("capture", "title")
+        compare(rep, "capture", "title", path, ca.get("title"),
+                rrow.get("title"))
+
+        csum, rsum = ca.get("summary"), rrow.get("summary")
+        if csum and rsum:
+            # Row against row, which is the only like-for-like form of this
+            # comparison: both strings are the lead of the RENDERED body.
+            # A declared front-matter `summary:` is a different thing and is
+            # reported as such by compare_front_matter.
+            rep.compared("capture", "summary")
+            compare(rep, "capture", "summary", path, csum, rsum)
+        else:
+            rep.compared("capture", "summary", yes=False)
+            rep.structural(
+                "capture", "summary", path,
+                "no row either daemon publishes for this document carries a "
+                "summary: kb-c's artifact row has none and the rust row "
+                "answered for it has none, so there is no pair of values to "
+                "compare and an absent value is not an agreeing one")
+
+        # The stored artefact. On the Rust side that is the rendered page,
+        # because the Rust indexer renders Markdown to HTML ONCE at ingest
+        # (indexer.rs:2344-2350) and /artifact/{id} serves what it stored.
+        # On the kb-c side it is the SOURCE, because the C serving route
+        # reads the file and renders per request (httpd.c:5231). The two
+        # routes are the same URL and the two bodies are not the same thing.
+        csrc = c_source(c, ca["id"])
+        rsrc_bytes = fetch_artifact(r, kb, ra["id"])
+        if csrc is None or rsrc_bytes is None:
+            rep.compared("capture", "store_bytes", yes=False)
+            rep.gap("capture", "store_bytes", path,
+                    "one daemon would not hand back its stored bytes, so the "
+                    "stored artefact was never compared",
+                    "re-run with --keep and read the sandbox's kbc.log / "
+                    "kb.log; a daemon that 404s an artifact it indexed is a "
+                    "serving-route fault, not a parity result")
+        else:
+            rep.compared("capture", "store_bytes")
+            compare(rep, "capture", "store_bytes", path,
+                    digest(csrc.encode("utf-8")),
+                    digest(rsrc_bytes))
+
+        cpage = fetch_artifact(c, kb, ca["id"])
+        if cpage is None or rsrc_bytes is None:
+            rep.compared("capture", "render_bytes", yes=False)
+            rep.gap("capture", "render_bytes", path,
+                    "one daemon would not render the document, so the served "
+                    "page was never compared",
+                    "re-run with --keep and read the sandbox's kbc.log / "
+                    "kb.log; the render is a serving route, and a missing one "
+                    "means nothing about parity")
+        else:
+            rep.compared("capture", "render_bytes")
+            compare(rep, "capture", "render_bytes", path,
+                    digest(cpage), digest(rsrc_bytes),
+                    detail=first_real_diff(cpage, rsrc_bytes))
+
+        # ---- front matter, field by field ----
+        if path in fm_override:
+            compare_front_matter(rep, path, fm_override[path], rrow)
+        else:
+            # Not a per-field story: the whole kb-c extraction is missing,
+            # so the whole front-matter column is one gap per document, and
+            # the remedy names the precondition this run did not meet.
+            for name, _kbc, _wire, _derived in FM_FIELDS:
+                rep.compared("capture", "frontmatter." + name, yes=False)
+                rep.gap("capture", "frontmatter." + name, path,
+                        "kb-c publishes no front matter over HTTP and this "
+                        "run was given none, so the field could not be "
+                        "compared at all",
+                        "pass --front-matter PATH; tests/kbc_parity.c links "
+                        "libkbc, calls kbc_parse() on every corpus file and "
+                        "supplies it. Running the harness directly does not.")
+
+    return cdocs, rdocs
+
+
+def compare(rep, suite, field, subject, cval, rval, detail=""):
+    if cval == rval:
+        rep.passed()
+        return
+    classify(rep, Div(suite, field, subject, cval, rval, detail), ENTRIES)
+
+
+def digest(b):
+    return "sha256:%d:%s" % (len(b), hashlib.sha256(b).hexdigest()[:16])
+
+
+def fetch_artifact(side, kb, ident):
+    code, body = side.get("/api/kb/%s/artifact/%s" % (kb, ident), raw=True)
+    return body if code == 200 else None
+
+
+def first_real_diff(a, b):
+    """The first differing line, so a byte mismatch is readable.
+
+    A bare 'the hashes differ' for a 25 KB page tells the reader nothing and
+    gets the whole comparison distrusted; the line does.
+    """
+    la, lb = a.split(b"\n"), b.split(b"\n")
+    for i in range(max(len(la), len(lb))):
+        x = la[i] if i < len(la) else b"<eof>"
+        y = lb[i] if i < len(lb) else b"<eof>"
+        if x != y:
+            return "line %d: kb-c %r vs rust %r" % (
+                i + 1, x[:70].decode("utf-8", "replace"),
+                y[:70].decode("utf-8", "replace"))
+    return ""
+
+
+# -------------------------------------------------------------------- links --
+
+def backlinked(side, kb, docs):
+    """The in-edge set, read off the one route both daemons implement.
+
+    Neither daemon exposes the out-edge set for an arbitrary document: the
+    Rust one has /kb/{kb}/edges in ids, and kb-c has no edges route at all.
+    /backlinks/{id} is implemented by BOTH and names the linking document by
+    source-relative path, so transposing it gives the same relation on both
+    sides from one comparable surface. Deriving the same quantity the same
+    way on both sides is the whole point; a comparison that read the graph
+    out of one daemon's own table would be measuring two different questions.
+    """
+    inb = {}
+    for path, row in docs.items():
+        code, body = side.get("/api/kb/%s/backlinks/%s" % (kb, row["id"]))
+        if code != 200 or not isinstance(body, dict):
+            inb[path] = set()
+            continue
+        inb[path] = {b["source_relative"] for b in body.get("backlinks", [])}
+    edges = set()
+    for dst, srcs in inb.items():
+        for src in srcs:
+            edges.add((src, dst))
+    return inb, edges
+
+
+def run_links(rep, c, r, kb, cdocs, rdocs):
+    cin, cedges = backlinked(c, kb, cdocs)
+    rin, redges = backlinked(r, kb, rdocs)
+    print("    links: %d documents, %d kb-c edges, %d rust edges"
+          % (len(set(cdocs) | set(rdocs)), len(cedges), len(redges)))
+
+    for path in sorted(set(cdocs) | set(rdocs)):
+        if path not in cdocs or path not in rdocs:
+            holder = "kb-c" if path in cdocs else "rust"
+            for f in ("backlink_count", "backlinks", "edge_count", "edges"):
+                rep.compared("links", f, yes=False)
+            rep.gap("links", "backlinks", path,
+                    "held by the %s daemon only, so the document has no "
+                    "counterpart to diff a graph against" % holder,
+                    "the document sets are reported as capture/document_set; "
+                    "a document one side has and the other does not is a "
+                    "real difference and is allowed to fail there")
+            continue
+        for field, cval, rval in (
+                ("backlink_count", len(cin.get(path, ())),
+                 len(rin.get(path, ()))),
+                ("backlinks", ",".join(sorted(cin.get(path, ()))),
+                 ",".join(sorted(rin.get(path, ())))),
+                ("edge_count", len([e for e in cedges if e[0] == path]),
+                 len([e for e in redges if e[0] == path])),
+                ("edges", ",".join(sorted(e[1] for e in cedges
+                                          if e[0] == path)),
+                 ",".join(sorted(e[1] for e in redges if e[0] == path)))):
+            rep.compared("links", field)
+            compare(rep, "links", field, path, cval, rval)
+
+    rep.compared("links", "graph_edge_count")
+    compare(rep, "links", "graph_edge_count", "<corpus>", len(cedges),
+            len(redges))
+    only_c = sorted(cedges - redges)
+    only_r = sorted(redges - cedges)
+    for e in only_c:
+        classify(rep, Div("links", "graph_edge", "%s -> %s" % e, "edge",
+                          "NO EDGE", "in kb-c's graph and not in the Rust "
+                          "one"), ENTRIES)
+    for e in only_r:
+        classify(rep, Div("links", "graph_edge", "%s -> %s" % e, "NO EDGE",
+                          "edge", "in the Rust graph and not in kb-c's"),
+                ENTRIES)
+
+    run_ladder(rep, c, r, kb, cdocs, rdocs)
+
+
+def run_ladder(rep, c, r, kb, cdocs, rdocs):
+    """Per-wikilink resolution outcome, on the route both daemons implement.
+
+    /api/kb/{kb}/notes/{id}/links answers with one entry per DISTINCT target
+    carrying state resolved|ambiguous|dangling and, when resolved, the target
+    it resolved to. That is the ladder's outcome per case, including the
+    ambiguous cases — which are the ones worth comparing, because "picked one
+    by index order" is the failure mode both daemons claim not to have.
+
+    The Rust route 404s an artifact that is not a note (notes.rs:305-317);
+    the kb-c route answers for any artifact because its ingest has one kind.
+    A document the rust does not call a note therefore has no comparable
+    ladder, and saying so is the honest answer: a coverage gap, not a pass.
+    It is a STRUCTURAL gap — no flag makes that route answer — so it does
+    not fail the run, and it is printed with its count and its subjects
+    every run so it can never be mistaken for a ladder that agreed.
+    """
+    for path in sorted(set(cdocs) & set(rdocs)):
+        rrow = rdocs[path]
+        if rrow["_kind"] != "note":
+            rep.compared("links", "ladder", yes=False)
+            rep.structural(
+                "links", "ladder", path,
+                "the rust notes route answers notes only, and this document "
+                "is not a note there — its ladder is a 404, not an empty "
+                "answer — so no rung of it can be compared. The document's "
+                "graph IS compared, as links/edges and links/backlink_count.",
+                "a document the rust lists as a NOTE — one whose front "
+                "matter declares `kb-category: note` — has a ladder on that "
+                "route, and its rungs are compared")
+            continue
+        cm, rm = ladder(c, kb, cdocs[path]["id"]), ladder(r, kb, rrow["id"])
+        if cm is None or rm is None:
+            rep.compared("links", "ladder", yes=False)
+            classify(rep, Div("links", "ladder", path,
+                              "answered" if cm else "no route",
+                              "answered" if rm else "no route",
+                              "one daemon has no ladder surface here"),
+                     ENTRIES)
+            continue
+        for target in sorted(set(cm) | set(rm)):
+            cstate, rtgt = cm.get(target, ("ABSENT", None))
+            rstate, rtgt2 = rm.get(target, ("ABSENT", None))
+            detail = "state kb-c=%s rust=%s" % (cstate, rstate)
+            if cstate == rstate == "resolved":
+                detail += "; target kb-c=%s rust=%s" % (rtgt, rtgt2)
+            if cstate == rstate == "ambiguous":
+                detail += " (ambiguous on both: the ladder refused to pick)"
+            rep.compared("links", "ladder." + cstate)
+            compare(rep, "links", "ladder." + cstate, path,
+                    "%s -> %s" % (cstate, rtgt), "%s -> %s" % (rstate, rtgt2),
+                    detail=detail)
+
+
+def ladder(side, kb, ident):
+    code, body = side.get("/api/kb/%s/notes/%s/links" % (kb, ident))
+    if code != 200 or not isinstance(body, dict):
+        return None
+    out = {}
+    for o in body.get("outgoing", []):
+        out[o["target"]] = (o.get("state", "?"), o.get("source_relative"))
+    return out
+
+
+# ------------------------------------------------------------------ staging --
+
+INDEXED_EXT = (".md", ".markdown", ".html", ".htm")
+
+
+def stage(src, dst):
+    shutil.copytree(src, dst)
+    return sorted(
+        os.path.relpath(os.path.join(root, name), dst)
+        for root, _d, files in os.walk(dst) for name in files
+        if name.lower().endswith(INDEXED_EXT))
+
+
+def write_configs(sandbox, corpus, kb, cport, rport):
+    cdir = os.path.join(sandbox, "c")
+    rdir = os.path.join(sandbox, "rust")
+    os.makedirs(cdir, exist_ok=True)
+    os.makedirs(os.path.join(rdir, ".config", "kb"), exist_ok=True)
+    ccfg = os.path.join(cdir, "kb.toml")
+    with open(ccfg, "w", encoding="utf-8") as fh:
+        fh.write('[daemon]\nbind = "127.0.0.1"\nport = %d\n'
+                 'data_dir = "%s"\nlog_level = "info"\n\n'
+                 '[[corpus]]\nname = "%s"\npath = "%s"\n'
+                 % (cport, os.path.join(cdir, "data"), kb, corpus))
+    rcfg = os.path.join(rdir, ".config", "kb", "kb.toml")
+    with open(rcfg, "w", encoding="utf-8") as fh:
+        fh.write('[daemon]\nname = "kbcparity-rust"\n\n[server]\n'
+                 'addr = "127.0.0.1:%d"\n\n[kb.%s]\npath = "%s"\n'
+                 % (rport, kb, corpus))
+    return ccfg, rcfg, cdir
+
+
+# --------------------------------------------------------------------- main --
+
+ENTRIES = []
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(
+        prog="kbcparity",
+        description="diff the Rust kb daemon against the C kb-c daemon over "
+                    "the same pinned inputs")
+    ap.add_argument("verb", choices=("verify", "run"))
+    ap.add_argument("--suite", default="all",
+                    choices=("all", "capture", "links"))
+    ap.add_argument("--corpus", default=DEFAULT_CORPUS)
+    ap.add_argument("--fixtures", default=DEFAULT_FIXTURES)
+    ap.add_argument("--allowlist", default=DEFAULT_ALLOWLIST)
+    ap.add_argument("--kbc", default=os.environ.get(
+        "KBC_BIN", os.path.join(HERE, "..", "..", "build", "kbc")))
+    ap.add_argument("--rust-kb", default=os.environ.get(
+        "KB_RUST_BIN", "/home/nik/project/kb/target/release/kb"))
+    ap.add_argument("--kb-name", default="parity")
+    ap.add_argument("--front-matter",
+                    help="JSON {doc path: {key: value}} of kb-c's own "
+                         "extraction, as tests/kbc_parity produces it")
+    ap.add_argument("--state", default=os.path.join(
+        os.environ.get("XDG_STATE_HOME",
+                       os.path.expanduser("~/.local/state")),
+        "kbcparity", "last_run.json"))
+    ap.add_argument("--json", help="write the full result as JSON here")
+    ap.add_argument("--keep", action="store_true",
+                    help="keep the sandbox, and print where it is")
+    ap.add_argument("--no-require-coverage", action="store_true",
+                    help="do not fail on a GAP — a comparison this run could "
+                         "have made and did not. Structural gaps are never "
+                         "failures and this flag does not change that")
+    ap.add_argument("--repo-root", default=os.path.normpath(
+        os.path.join(HERE, "..", "..")),
+        help="the kb-c checkout the --kbc binary should have been built "
+             "from; its newest source decides whether the binary is stale")
+    ap.add_argument("--build-dir", default=os.path.normpath(
+        os.path.join(HERE, "..", "..", "build")),
+        help="the cmake build directory, named in the stale-binary error")
+    ap.add_argument("--ready-timeout", type=int, default=180)
+    ap.add_argument("--ingest-timeout", type=int, default=420)
+    args = ap.parse_args(argv)
+
+    if args.verb == "verify":
+        return do_verify(args)
+
+    global ENTRIES
+    ENTRIES = load_allowlist(args.allowlist)
+    banner(args)
+    try:
+        return do_run(args)
+    except HardStop as e:
+        print("\nHARD STOP: %s" % e, file=sys.stderr)
+        print("A corpus that does not verify is not a smaller result, it is "
+              "no result. Not proceeding.", file=sys.stderr)
+        return EXIT_HARD_STOP
+    except Blocked as e:
+        print("\n" + "=" * 72, file=sys.stderr)
+        print("SKIPPED-BLOCKED: %s" % e, file=sys.stderr)
+        print("NO COMPARISON WAS PERFORMED. This is NOT a pass and NOT a "
+              "clean result: the gate did not run.", file=sys.stderr)
+        print("=" * 72, file=sys.stderr)
+        return EXIT_BLOCKED
+
+
+def banner(args):
+    print("kbcparity — rust kb vs c kb-c, over the same pinned inputs")
+    print("  allowlist : %s (%d entries)" % (args.allowlist, len(ENTRIES)))
+    for label, why in PINNED_INPUTS:
+        root = args.corpus if label == "corpus" else args.fixtures
+        print("  %-9s : %s  (%s)" % (label, root, why))
+    print("  kb-c      : %s" % args.kbc)
+    print("  rust kb   : %s" % args.rust_kb)
+    print("  sources   : %s  (a --kbc older than its newest source is "
+          "BLOCKED: `make kbc` builds the library, `make kbc_cli` builds "
+          "the daemon)" % args.repo_root)
+    print("  exit codes: 0 ok / 1 divergence / 3 hard stop / 77 blocked")
+
+
+def do_verify(args):
+    total = 0
+    for label, _why in PINNED_INPUTS:
+        root = args.corpus if label == "corpus" else args.fixtures
+        try:
+            n = verify_pins(root, label)
+        except HardStop as e:
+            print("HARD STOP: %s" % e, file=sys.stderr)
+            return EXIT_HARD_STOP
+        total += n
+        print("%-9s: %d files verify against SHA256SUMS" % (label, n))
+    print("total: %d pinned files verify" % total)
+    return EXIT_OK
+
+
+def newest_source(repo_root):
+    """The newest file kb-c's daemon binary is supposed to have been built
+    from, as (path, mtime), or None if there is no such tree.
+
+    The build inputs and nothing else: the C sources, the headers and the
+    build description. Tests and tools are excluded on purpose — they do
+    not go into the daemon, and a test edit must not invalidate a binary.
+    """
+    best = None
+    for sub in ("src", "include", "cli"):
+        for dirpath, _dirs, files in os.walk(os.path.join(repo_root, sub)):
+            for name in files:
+                if not name.endswith((".c", ".h")):
+                    continue
+                p = os.path.join(dirpath, name)
+                try:
+                    m = os.path.getmtime(p)
+                except OSError:
+                    continue
+                if best is None or m > best[1]:
+                    best = (os.path.relpath(p, repo_root), m)
+    p = os.path.join(repo_root, "CMakeLists.txt")
+    if os.path.isfile(p):
+        m = os.path.getmtime(p)
+        if best is None or m > best[1]:
+            best = ("CMakeLists.txt", m)
+    return best
+
+
+def stamp(t):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+
+
+def check_binary_freshness(args):
+    """Refuse to measure a kb-c binary older than the sources behind it.
+
+    THE TRAP THIS EXISTS FOR. `make kbc` builds the LIBRARY — the CMake
+    target `kbc` is libkbc.a, and the executable is the target `kbc_cli`
+    (OUTPUT_NAME=kbc, so both are called kbc and only one of them is a
+    program). A `make kbc` after an edit to src/ prints "Built target kbc",
+    changes no file the harness runs, and leaves the previous binary in
+    place. A parity run then measures the OLD kb-c and reports it as the
+    current one: a fixed divergence reappears, or a render fix appears not
+    to work, and every conclusion drawn from the report is wrong. It cost
+    two 200-second runs to spot by hand.
+
+    So the check is here, and it is cheap: one walk of three directories
+    and a getmtime. A stale binary is BLOCKED, not failed — the comparison
+    did not happen, and a diff between yesterday's kb-c and today's rust is
+    a number about a program nobody is testing.
+    """
+    if not args.kbc or not os.path.isfile(args.kbc):
+        return
+    newest = newest_source(args.repo_root)
+    if newest is None:
+        return
+    rel, m = newest
+    try:
+        built = os.path.getmtime(args.kbc)
+    except OSError:
+        return
+    if built >= m:
+        return
+    raise Blocked(
+        "%s was built at %s, and %s is newer (%s): it is a STALE binary, and "
+        "every number this run would produce is about a kb-c that no longer "
+        "exists.\n"
+        "  NOTE THE TARGET NAME. `make kbc` builds the LIBRARY (libkbc.a), "
+        "not the daemon. The executable is the `kbc_cli` target, whose "
+        "OUTPUT_NAME is kbc — so the library and the program are both called "
+        "kbc, and `make kbc` rebuilds the wrong one and leaves the old "
+        "binary in build/.\n"
+        "  Fix: make -C %s kbc_cli   (NOT `make kbc`)"
+        % (args.kbc, stamp(built), os.path.join(args.repo_root, rel),
+           stamp(m), args.build_dir))
+
+
+def preflight(args):
+    for what, path in (("kb-c daemon", args.kbc),
+                       ("rust kb daemon", args.rust_kb)):
+        if not path or not os.path.isfile(path):
+            raise Blocked("no %s at %s — the diff needs BOTH "
+                          "implementations and one of them is not here"
+                          % (what, path or "<unset>"))
+        if not os.access(path, os.X_OK):
+            raise Blocked("%s at %s is not executable" % (what, path))
+    check_binary_freshness(args)
+    for label, root in (("corpus", args.corpus), ("fixtures", args.fixtures)):
+        if not os.path.isdir(root):
+            raise Blocked("no %s at %s" % (label, root))
+    for label, _why in PINNED_INPUTS:
+        root = args.corpus if label == "corpus" else args.fixtures
+        n = verify_pins(root, label)
+        print("    %-8s: %d pinned files verify" % (label, n))
+
+
+def do_run(args):
+    print("\n[0] preflight")
+    preflight(args)
+
+    fm = {}
+    if args.front_matter:
+        with open(args.front_matter, "r", encoding="utf-8") as fh:
+            fm = json.load(fh)
+        print("    kb-c front matter: %d documents from %s"
+              % (len(fm), args.front_matter))
+    else:
+        print("    kb-c front matter: NOT SUPPLIED — the front-matter "
+              "column of the capture suite cannot be compared")
+
+    sandbox = tempfile.mkdtemp(prefix="kbcparity-")
+    corpus = os.path.join(sandbox, "corpus")
+    ladder_root = args.fixtures
+    merged = os.path.join(sandbox, "corpus")
+    shutil.copytree(args.corpus, merged)
+    if os.path.isdir(ladder_root):
+        # The ladder fixtures are MERGED into the same corpus: the ambiguity
+        # of a wikilink is a property of the whole corpus, so a separate
+        # corpus would measure a different graph than the one under test.
+        for name in os.listdir(ladder_root):
+            src = os.path.join(ladder_root, name)
+            if name == "SHA256SUMS":
+                continue
+            dst = os.path.join(merged, name)
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+    expected = sorted(
+        os.path.relpath(os.path.join(root, name), merged)
+        for root, _d, files in os.walk(merged) for name in files
+        if name.lower().endswith(INDEXED_EXT))
+    print("    staged corpus: %d indexable files in %s"
+          % (len(expected), merged))
+
+    cport = free_port()
+    rport = free_port(exclude=(cport,))
+    ccfg, rcfg, cdir = write_configs(sandbox, merged, args.kb_name,
+                                     cport, rport)
+    clog, rlog = os.path.join(sandbox, "kbc.log"), \
+        os.path.join(sandbox, "kb.log")
+    side_c = Side("kbc", "http://127.0.0.1:%d" % cport)
+    side_r = Side("rust", "http://127.0.0.1:%d" % rport)
+    try:
+        print("\n[1] start both daemons on the staged corpus")
+        # The token is generated BEFORE the daemon starts. `kbc daemon`
+        # refuses to come up when a token_path is configured and the file
+        # cannot be read, so starting first and authenticating second is a
+        # daemon that never runs at all.
+        tok = subprocess.run([args.kbc, "token", "generate", "--config", ccfg],
+                             capture_output=True, text=True)
+        if tok.returncode != 0:
+            raise Blocked("could not generate a kb-c token: %s"
+                          % tok.stderr.strip())
+        with open(os.path.join(cdir, "data", "token"), "r",
+                  encoding="utf-8") as fh:
+            side_c.token = fh.read().strip()
+        side_c.proc = start_c(args.kbc, ccfg, clog)
+        side_r.proc = start_rust(args.rust_kb, rcfg,
+                                 os.path.join(sandbox, "rust"), rlog)
+        wait_ready(side_r, args.kb_name, args.ready_timeout, rlog)
+        wait_ready(side_c, args.kb_name, args.ready_timeout, clog)
+        print("    both daemons answer their liveness route")
+
+        print("\n[2] ingest, and wait for the graph to settle")
+        side_c.post("/api/reindex")
+        side_r.post("/api/kb/%s/reindex" % args.kb_name)
+        nc = wait_ingest(side_c, args.kb_name, len(expected),
+                         args.ingest_timeout, print)
+        nr = wait_ingest(side_r, args.kb_name, len(expected),
+                         args.ingest_timeout, print)
+        print("    kb-c holds %d documents, rust holds %d, corpus has %d"
+              % (nc, nr, len(expected)))
+
+        rep = Report()
+        cdocs, rdocs = {}, {}
+        if args.suite in ("all", "capture"):
+            print("\n[3] capture suite — stored artefact and front matter")
+            cdocs, rdocs = run_capture(rep, side_c, side_r, args.kb_name, fm)
+        if args.suite in ("all", "links"):
+            if not cdocs:
+                cdocs, rdocs = c_docs(side_c, args.kb_name), \
+                    rust_docs(side_r, args.kb_name)
+            print("\n[4] links suite — edges, ladder, backlinks")
+            run_links(rep, side_c, side_r, args.kb_name, cdocs, rdocs)
+
+        if nc != nr:
+            classify(rep, Div("ingest", "document_count", "<corpus>", nc, nr,
+                              "the two daemons did not index the same number "
+                              "of documents"), ENTRIES)
+        return finish(rep, args, nc, nr, len(expected))
+    finally:
+        side_c.stop()
+        side_r.stop()
+        if args.keep:
+            print("\nsandbox kept at %s" % sandbox)
+        else:
+            shutil.rmtree(sandbox, ignore_errors=True)
+
+
+def finish(rep, args, nc, nr, expected):
+    # A GAP — a comparison this run could have made and did not — fails the
+    # run, and says which ones, because an unchecked comparison is not an
+    # agreeing one. The remedy is the gap's own, so it can never advise
+    # passing a flag this run already passed. A STRUCTURAL gap — a question
+    # no implemented surface answers — is reported and does not fail, and
+    # the line below names how many of each there were so the two can never
+    # be added together into a single reassuring number.
+    gaps = rep.gaps
+    if gaps and not args.no_require_coverage:
+        classes = sorted({(g.suite, g.field, g.why) for g in gaps})
+        rep.failures.append(Div(
+            "coverage", "gap", "<corpus>", len(gaps), "0",
+            "%d comparison(s) this run was able to make and did not, in %d "
+            "class(es) — each is listed under GAPS below with what it would "
+            "take to make it. An unmeasured comparison is not an agreeing "
+            "one." % (len(gaps), len(classes))))
+    for e in ENTRIES:
+        if e.matched == 0:
+            rep.stale.append(e.id)
+        for div, eid in rep.accepted:
+            if eid != e.id:
+                continue
+            for g in e.subjects:
+                if fnmatch.fnmatch(div.subject, g):
+                    e.subjects_hit[g] = e.subjects_hit.get(g, 0) + 1
+
+    growth = record_growth(args)
+
+    print("\n" + "=" * 72)
+    print("PASS       %d comparisons matched, of which %d are \"neither side "
+          "declares this field\""
+          % (rep.passes, rep.absent))
+    print("ACCEPTED   %d divergences, each with an allowlist entry"
+          % len(rep.accepted))
+    print("FAILURE    %d unlisted divergences" % len(rep.failures))
+    if rep.stale:
+        print("STALE      %d allowlist entries matched nothing — an entry "
+              "that no longer describes a real divergence is a false claim"
+              % len(rep.stale))
+    print("NOT MEASURED %d comparisons this run did not make: %d GAP "
+          "(a precondition this run did not meet — each one fails the run) "
+          "and %d STRUCTURAL (no surface either daemon implements can answer "
+          "the question — reported every run, never a pass)"
+          % (len(rep.not_measured), len(gaps), len(rep.unmappable)))
+
+    if rep.accepted:
+        print("\nACCEPTED DIVERGENCES (agreed, with reason and date — these "
+              "are NOT passes)")
+        for div, eid in sorted(rep.accepted, key=lambda d: str(d[0])):
+            e = next(x for x in ENTRIES if x.id == eid)
+            print("  %-58s %s" % (str(div)[:58], e.label()))
+    if rep.failures:
+        print("\nFAILURES (a divergence nobody accepted)")
+        for div in sorted(rep.failures, key=str):
+            print("  %s" % div)
+            print("      kb-c : %s" % short(div.c))
+            print("      rust : %s" % short(div.r))
+            if div.detail:
+                print("      note : %s" % div.detail)
+    unmatched = []
+    for e in ENTRIES:
+        for g in e.subjects:
+            if not e.subjects_hit.get(g, 0):
+                unmatched.append((e.id, g))
+    if unmatched:
+        # A subject glob that matched NOTHING is a narrower lie than a whole
+        # entry that matched nothing: the entry still shows up in the report
+        # as "accepted", so a reader concludes the divergence is covered when
+        # the document it was written for has quietly stopped diverging — and
+        # the day a DIFFERENT document starts, the entry is already there.
+        print("\nALLOWLIST SUBJECTS THAT MATCHED NOTHING")
+        for eid, g in unmatched:
+            print("  %s: %s" % (eid, g))
+    if rep.stale:
+        print("\nSTALE ALLOWLIST ENTRIES — an entry that matched no divergence "
+              "in this run describes a difference that no longer exists, so "
+              "it is a standing permission that covers nothing. Each one is "
+              "printed with what it was written to match.")
+        for eid in sorted(rep.stale):
+            e = next(x for x in ENTRIES if x.id == eid)
+            print("  %s  [%s]" % (eid, e.label()))
+            print("      matched: %s/%s over %s"
+                  % (e.suite, e.field, ", ".join(e.subjects)))
+            print("      reason : %s" % e.reason)
+            if e.note:
+                print("      note   : %s" % e.note[:400]
+                      + ("..." if len(e.note) > 400 else ""))
+    for kind, title, blurb in (
+            ("gap", "GAPS — COMPARISONS THIS RUN DID NOT MAKE",
+             "each of these could have been made and was not, so this run has "
+             "no evidence about them either way. They fail the run."),
+            ("structural",
+             "STRUCTURALLY UNMEASURABLE — NO SURFACE ANSWERS THE QUESTION",
+             "these cannot be made by any flag, on either implementation. "
+             "They do not fail the run, and they are not passes: no rung of "
+             "them was checked against anything.")):
+        entries = rep.of_kind(kind)
+        if not entries:
+            continue
+        print("\n%s — %s" % (title, blurb))
+        label = ("to make it" if kind == "gap"
+                 else "what would make it measurable")
+        seen = {}
+        for u in entries:
+            seen.setdefault((u.suite, u.field, u.why, u.remedy),
+                            []).append(u.subject)
+        for (suite, field, why, remedy), subs in sorted(seen.items()):
+            print("  %s/%s: %d document(s) — %s" % (suite, field, len(subs),
+                                                    why))
+            if remedy:
+                print("      %s: %s" % (label, remedy))
+            if len(subs) <= 6:
+                for s in sorted(subs):
+                    print("      %s" % s)
+            else:
+                print("      (%d more; the full list is in --json)"
+                      % (len(subs) - 6))
+    if rep.coverage:
+        print("\nFIELD COVERAGE — how many documents each field was actually "
+              "compared on, so a pass count cannot be read as breadth it "
+              "does not have")
+        for (suite, field), (done, total) in sorted(rep.coverage.items()):
+            print("  %s/%s: compared on %d of %d document(s)%s"
+                  % (suite, field, done, total,
+                     "" if done == total else "  <-- NOT ALL"))
+    if growth is not None:
+        print("\nALLOWLIST GROWTH: %d entries (was %d, grew by %d). An entry "
+              "appears only by an explicit edit to %s."
+              % (len(ENTRIES), growth, len(ENTRIES) - growth, args.allowlist))
+    print("=" * 72)
+    print("kb-c indexed %d, rust indexed %d, corpus has %d files"
+          % (nc, nr, expected))
+
+    if args.json:
+        with open(args.json, "w", encoding="utf-8") as fh:
+            json.dump({
+                "passes": rep.passes,
+                "accepted": [{"divergence": str(d), "entry": e}
+                             for d, e in rep.accepted],
+                "failures": [{"divergence": str(d), "kb_c": short(d.c),
+                              "rust": short(d.r), "detail": d.detail}
+                             for d in rep.failures],
+                "absent_agreements": rep.absent,
+                "stale": sorted(rep.stale),
+                "not_measured": [{"kind": u.kind, "suite": u.suite,
+                                  "field": u.field, "subject": u.subject,
+                                  "why": u.why, "remedy": u.remedy}
+                                 for u in rep.not_measured],
+                "coverage": {"%s/%s" % k: {"compared": v[0], "documents": v[1]}
+                             for k, v in rep.coverage.items()},
+                "documents": {"kbc": nc, "rust": nr, "corpus": expected},
+            }, fh, indent=1, sort_keys=True)
+        print("full result: %s" % args.json)
+
+    if rep.failures or rep.stale:
+        return EXIT_FAIL
+    return EXIT_OK
+
+
+def short(v):
+    s = str(v)
+    return s if len(s) <= 160 else s[:157] + "..."
+
+
+def record_growth(args):
+    """Compare the allowlist size against the previous run's, and record it.
+
+    A divergence enters the list only by someone editing the file, so the
+    growth between two runs is a human decision and it is printed as one.
+    Without this, a list that has quietly grown to forty entries looks
+    exactly like a list that has quietly grown to four.
+    """
+    try:
+        prev = None
+        if os.path.isfile(args.state):
+            with open(args.state, "r", encoding="utf-8") as fh:
+                prev = json.load(fh).get("entries")
+        os.makedirs(os.path.dirname(args.state), exist_ok=True)
+        with open(args.state, "w", encoding="utf-8") as fh:
+            json.dump({"entries": len(ENTRIES),
+                       "ids": sorted(e.id for e in ENTRIES)}, fh)
+        return prev
+    except (OSError, ValueError):
+        return None
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

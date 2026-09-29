@@ -23,7 +23,14 @@ kbc_parsed *kbc_parse(kbc_arena *a, const char *text, size_t len,
                       const char *rel_path, kbc_err *err);
 
 const kbc_blocks *kbc_parsed_blocks(const kbc_parsed *p);
-/* The first h1, else the first non-empty block, else the filename stem. */
+/* The document's title, in the order the original resolves it: the `<title>`
+ * ELEMENT first, then a front-matter `title:`, then the first heading, then
+ * the filename stem. The `<title>`-before-heading order is not a preference —
+ * it is what parser.rs:345 does, and the parity harness found the cost of
+ * getting it backwards: `canon/pm/00-summary.html` has its first `<h1>`
+ * halfway down the page, so an h1-first resolver listed a four-page incident
+ * report under a section heading, and that title is what the backlinks
+ * surface names the document by. */
 const char *kbc_parsed_title(const kbc_parsed *p);
 /* Index of an explicit id="" attribute found in the source, for anchor
  * resolution. Returns false when the id is not present. */

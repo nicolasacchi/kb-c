@@ -83,7 +83,95 @@ typedef struct {
   bool needs_auth;
 } kbc_route;
 
-extern const kbc_route KBC_ROUTES[];
+/* REGISTRATION, which is why the table is no longer one array in httpd.c.
+ *
+ * A single `KBC_ROUTES[]` in the daemon's own file is a contention point: the
+ * twenty-odd route rows still to build are independent features, and every one
+ * of them wants to append a line to the same array in the same file, so they
+ * cannot be built in parallel at all. Here each subsystem OWNS its routes —
+ * the file that implements the feature declares them and registers them — and
+ * the daemon never edits for a feature it does not implement.
+ *
+ * `handler` is the route's implementation. It is NULL for the handful of
+ * routes that are still served by the daemon's own switch, which is what makes
+ * this additive: a subsystem registers with a handler and the switch stops
+ * growing, and nothing has to be rewritten to get there.
+ *
+ * A handler receives its path parameters ALREADY SPLIT, because the obvious
+ * alternative — making every handler re-derive `/api/kb/{kb}/thing/{id}` from
+ * `req->path` by hand — is a chance to get the index wrong per route, and
+ * there are twenty of them landing here.
+ *
+ * Matching follows matchit 0.8.4, the router behind axum 0.8, and the
+ * distinction is the one every implementer gets wrong: `{name}` is exactly
+ * ONE non-empty segment and never spans a `/`; `{*name}` is the catch-all,
+ * spans a remainder, and is legal only as the final segment (matchit refuses
+ * it anywhere else, InvalidCatchAll). The original uses both —
+ * `/kb/{kb}/docs/by-path/{*path}` at router.rs:121.
+ */
+#define KBC_ROUTE_MAX_PARAMS 8
+
+typedef struct {
+  const char *name;  /* the literal text between the braces, NUL-terminated */
+  const char *value; /* NUL-terminated */
+  size_t len;
+} kbc_route_param;
+/* LIFETIME, and it is sharper than it looks. `name` AND `value` are both
+ * NUL-terminated, but NEITHER is a borrow of the template: a template's name
+ * is followed by `}` (dispatch copies it out precisely because a borrow would
+ * make `strcmp(name, "kb")` read `"kb}/thing/{id}"`). Both point into a
+ * scratch buffer owned by the caller and are valid only until the handler
+ * returns. Nothing in the type system stops a handler from storing a pointer
+ * past that, and an ASan stack-use-after-return is what it looks like. DO NOT
+ * RETAIN either string; deep-copy if a parameter must outlive the call.
+ *
+ * A catch-all's bound name DROPS the `*`: `{*path}` binds the name `"path"`.
+ * Both readings are defensible from the syntax; this is the useful one, so it
+ * is pinned by a test rather than left to each author's guess.
+ *
+ * Params are bound per CANDIDATE route, not once per scan — otherwise a route
+ * that matched two segments and failed on the third leaves its values behind
+ * for the next candidate to inherit, and the winner gets another route's
+ * parameters.
+ */
+
+typedef struct {
+  kbc_route_param v[KBC_ROUTE_MAX_PARAMS]; /* fixed: a request path allocates
+                                             * nothing to pass its own
+                                             * parameters */
+  size_t n;
+} kbc_route_params;
+
+typedef kbc_status (*kbc_route_handler)(kbc_app *app, const kbc_request *req,
+                                         const kbc_route_params *params,
+                                         kbc_response *out, kbc_err *err);
+
+typedef struct {
+  const char *method;
+  const char *path;   /* template, with {params} */
+  const char *summary;
+  bool needs_auth;
+  kbc_route_handler handler; /* NULL: still served by the daemon's switch */
+} kbc_route_entry;
+
+/* Registers `n` routes. Called from a subsystem's initialiser, before
+ * kbc_httpd_start, and NOT from a request path: the registry is fixed once
+ * start-up is over, which is what lets the dispatcher read it without a lock.
+ * Re-registering a (method, path) pair is KBC_ERR_INVALID rather than a
+ * silent duplicate, because two handlers claiming one route is a bug that would
+ * otherwise be decided by array order. */
+kbc_status kbc_httpd_routes_add(const kbc_route_entry *routes, size_t n,
+                                kbc_err *err);
+
+/* Every registered route, in registration order, for docs and tests. Derived
+ * from the registry rather than maintained by hand, so it cannot disagree with
+ * what the daemon actually serves.
+ *
+ * KBC_ROUTES and KBC_ROUTES_LEN remain, unchanged and pointing at the SAME
+ * storage, so nothing that reads the table has to change in the same commit
+ * that introduces the registry. There is one array, not two that can drift. */
+const kbc_route *kbc_httpd_routes(size_t *n_out);
+extern const kbc_route *const KBC_ROUTES;
 extern const size_t KBC_ROUTES_LEN;
 
 #ifdef __cplusplus

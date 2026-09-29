@@ -236,6 +236,14 @@ struct kbc_parsed {
   kbc_metas metas;    /* KBC_ARENA; kb-* metadata, document order */
 };
 
+/* How many CODE regions one document may record for `extract_metas` to
+ * consult. Chosen to be generous next to any real document (the parity
+ * corpus's densest has a few dozen) and small enough that the list cannot
+ * become an amplifier: a source of N backticks is at most N/2 spans and each
+ * span costs 8 bytes here, so the worst case stays a fraction of the
+ * document's own size rather than a multiple of it. */
+#define PARSE_MAX_CODE_RANGES 8192
+
 typedef struct {
   kbc_arena *a;
   kbc_err *err;
@@ -254,8 +262,26 @@ typedef struct {
   bool in_fence;
   char fence_ch;
   size_t fence_len;
+  size_t fence_off; /* source offset of the line that opened the fence */
   size_t code_n;
 
+  /* Source ranges that are CODE: a fenced block, or an inline code span.
+   * The block scan records them and `extract_metas` reads them, because a
+   * `<meta name="kb-tags" content="...">` an author wrote INSIDE a code
+   * example is a documentation example, not a facet on the document. Both
+   * readers have to agree on that or the front matter the harness compares
+   * is the corpus's own sample text. Ordered and non-overlapping, so a
+   * lookup is a walk with a cursor rather than a search. */
+  struct {
+    uint32_t start, end; /* [start, end) in source bytes */
+  } *code;
+  size_t code_len, code_cap;
+  /* More code regions than the cap. The list is then incomplete and
+   * `extract_metas` reads the source blind — which is what it did before
+   * the list existed. A document with thousands of code spans is
+   * pathological; the flag keeps the memory bounded and keeps the
+   * degradation to the old behaviour rather than to a wrong answer. */
+  bool code_overflow;
   bool in_title; /* inside <title>...</title> */
   bool title_pending; /* whitespace run pending in the title buffer */
   kbc_str title_buf;
@@ -298,6 +324,30 @@ static kbc_status arena_grow(void ***items, size_t *cap, size_t need,
   }
   *items = fresh;
   *cap = ncap;
+  return KBC_OK;
+}
+
+/* Records `[start, end)` as a CODE region. Ranges arrive in document order
+ * and never overlap, which is the property `in_code` below relies on to
+ * answer with a cursor instead of a scan.
+ *
+ * Past PARSE_MAX_CODE_RANGES this sets `code_overflow` and returns OK: the
+ * list is incomplete, and a caller that needs completeness must check the
+ * flag rather than trust a short list. Failing the parse instead would let
+ * a hostile document refuse to be indexed by writing backticks, which is
+ * the wrong answer to "this document is unusual". */
+static kbc_status note_code(parser *p, size_t start, size_t end) {
+  if (end <= start) return KBC_OK;
+  if (p->code_len >= PARSE_MAX_CODE_RANGES) {
+    p->code_overflow = true;
+    return KBC_OK;
+  }
+  kbc_status st = arena_grow((void ***)&p->code, &p->code_cap, p->code_len + 1,
+                             sizeof(*p->code), p->a);
+  if (kbc_failed(st)) return st;
+  p->code[p->code_len].start = (uint32_t)(start > UINT32_MAX ? 0 : start);
+  p->code[p->code_len].end = (uint32_t)(end > UINT32_MAX ? 0 : end);
+  p->code_len++;
   return KBC_OK;
 }
 
@@ -1078,6 +1128,12 @@ static kbc_status p_line(parser *p, const char *s, size_t n, size_t *pos) {
       if (k - j >= p->fence_len && (e >= n || s[e] == '\n')) {
         p->in_fence = false;
         *pos = (e < n) ? e + 1 : n;
+        /* The region is recorded whole, from the line that OPENED the fence
+         * to the end of the line that closed it. The interior lines are
+         * consumed by the branch below and reach no other recorder, so a
+         * per-line record would leave every one of them uncovered. */
+        kbc_status st = note_code(p, p->fence_off, *pos);
+        if (kbc_failed(st)) return st;
         return p_flush(p);
       }
     }
@@ -1117,6 +1173,7 @@ static kbc_status p_line(parser *p, const char *s, size_t n, size_t *pos) {
       p->in_fence = true;
       p->fence_ch = ch;
       p->fence_len = k - j;
+      p->fence_off = *pos;
       kbc_status st = p_open_code(p, s + k, info_end - k, *pos);
       *pos = (le < n) ? le + 1 : n;
       return st;
@@ -1535,12 +1592,59 @@ static kbc_status html_meta(kbc_arena *a, const char *s, size_t n,
   return meta_push(a, out, key, content != NULL ? content : "", content_len);
 }
 
-static kbc_status extract_metas(kbc_arena *a, const char *s, size_t n,
-                                kbc_metas *out) {
+/* Whether `off` falls inside a recorded CODE region: the last range that
+ * starts at or before `off`, and whether `off` is still inside it. A binary
+ * search rather than a walk because `extract_metas` asks once per `<` in the
+ * source, and a document full of `<` would otherwise be quadratic in the
+ * number of code spans — which is a denial of service a reader parse has no
+ * business carrying.
+ *
+ * `overflow` is the honest answer when the recorder gave up: an incomplete
+ * list would report "not code" for a `<meta>` that IS inside a code span,
+ * which is the bug this exists to remove. An incomplete list therefore
+ * reports "code" for nothing and lets every declaration through, which is
+ * exactly what this function did before the list existed. */
+static bool in_code(const parser *p, size_t off, bool overflow) {
+  if (overflow || p->code_len == 0) return false;
+  size_t lo = 0, hi = p->code_len; /* first range with start > off */
+  while (lo < hi) {
+    const size_t mid = lo + (hi - lo) / 2;
+    if (p->code[mid].start <= off) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo > 0 && off < p->code[lo - 1].end;
+}
+
+/* An inline code span opened by a run of `run` backticks at `open` ends at
+ * the next run of EXACTLY that many backticks; anything else is not a closer
+ * (CommonMark §2.2). Returns the offset just past the closing run, or 0 when
+ * the span never closes — in which case the backticks are ordinary text and
+ * the caller's ordinary path handles them. */
+static size_t code_span_close(const char *s, size_t n, size_t open,
+                              size_t run) {
+  for (size_t i = open + run; i < n;) {
+    if (s[i] != '`') {
+      i++;
+      continue;
+    }
+    size_t k = i;
+    while (k < n && s[k] == '`') k++;
+    if (k - i == run) return k;
+    i = k;
+  }
+  return 0;
+}
+
+static kbc_status extract_metas(kbc_arena *a, const parser *p, const char *s,
+                                size_t n, kbc_metas *out) {
   kbc_status st = front_matter(a, s, n, out);
   if (kbc_failed(st)) return st;
   for (size_t i = 0; i + 5 < n; i++) {
     if (s[i] != '<') continue;
+    if (in_code(p, i, p->code_overflow)) continue;
     /* "<metadata" and "<meta-" are not a meta element. */
     const unsigned char after = (unsigned char)s[i + 5];
     if (after != '>' && !is_space(after) && after != '/') continue;
@@ -1641,6 +1745,53 @@ kbc_parsed *kbc_parse(kbc_arena *a, const char *text, size_t len,
         continue;
       }
     }
+    if (c == '`') {
+      /* An inline code span is LITERAL TEXT, and both halves of that are
+       * load-bearing. The delimiters are syntax, not prose, so they are
+       * consumed and the content is appended bare — the same treatment the
+       * link syntax above gets, and for the same reason: the block's prose
+       * is what the same document would read without the syntax. And
+       * nothing INSIDE is interpreted, because a span is where an author
+       * quotes markup: `<a href="x.md">` in backticks is an example of a
+       * link, not a link, and reading it as one puts a phantom edge in the
+       * graph and a `dangling` rung in the ladder for a document nobody
+       * linked to. The Rust reads the same rule off comrak's AST, which
+       * never emits a link or a WikiLink node inside a code span. */
+      size_t run = 0;
+      while (pos + run < len && text[pos + run] == '`') run++;
+      const size_t close = code_span_close(text, len, pos, run);
+      if (close > 0) {
+        size_t from = pos + run, to = close - run;
+        /* CommonMark §2.2: one space is stripped from each end when BOTH
+         * are present and the content is not entirely spaces. A code span
+         * written `` ` x ` `` is the letter x, not " x ". */
+        if (to - from >= 2 && text[from] == ' ' && text[to - 1] == ' ') {
+          bool all_space = true;
+          for (size_t x = from + 1; x + 1 < to; x++) {
+            if (text[x] != ' ') {
+              all_space = false;
+              break;
+            }
+          }
+          if (!all_space) {
+            from++;
+            to--;
+          }
+        }
+        st = note_code(&p, pos, close);
+        if (kbc_failed(st)) goto fail;
+        p.src_off = from;
+        for (size_t x = from; x < to; x++) {
+          const unsigned char k = (unsigned char)text[x];
+          st = is_space(k) ? p_space(&p) : p_put_char(&p, k);
+          if (kbc_failed(st)) goto fail;
+        }
+        pos = close;
+        continue;
+      }
+      /* An unclosed run is not a span: the backticks are ordinary text and
+       * the ordinary path below appends them one byte at a time. */
+    }
     if (c == '<') {
       size_t before = pos;
       st = p_tag(&p, text, len, &pos);
@@ -1681,14 +1832,38 @@ kbc_parsed *kbc_parse(kbc_arena *a, const char *text, size_t len,
   st = p_flush(&p);
   if (kbc_failed(st)) goto fail;
 
+  /* A fence the document never closed is still a fence for the rest of the
+   * file: every byte after the opener is code, and a `<meta>` in there is an
+   * example. Recorded here because the closing branch in p_line is the only
+   * other place that could, and it never runs for this document. */
+  if (p.in_fence) {
+    st = note_code(&p, p.fence_off, len);
+    if (kbc_failed(st)) goto fail;
+  }
+
   /* After the block scan, and writing only p.out->metas: the metadata a
    * document declares is read without touching a byte of what the index
    * tokenizes, which is the invariant the link and block tests pin. */
-  st = extract_metas(a, text, len, &p.out->metas);
+  st = extract_metas(a, &p, text, len, &p.out->metas);
   if (kbc_failed(st)) goto fail;
 
-  const char *title = p.title_h1 != NULL   ? p.title_h1
-                      : p.title_tag != NULL ? p.title_tag
+  /* The `<title>` element outranks a heading, and the order is the original's
+   * (parser.rs:345 `first_text(&doc, &p.title)`, with `h1` kept as a separate
+   * field that the doc row does not use for the title).
+   *
+   * It is not a close call. A heading names a section; the `<title>` is the
+   * name the document gives itself, and for a multi-page artifact the two are
+   * different things on purpose — `canon/pm/02-cause.html` is titled
+   * "INC-0315 · Root Cause" and its h1 is "Two bugs, one trigger". Preferring
+   * the h1 did not merely pick a different name for those pages, it picked a
+   * name from the WRONG SECTION: `pm/00-summary.html` was listed as "Checkout
+   * returned 500s for 47 minutes after a routine config push", a paragraph
+   * heading from halfway down the page, because that was the first `<h1>`
+   * anywhere in the file. A document listed in backlinks under a stranger's
+   * sentence is a broken backlink, and the row title is what every list,
+   * search hit and comment target names the document by. */
+  const char *title = p.title_tag != NULL   ? p.title_tag
+                      : p.title_h1 != NULL   ? p.title_h1
                       : p.title_prose != NULL ? p.title_prose
                                               : kbc_title_from_path(
                                                     a, rel_path ? rel_path : "", "");

@@ -1369,6 +1369,554 @@ KBC_TEST(new_routes_are_in_the_route_table) {
     KBC_CHECK_MSG(found, "/api/kb/{kb}/capture is missing from KBC_ROUTES");
   }
 }
+/* ------------------------------------------------------- the registry ----- */
+
+/* A registered handler, and the thing that makes this seam worth having: the
+ * daemon's own switch is never taught about this route. The handler records
+ * the request it was handed and answers 200 with a fixed body, so a test can
+ * assert both that it RAN and what it SAW.
+ *
+ * The registry is process-global and there is no removal, so every test that
+ * registers uses a path of its own. Two tests registering the same template
+ * would collide by design — that is the duplicate rule under test below. */
+static kbc_status probe_handler(kbc_app *app, const kbc_request *req,
+                                const kbc_route_params *params,
+                                kbc_response *out, kbc_err *err) {
+  (void)params;
+  (void)app;
+  (void)err;
+  return kbc_str_printf(&out->body, "{\"probe\":\"%s\",\"method\":\"%s\"}",
+                        req->path, req->method);
+}
+
+static kbc_status register_one(const kbc_route_entry *e, kbc_status *out_st) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_status st = kbc_httpd_routes_add(e, 1, &err);
+  if (out_st != NULL) *out_st = st;
+  return st;
+}
+
+KBC_TEST(a_registered_handler_is_dispatched) {
+  fixture f;
+  fx_setup(&f, NULL);
+  kbc_route_entry e = {"GET", "/api/registry/probe", "registry probe", false,
+                       probe_handler};
+  kbc_status st = KBC_OK;
+  KBC_CHECK_OK(register_one(&e, &st));
+  if (kbc_failed(st)) {
+    fx_teardown(&f);
+    return;
+  }
+  /* The switch has never heard of this path, so a 200 can only have come
+   * from the registry. */
+  kbc_response r;
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/registry/probe", NULL, NULL, &r), 200);
+  KBC_CHECK_NOT_NULL(strstr(r.body.ptr, "\"probe\":\"/api/registry/probe\""));
+  kbc_response_free(&r);
+  fx_teardown(&f);
+}
+
+KBC_TEST(a_two_param_template_matches_the_right_concrete_path) {
+  fixture f;
+  fx_setup(&f, NULL);
+  /* The original's shape (router.rs:125): two params, the second an id. */
+  kbc_route_entry e = {"GET", "/api/registry/{kb}/thing/{id}",
+                       "two-param template", false, probe_handler};
+  kbc_status st = KBC_OK;
+  KBC_CHECK_OK(register_one(&e, &st));
+  if (kbc_failed(st)) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_response r;
+  /* Both params are substituted into the concrete path, in order. */
+  KBC_CHECK_EQ_INT(
+      call(&f, "GET", "/api/registry/notes/thing/abc123", NULL, NULL, &r), 200);
+  KBC_CHECK_NOT_NULL(
+      strstr(r.body.ptr, "\"probe\":\"/api/registry/notes/thing/abc123\""));
+  kbc_response_free(&r);
+  /* A different corpus and a different id both match — the params are
+   * positional, not pinned to the values used above. */
+  KBC_CHECK_EQ_INT(
+      call(&f, "GET", "/api/registry/other/thing/zzz", NULL, NULL, &r), 200);
+  kbc_response_free(&r);
+  fx_teardown(&f);
+ }
+
+KBC_TEST(a_template_does_not_match_a_wrong_number_of_segments) {
+  fixture f;
+  fx_setup(&f, NULL);
+  kbc_route_entry e = {"GET", "/api/registry/seg/{kb}/thing/{id}",
+                       "segment count matters", false, probe_handler};
+  kbc_status st = KBC_OK;
+  KBC_CHECK_OK(register_one(&e, &st));
+  if (kbc_failed(st)) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_response r;
+  KBC_CHECK_EQ_INT(
+      call(&f, "GET", "/api/registry/seg/kb/thing/id", NULL, NULL, &r), 200);
+  kbc_response_free(&r);
+  /* ONE segment short: the shape the switch also refuses (httpd.c:2994-3000).
+   * A prefix match here would serve this path with a truncated id. */
+  KBC_CHECK_EQ_INT(
+      call(&f, "GET", "/api/registry/seg/kb/thing", NULL, NULL, &r), 404);
+  kbc_response_free(&r);
+  /* One segment TOO MANY: `{id}` is one segment, never a remainder. */
+  KBC_CHECK_EQ_INT(
+      call(&f, "GET", "/api/registry/seg/kb/thing/id/extra", NULL, NULL, &r),
+      404);
+  kbc_response_free(&r);
+  /* An empty segment is not a match either: `{kb}` requires a non-empty one. */
+  KBC_CHECK_EQ_INT(
+      call(&f, "GET", "/api/registry//thing/id", NULL, NULL, &r), 404);
+  kbc_response_free(&r);
+  fx_teardown(&f);
+}
+
+/* The security case, and deliberately over a REAL SOCKET. The socketless
+ * kbc_httpd_handle would answer this from the same code, but a 401 is the one
+ * answer a test must not be able to get from a seam that never built a
+ * request line, a header table or a connection: what is being proved is that
+ * the route is gated on the wire, where a client without a token is refused
+ * before the handler runs.
+ *
+ * It is proved both ways — refused without, served with — because a handler
+ * that is simply unreachable would pass a one-sided test. */
+KBC_TEST(a_registered_needs_auth_route_is_refused_without_a_token) {
+  fixture f;
+  fx_setup(&f, TOKEN);
+  kbc_route_entry e = {"GET", "/api/registry/guarded", "gated route", true,
+                       probe_handler};
+  kbc_status st = KBC_OK;
+  KBC_CHECK_OK(register_one(&e, &st));
+  if (kbc_failed(st)) {
+    fx_teardown(&f);
+    return;
+  }
+  server s;
+  srv_start(&s, &f);
+  if (s.h == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  {
+    const char *r = "GET /api/registry/guarded HTTP/1.1\r\nHost: x\r\n\r\n";
+    char reply[8192];
+    int status = 0;
+    bool ok = raw_exchange(&s, r, strlen(r), &status, reply, sizeof reply);
+    KBC_CHECK_MSG(ok, "no HTTP reply");
+    /* 401, not 403: nothing was presented at all. */
+    KBC_CHECK_EQ_INT(status, 401);
+    KBC_CHECK_NOT_NULL(strstr(reply, "application/problem+json"));
+    /* The handler must not have run — no "probe" anywhere in the answer. */
+    KBC_CHECK_MSG(strstr(reply, "\"probe\"") == NULL,
+                  "the gated route ran its handler without a token: %s", reply);
+  }
+  /* The wrong token is a 403, not a 401: the caller is known, the secret is
+   * not right. Same split as every other /api route. */
+  {
+    const char *r = "GET /api/registry/guarded HTTP/1.1\r\nHost: x\r\n"
+                    "Authorization: Bearer nope\r\n\r\n";
+    char reply[8192];
+    int status = 0;
+    (void)raw_exchange(&s, r, strlen(r), &status, reply, sizeof reply);
+    KBC_CHECK_EQ_INT(status, 403);
+    KBC_CHECK_MSG(strstr(reply, "\"probe\"") == NULL,
+                  "the gated route ran its handler with a bad token: %s", reply);
+  }
+  /* With the token it is served: the gate admits exactly one credential. */
+  {
+    char req[512];
+    snprintf(req, sizeof req,
+             "GET /api/registry/guarded HTTP/1.1\r\nHost: x\r\n"
+             "Authorization: Bearer %s\r\n\r\n",
+             TOKEN);
+    char reply[8192];
+    int status = 0;
+    bool ok = raw_exchange(&s, req, strlen(req), &status, reply, sizeof reply);
+    KBC_CHECK_MSG(ok, "no HTTP reply");
+    KBC_CHECK_EQ_INT(status, 200);
+    KBC_CHECK_NOT_NULL(strstr(reply, "\"probe\":\"/api/registry/guarded\""));
+  }
+  srv_stop(&s);
+  fx_teardown(&f);
+}
+
+KBC_TEST(a_needs_auth_false_route_is_served_without_a_token) {
+  /* The other half of the same rule, and the reason enforcement reads the row
+   * rather than a list: a route that says false is genuinely open. Without
+   * this, "needs_auth is enforced" and "every registered route is gated" would
+   * be the same claim, and only the first would be true. */
+  fixture f;
+  fx_setup(&f, TOKEN);
+  kbc_route_entry e = {"GET", "/api/registry/open", "open route", false,
+                       probe_handler};
+  kbc_status st = KBC_OK;
+  KBC_CHECK_OK(register_one(&e, &st));
+  if (kbc_failed(st)) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_response r;
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/registry/open", NULL, NULL, &r), 200);
+  KBC_CHECK_NOT_NULL(strstr(r.body.ptr, "\"probe\":\"/api/registry/open\""));
+  kbc_response_free(&r);
+  fx_teardown(&f);
+}
+
+KBC_TEST(a_duplicate_registration_is_refused) {
+  kbc_route_entry first = {"GET", "/api/registry/dup", "first", false,
+                           probe_handler};
+  kbc_status st = KBC_OK;
+  KBC_CHECK_OK(register_one(&first, &st));
+  if (kbc_failed(st)) return;
+  /* Same (method, template) again: refused, not resolved by array order. */
+  kbc_route_entry again = {"GET", "/api/registry/dup", "second", false,
+                           probe_handler};
+  kbc_err err;
+  kbc_err_reset(&err);
+  st = kbc_httpd_routes_add(&again, 1, &err);
+  KBC_CHECK_EQ_INT(st, KBC_ERR_INVALID);
+  KBC_CHECK_MSG(err.msg[0] != '\0', "a refused registration said nothing");
+  /* A different METHOD on the same path is a different route, and the
+   * daemon's own table relies on that (GET and POST never share a path). */
+  kbc_route_entry other = {"POST", "/api/registry/dup", "post variant", false,
+                           probe_handler};
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_httpd_routes_add(&other, 1, &err));
+  /* Re-registering one of the daemon's OWN rows is refused too, so a
+   * subsystem cannot quietly take over a route the switch still serves. */
+  kbc_route_entry builtin = {"GET", "/api/kbs", "hijack", true, probe_handler};
+  kbc_err_reset(&err);
+  KBC_CHECK_EQ_INT(kbc_httpd_routes_add(&builtin, 1, &err), KBC_ERR_INVALID);
+}
+
+KBC_TEST(a_malformed_template_is_refused_at_registration) {
+  /* A template that could never match is a route nobody can call, and it is
+   * far cheaper to refuse it here than to debug it as a 404 forever. */
+  kbc_err err;
+  const kbc_route_entry bad[] = {
+      {"GET", "api/no-leading-slash", "bad", false, probe_handler},
+      {"GET", "/api/registry/trailing/", "bad", false, probe_handler},
+      {"GET", "/api/registry/{unclosed", "bad", false, probe_handler},
+      {"GET", "/api/registry/{}empty", "bad", false, probe_handler},
+      {"GET", "/api/registry/{*rest}/not-last", "bad", false, probe_handler},
+  };
+  for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+    kbc_err_reset(&err);
+    KBC_CHECK_MSG(kbc_httpd_routes_add(&bad[i], 1, &err) == KBC_ERR_INVALID,
+                  "a malformed template was accepted: %s", bad[i].path);
+  }
+}
+
+KBC_TEST(the_eighteen_built_in_rows_survive_in_the_derived_view) {
+  /* The view is DERIVED, so the eighteen built-ins are still there — but the
+   * point of this case is that they are the same rows, in the same order,
+   * with the same needs_auth, as before the registry existed. Every pair
+   * below is copied from the table the switch has always served, so a
+   * registration that reordered, dropped or re-flagged a row fails here. */
+  static const struct {
+    const char *method;
+    const char *path;
+    bool needs_auth;
+  } expected[] = {
+      {"GET", "/api/health", false},
+      {"GET", "/api/identity", true},
+      {"GET", "/api/kbs", true},
+      {"GET", "/api/stats", true},
+      {"GET", "/api/search", true},
+      {"GET", "/api/artifacts", true},
+      {"GET", "/api/artifacts/{id}", true},
+      {"GET", "/api/kb/{kb}/artifact/{id}", true},
+      {"GET", "/api/kb/{kb}/notes/{id}/links", true},
+      {"GET", "/api/kb/{kb}/backlinks/{id}", true},
+      {"GET", "/api/kb/{kb}/wikilinks/suggest", true},
+      {"POST", "/api/kb/{kb}/capture", true},
+      {"POST", "/api/reindex", true},
+      {"GET", "/api/events", true},
+      {"GET", "/metrics", true},
+      {"GET", "/", false},
+      {"GET", "*", false},
+      {"GET", "<id>.artifacts.localhost/*", false},
+  };
+  const size_t n = sizeof expected / sizeof expected[0];
+  KBC_CHECK_EQ_INT(KBC_ROUTES_LEN, n);
+  for (size_t i = 0; i < n; i++) {
+    KBC_CHECK_EQ_STR(KBC_ROUTES[i].method, expected[i].method);
+    KBC_CHECK_EQ_STR(KBC_ROUTES[i].path, expected[i].path);
+    KBC_CHECK_MSG(KBC_ROUTES[i].needs_auth == expected[i].needs_auth,
+                  "%s %s changed its auth flag", expected[i].method,
+                  expected[i].path);
+    KBC_CHECK_MSG(KBC_ROUTES[i].summary[0] != '\0', "%s has no summary",
+                  expected[i].path);
+  }
+  /* The derived view IS that storage: kbc_httpd_routes() hands out the same
+   * rows, in the same order, ahead of anything a subsystem registered. */
+  size_t n_view = 0;
+  const kbc_route *view = kbc_httpd_routes(&n_view);
+  KBC_CHECK_NOT_NULL(view);
+  KBC_CHECK_MSG(n_view >= n, "the view has %zu rows, fewer than the %zu built-ins",
+                n_view, n);
+  KBC_CHECK_MSG(view == KBC_ROUTES, "the view is not the exported storage");
+  for (size_t i = 0; i < n; i++) {
+    KBC_CHECK_EQ_STR(view[i].path, expected[i].path);
+    KBC_CHECK_MSG(view[i].needs_auth == expected[i].needs_auth,
+                  "%s changed its auth flag in the view", expected[i].path);
+  }
+}
+
+KBC_TEST(a_catch_all_template_matches_a_remainder_with_slashes) {
+  /* The original's by-path route (router.rs:121) is
+   * `/kb/{kb}/docs/by-path/{*path}`: the tail is spelled `{*path}` precisely
+   * because it spans `/`, and matchit refuses that spelling anywhere but last
+   * (tree.rs:373). A bare `{name}` deliberately does NOT get this behaviour —
+   * see the next case. */
+  fixture f;
+  fx_setup(&f, NULL);
+  kbc_route_entry e = {"GET", "/api/registry/{kb}/by-path/{*path}",
+                       "catch-all tail", false, probe_handler};
+  kbc_status st = KBC_OK;
+  KBC_CHECK_OK(register_one(&e, &st));
+  if (kbc_failed(st)) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_response r;
+  KBC_CHECK_EQ_INT(
+      call(&f, "GET", "/api/registry/kb/by-path/a/b/c.html", NULL, NULL, &r),
+  200);
+  KBC_CHECK_NOT_NULL(strstr(r.body.ptr, "a/b/c.html"));
+  kbc_response_free(&r);
+  fx_teardown(&f);
+}
+
+KBC_TEST(a_bare_param_does_not_span_slashes) {
+  /* The distinction that keeps `/api/artifacts/{id}` meaning ONE document: a
+  * trailing `{name}` that swallowed a remainder would serve
+  * `/api/artifacts/a/b` for the id "a/b", which is a different document. */
+  fixture f;
+  fx_setup(&f, NULL);
+  kbc_route_entry e = {"GET", "/api/registry/plain/{id}", "one segment", false,
+                       probe_handler};
+  kbc_status st = KBC_OK;
+  KBC_CHECK_OK(register_one(&e, &st));
+  if (kbc_failed(st)) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_response r;
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/registry/plain/abc", NULL, NULL, &r),
+  200);
+  kbc_response_free(&r);
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/registry/plain/a/b", NULL, NULL, &r),
+  404);
+  kbc_response_free(&r);
+  fx_teardown(&f);
+}
+
+/* A handler that captures its params into file-scope storage, so a test can
+ * assert the STRUCT — names, values and lengths — rather than parsing a body
+ * back out. A body assertion would pass on a value that happens to be right
+ * for the wrong reason, and would not see `len` at all.
+ *
+ * It DEEP-copies, and that is the whole discipline of the borrow: `params`
+ * and every string in it are valid only for the duration of this call, so
+ * keeping the struct past the return would leave `g_seen_name[i]` and
+ * `.value` pointing into a dispatch frame that no longer exists. Copying the
+ * strings and keeping the lengths is what a real handler has to do to hold on
+ * to a parameter, and ASan is what proves it here — the first version of this
+ * handler kept the struct and was reported as a stack-use-after-return. */
+static size_t g_seen_n;
+static char g_seen_name[KBC_ROUTE_MAX_PARAMS][64];
+static char g_seen_value[KBC_ROUTE_MAX_PARAMS][256];
+static size_t g_seen_len[KBC_ROUTE_MAX_PARAMS];
+static size_t g_seen_calls;
+
+static kbc_status capture_handler(kbc_app *app, const kbc_request *req,
+                                  const kbc_route_params *params,
+                                  kbc_response *out, kbc_err *err) {
+  (void)app;
+  (void)req;
+  (void)err;
+  g_seen_n = params->n > KBC_ROUTE_MAX_PARAMS ? KBC_ROUTE_MAX_PARAMS
+                                              : params->n;
+  for (size_t i = 0; i < g_seen_n; i++) {
+    size_t nl = strlen(params->v[i].name);
+    if (nl >= sizeof g_seen_name[i]) nl = sizeof g_seen_name[i] - 1;
+    memcpy(g_seen_name[i], params->v[i].name, nl);
+    g_seen_name[i][nl] = '\0';
+    /* The NUL-termination promise is asserted by copying len+1 bytes and
+     * finding the terminator where the contract says it is — a value that ran
+     * on into the next segment would leave a different string here. */
+    size_t vl = params->v[i].len;
+    if (vl >= sizeof g_seen_value[i]) vl = sizeof g_seen_value[i] - 1;
+    memcpy(g_seen_value[i], params->v[i].value, vl);
+    g_seen_value[i][vl] = '\0';
+    g_seen_len[i] = params->v[i].len;
+  }
+  g_seen_calls++;
+  out->status = 200;
+  return kbc_str_puts(&out->body, "{\"ok\":true}");
+}
+
+KBC_TEST(a_two_param_template_hands_the_handler_both_values) {
+  fixture f;
+  fx_setup(&f, NULL);
+  kbc_route_entry e = {"GET", "/api/registry/bind/{kb}/thing/{id}",
+                       "two bound params", false, capture_handler};
+  kbc_status st = KBC_OK;
+  KBC_CHECK_OK(register_one(&e, &st));
+  if (kbc_failed(st)) {
+    fx_teardown(&f);
+    return;
+  }
+  g_seen_calls = 0;
+  g_seen_n = 0;
+  memset(g_seen_name, 0, sizeof g_seen_name);
+  memset(g_seen_value, 0, sizeof g_seen_value);
+  kbc_response r;
+  KBC_CHECK_EQ_INT(
+      call(&f, "GET", "/api/registry/bind/notes/thing/abc123", NULL, NULL, &r),
+  200);
+  kbc_response_free(&r);
+  KBC_CHECK_EQ_INT(g_seen_calls, 1);
+  /* BOTH values, in template order, with the names the template declared. */
+  KBC_CHECK_EQ_INT(g_seen_n, 2);
+  if (g_seen_n != 2) {
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK_EQ_STR(g_seen_name[0], "kb");
+  KBC_CHECK_EQ_STR(g_seen_name[1], "id");
+  KBC_CHECK_EQ_STR(g_seen_value[0], "notes");
+  KBC_CHECK_EQ_STR(g_seen_value[1], "abc123");
+  /* `len` is the value's own length, not the rest of the path: the copy
+   * above is len+1 bytes precisely because the NUL is not counted. */
+  KBC_CHECK_EQ_INT(g_seen_len[0], 5);
+  KBC_CHECK_EQ_INT(g_seen_len[1], 6);
+  fx_teardown(&f);
+}
+
+KBC_TEST(a_repeated_param_name_binds_both_entries) {
+  /* `{a}/x/{a}` is TWO entries, not one. A handler that names a parameter
+   * twice means it, and collapsing the entries would make the count depend on
+   * the spelling of the template rather than on the request. */
+  fixture f;
+  fx_setup(&f, NULL);
+  kbc_route_entry e = {"GET", "/api/registry/rep/{a}/x/{a}", "repeated name",
+                       false, capture_handler};
+  kbc_status st = KBC_OK;
+  KBC_CHECK_OK(register_one(&e, &st));
+  if (kbc_failed(st)) {
+    fx_teardown(&f);
+    return;
+  }
+  g_seen_calls = 0;
+  g_seen_n = 0;
+  memset(g_seen_name, 0, sizeof g_seen_name);
+  memset(g_seen_value, 0, sizeof g_seen_value);
+  kbc_response r;
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/registry/rep/one/x/two", NULL, NULL, &r),
+  200);
+  kbc_response_free(&r);
+  KBC_CHECK_EQ_INT(g_seen_n, 2);
+  if (g_seen_n != 2) {
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK_EQ_STR(g_seen_name[0], "a");
+  KBC_CHECK_EQ_STR(g_seen_name[1], "a");
+  KBC_CHECK_EQ_STR(g_seen_value[0], "one");
+  KBC_CHECK_EQ_STR(g_seen_value[1], "two");
+  fx_teardown(&f);
+}
+
+KBC_TEST(a_catch_all_binds_its_whole_remainder) {
+  /* The catch-all's value is the remainder INCLUDING the slashes — that is
+   * the whole point of the `{*name}` spelling — so it is longer than any one
+   * segment and must still be NUL-terminated at its own length. */
+  fixture f;
+  fx_setup(&f, NULL);
+  kbc_route_entry e = {"GET", "/api/registry/ca/{kb}/by-path/{*path}",
+                       "catch-all binds", false, capture_handler};
+  kbc_status st = KBC_OK;
+  KBC_CHECK_OK(register_one(&e, &st));
+  if (kbc_failed(st)) {
+    fx_teardown(&f);
+    return;
+  }
+  g_seen_calls = 0;
+  g_seen_n = 0;
+  memset(g_seen_name, 0, sizeof g_seen_name);
+  memset(g_seen_value, 0, sizeof g_seen_value);
+  kbc_response r;
+  KBC_CHECK_EQ_INT(
+      call(&f, "GET", "/api/registry/ca/notes/by-path/a/b/c.html", NULL, NULL,
+           &r),
+  200);
+  kbc_response_free(&r);
+  KBC_CHECK_EQ_INT(g_seen_n, 2);
+  if (g_seen_n != 2) {
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK_EQ_STR(g_seen_name[0], "kb");
+  /* The catch-all's name is the text between the braces, WITHOUT the `*`:
+   * `{*path}` binds the name "path". */
+  KBC_CHECK_EQ_STR(g_seen_name[1], "path");
+  KBC_CHECK_EQ_STR(g_seen_value[0], "notes");
+  KBC_CHECK_EQ_STR(g_seen_value[1], "a/b/c.html");
+  KBC_CHECK_EQ_INT(g_seen_len[1], 10); /* "a/b/c.html", slashes included */
+  fx_teardown(&f);
+}
+
+KBC_TEST(a_template_over_the_param_limit_is_refused) {
+  /* A template with more distinct parameters than KBC_ROUTE_MAX_PARAMS is
+   * REFUSED, not truncated. The failure this prevents is the one a routing
+   * layer must never have: a handler that shipped nine params, got five, and
+   * read a value belonging to a different parameter as if it were its own.
+   * A refused registration is a startup error naming the route; a truncated
+   * match is a silently wrong answer at runtime. */
+  kbc_err err;
+  /* Exactly the limit: accepted, so the bound is not off by one. */
+  kbc_route_entry ok = {"GET",
+                        "/api/registry/p0/{a0}/{a1}/{a2}/{a3}/{a4}/{a5}/{a6}/"
+                        "{a7}",
+                        "exactly at the limit", false, capture_handler};
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_httpd_routes_add(&ok, 1, &err));
+  /* One over: refused, with a message that says why. */
+  kbc_route_entry over = {"GET",
+                          "/api/registry/p1/{a0}/{a1}/{a2}/{a3}/{a4}/{a5}/"
+                          "{a6}/{a7}/{a8}",
+                          "one over the limit", false, capture_handler};
+  kbc_err_reset(&err);
+  KBC_CHECK_EQ_INT(kbc_httpd_routes_add(&over, 1, &err), KBC_ERR_INVALID);
+  KBC_CHECK_MSG(strstr(err.msg, "parameter") != NULL,
+                "the refusal did not mention parameters: %s", err.msg);
+  /* A catch-all counts toward the limit like any other parameter — so eight
+   * named segments PLUS a catch-all is nine, and is refused. */
+  kbc_route_entry ca_over = {"GET",
+                             "/api/registry/p2/{a0}/{a1}/{a2}/{a3}/{a4}/{a5}/"
+                             "{a6}/{a7}/{*rest}",
+                             "catch-all counts", false, capture_handler};
+  kbc_err_reset(&err);
+  KBC_CHECK_EQ_INT(kbc_httpd_routes_add(&ca_over, 1, &err), KBC_ERR_INVALID);
+  /* And the refused ones are NOT in the table: the limit is enforced before
+   * anything is written, so a rejected batch leaves no half-registered row. */
+  size_t n = 0;
+  (void)kbc_httpd_routes(&n);
+  bool found_over = false;
+  for (size_t i = 0; i < n; i++) {
+    if (strcmp(kbc_httpd_routes(&n)[i].path, over.path) == 0) found_over = true;
+    if (strcmp(kbc_httpd_routes(&n)[i].path, ca_over.path) == 0)
+      found_over = true;
+  }
+  KBC_CHECK_MSG(!found_over, "an over-limit template reached the route table");
+}
 
 /* ------------------------------------------------------------------ CORS -- */
 
@@ -2616,6 +3164,130 @@ KBC_TEST(artifact_bytes_on_the_parent_origin) {
   }
 
   srv_stop(&s);
+  ofx_teardown(&o);
+}
+
+/* An HTML artifact on the parent origin is FILTERED, and the allowlist is
+ * ammonia's, which has no `html`, `head`, `body` or doctype in it. What comes
+ * back is therefore the document's CONTENT and not a document, and served
+ * that way a browser puts the page in quirks mode while the tab, the bookmark
+ * and the history all say "". The envelope is added in the serve path for
+ * exactly that reason, and the filter is left alone: a filter that grew a
+ * doctype would be a filter manufacturing the token it was asked to
+ * remove. */
+KBC_TEST(an_html_artifact_is_served_as_a_document_not_a_fragment) {
+  origin_fixture o;
+  ofx_setup(&o);
+  /* One HTML document beside the markdown one, with a title the allowlist
+   * drops (a `title` element is in clean_content_tags) and a stylesheet it
+   * drops with it — so the only way the response can carry either is if the
+   * serve path put them there. */
+  char p[KBC_TEST_PATH_MAX];
+  path_under(p, sizeof p, o.sub, "page.html");
+  kbc_test_write_file(p, "<!DOCTYPE html><html><head>"
+                         "<title>Page &amp; Chapter</title>"
+                         "<style>p { color: red }</style></head>"
+                         "<body onload=\"boom()\"><h1>Chapter</h1>"
+                         "<p>body text</p></body></html>");
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(o.f.app, &err));
+
+  char id[KBC_MAX_ID_LEN + 1];
+  ofx_id_for(&o, "sub/page.html", id, sizeof id);
+  if (id[0] == '\0') {
+    /* No id means the fixture never landed; asserting against an empty
+     * response below would pass for the wrong reason. */
+    ofx_teardown(&o);
+    KBC_CHECK_MSG(false, "page.html was not indexed");
+    return;
+  }
+
+  char path[256];
+  snprintf(path, sizeof path, "/api/kb/kb/artifact/%s", id);
+  server s;
+  srv_start(&s, &o.f);
+  char reply[PAGE_REPLY];
+  int status = 0;
+  kbc_str req;
+  kbc_str_init(&req);
+  (void)kbc_str_printf(&req, "GET %s HTTP/1.1\r\nHost: x\r\n\r\n", path);
+  const int ok = s.h != NULL && raw_exchange(&s, req.ptr, req.len, &status,
+                                              reply, sizeof reply);
+  kbc_str_free(&req);
+  srv_stop(&s);
+  ofx_teardown(&o);
+  KBC_CHECK(ok);
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK_MSG(strstr(reply, "<!DOCTYPE html>") != NULL,
+                "an HTML artifact is served with no doctype, so the browser "
+                "renders it in quirks mode: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "<meta charset=\"utf-8\">") != NULL,
+                "an HTML artifact is served with no charset declaration: %s",
+                reply);
+  /* The title is the document's own name, ESCAPED: a title element is parsed
+   * as markup, so a name carrying `&` is exactly the case where an
+   * unescaped interpolation would change the page. */
+  KBC_CHECK_MSG(strstr(reply, "<title>Page &amp; Chapter</title>") != NULL,
+                "an HTML artifact is served with no title, or an unescaped "
+                "one: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "<body") != NULL &&
+                    strstr(reply, "</body>") != NULL,
+                "an HTML artifact is served without a body: %s", reply);
+  /* And the filter still ran: the event handler is gone, the content is
+   * not. An envelope that also stopped sanitising would pass every check
+   * above. */
+  KBC_CHECK_MSG(strstr(reply, "onload") == NULL,
+                "the served artifact kept an event handler: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "body text") != NULL,
+                "the served artifact lost its own content: %s", reply);
+}
+
+/* A `.md` with neither a frontmatter `title:` nor a `# ` heading is a document
+ * the renderer cannot name, and the renderer's answer for that is the literal
+ * "Untitled" (markdown.c:919). The row takes the renderer's title so that one
+ * document has one name — but a name of "Untitled" is not a name, and a corpus
+ * of hook and skill files is a LIST of them: every row identical, nothing to
+ * search, click or bookmark. The filename stem is the only name available, and
+ * it is the one the original's indexer falls back to (indexer.rs:2705).
+ *
+ * The fallback fires ONLY on the renderer's no-name answer, so a document the
+ * renderer did name keeps the renderer's name — the property that makes the
+ * case above meaningful rather than decorative. */
+KBC_TEST(a_markdown_artifact_with_no_name_is_listed_under_its_filename) {
+  origin_fixture o;
+  ofx_setup(&o);
+  static const char kUnnamed[] = "---\nname: hook\ndescription: no title\n"
+                                 "---\n\n"
+                                 "You are the hook. You do a thing.\n\n"
+                                 "## Method\n\nmore\n";
+  char id[KBC_MAX_ID_LEN + 1];
+  ofx_add_md(&o, "some-hook.md", kUnnamed, id, sizeof id);
+  if (id[0] == '\0') {
+    ofx_teardown(&o);
+    KBC_CHECK_MSG(false, "some-hook.md was not indexed");
+    return;
+  }
+
+  kbc_response r;
+  char p[256];
+  snprintf(p, sizeof p, "/api/artifacts/%s", id);
+  KBC_CHECK_EQ_INT(call(&o.f, "GET", p, NULL, NULL, &r), 200);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"title\":\"some-hook\"") != NULL,
+                "an unnamed .md is not listed under its filename: %s",
+                r.body.ptr);
+  kbc_response_free(&r);
+
+  KBC_CHECK_EQ_INT(call(&o.f, "GET", "/api/artifacts", AT0, NULL, &r), 200);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"title\":\"some-hook\"") != NULL,
+                "the list does not fall back to the filename: %s", r.body.ptr);
+  /* The control: a document the renderer DID name is untouched, and a
+   * resolver that always answered with the stem would pass the case above. */
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"title\":\"One\"") != NULL,
+                "a named .md is no longer titled from its heading: %s",
+                r.body.ptr);
+  kbc_response_free(&r);
+
   ofx_teardown(&o);
 }
 
@@ -4639,6 +5311,33 @@ int main(void) {
       {"identity_reports_the_carrier_for_a_socketless_token",
        identity_reports_the_carrier_for_a_socketless_token},
       {"new_routes_are_in_the_route_table", new_routes_are_in_the_route_table},
+      {"a_registered_handler_is_dispatched", a_registered_handler_is_dispatched},
+      {"a_two_param_template_matches_the_right_concrete_path",
+       a_two_param_template_matches_the_right_concrete_path},
+      {"a_template_does_not_match_a_wrong_number_of_segments",
+       a_template_does_not_match_a_wrong_number_of_segments},
+      {"a_registered_needs_auth_route_is_refused_without_a_token",
+       a_registered_needs_auth_route_is_refused_without_a_token},
+      {"a_needs_auth_false_route_is_served_without_a_token",
+       a_needs_auth_false_route_is_served_without_a_token},
+      {"a_duplicate_registration_is_refused",
+       a_duplicate_registration_is_refused},
+      {"a_malformed_template_is_refused_at_registration",
+       a_malformed_template_is_refused_at_registration},
+      {"the_eighteen_built_in_rows_survive_in_the_derived_view",
+       the_eighteen_built_in_rows_survive_in_the_derived_view},
+      {"a_catch_all_template_matches_a_remainder_with_slashes",
+       a_catch_all_template_matches_a_remainder_with_slashes},
+      {"a_bare_param_does_not_span_slashes",
+       a_bare_param_does_not_span_slashes},
+      {"a_two_param_template_hands_the_handler_both_values",
+       a_two_param_template_hands_the_handler_both_values},
+      {"a_repeated_param_name_binds_both_entries",
+       a_repeated_param_name_binds_both_entries},
+      {"a_catch_all_binds_its_whole_remainder",
+       a_catch_all_binds_its_whole_remainder},
+      {"a_template_over_the_param_limit_is_refused",
+       a_template_over_the_param_limit_is_refused},
       {"cors_is_same_origin_only_unless_configured",
        cors_is_same_origin_only_unless_configured},
       {"rate_limit_caps_one_connection", rate_limit_caps_one_connection},
@@ -4658,6 +5357,8 @@ int main(void) {
        the_artifact_subdomain_is_chosen_by_host},
       {"artifact_bytes_on_the_parent_origin",
        artifact_bytes_on_the_parent_origin},
+      {"an_html_artifact_is_served_as_a_document_not_a_fragment",
+       an_html_artifact_is_served_as_a_document_not_a_fragment},
       {"a_markdown_artifact_is_served_as_a_rendered_page",
        a_markdown_artifact_is_served_as_a_rendered_page},
       {"a_markdown_artifact_is_rendered_on_the_subdomain_too",
@@ -4674,6 +5375,8 @@ int main(void) {
        a_markdown_download_is_the_source_not_the_page},
       {"a_markdown_artifact_is_reported_under_the_renderers_title",
        a_markdown_artifact_is_reported_under_the_renderers_title},
+      {"a_markdown_artifact_with_no_name_is_listed_under_its_filename",
+       a_markdown_artifact_with_no_name_is_listed_under_its_filename},
       {"metrics_is_prometheus_text_exposition",
        metrics_is_prometheus_text_exposition},
       {"metrics_counts_served_api_requests", metrics_counts_served_api_requests},

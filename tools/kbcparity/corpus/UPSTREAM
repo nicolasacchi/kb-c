@@ -1,0 +1,49 @@
+# Provenance of the vendored parity corpus.
+#
+# UPSTREAM ships NO SHA256SUMS of any kind: no file named SHA256SUMS, no
+# *.sha256, anywhere in the kb checkout outside target/. The task brief
+# asserted one was there; it is not, and the harness says so rather than
+# pretending otherwise. This pin was therefore taken AT VENDOR TIME from the
+# read-only upstream tree, and is anchored to git so it stays re-checkable
+# against the original rather than against my copy of it.
+#
+# Regenerating these bytes would make the parity claim about a corpus nobody
+# else has. Do not. The files are copied verbatim and `kbcparity verify` fails
+# the run if a single one changes.
+#
+upstream_repo=/home/nik/project/kb
+upstream_commit=170ebd0fd7b3c0d6526659655d5cdca778597885
+upstream_commit_date=2026-09-29T16:27:33+02:00
+upstream_corpus_dir=corpus/
+vendored_on=2026-09-29
+#
+# corpus/canon/**            is corpus/canon/** of the upstream repo, verbatim.
+# corpus/md/<path>          is <path> from the upstream repo root, verbatim.
+#
+# The markdown slice is the front-matter-and-link-bearing part of the upstream
+# Markdown: 18 of the 84 tracked .md files carry a leading `---` fence, and
+# only ONE of those declares the kb-* keys the two daemons interpret
+# (docs/research/kb-reflect-implementation-plan.md). The slice is chosen to
+# exercise, not to sample: front matter, kb-category, kb-tags, fenced code in
+# several languages, GFM tables, task lists, and Obsidian wikilinks.
+#
+# Per file: git blob sha1 of the upstream object, the vendored path, and the
+# upstream path. `git cat-file -p <blob>` in the upstream repo must reproduce
+# the same bytes as corpus/<vendored path>.
+#
+6dc8c47421f7d9b57a49642f37e508e221ef3976  canon/README.md  corpus/canon/README.md
+98bd235d527d2761904db522b66e0ac724d60e27  canon/cost-of-abstraction.html  corpus/canon/cost-of-abstraction.html
+ccf5e1d85b270809962bd3d381e7ae3e9b9293a9  canon/fullscreen-viz.html  corpus/canon/fullscreen-viz.html
+6e8963c744df1dbb0b83bc78817474381fdf9b1b  canon/kitchen-sink.html  corpus/canon/kitchen-sink.html
+92b204abf173107bcdaca90918d92f9d0ff81de6  canon/multi-page.html  corpus/canon/multi-page.html
+f25c5a6aff9889c4d3e8d4bfa3c6e52eacd7b2c8  canon/pm/00-summary.html  corpus/canon/pm/00-summary.html
+797621749a5d4979ff87e83d3ab5aceb42358678  canon/pm/01-timeline.html  corpus/canon/pm/01-timeline.html
+097f3dc6427e9a0f4b2903414b9d88466e45516b  canon/pm/02-cause.html  corpus/canon/pm/02-cause.html
+0232756f312067b6cd3656db7c74373cce0749e1  canon/pm/03-actions.html  corpus/canon/pm/03-actions.html
+2f7485417df3125ffa4365287fb07e71602c3228  canon/pm/style.css  corpus/canon/pm/style.css
+401b05528b3acddcf4f191a4822ffa90d066ba18  md/crates/kb-code-server/tests/fixtures/review-doc/acme-app-standard.md  crates/kb-code-server/tests/fixtures/review-doc/acme-app-standard.md
+87505f26e6bdfea277b06d7950a1baed2ade9a27  md/docs/kb-code.md  docs/kb-code.md
+8da68a9701137121f6214152a0be468775f08f50  md/docs/research/kb-reflect-implementation-plan.md  docs/research/kb-reflect-implementation-plan.md
+15d9f1ba8fc8cd04203fc8da111e8e5cf3955223  md/docs/research/notes-as-connective-tissue.md  docs/research/notes-as-connective-tissue.md
+a7ad945aa865dd2bd43e4cc0c0821eb9273785ff  md/plugins/kb-memory/hooks/omp-agents/kb-librarian.md  plugins/kb-memory/hooks/omp-agents/kb-librarian.md
+1f97ed67d9348407c9582416d6c549501fe11bba  md/plugins/kb-memory/skills/kb-distill/SKILL.md  plugins/kb-memory/skills/kb-distill/SKILL.md

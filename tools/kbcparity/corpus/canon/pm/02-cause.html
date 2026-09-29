@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<title>INC-0315 · Root Cause</title>
+<link rel="stylesheet" href="style.css"/>
+</head><body data-page="2">
+
+<header class="head">
+  <span class="sev">SEV-1</span>
+  <span class="id"><b>INC-0315</b> · checkout-api · 2024-03-15</span>
+  <span class="pg">page <b>3</b> / 4</span>
+</header>
+
+<section class="hero">
+  <p class="eyebrow">Page 03 — Root Cause</p>
+  <h1>Two bugs, one trigger</h1>
+  <p class="lede">Neither bug alone would have caused an outage. They had been coexisting in production for ~14 months. The config push was the first touch that activated both at once.</p>
+</section>
+
+<section class="section">
+  <h2>The bug chain</h2>
+
+  <div class="diagram">
+<b>config push</b>                       <b>flag library</b>                <b>checkout pool</b>
+─────────────                       ────────────                ──────────────
+"checkout.pool.enabled"     ─→     parseValue("true")    ─→    pool.enabled = ?
+   value: "true"  <span class="bad">⚠ string</span>            returns <span class="bad">undefined</span>           reads <span class="bad">undefined</span>
+                                       │                              │
+                                       ▼                              ▼
+                              fallback to default          default is <span class="bad">false</span>  <span class="bad">⚠ unsafe</span>
+                                                                      │
+                                                                      ▼
+                                                          <b>pool disabled silently</b>
+  </div>
+
+  <h2>Bug 1 · String values dropped on bootstrap</h2>
+  <p>The flag library has two read paths: <code>get()</code> and <code>bootstrap()</code>. <code>get()</code> coerces strings; <code>bootstrap()</code> validates types strictly and returns <code>undefined</code> on mismatch. Pool config is read once at bootstrap.</p>
+
+<pre class="diff"><span class="ctx">// flags-lib/src/bootstrap.ts</span>
+<span class="ctx">function bootstrap&lt;T&gt;(key: string, schema: Schema&lt;T&gt;): T | undefined {</span>
+<span class="ctx">  const raw = store.read(key);</span>
+<span class="rm">- if (typeof raw !== schema.type) return undefined;</span>
+<span class="add">+ const coerced = coerce(raw, schema);</span>
+<span class="add">+ if (coerced === undefined) return undefined;</span>
+<span class="ctx">  return coerced;</span>
+<span class="ctx">}</span></pre>
+
+  <h2>Bug 2 · Unsafe default on missing pool config</h2>
+  <p>The pool initializer treated &ldquo;config missing&rdquo; as &ldquo;user opted out of pooling.&rdquo; This was a deliberate decision in 2023 — pooling was new, and we wanted opt-in. We forgot to flip the default after pooling became mandatory eight months ago.</p>
+
+<pre class="diff"><span class="ctx">// checkout/pool.ts</span>
+<span class="ctx">const cfg = flags.bootstrap("checkout.pool.enabled", boolean);</span>
+<span class="rm">- this.enabled = cfg ?? false;   // 2023: opt-in</span>
+<span class="add">+ this.enabled = cfg ?? true;    // 2024: pooling is mandatory</span>
+<span class="add">+ if (cfg === undefined) log.warn("pool.enabled defaulted; investigate");</span></pre>
+
+  <h2>Why didn&rsquo;t we catch this earlier?</h2>
+  <p>The integration tests for the flag library use <code>get()</code>, not <code>bootstrap()</code>. The pool integration tests pass an explicit boolean, never relying on the default. Both bugs lived in the seam between two well-tested components.</p>
+</section>
+
+<nav class="pagenav">
+  <a class="prev" href="01-timeline.html"><div class="dir">← prev</div><div class="ttl">02 · Timeline</div></a>
+  <a class="next" href="03-actions.html"><div class="dir">next →</div><div class="ttl">04 · Action Items</div></a>
+</nav>
+
+<script>
+  try { window.parent.postMessage({ type: 'pm:page', page: 2, of: 4, file: '02-cause.html' }, '*'); } catch(_) {}
+</script>
+</body></html>

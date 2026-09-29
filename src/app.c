@@ -43,6 +43,7 @@
 
 #include <stdio.h>
 
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -58,6 +59,7 @@
 #include <time.h>
 
 #include "kbc/app.h"
+#include "kbc/html.h"
 #include "kbc/chunk.h"
 #include "kbc/json.h"
 #include "kbc/links.h"
@@ -630,8 +632,21 @@ static kbc_status document_chunks(kbc_arena *a, const kbc_parsed *p,
 
 /* --------------------------------------------------------------- summary */
 
-/* First non-heading block, whitespace-collapsed and truncated. KBC_OWN; never
- * NULL on success, "" when the document has no prose. */
+/* The summary is a LEAD, and a lead is prose. The block text it is cut from
+ * is a reader's text, not a rendering's, so it still carries the emphasis
+ * markers the source spelled the emphasis with — `**bold**`, `_em_`, `~~old~~`
+ * — and those are what the user reads. A search result that says "You are
+ * the kb librarian. You answer questions **from the knowledge base**" is
+ * showing markup where prose belongs, and the original's summary never can:
+ * it is a text walk of the rendered page, where the markers are already gone
+ * (parser.rs:540-544, `body_text` over the DOM).
+ *
+ * So the markers are removed here, at the one place a summary is built, and
+ * nowhere else: the block text keeps them because the block text is what the
+ * index tokenizes, and an index that searched for the word "bold" because a
+ * document happened to emphasise it would be a worse index.
+ *
+ * KBC_OWN; never NULL on success, "" when the document has no prose. */
 static char *summary_from_blocks(const kbc_blocks *b) {
   for (size_t i = 0; i < b->len; i++) {
     const kbc_block *blk = &b->items[i];
@@ -654,6 +669,30 @@ static char *summary_from_blocks(const kbc_blocks *b) {
         space = w > 0;
         continue;
       }
+      if (c == '*' || c == '_' || c == '~') {
+        size_t k = j;
+        while (k < n && blk->text[k] == c) k++;
+        /* A run can only EMPHASISE when a WORD sits on exactly one side of
+         * it: `**bold**` and `*bold*` each open against a boundary and close
+         * against one, while `2 * 3` and `snake_case_name` have a word on
+         * both sides. Punctuation counts as a boundary, which is what makes
+         * `**bold**,` close: the comma is not part of the word the markers
+         * are wrapped around. The test is the same for every marker
+         * character, so it is one comparison rather than a rule per
+         * character, and it is what keeps arithmetic and identifiers whole.
+         * A `~` is only ever the two-character strikethrough. */
+        const unsigned char lchar =
+            j > 0 ? (unsigned char)blk->text[j - 1] : (unsigned char)0;
+        const unsigned char rchar =
+            k < n ? (unsigned char)blk->text[k] : (unsigned char)0;
+        const bool lword = j > 0 && isalnum(lchar) != 0;
+        const bool rword = k < n && isalnum(rchar) != 0;
+        const bool delim = (c != '~' || k - j == 2) && (lword != rword);
+        if (delim) {
+          j = k - 1; /* the run is syntax: consume it, emit nothing */
+          continue;
+        }
+      }
       if (space) {
         out[w++] = ' ';
         space = false;
@@ -665,6 +704,7 @@ static char *summary_from_blocks(const kbc_blocks *b) {
   }
   return dup_cstr("");
 }
+
 
 /* --------------------------------------------------------------- ingest  */
 
@@ -4039,12 +4079,17 @@ kbc_status kbc_app_delete_path(kbc_app *app, const char *corpus,
  * has already capped, and matching the reference's algorithm is worth more
  * here than saving six copies would be.
  *
- * WHAT IS DELIBERATELY ABSENT: the HTML pipeline. capture.rs stamps an HTML
- * capture by splicing <meta> tags into <head> and, opt-in, running ammonia
- * over the page. kb-c has no sanitiser (PORT_PLAN.md §1 lists ammonia as a
- * known gap, "writes captures un-sanitised"), and a head-splice without one
- * is a way to persist attacker markup into a trusted origin. Markdown only,
- * until the sanitiser exists. */
+ * THE HTML PIPELINE EXISTS NOW, and the order it runs in is the whole point.
+ * capture.rs stamps an HTML capture by splicing <meta> tags into <head> and
+ * running ammonia over the page — SANITISE FIRST, STAMP SECOND
+ * (capture.rs:220-225, then :235). kb-c originally had neither, and refused
+ * `.html` at the route with a 415; that refusal protected nothing, because the
+ * corpus is how HTML arrives anyway. The refusal is gone, the gate admits the
+ * same four extensions `is_indexable` accepts, and capture_write now branches
+ * on the extension. A head-splice WITHOUT a sanitiser would be a way to
+ * persist attacker markup into a trusted origin, and a sanitiser WITHOUT the
+ * splice would store a capture with its own provenance removed; both orderings
+ * are bugs and both are named in the code that could get them wrong. */
 
 /* The per-kb capture subfolder (capture.rs:27). kb-c's frozen config has no
  * `[server.capture].capture_dir` override, so the default is the only
@@ -4075,6 +4120,14 @@ kbc_status kbc_app_delete_path(kbc_app *app, const char *corpus,
  * and then call one private writer (capture.rs:154, 166, 201), because the
  * url-stub's raw `kind:url-stub` provenance tag must not be slugified — the
  * transform would collapse its colon to a dash. */
+/* `.html` and `.htm` take the sanitising path in capture_write. This is the
+ * same pair `is_indexable` already accepts, so a capture written here IS a
+ * document the indexer will pick up and the serve layer will hand back —
+ * which is exactly why it is the pair that has to be sanitised. */
+static bool capture_ext_is_html(const char *ext) {
+  return ext != NULL && (strcmp(ext, "html") == 0 || strcmp(ext, "htm") == 0);
+}
+
 static kbc_status capture_write(kbc_app *app, const kbc_corpus_cfg *cc,
                                 const kbc_capture_input *in,
                                 const char *tags_joined, kbc_capture_result *out,
@@ -4427,40 +4480,88 @@ static kbc_status build_tag_list(kbc_str *out, const char *from,
   return KBC_OK;
 }
 
-/* The stamp, in the order documented at the top of this section. */
-static kbc_status stamp_capture(kbc_str *out, const char *src, size_t n,
-                                const kbc_capture_input *in,
-                                const char *tags_joined, int64_t ts) {
-  kbc_str doc, val;
-  kbc_str_init(&doc);
-  kbc_str_init(&val);
-  kbc_status st = kbc_str_append(&doc, src, n);
-  if (kbc_failed(st)) goto done;
+/* The seven provenance keys, resolved ONCE and then rendered by whichever
+ * stamper the capture's extension calls for.
+ *
+ * It was tempting to write the HTML stamper as a second copy of the loop
+ * below. That is precisely the drift this file keeps paying for: seven
+ * conditionals, two of them conditional on a clean value being non-empty and
+ * one on the SOURCE already carrying a key, is seven chances to disagree, and
+ * a disagreement is a capture whose provenance differs by upload path. So the
+ * rules live here, once, and both renderers consume the result. */
+#define CAPTURE_FIELD_MAX 7
+typedef struct {
+  const char *key; /* a string literal */
+  kbc_str val;     /* KBC_OWN */
+} capture_field;
+
+/* Frees EXACTLY the slots capture_build_fields built, and the count it
+ * returns is the count, not the capacity. The two differ the moment any key
+ * is skipped — an empty optional value, or a `kb-session` the source already
+ * carries — because a skipped key frees its value and does NOT advance the
+ * index, so the array's tail is left UNWRITTEN. Walking the capacity freed
+ * whatever the stack happened to hold in those slots: `free()` on a stale
+ * pointer from an earlier capture aborts, and on anything else it faults,
+ * which is a SIGSEGV out of kbc_app_capture on a capture that had already
+ * succeeded. The write side is the reason this is subtle — `nf` is the ONLY
+ * number that means "every slot in here owns something". */
+static void capture_fields_free(capture_field *f, size_t n) {
+  for (size_t i = 0; i < n; i++) kbc_str_free(&f[i].val);
+}
+
+static kbc_status field_clean(capture_field *f, const char *key,
+                              const char *raw) {
+  f->key = key;
+  kbc_str_init(&f->val);
+  kbc_status st = fm_value_clean(&f->val, raw != NULL ? raw : "");
+  if (kbc_failed(st)) kbc_str_free(&f->val);
+  return st;
+}
+
+/* `src`/`n` are the UPLOADED bytes, not the working document: the `kb-session`
+ * rule deliberately reads the source (see the note at key 6 below). */
+static kbc_status capture_build_fields(capture_field *out, size_t *n_out,
+                                       const char *src, size_t n,
+                                       const kbc_capture_input *in,
+                                       const char *tags_joined, int64_t ts,
+                                       kbc_err *err) {
+  size_t k = 0;
+  kbc_status st;
+  kbc_str tmp;
+  kbc_str_init(&tmp);
 
   /* 1 kb-category — capture.rs:511-517. Sanitised, and empty falls back to
    * "capture" rather than writing a bare `kb-category:`. */
-  kbc_str_clear(&val);
-  st = fm_value_clean(&val, in->category != NULL ? in->category : "");
-  if (st == KBC_OK && val.len == 0) st = kbc_str_puts(&val, "capture");
-  if (st != KBC_OK) goto done;
-  st = fm_apply(&doc, "kb-category", val.ptr);
-  if (kbc_failed(st)) goto done;
+  st = field_clean(&out[k], "kb-category",
+                   in->category != NULL ? in->category : "");
+  if (st == KBC_OK && out[k].val.len == 0) {
+    st = kbc_str_puts(&out[k].val, "capture");
+  }
+  if (kbc_failed(st)) {
+    *n_out = k;
+    return kbc_err_set(err, st, "capture: kb-category");
+  }
+  k++;
 
   /* 2 kb-tags — capture.rs:518. Always present, even empty: a capture with
    * no tags and no `from` still declares where it came from. */
-  st = fm_apply(&doc, "kb-tags", tags_joined);
-  if (kbc_failed(st)) goto done;
+  st = field_clean(&out[k], "kb-tags", tags_joined);
+  if (kbc_failed(st)) {
+    *n_out = k;
+    return kbc_err_set(err, st, "capture: kb-tags");
+  }
+  k++;
 
   /* 3 kb-capture-original — capture.rs:519-524. */
-  kbc_str_clear(&val);
-  st = fm_value_clean(&val, in->original_filename != NULL
-                                   ? in->original_filename
-                                   : "");
-  if (kbc_failed(st)) goto done;
-  if (val.len > 0) {
-    st = fm_apply(&doc, "kb-capture-original", val.ptr);
-    if (kbc_failed(st)) goto done;
+  st = field_clean(&out[k], "kb-capture-original",
+                   in->original_filename != NULL ? in->original_filename
+                                                 : NULL);
+  if (kbc_failed(st)) {
+    *n_out = k;
+    return kbc_err_set(err, st, "capture: kb-capture-original");
   }
+  if (out[k].val.len > 0) k++;
+  else kbc_str_free(&out[k].val);
 
   /* 4 kb-capture-url — capture.rs:525-530.
    *
@@ -4471,50 +4572,192 @@ static kbc_status stamp_capture(kbc_str *out, const char *src, size_t n,
    * is allowed to reach the internet. If you are reading this while adding
    * a fetch, stop: you are adding a server-side request forgery to a daemon
    * that binds to a network. */
-  kbc_str_clear(&val);
-  st = fm_value_clean(&val, in->url != NULL ? in->url : "");
-  if (kbc_failed(st)) goto done;
-  if (val.len > 0) {
-    st = fm_apply(&doc, "kb-capture-url", val.ptr);
-    if (kbc_failed(st)) goto done;
+  st = field_clean(&out[k], "kb-capture-url", in->url != NULL ? in->url : NULL);
+  if (kbc_failed(st)) {
+    *n_out = k;
+    return kbc_err_set(err, st, "capture: kb-capture-url");
   }
+  if (out[k].val.len > 0) k++;
+  else kbc_str_free(&out[k].val);
 
   /* 5 kb-capture-at — capture.rs:531. The only unconditional stamp after the
    * category: a capture without a clock is not provenance. */
-  kbc_str_clear(&val);
-  st = kbc_str_printf(&val, "%lld", (long long)ts);
-  if (kbc_failed(st)) goto done;
-  st = fm_apply(&doc, "kb-capture-at", val.ptr);
-  if (kbc_failed(st)) goto done;
+  st = kbc_str_printf(&tmp, "%lld", (long long)ts);
+  if (kbc_failed(st)) {
+    *n_out = k;
+    return kbc_err_set(err, st, "capture: kb-capture-at");
+  }
+  out[k].key = "kb-capture-at";
+  out[k].val = tmp; /* ownership moved */
+  k++;
 
   /* 6 kb-session — capture.rs:532-543. Never overwrites a session marker
    * the UPLOADED content already carries: the check is against the SOURCE,
    * not against the document this loop has been editing, or a capture
    * would stamp a second kb-session on every retry. */
-  kbc_str_clear(&val);
-  st = fm_value_clean(&val, in->session_id != NULL ? in->session_id : "");
-  if (kbc_failed(st)) goto done;
-  if (val.len > 0 && !fm_src_has_key(src, n, "kb-session")) {
-    st = fm_apply(&doc, "kb-session", val.ptr);
-    if (kbc_failed(st)) goto done;
+  st = field_clean(&out[k], "kb-session",
+                   in->session_id != NULL ? in->session_id : NULL);
+  if (kbc_failed(st)) {
+    *n_out = k;
+    return kbc_err_set(err, st, "capture: kb-session");
   }
+  if (out[k].val.len > 0 && !fm_src_has_key(src, n, "kb-session")) k++;
+  else kbc_str_free(&out[k].val);
 
   /* 7 kb-expires-at — capture.rs:544-546. Display-only; there is no sweeper,
    * and an absent expiry is byte-identical to not stamping one at all. */
   if (in->has_expires_at) {
-    kbc_str_clear(&val);
-    st = kbc_str_printf(&val, "%lld", (long long)in->expires_at);
-    if (kbc_failed(st)) goto done;
-    st = fm_apply(&doc, "kb-expires-at", val.ptr);
-    if (kbc_failed(st)) goto done;
+    kbc_str_init(&tmp);
+    st = kbc_str_printf(&tmp, "%lld", (long long)in->expires_at);
+    if (kbc_failed(st)) {
+      *n_out = k;
+      return kbc_err_set(err, st, "capture: kb-expires-at");
+    }
+    out[k].key = "kb-expires-at";
+    out[k].val = tmp;
+    k++;
   }
 
+  *n_out = k;
+  return KBC_OK;
+}
+
+/* The Markdown stamp: the key order documented at the top of this section,
+ * applied as front matter. */
+static kbc_status stamp_capture(kbc_str *out, const char *src, size_t n,
+                                const kbc_capture_input *in,
+                                const char *tags_joined, int64_t ts) {
+  capture_field f[CAPTURE_FIELD_MAX];
+  size_t nf = 0;
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_status st = capture_build_fields(f, &nf, src, n, in, tags_joined, ts,
+                                       &err);
+  kbc_str doc;
+  kbc_str_init(&doc);
+  if (st == KBC_OK) st = kbc_str_append(&doc, src, n);
+  for (size_t i = 0; st == KBC_OK && i < nf; i++) {
+    st = fm_apply(&doc, f[i].key, f[i].val.ptr);
+  }
+  capture_fields_free(f, nf); /* nf, never CAPTURE_FIELD_MAX — see above */
+  if (kbc_failed(st)) {
+    kbc_str_free(&doc);
+    return st;
+  }
+  /* Ownership moves: `doc` is now `*out` and the local is neutralised, NOT
+   * freed — freeing it after the copy hands the caller a pointer the allocator
+   * has already reclaimed. */
   *out = doc;
-  kbc_str_init(&doc); /* ownership moved; the free below is a no-op */
-done:
-  kbc_str_free(&doc);
-  kbc_str_free(&val);
-  return st;
+  kbc_str_init(&doc);
+  return KBC_OK;
+}
+
+/* Escapes a value for a double-quoted HTML attribute. Only `&` and `"` can
+ * change how the attribute parses; `<` inside a quoted value is inert and
+ * fm_value_clean has already turned every newline into a space, so a value
+ * can never terminate the tag. */
+static kbc_status attr_escape(kbc_str *out, const char *s, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    kbc_status st;
+    if (s[i] == '&') {
+      st = kbc_str_puts(out, "&amp;");
+    } else if (s[i] == '"') {
+      st = kbc_str_puts(out, "&quot;");
+    } else {
+      st = kbc_str_putc(out, s[i]);
+    }
+    if (kbc_failed(st)) return st;
+  }
+  return KBC_OK;
+}
+
+/* The HTML stamp, and the ORDERING IS THE WHOLE POINT.
+ *
+ * The reference sanitises FIRST and stamps SECOND (capture.rs:220-225, then
+ * :235). Reversing them hands the provenance `<meta>` to the sanitiser, which
+ * strips `meta` — and the capture is then stored with its own provenance
+ * removed, which is not a security problem but is the kind of silent data
+ * loss that is only noticed a year later. So: sanitise, then stamp, and never
+ * run a stamp through kbc_html_sanitize.
+ *
+ * `sanitised` is the document to stamp, and it is already filtered. The meta
+ * tags this function adds are therefore NOT filtered, which is the point:
+ * they are the daemon's own construction, over a key the daemon chose and a
+ * value that has been through fm_value_clean and attr_escape.
+ *
+ * THE ORDER INSIDE `doc` IS THE OTHER HALF OF THAT CONSTRAINT, and it is the
+ * half that was wrong: the metas go BETWEEN the head and the body, which is
+ * the invariant kbc_html_split_head documents (`head ++ metas ++ body` is
+ * what `stamp_html_head` returns). Emitting them first put the provenance
+ * ABOVE the head — the file opened with seven `<meta>` lines and then an EMPTY
+ * `<head></head>` — which is a document whose provenance is not in its head,
+ * and the test that claimed to check for that passed anyway because it only
+ * asked whether the first meta came before the first paragraph.
+ *
+ * WHY THE HEAD IS ALWAYS THE SYNTHESISED ONE, so nobody re-derives it:
+ * kbc_html_split_head searches for a literal `</head>`, and a SANITISED
+ * document cannot contain one. The tree builder parses a fragment in a `div`
+ * context, so `<html>`, `<head>` and `<body>` start tags are ignored before
+ * the allowlist ever runs and `head` is never in the tree to begin with; a
+ * saved page therefore arrives here as bare content and the synthesise branch
+ * is the only live one. That is ammonia's behaviour too, and it is why this
+ * file does not put `head` on the keep list to make the search find one: the
+ * keep list is a filter decision and this is a parser decision, and changing
+ * the filter would only make kb-c diverge from ammonia on documents the
+ * differential harness checks. The search stays because split_head is a
+ * splitter, not a stamper, and a caller with unsanitised bytes gets the split
+ * it asked for. */
+static kbc_status stamp_capture_html(kbc_str *out, const char *sanitised,
+                                     size_t n, const char *src, size_t src_n,
+                                     const kbc_capture_input *in,
+                                     const char *tags_joined, int64_t ts,
+                                     kbc_err *err) {
+  kbc_str head, body;
+  kbc_str_init(&head);
+  kbc_str_init(&body);
+  kbc_status st = kbc_html_split_head(sanitised, n, &head, &body, err);
+  if (kbc_failed(st)) {
+    kbc_str_free(&head);
+    kbc_str_free(&body);
+    return st;
+  }
+  capture_field f[CAPTURE_FIELD_MAX];
+  size_t nf = 0;
+  st = capture_build_fields(f, &nf, src, src_n, in, tags_joined, ts, err);
+  kbc_str doc;
+  kbc_str_init(&doc);
+  if (st == KBC_OK) st = kbc_str_append(&doc, head.ptr, head.len);
+  for (size_t i = 0; st == KBC_OK && i < nf; i++) {
+    st = kbc_str_puts(&doc, "<meta name=\"");
+    if (st == KBC_OK) st = kbc_str_puts(&doc, f[i].key);
+    if (st == KBC_OK) st = kbc_str_puts(&doc, "\" content=\"");
+    if (st == KBC_OK) st = attr_escape(&doc, f[i].val.ptr, f[i].val.len);
+    if (st == KBC_OK) st = kbc_str_puts(&doc, "\">");
+    /* The newline TRAILS each meta, as it does in the original: `metas` there
+     * is built by pushing `"<meta …>\n"` once per field (capture.rs:596-631),
+     * so `head ++ metas ++ body` is byte-identical to the original's output in
+     * BOTH branches. A LEADING newline is the same bytes only when the field
+     * list is non-empty and only in the synthesise branch it mangles: it left a
+     * blank line after `<head>` and glued `</head>` onto the last meta, so the
+     * stored document did not have the `<head>\n{metas}</head>\n{html}` shape
+     * that html.c section 11 quotes. */
+    if (st == KBC_OK) st = kbc_str_puts(&doc, "\n");
+  }
+  if (st == KBC_OK) st = kbc_str_append(&doc, body.ptr, body.len);
+  capture_fields_free(f, nf); /* nf, never CAPTURE_FIELD_MAX — see above */
+  kbc_str_free(&head);
+  kbc_str_free(&body);
+  if (kbc_failed(st)) {
+    kbc_str_free(&doc);
+    return kbc_err_set(err, st, "capture: HTML stamp");
+  }
+  /* Ownership moves: `doc` is now `*out` and the local is neutralised, NOT
+   * freed. Freeing it after the copy hands the caller a pointer the allocator
+   * has already reclaimed, which is a double free at the caller's first free
+   * and an abort several captures later. */
+  *out = doc;
+  kbc_str_init(&doc);
+  return KBC_OK;
 }
 
 static kbc_status capture_taken(const char *dir_abs, const char *name) {
@@ -4619,10 +4862,29 @@ static kbc_status capture_write(kbc_app *app, const kbc_corpus_cfg *cc,
     goto done;
   }
 
-  st = stamp_capture(&stamped, in->body, in->body_len, in, tags_joined, ts);
-  if (kbc_failed(st)) {
-    st = kbc_err_set(err, KBC_ERR_NOMEM, "capture stamp for %s", rel.ptr);
-    goto done;
+  if (capture_ext_is_html(ext)) {
+    /* SANITISE, THEN STAMP. See stamp_capture_html: the order is the
+     * reference's (capture.rs:220-225 then :235) and inverting it hands the
+     * provenance `<meta>` to the sanitiser, which strips it. */
+    kbc_str clean;
+    kbc_str_init(&clean);
+    st = kbc_html_sanitize(in->body, in->body_len, &clean, err);
+    if (st == KBC_OK) {
+      st = stamp_capture_html(&stamped, clean.ptr != NULL ? clean.ptr : "",
+                              clean.len, in->body, in->body_len, in, tags_joined,
+                              ts, err);
+    }
+    kbc_str_free(&clean);
+    if (kbc_failed(st)) {
+      st = kbc_err_set(err, st, "capture HTML stamp for %s", rel.ptr);
+      goto done;
+    }
+  } else {
+    st = stamp_capture(&stamped, in->body, in->body_len, in, tags_joined, ts);
+    if (kbc_failed(st)) {
+      st = kbc_err_set(err, KBC_ERR_NOMEM, "capture stamp for %s", rel.ptr);
+      goto done;
+    }
   }
 
   /* The directory before the file: a capture into a corpus that has never

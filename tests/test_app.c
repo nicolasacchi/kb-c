@@ -908,6 +908,63 @@ KBC_TEST(get_artifact_round_trips_and_rejects_unknown_ids) {
   fx_teardown(&f);
 }
 
+/* The summary is a LEAD, and a lead is prose. The block text it is cut from
+ * is a reader's text, so it still carries the emphasis markers the source
+ * spelled the emphasis with, and those markers are what a search result and
+ * a list row show. A row reading "You answer questions **from the knowledge
+ * base**" is showing markup where prose belongs; the original's summary
+ * cannot, because it is a text walk of the rendered page where the markers
+ * are already gone.
+ *
+ * The stripping must not become a character-eating pass: `snake_case_name`
+ * and `2 * 3` are an identifier and arithmetic, and a summary that has
+ * swallowed either is a worse lie than one that shows a stray marker. Each
+ * is asserted because they are the two ways a naive "delete every marker"
+ * gets it wrong. */
+KBC_TEST(a_summary_is_prose_and_keeps_words_that_look_like_markers) {
+  fixture f;
+  fx_setup(&f, false);
+  static const char kDoc[] =
+      "# Emphasis\n\n"
+      "You answer **from the knowledge base**, with _one_ caveat and a\n"
+      "`kb_code` span; see snake_case_name and 2 * 3 = 6 for the notation.\n";
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, "emph.md");
+  kbc_test_write_file(p, kDoc);
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  char id[KBC_MAX_ID_LEN + 1];
+  kbc_id_for_artifact(id, CORPUS_A, "emph.md");
+  kbc_arena *a = kbc_arena_new(0);
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  KBC_CHECK_OK(kbc_app_get_artifact(f.app, a, id, true, &art, &err));
+  KBC_CHECK_NOT_NULL(art.summary);
+  if (art.summary != NULL) {
+    KBC_CHECK_MSG(strstr(art.summary, "**") == NULL,
+                  "a summary still carries a strong marker: %s", art.summary);
+    KBC_CHECK_MSG(strstr(art.summary, "_one_") == NULL,
+                  "a summary still carries an emphasis marker: %s",
+                  art.summary);
+    KBC_CHECK_MSG(strstr(art.summary, "from the knowledge base") != NULL,
+                  "a summary lost the emphasised words themselves: %s",
+                  art.summary);
+    KBC_CHECK_MSG(strstr(art.summary, "snake_case_name") != NULL,
+                  "a summary ate an identifier's underscores: %s", art.summary);
+    KBC_CHECK_MSG(strstr(art.summary, "2 * 3 = 6") != NULL,
+                  "a summary ate an arithmetic asterisk: %s", art.summary);
+    /* A code span's delimiters are consumed by the PARSE, not by the summary
+     * pass, so what reaches the summary is the code and nothing else. */
+    KBC_CHECK_MSG(strstr(art.summary, "kb_code span") != NULL,
+                  "a summary lost a code span's content: %s", art.summary);
+  }
+  kbc_arena_free(a);
+  fx_teardown(&f);
+}
+
+
 KBC_TEST(list_artifacts_filters_by_corpus_and_honours_limit) {
   fixture f;
   fx_setup(&f, true);
@@ -3524,6 +3581,122 @@ static void full_capture_input(kbc_capture_input *in, const char *body) {
   in->now_unix = 1700000000;
 }
 
+/* The HTML capture path, and the two things it can get wrong in opposite
+ * directions. It used to be refused with a 415, which protected nothing: HTML
+ * reaches the corpus by `kb add`, `git checkout` and sync regardless, and the
+ * artifact route and the subdomain then serve it. So the route accepts
+ * `.html`/`.htm` now, and the file that lands on disk has to be BOTH
+ * sanitised and stamped. */
+
+/* A capture input shaped like the Markdown one above, so the seven provenance
+ * keys are the same seven and a divergence between the two paths is visible
+ * as a different file rather than as a missing key. */
+static void html_capture_input(kbc_capture_input *in, const char *body) {
+  full_capture_input(in, body);
+  in->original_filename = "page.html";
+  /* `ext` is the ROUTE's decision, taken from the multipart filename by
+   * capture_ext_of and carried on the input; a caller that leaves it empty
+   * gets Markdown, which is the default and not a fallback. */
+  in->ext = "html";
+}
+
+KBC_TEST(an_html_capture_is_sanitised_and_stamped) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_capture_input in;
+  html_capture_input(&in,
+                     "<html><head><title>t</title></head><body>"
+                     "<script>alert(document.cookie)</script>"
+                     "<img src=x onerror=alert(1)>"
+                     "<a href=\"javascript:alert(1)\">c</a>"
+                     "<!-- secret -->"
+                     "<p>prose</p></body></html>");
+  kbc_capture_result r;
+  memset(&r, 0, sizeof r);
+  KBC_CHECK_OK(kbc_app_capture(f.app, CORPUS_A, &in, &r, &err));
+  KBC_CHECK_MSG(strstr(r.path, ".html") != NULL,
+                "an HTML capture did not keep its extension: %s", r.path);
+
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, r.path);
+  char *got = kbc_test_read_file(p);
+  KBC_CHECK_NOT_NULL(got);
+  if (got == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  /* The attack surface is gone. */
+  KBC_CHECK_MSG(strstr(got, "<script") == NULL, "a script reached the corpus: %s",
+                got);
+  KBC_CHECK_MSG(strstr(got, "onerror") == NULL, "an event handler reached the "
+                "corpus: %s", got);
+  KBC_CHECK_MSG(strstr(got, "javascript:") == NULL, "a javascript: URL reached "
+                "the corpus: %s", got);
+  KBC_CHECK_MSG(strstr(got, "<!--") == NULL, "a comment reached the corpus: %s",
+                got);
+  /* And the document is still a document: an implementation that answers
+   * every attack by storing nothing passes the four assertions above. */
+  KBC_CHECK_MSG(strstr(got, "prose") != NULL, "the capture's own prose was "
+                "lost: %s", got);
+
+  /* The provenance is there, which is the ordering constraint stated in
+   * stamp_capture_html: SANITISE FIRST, STAMP SECOND. Stamping first would
+   * hand these `<meta>` tags to ammonia, which strips `meta`, and the
+   * capture would be stored with its own provenance removed. The same seven
+   * keys, the same values, the same skip rules as the Markdown path. */
+  KBC_CHECK_MSG(strstr(got, "<meta name=\"kb-capture-at\" content=\"1700000000\">") != NULL,
+                "kb-capture-at did not survive the sanitiser: %s", got);
+  KBC_CHECK_MSG(strstr(got, "<meta name=\"kb-category\" content=\"capture\">") != NULL,
+                "kb-category did not survive the sanitiser: %s", got);
+  KBC_CHECK_MSG(strstr(got, "<meta name=\"kb-capture-original\" content=\"page.html\">") != NULL,
+                "kb-capture-original did not survive the sanitiser: %s", got);
+  KBC_CHECK_MSG(strstr(got, "<meta name=\"kb-session\" content=\"sess-7\">") != NULL,
+                "kb-session did not survive the sanitiser: %s", got);
+  /* The provenance lands INSIDE the head, which is the property the head
+   * splice exists for, and it is asserted as a BOUNDARY rather than as
+   * "the first meta is somewhere before the first paragraph": that weaker
+   * question is answered yes by a file that opens with seven bare `<meta>`
+   * lines and then an empty `<head></head>`, which is not a document whose
+   * provenance is in its head at all. kbc_html_split_head's contract is
+   * `head ++ metas ++ body`, so every `kb-` meta has to sit between the
+   * opening tag and the close, and the close has to come before the body. */
+  const char *open_head = strstr(got, "<head>");
+  const char *close_head = strstr(got, "</head>");
+  const char *prose = strstr(got, "<p>prose</p>");
+  KBC_CHECK_MSG(open_head != NULL && open_head == got,
+                "the stored capture does not open with its head: %.600s", got);
+  KBC_CHECK_MSG(close_head != NULL,
+                "the stored capture never closes its head: %.600s", got);
+  KBC_CHECK_MSG(prose != NULL, "the body is not where it should be: %.600s",
+                got);
+  KBC_CHECK_MSG(open_head != NULL && close_head != NULL &&
+                    open_head < close_head && close_head < prose,
+                "the head does not wrap the body: %.600s", got);
+  /* Every provenance meta, not just the first: one that escaped the head
+   * while the rest stayed inside is the same defect with better luck. */
+  size_t metas = 0, inside = 0;
+  for (const char *q = got; (q = strstr(q, "<meta name=\"kb-")) != NULL; q++) {
+    metas++;
+    if (open_head != NULL && close_head != NULL && open_head < q &&
+        q < close_head) {
+      inside++;
+    }
+  }
+  KBC_CHECK_MSG(metas == 7, "%zu provenance metas in the file, not 7: %.600s",
+                metas, got);
+  KBC_CHECK_MSG(inside == metas,
+                "%zu of %zu provenance metas are outside the head: %.600s",
+                metas - inside, metas, got);
+  free(got);
+  fx_teardown(&f);
+}
+
 KBC_TEST(a_capture_writes_the_originals_keys_in_the_originals_order) {
   fixture f;
   fx_setup(&f, false);
@@ -3732,6 +3905,123 @@ KBC_TEST(a_capture_does_not_restamp_a_session_the_document_already_carries) {
   size_t hits = 0;
   for (const char *q = got; (q = strstr(q, "kb-session:")) != NULL; q++) hits++;
   KBC_CHECK_EQ_INT(hits, 1);
+  free(got);
+  fx_teardown(&f);
+}
+
+/* The capture's seven provenance keys are built into a fixed seven-slot
+ * array, and a key that is SKIPPED — an empty optional value, or a
+ * `kb-session` the source already carries — releases its slot without
+ * advancing the index, so the array's tail is never written at all. The free
+ * walk therefore has to be told how many slots were BUILT: walking the
+ * capacity hands `free()` whatever the stack held in the unwritten ones, and
+ * that is a crash out of a capture that had already succeeded — a SIGSEGV
+ * when the garbage is not a pointer at all, an abort when it is a stale one.
+ * Every case in this file that stamped all seven keys passed, which is why it
+ * went unnoticed: only a capture with something left out reached it.
+ *
+ * The capture below is that case, over a POISONED stack. The stack the stamper
+ * runs on is whatever the previous call left in it, so a regression here reads
+ * whatever this function happened to write a few frames down — which on a
+ * given build is a value, and on the next is a pointer to freed heap, and on
+ * the one after that is a pointer into the middle of a live mapping. Filling
+ * those bytes with a constant first makes the failure the SAME failure every
+ * time instead of a coin flip, and puts it in this case rather than in
+ * whichever case happened to run over dirty memory. */
+static void capture_over_poisoned_stack(kbc_app *app,
+                                        const kbc_capture_input *in,
+                                        kbc_capture_result *r, int depth) {
+  volatile unsigned char poison[16u * 1024u];
+  for (size_t i = 0; i < sizeof poison; i++) {
+    poison[i] = (unsigned char)(0xA5u ^ (unsigned)depth);
+  }
+  if (depth > 0) {
+    capture_over_poisoned_stack(app, in, r, depth - 1);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_capture(app, CORPUS_A, in, r, &err));
+}
+
+KBC_TEST(a_capture_that_skips_provenance_keys_frees_only_what_it_built) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  /* Nothing optional set: no category, no original filename, no URL, no
+   * session, no expiry. Three of the seven keys are stamped and FOUR slots
+   * of the array are left unwritten. */
+  kbc_capture_input in;
+  memset(&in, 0, sizeof in);
+  in.corpus = CORPUS_A;
+  in.from = "cli";
+  in.title = "Bare";
+  in.now_unix = 1700000000;
+  in.body = "Body.\n";
+  in.body_len = strlen(in.body);
+
+  kbc_capture_result r;
+  memset(&r, 0, sizeof r);
+  capture_over_poisoned_stack(f.app, &in, &r, 3);
+  KBC_CHECK_MSG(r.path[0] != '\0', "the Markdown capture reported no path");
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, r.path);
+  char *got = kbc_test_read_file(p);
+  KBC_CHECK_NOT_NULL(got);
+  if (got == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  /* The three that were asked for, in the reference's order. */
+  KBC_CHECK_EQ_STR(got,
+                   "---\n"
+                   "kb-category: capture\n"
+                   "kb-tags: source:upload, from:cli\n"
+                   "kb-capture-at: 1700000000\n"
+                   "---\n"
+                   "Body.\n");
+  free(got);
+
+  /* The same four skips through the HTML stamper, which frees the same array
+   * through the same helper. */
+  in.ext = "html";
+  in.original_filename = NULL;
+  in.body = "<p>prose</p>";
+  in.body_len = strlen(in.body);
+  memset(&r, 0, sizeof r);
+  capture_over_poisoned_stack(f.app, &in, &r, 3);
+  KBC_CHECK_MSG(strstr(r.path, ".html") != NULL,
+                "the HTML capture did not keep its extension: %s", r.path);
+  join(p, sizeof p, f.corpus_a, r.path);
+  got = kbc_test_read_file(p);
+  KBC_CHECK_NOT_NULL(got);
+  if (got == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  /* A skipped key must leave no trace — a stale value read out of an
+   * unwritten slot is the same defect wearing a different hat. */
+  KBC_CHECK_MSG(strstr(got, "kb-capture-original") == NULL &&
+                    strstr(got, "kb-capture-url") == NULL &&
+                    strstr(got, "kb-session") == NULL &&
+                    strstr(got, "kb-expires-at") == NULL,
+                "a skipped key wrote something: %s", got);
+  /* Byte for byte, because the cross-implementation diff is byte for byte.
+   * The shape is `head ++ metas ++ body`: a synthesised head, the three keys
+   * inside it, then the sanitised body. Each meta carries its own TRAILING
+   * newline, which is what the original's `metas` string does — capture.rs
+   * pushes `"<meta …>\n"` once per key (capture.rs:596-631) — so this is
+   * `<head>\n{metas}</head>\n{html}` byte for byte. */
+  KBC_CHECK_EQ_STR(got,
+                   "<head>\n"
+                   "<meta name=\"kb-category\" content=\"capture\">\n"
+                   "<meta name=\"kb-tags\" content=\"source:upload, from:cli\">\n"
+                   "<meta name=\"kb-capture-at\" content=\"1700000000\">\n"
+                   "</head>\n"
+                   "<p>prose</p>");
   free(got);
   fx_teardown(&f);
 }
@@ -7165,6 +7455,8 @@ int main(void) {
        a_save_in_a_running_daemon_updates_the_document},
       {"get_artifact_round_trips_and_rejects_unknown_ids",
        get_artifact_round_trips_and_rejects_unknown_ids},
+      {"a_summary_is_prose_and_keeps_words_that_look_like_markers",
+       a_summary_is_prose_and_keeps_words_that_look_like_markers},
       {"list_artifacts_filters_by_corpus_and_honours_limit",
        list_artifacts_filters_by_corpus_and_honours_limit},
       {"the_index_survives_a_restart_without_reindexing",
@@ -7234,6 +7526,7 @@ int main(void) {
      delete_by_path_takes_the_document_and_announces_it},
     {"delete_by_path_refuses_a_bad_target_and_forgives_an_absent_one",
      delete_by_path_refuses_a_bad_target_and_forgives_an_absent_one},
+    {"an_html_capture_is_sanitised_and_stamped", an_html_capture_is_sanitised_and_stamped},
     {"a_capture_writes_the_originals_keys_in_the_originals_order",
      a_capture_writes_the_originals_keys_in_the_originals_order},
     {"the_same_bytes_captured_twice_are_byte_identical",
@@ -7244,6 +7537,8 @@ int main(void) {
      a_capture_edits_a_key_in_place_and_appends_the_rest_after_it},
     {"a_capture_does_not_restamp_a_session_the_document_already_carries",
      a_capture_does_not_restamp_a_session_the_document_already_carries},
+    {"a_capture_that_skips_provenance_keys_frees_only_what_it_built",
+     a_capture_that_skips_provenance_keys_frees_only_what_it_built},
     {"a_newline_in_an_uploaded_name_cannot_close_the_frontmatter_fence",
      a_newline_in_an_uploaded_name_cannot_close_the_frontmatter_fence},
     {"a_capture_is_a_document_the_index_picks_up_under_the_id_it_reported",

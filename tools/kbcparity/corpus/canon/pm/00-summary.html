@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<title>INC-0315 · Summary</title>
+<link rel="stylesheet" href="style.css"/>
+</head><body data-page="0">
+
+<header class="head">
+  <span class="sev">SEV-1</span>
+  <span class="id"><b>INC-0315</b> · checkout-api · 2024-03-15</span>
+  <span class="pg">page <b>1</b> / 4</span>
+</header>
+
+<section class="hero">
+  <p class="eyebrow">Postmortem</p>
+  <h1>Checkout returned 500s for 47 minutes after a routine config push</h1>
+  <p class="lede">A single mistyped boolean in our feature-flag service silently disabled connection pooling on the checkout cluster. Latencies climbed for 11 minutes before the SLO burn alert fired; we restored service by reverting the flag.</p>
+</section>
+
+<section class="stats">
+  <div class="stat bad"><div class="k">duration</div><div class="v">47 <small>min</small></div></div>
+  <div class="stat warn"><div class="k">customer impact</div><div class="v">~12k <small>failed checkouts</small></div></div>
+  <div class="stat bad"><div class="k">revenue impact</div><div class="v">$184k <small>est.</small></div></div>
+  <div class="stat ok"><div class="k">detection</div><div class="v">11 <small>min (SLO burn)</small></div></div>
+</section>
+
+<section class="section">
+  <h2>What happened</h2>
+  <p>At 14:03 UTC, an engineer pushed a config change to the feature-flag service intending to enable a new A/B test. The change accidentally toggled the <code>checkout.pool.enabled</code> flag from <code>true</code> to <code>"true"</code>. Our flag library treats string values as truthy on read but as <em>missing</em> on bootstrap, which silently fell back to the default — <code>false</code>.</p>
+  <p>Checkout pods rolled their connections every 90 seconds. Within ~12 minutes, all instances were holding zero pooled connections. Each request opened a fresh TCP+TLS handshake to Postgres. Throughput collapsed; the cluster started returning 500s as request queues overflowed.</p>
+
+  <div class="callout">
+    <b>tl;dr</b>
+    A type-coercion quirk in our flag library let a string masquerade as a missing value during bootstrap. The default for the missing case was the unsafe one. Both bugs needed to align — and they did.
+  </div>
+
+  <h2>Status</h2>
+  <p>Resolved at 14:50 UTC by reverting the flag. Three follow-up action items are P0 and tracked on the next page. The flag library has been patched to treat string &ldquo;true&rdquo; / &ldquo;false&rdquo; as their boolean counterparts at every read site.</p>
+</section>
+
+<nav class="pagenav">
+  <a class="prev disabled"><div class="dir">← prev</div><div class="ttl">—</div></a>
+  <a class="next" href="01-timeline.html"><div class="dir">next →</div><div class="ttl">02 · Timeline</div></a>
+</nav>
+
+<script>
+  try { window.parent.postMessage({ type: 'pm:page', page: 0, of: 4, file: '00-summary.html' }, '*'); } catch(_) {}
+</script>
+</body></html>

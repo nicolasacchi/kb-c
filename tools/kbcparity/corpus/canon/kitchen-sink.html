@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Everything HTML Can Do, in One Page</title>
+<style>
+  :root {
+    --bg: #fbf9f4; --panel: #f3eee2; --border: #e8e0d0; --text: #2a2620;
+    --muted: #8a7f70; --accent: oklch(0.6 0.15 145);
+    --serif: 'Lora', Georgia, serif;
+    --sans: 'Geist', -apple-system, sans-serif;
+    --mono: 'Geist Mono', ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--serif); line-height: 1.65; }
+  body { padding: 64px 24px 120px; }
+  .wrap { max-width: 720px; margin: 0 auto; }
+  .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--accent); margin-bottom: 18px; }
+  h1.title { font-family: var(--serif); font-size: 48px; line-height: 1.05; letter-spacing: -0.022em; margin: 0 0 18px; font-weight: 600; }
+  .lede { font-size: 19px; color: var(--muted); margin: 0 0 40px; }
+  h2 { font-family: var(--serif); font-size: 28px; margin: 56px 0 12px; font-weight: 600; letter-spacing: -0.012em; }
+  h3 { font-size: 18px; margin: 28px 0 10px; font-weight: 600; font-family: var(--sans); }
+  p { font-size: 17px; margin: 0 0 18px; }
+  pre { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; font-family: var(--mono); font-size: 13.5px; line-height: 1.55; }
+  code { font-family: var(--mono); font-size: 0.92em; background: var(--panel); padding: 1px 5px; border-radius: 3px; }
+  pre code { background: none; padding: 0; }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 56px 0; }
+
+  details { border: 1px solid var(--border); border-radius: 6px; padding: 12px 16px; margin: 8px 0; background: var(--panel); }
+  details[open] { background: var(--bg); }
+  summary { cursor: pointer; font-family: var(--sans); font-weight: 500; font-size: 14px; }
+  summary::marker { color: var(--accent); }
+
+  .copyable { position: relative; }
+  .copy-btn {
+    position: absolute; top: 10px; right: 10px;
+    padding: 4px 10px;
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: var(--mono); font-size: 11px;
+    color: var(--muted); cursor: pointer;
+  }
+  .copy-btn:hover { color: var(--text); border-color: var(--accent); }
+  .copy-btn.copied { color: var(--accent); }
+
+  table { width: 100%; border-collapse: collapse; margin: 18px 0; font-family: var(--sans); font-size: 14px; }
+  thead th { position: sticky; top: 0; background: var(--bg); border-bottom: 2px solid var(--border); padding: 10px 12px; text-align: left; font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); cursor: pointer; user-select: none; }
+  thead th::after { content: '↕'; opacity: 0.3; margin-left: 4px; }
+  thead th.sort-asc::after { content: '↑'; opacity: 1; color: var(--accent); }
+  thead th.sort-desc::after { content: '↓'; opacity: 1; color: var(--accent); }
+  tbody td { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  tbody tr:hover { background: var(--panel); }
+  .num { font-family: var(--mono); text-align: right; }
+
+  .gallery { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 18px 0; }
+  .gallery .tile {
+    aspect-ratio: 1;
+    border-radius: 6px;
+    overflow: hidden;
+    cursor: zoom-in;
+    border: 1px solid var(--border);
+    display: grid; place-items: center;
+    color: rgba(255,255,255,0.85);
+    font-family: var(--mono); font-size: 11px;
+    text-shadow: 0 1px 4px rgba(0,0,0,0.4);
+    letter-spacing: 0.04em;
+  }
+
+  dialog {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    max-width: 480px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+  }
+  dialog::backdrop { background: rgba(0,0,0,0.5); backdrop-filter: blur(4px); }
+  dialog h3 { margin-top: 0; }
+  dialog .close-x { position: absolute; top: 12px; right: 14px; cursor: pointer; color: var(--muted); background: none; border: 0; font-size: 18px; line-height: 1; }
+
+  .controls { display: flex; flex-direction: column; gap: 14px; padding: 18px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+  .ctrl-row { display: grid; grid-template-columns: 120px 1fr auto; align-items: center; gap: 14px; font-family: var(--sans); font-size: 13px; }
+  .ctrl-row label { color: var(--muted); font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .ctrl-row input[type="range"] { accent-color: var(--accent); }
+  .ctrl-row .val { font-family: var(--mono); color: var(--accent); min-width: 40px; text-align: right; }
+  #demo-box {
+    height: 100px; margin-top: 8px; border-radius: 8px;
+    background: linear-gradient(135deg, oklch(0.7 0.13 165), oklch(0.7 0.13 240));
+    transition: filter 0.1s;
+  }
+
+  ul.todo { list-style: none; padding: 0; }
+  ul.todo li {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 6px;
+    background: var(--bg);
+    cursor: grab;
+    font-family: var(--sans); font-size: 14px;
+  }
+  ul.todo li.dragging { opacity: 0.5; cursor: grabbing; }
+  ul.todo li.over { border-color: var(--accent); border-style: dashed; }
+  .grip { color: var(--muted); cursor: grab; }
+
+  .math { font-family: 'Cambria Math', 'STIX Two Math', serif; font-size: 18px; padding: 14px 18px; background: var(--panel); border-radius: 6px; border-left: 3px solid var(--accent); margin: 18px 0; }
+  .math sub, .math sup { font-size: 0.7em; }
+
+  meter { width: 200px; height: 12px; }
+  progress { width: 200px; height: 12px; }
+  meter::-webkit-meter-optimum-value { background: var(--accent); }
+
+  .popover-host { position: relative; display: inline-block; }
+  .popover-host::after { content: 'i'; display: inline-grid; place-items: center; width: 16px; height: 16px; border-radius: 50%; border: 1px solid var(--accent); color: var(--accent); font-family: var(--mono); font-size: 10px; vertical-align: 1px; cursor: help; }
+  .popover-host:hover [popover] { display: block; }
+  [popover] {
+    position: absolute; top: 24px; left: 0;
+    background: var(--text); color: var(--bg);
+    padding: 8px 10px;
+    border-radius: 4px;
+    font-family: var(--sans); font-size: 12px;
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .ranges { display: flex; gap: 6px; margin: 18px 0; flex-wrap: wrap; }
+  .range-pill { padding: 4px 10px; border-radius: 999px; background: var(--panel); border: 1px solid var(--border); font-family: var(--mono); font-size: 11px; cursor: pointer; }
+  .range-pill.is-on { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+
+  .marquee { font-size: 14px; padding: 6px 0; }
+  .marquee mark { background: color-mix(in oklch, var(--accent) 30%, transparent); padding: 2px 4px; border-radius: 3px; }
+
+  blockquote { border-left: 3px solid var(--accent); padding-left: 18px; margin: 24px 0; color: var(--muted); font-style: italic; }
+  abbr { text-decoration: underline dotted; text-underline-offset: 3px; cursor: help; }
+  kbd { font-family: var(--mono); font-size: 12px; padding: 1px 6px; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; background: var(--bg); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="eyebrow">demonstration · the unreasonable effectiveness</div>
+  <h1 class="title">Everything HTML can do, in one page</h1>
+  <p class="lede">A working tour of native browser primitives that, in combination, are most of what you need to ship a useful artifact. No frameworks, no transpilers, no build step.</p>
+
+  <h2>Disclosure</h2>
+  <p>The humble <code>&lt;details&gt;</code> tag, much-maligned, does in twelve characters what an accordion library does in sixty kilobytes.</p>
+  <details>
+    <summary>What is the borrow checker?</summary>
+    <p style="margin-top: 10px">A static analysis pass that enforces three rules at every program point: at most one <code>&amp;mut</code> reference, no aliasing of <code>&amp;mut</code> with <code>&amp;</code>, and all references must be valid for their entire scope.</p>
+  </details>
+  <details>
+    <summary>Why does Pin exist?</summary>
+    <p style="margin-top: 10px">Self-referential structs &mdash; like the state machines async functions compile into &mdash; can&rsquo;t be moved without invalidating the references they hold. <code>Pin</code> is a marker that says &ldquo;don&rsquo;t move me&rdquo;.</p>
+  </details>
+  <details>
+    <summary>What does <code>?</code> actually do?</summary>
+    <p style="margin-top: 10px">It&rsquo;s sugar for: if <code>Ok(x)</code>, evaluate to <code>x</code>; if <code>Err(e)</code>, return <code>Err(e.into())</code> from the enclosing function. The <code>.into()</code> is what makes <code>thiserror</code>&rsquo;s <code>#[from]</code> work.</p>
+  </details>
+
+  <h2>Copyable code</h2>
+  <p>Every code block has a copy button. <kbd>Ctrl</kbd> + <kbd>C</kbd> still works too.</p>
+  <div class="copyable">
+    <button class="copy-btn">copy</button>
+    <pre><code>fn main() {
+    let v = vec![1, 2, 3];
+    let sum: i32 = v.iter().sum();
+    println!("sum = {sum}");
+}</code></pre>
+  </div>
+
+  <h2>Sortable, sticky-header table</h2>
+  <p>Click a column header to sort. Headers stay pinned while you scroll the page.</p>
+  <div style="max-height: 240px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px;">
+    <table id="bench-table">
+      <thead><tr>
+        <th data-sort="str">crate</th>
+        <th data-sort="num">version</th>
+        <th data-sort="num">throughput</th>
+        <th data-sort="num">p99 latency</th>
+      </tr></thead>
+      <tbody>
+        <tr><td>tokio</td><td class="num">1.40</td><td class="num">8,420</td><td class="num">2.1ms</td></tr>
+        <tr><td>async-std</td><td class="num">1.12</td><td class="num">6,180</td><td class="num">3.4ms</td></tr>
+        <tr><td>smol</td><td class="num">2.0</td><td class="num">7,290</td><td class="num">2.8ms</td></tr>
+        <tr><td>glommio</td><td class="num">0.9</td><td class="num">9,910</td><td class="num">1.4ms</td></tr>
+        <tr><td>monoio</td><td class="num">0.2</td><td class="num">10,240</td><td class="num">1.2ms</td></tr>
+        <tr><td>compio</td><td class="num">0.12</td><td class="num">8,900</td><td class="num">1.8ms</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Image gallery with modal zoom</h2>
+  <p>Click any tile.</p>
+  <div class="gallery">
+    <div class="tile" style="background: linear-gradient(135deg, oklch(0.6 0.13 240), oklch(0.7 0.13 165))">stack</div>
+    <div class="tile" style="background: linear-gradient(135deg, oklch(0.65 0.15 30), oklch(0.7 0.13 65))">heap</div>
+    <div class="tile" style="background: linear-gradient(135deg, oklch(0.6 0.13 290), oklch(0.65 0.15 320))">arena</div>
+    <div class="tile" style="background: linear-gradient(135deg, oklch(0.55 0.18 22), oklch(0.7 0.13 50))">linked</div>
+    <div class="tile" style="background: linear-gradient(135deg, oklch(0.55 0.13 200), oklch(0.65 0.13 240))">btree</div>
+    <div class="tile" style="background: linear-gradient(135deg, oklch(0.6 0.15 145), oklch(0.7 0.13 170))">graph</div>
+  </div>
+
+  <h2>Native dialog</h2>
+  <p>One <code>&lt;dialog&gt;</code> tag, one <code>showModal()</code> call. Backdrop, focus trap, esc-to-close: all native.</p>
+  <button id="open-dialog" class="copy-btn" style="position: static; padding: 8px 14px; font-family: var(--sans);">open dialog →</button>
+  <dialog id="d">
+    <button class="close-x" id="close-dialog">&times;</button>
+    <h3>From the docs</h3>
+    <p>The <code>showModal()</code> method displays a modal dialog. Focus is trapped, the backdrop receives <code>::backdrop</code> styling, and pressing <kbd>Esc</kbd> closes it &mdash; for free.</p>
+    <p style="margin: 0; color: var(--muted); font-size: 14px;">No JS framework was harmed in the making of this dialog.</p>
+  </dialog>
+
+  <h2>Live controls</h2>
+  <p>Range inputs wired to a CSS variable. The box updates in real time.</p>
+  <div class="controls">
+    <div class="ctrl-row"><label>hue</label><input type="range" min="0" max="360" value="180" id="hue"/><span class="val" id="hue-v">180</span></div>
+    <div class="ctrl-row"><label>blur</label><input type="range" min="0" max="40" value="0" id="blur"/><span class="val" id="blur-v">0</span></div>
+    <div class="ctrl-row"><label>radius</label><input type="range" min="0" max="50" value="8" id="rad"/><span class="val" id="rad-v">8</span></div>
+    <div id="demo-box"></div>
+  </div>
+
+  <h2>Drag-to-reorder</h2>
+  <p>Pure HTML5 drag-and-drop. Grab a row.</p>
+  <ul class="todo" id="todo">
+    <li draggable="true"><span class="grip">⋮⋮</span> Read the borrow checker chapter</li>
+    <li draggable="true"><span class="grip">⋮⋮</span> Build a mini executor</li>
+    <li draggable="true"><span class="grip">⋮⋮</span> Profile the allocator</li>
+    <li draggable="true"><span class="grip">⋮⋮</span> Write the tests first</li>
+    <li draggable="true"><span class="grip">⋮⋮</span> Ship it</li>
+  </ul>
+
+  <h2>Math, kind of</h2>
+  <p>Without MathML, you still get a long way:</p>
+  <div class="math">T(n) = T(n/2) + O(1) &nbsp; ⟹ &nbsp; T(n) ∈ O(log n)</div>
+  <div class="math">∀ &amp;mut x : ¬∃ &amp;y . y = &amp;x</div>
+
+  <h2>Progress &amp; meters</h2>
+  <p>Indexing: <progress max="100" value="68"></progress> 68/100</p>
+  <p>Disk: <meter min="0" max="100" low="40" high="80" optimum="20" value="62">62%</meter> 62%</p>
+
+  <h2>Popovers &amp; abbreviations</h2>
+  <p>Hover the marker for a tooltip <span class="popover-host"><span popover="manual">popovers are CSS-only since 2024</span></span>. Or hover the abbreviation: <abbr title="Higher-Ranked Trait Bound">HRTB</abbr>.</p>
+
+  <h2>Filter pills</h2>
+  <p>Multi-select, single-state-of-truth. <span class="marquee">Active selection: <mark id="active-pills">none</mark></span></p>
+  <div class="ranges" id="pills">
+    <button class="range-pill" data-v="rust">rust</button>
+    <button class="range-pill" data-v="async">async</button>
+    <button class="range-pill" data-v="memory">memory</button>
+    <button class="range-pill" data-v="perf">perf</button>
+    <button class="range-pill" data-v="systems">systems</button>
+  </div>
+
+  <hr/>
+  <p style="font-family: var(--mono); font-size: 12px; color: var(--muted);">
+    <strong style="color: var(--text)">verdict:</strong> a single HTML file. zero frameworks. eleven interactions. every one of them works without JavaScript &mdash; except the ones that don&rsquo;t, which use a sum total of about 60 lines.
+  </p>
+</div>
+<script>
+  // copy buttons
+  document.querySelectorAll('.copy-btn').forEach(btn => {
+    if (btn.id) return; // dialog open button
+    btn.addEventListener('click', () => {
+      const code = btn.parentElement.querySelector('code').textContent;
+      navigator.clipboard.writeText(code).catch(() => {});
+      btn.textContent = 'copied'; btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 1200);
+    });
+  });
+
+  // table sort
+  const tb = document.getElementById('bench-table');
+  tb.querySelectorAll('th').forEach((th, i) => {
+    th.addEventListener('click', () => {
+      const dir = th.classList.contains('sort-asc') ? 'desc' : 'asc';
+      tb.querySelectorAll('th').forEach(x => x.classList.remove('sort-asc', 'sort-desc'));
+      th.classList.add(dir === 'asc' ? 'sort-asc' : 'sort-desc');
+      const rows = [...tb.querySelector('tbody').rows];
+      const isNum = th.dataset.sort === 'num';
+      rows.sort((a, b) => {
+        const av = a.cells[i].textContent.trim();
+        const bv = b.cells[i].textContent.trim();
+        if (isNum) {
+          const an = parseFloat(av.replace(/[^\d.]/g, ''));
+          const bn = parseFloat(bv.replace(/[^\d.]/g, ''));
+          return dir === 'asc' ? an - bn : bn - an;
+        }
+        return dir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+      });
+      const body = tb.querySelector('tbody');
+      rows.forEach(r => body.appendChild(r));
+    });
+  });
+
+  // dialog
+  const d = document.getElementById('d');
+  document.getElementById('open-dialog').onclick = () => d.showModal();
+  document.getElementById('close-dialog').onclick = () => d.close();
+
+  // gallery zoom — uses dialog
+  const zoomDialog = document.createElement('dialog');
+  zoomDialog.style.cssText = 'padding: 0; border: 0; max-width: 80vw; max-height: 80vh; background: transparent;';
+  document.body.appendChild(zoomDialog);
+  document.querySelectorAll('.gallery .tile').forEach(t => {
+    t.addEventListener('click', () => {
+      zoomDialog.innerHTML = '';
+      const big = t.cloneNode(true);
+      big.style.cssText += 'width: 60vmin; height: 60vmin; font-size: 36px;';
+      zoomDialog.appendChild(big);
+      zoomDialog.showModal();
+    });
+  });
+  zoomDialog.addEventListener('click', () => zoomDialog.close());
+
+  // sliders → CSS
+  const box = document.getElementById('demo-box');
+  function bind(id, prop, suffix, fmt) {
+    const el = document.getElementById(id);
+    const v = document.getElementById(id + '-v');
+    el.addEventListener('input', () => {
+      v.textContent = fmt ? fmt(el.value) : el.value;
+      apply();
+    });
+  }
+  bind('hue'); bind('blur'); bind('rad');
+  function apply() {
+    const h = document.getElementById('hue').value;
+    const b = document.getElementById('blur').value;
+    const r = document.getElementById('rad').value;
+    box.style.background = `linear-gradient(135deg, oklch(0.7 0.15 ${h}), oklch(0.7 0.15 ${(parseInt(h)+60)%360}))`;
+    box.style.filter = `blur(${b}px)`;
+    box.style.borderRadius = r + 'px';
+  }
+
+  // drag to reorder
+  const ul = document.getElementById('todo');
+  let dragEl = null;
+  ul.addEventListener('dragstart', e => {
+    dragEl = e.target.closest('li');
+    dragEl.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+  });
+  ul.addEventListener('dragend', () => { dragEl?.classList.remove('dragging'); dragEl = null; ul.querySelectorAll('.over').forEach(x => x.classList.remove('over')); });
+  ul.addEventListener('dragover', e => {
+    e.preventDefault();
+    const target = e.target.closest('li');
+    if (!target || target === dragEl) return;
+    ul.querySelectorAll('.over').forEach(x => x.classList.remove('over'));
+    target.classList.add('over');
+    const r = target.getBoundingClientRect();
+    const after = e.clientY > r.top + r.height/2;
+    ul.insertBefore(dragEl, after ? target.nextSibling : target);
+  });
+
+  // pills
+  const pillState = new Set();
+  document.querySelectorAll('#pills .range-pill').forEach(p => {
+    p.onclick = () => {
+      const v = p.dataset.v;
+      if (pillState.has(v)) { pillState.delete(v); p.classList.remove('is-on'); }
+      else { pillState.add(v); p.classList.add('is-on'); }
+      const txt = pillState.size ? [...pillState].join(' + ') : 'none';
+      document.getElementById('active-pills').textContent = txt;
+    };
+  });
+</script>
+</body>
+</html>

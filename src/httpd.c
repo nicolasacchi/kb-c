@@ -38,6 +38,7 @@
 #include "kbc/httpd.h"
 #include "kbc/json.h"
 #include "kbc/log.h"
+#include "kbc/html.h"
 #include "kbc/markdown.h"
 #include "kbc/parse.h"
 
@@ -886,12 +887,55 @@ static const char *markdown_title_for(kbc_arena *a, const char *src,
  * A fetch that fails, or a document the renderer will not title, leaves the
  * store's title standing: a list row is a summary of the store's record, and
  * one unreadable document must not empty the page. */
+
+/* The renderer's name for a document it could not name. `kbc_markdown_title`
+ * returns exactly this string, and exactly this string, when the source has
+ * no frontmatter `title:` and no `# ` heading (markdown.c:919). It is
+ * compared rather than assumed, because it is the one place the two title
+ * rules meet: everywhere else a title is a title, and here it is the
+ * difference between naming a document and not naming it. */
+#define KBC_UNTITLED "Untitled"
+
+/* A document's own name when neither the renderer nor the store has one: the
+ * filename stem, which is what the original's indexer falls back to
+ * (indexer.rs:2705, `path.file_stem()`). ARENA. */
+static const char *title_from_stem(kbc_arena *a, const char *path) {
+  const char *base = path != NULL ? strrchr(path, '/') : NULL;
+  base = base != NULL ? base + 1 : path;
+  if (base == NULL) return NULL;
+  const char *dot = strrchr(base, '.');
+  size_t n = (dot != NULL && dot != base) ? (size_t)(dot - base) : strlen(base);
+  if (n == 0 || n > 200) return NULL;
+  char buf[208];
+  memcpy(buf, base, n);
+  buf[n] = '\0';
+  return kbc_arena_strdup(a, buf);
+}
+
+/* One title per document, and never the word "Untitled" where a name was
+ * available: the renderer produced no name at all, so the store's title and
+ * the renderer's agree that this document is unnamed, and the filename stem
+ * is the only name either of them has. The original's indexer falls back the
+ * same way (indexer.rs:2705) and a corpus of hook and skill files — no
+ * frontmatter `title:`, no `# ` heading, all of them named by their filename
+ * — is listed, bookmarked and commented on under that stem rather than under
+ * one indistinguishable row per document. */
+static const char *named_title_for(kbc_arena *a, const char *renderer,
+                                   const char *path) {
+  if (renderer == NULL || strcmp(renderer, KBC_UNTITLED) != 0) {
+    return renderer;
+  }
+  const char *stem = title_from_stem(a, path);
+  return stem != NULL ? stem : renderer;
+}
 static const char *artifact_title_for(kbc_app *app, kbc_arena *a,
                                       const kbc_artifact *art) {
   const char *stored = art->title != NULL ? art->title : "";
   if (art->path == NULL || !is_markdown(art->path)) return stored;
   if (art->source != NULL) {
-    return markdown_title_for(a, art->source, strlen(art->source), stored);
+    return named_title_for(a, markdown_title_for(a, art->source,
+                                                 strlen(art->source), stored),
+                           art->path);
   }
   kbc_arena *scratch = kbc_arena_new(4096);
   if (scratch == NULL) return stored;
@@ -903,7 +947,9 @@ static const char *artifact_title_for(kbc_app *app, kbc_arena *a,
   if (!kbc_failed(kbc_app_get_artifact(app, scratch, art->id, true, &full,
                                        &local)) &&
       full.source != NULL) {
-    t = markdown_title_for(a, full.source, strlen(full.source), stored);
+    t = named_title_for(a, markdown_title_for(a, full.source,
+                                               strlen(full.source), stored),
+                        art->path);
   }
   kbc_arena_free(scratch);
   return t;
@@ -2292,9 +2338,14 @@ static bool path_within(const char *root, const char *path);
  * for both or a legal 50-file request with a title would be refused as a
  * buffer overflow. */
 #define CAPTURE_MAX_PARTS (CAPTURE_MAX_FILES + 6u)
-/* The indexable Markdown spellings (app.c's is_indexable, minus the HTML
- * ones — see below). */
-static const char *const kCaptureExts[] = {"md", "markdown"};
+/* The indexable spellings, and this is now the FULL set: app.c's
+ * is_indexable accepts `.md`, `.markdown`, `.html` and `.htm`, and the two
+ * HTML ones are here because there is a sanitiser to run them through
+ * (kbc_html_sanitize, in app.c's capture path) rather than because a 415
+ * would protect anything. It never did: the corpus is how HTML arrives
+ * anyway, by `kb add`, `git checkout` or a sync, and a gate that only covers
+ * the upload path covers the upload path and nothing else. */
+static const char *const kCaptureExts[] = {"md", "markdown", "html", "htm"};
 
 /* capture.rs:129-137, from_default. The `X-Requested-By` header is how kb-cli
  * and the SPA name themselves; the `kb-` prefix is stripped so the stamped
@@ -2390,18 +2441,20 @@ static const char *capture_ext_of(const char *filename) {
   return NULL;
 }
 
-/* The extension gate, and the ONE place this port's capture is narrower than
- * the original's. The original resolves every file against the corpus's
+/* The extension gate. The original resolves every file against the corpus's
  * extension map and 415s an unmapped one (capture.rs:340-352) so a capture
  * can never write a file the indexer would then refuse to pick up. kb-c's
- * indexer reads .html too, so a literal transcription would accept one — and
- * then write it UNSTAMPED, because the capture engine here is Markdown-only:
- * it prepends a front matter block, and front matter in an HTML file is a
- * comment-shaped lie. The original avoids this by having a real HTML pipeline
- * with a real sanitiser; kb-c has neither (PORT_PLAN.md §1 lists ammonia as a
- * known gap, and app.c refuses the HTML pipeline outright for the same
- * reason). So the gate is the Markdown pair, and a non-Markdown upload is a
- * 415 that says why rather than a file that will not index.
+ * indexer reads .html too, so the gate is the same four spellings
+ * `is_indexable` accepts.
+ *
+ * HTML was refused here until the sanitiser existed, and the reason it was
+ * refused is still the reason it is not: an HTML capture cannot be stamped
+ * with a front matter block, because front matter in an HTML file is a
+ * comment-shaped lie. What changed is that there is now a real HTML pipeline
+ * to stamp into — kbc_html_sanitize then a `<meta>` splice into the head
+ * (app.c, stamp_capture_html) — so `.html` and `.htm` are accepted and the
+ * provenance lands where a reader of the file will find it. Sanitise BEFORE
+ * stamping, always; see the comment on stamp_capture_html.
  *
  * Checked for EVERY file BEFORE the first write, so a mixed batch fails
  * whole: capture.rs:309-315 is explicit that only the VALIDATION is
@@ -2742,6 +2795,448 @@ done:
   return st;
 }
 
+/* ------------------------------------------------------------ the registry --
+ *
+ * One array of routes, fixed before the daemon serves anything, that twenty
+ * subsystems can extend without anyone editing this file. A subsystem that
+ * implements a feature calls kbc_httpd_routes_add from its initialiser and is
+ * done: the dispatcher finds its handler, the derived view lists its route,
+ * and the daemon's own switch never learns the route exists.
+ *
+ * WHY THERE IS NO LOCK ON THE READ PATH. The array is written by exactly one
+ * function, kbc_httpd_routes_add, and that function REFUSES to run once the
+ * daemon has started: kbc_httpd_start sets `g_registry_sealed` and
+ * kbc_httpd_stop clears it, and add() returns KBC_ERR_CONFLICT while it is
+ * set. So there is no window in which a request can observe a half-written
+ * table, which is the whole safety argument — the dispatcher reads
+ * g_view/g_view_n with plain loads and takes no lock, and it is correct to.
+ *
+ * What would break it, and must therefore stay forbidden: registering from a
+ * request path (a handler, or a lazy first-call registration), registering
+ * after kbc_httpd_start, or registering from a signal handler. Each of those
+ * puts a write concurrent with the reads above. The seal is what makes them
+ * impossible rather than merely discouraged.
+ *
+ * WHY THE STORAGE IS STATIC AND BOUNDED. KBC_ROUTES is declared
+ * `const kbc_route *const` (httpd.h:127) — a pointer to const rows, itself
+ * const — so it has to be initialised by a LINK-TIME constant and can never be
+ * repointed. A heap array that grows with realloc cannot be aliased by such a
+ * pointer, so the derived view is a static array and the registry is bounded
+ * by KBC_ROUTE_VIEW_CAP rather than grown on demand. The same const-ness is
+ * why KBC_ROUTES_LEN is the BUILT-IN row count and not the live count: a
+ * `const size_t` is fixed at link time too. The live count is what
+ * kbc_httpd_routes() reports, and the two agree on every row they share,
+ * because both are the same storage.
+ *
+ * The handler lives in a parallel array rather than in the row because
+ * kbc_route is the published, frozen shape (httpd.h:79-84) and a function
+ * pointer in it would change an ABI twenty subsystems are about to compile
+ * against. Both arrays are indexed by the same i, and both are written only
+ * by add(). */
+
+#define KBC_ROUTE_SEED_LEN 18u
+#define KBC_ROUTE_VIEW_CAP 128u
+
+/* The daemon's own rows, written down ONCE. A registered route is appended
+ * after them, so the first KBC_ROUTE_SEED_LEN entries of the view are these,
+ * in this order, forever — which is what lets KBC_ROUTES keep pointing at
+ * slot 0 and keep meaning what it meant before the registry existed.
+ *
+ * Two of these rows are ORIGIN-scoped rather than path-scoped, and the path
+ * column says so: a request is routed by its `Host:` before it is routed by
+ * its path (`routes/dispatch.rs:46-50`). They are listed with `needs_auth`
+ * false because the Host is chosen by the client and is therefore not
+ * admission control — the same posture the original takes, where the origin
+ * split sits outside the /api auth layer (`router.rs:1000-1025`). */
+static kbc_route g_view[KBC_ROUTE_VIEW_CAP] = {
+    {"GET", "/api/health", "liveness, version, uptime, indexed doc count",
+     false},
+    {"GET", "/api/identity",
+     "resolved identity and its source; attribution, not authorization", true},
+    {"GET", "/api/kbs", "configured corpora with doc counts, ?kb= filters one",
+     true},
+    {"GET", "/api/stats", "daemon counters as JSON", true},
+    {"GET", "/api/search", "search, ?q=&kb=&kind=&mode=&limit=&offset=", true},
+    {"GET", "/api/artifacts", "list artifacts, ?kb=&kind=&limit=&offset=",
+     true},
+    {"GET", "/api/artifacts/{id}", "one artifact, ?source=1 adds the raw text",
+     true},
+    {"GET", "/api/kb/{kb}/artifact/{id}",
+     "artifact bytes, sandboxed CSP + nosniff, ?download=1 attaches", true},
+    {"GET", "/api/kb/{kb}/notes/{id}/links",
+     "a document's outgoing wikilinks (state resolved|ambiguous|dangling, an "
+     "ambiguous one carries no ids) and its backlinks",
+     true},
+    {"GET", "/api/kb/{kb}/backlinks/{id}",
+     "documents linking to any artifact, notes first then by title; nothing "
+     "linking here is an empty array, not a 404",
+     true},
+    {"GET", "/api/kb/{kb}/wikilinks/suggest",
+     "[[ autocomplete over titles and basenames, ?q= required, ?limit= <= 50",
+     true},
+    {"POST", "/api/kb/{kb}/capture",
+     "multipart upload into the corpus: `files` parts, or a `url`/`text` share "
+     "with none; 201 with the created ids and source-relative paths, at most "
+     "50 files and 10 MiB each, and a `url` is recorded, never fetched",
+     true},
+    {"POST", "/api/reindex", "synchronous full rescan, answers 202", true},
+    {"GET", "/api/events",
+     "server-sent event stream; Last-Event-ID replays, and an unusable cursor "
+     "gets a synthetic `gap` frame instead (a stalled client gets `lag`)",
+     true},
+    {"GET", "/metrics", "Prometheus text exposition 0.0.4, no-store", true},
+    {"GET", "/", "plain-text API banner (no reader UI in this port)", false},
+    {"GET", "*", "parent-origin static files from KB_SPA_DIST, else 404",
+     false},
+    {"GET", "<id>.artifacts.localhost/*",
+     "artifact subdomain: one origin per artifact, canonicalised under the "
+     "corpus root",
+     false},
+};
+
+/* NULL for every built-in row: those are served by the switch below, and a
+ * NULL handler is what the dispatcher skips, so the switch keeps serving
+ * everything nobody has claimed. Only a subsystem's row is non-NULL. */
+static kbc_route_handler g_handlers[KBC_ROUTE_VIEW_CAP];
+static size_t g_view_n = KBC_ROUTE_SEED_LEN;
+static pthread_mutex_t g_registry_mu = PTHREAD_MUTEX_INITIALIZER;
+static atomic_bool g_registry_sealed;
+
+/* A template is well formed or it is refused at registration, so a
+ * subsystem cannot ship a route that silently never matches. Rules, taken
+ * from the original's router (matchit 0.8.4, tree.rs:350-400):
+ *   - a segment is EITHER a literal OR a whole `{name}` / `{*name}`;
+ *   - `{name}` is one segment and `{*name}` is the REST, so they are spelled
+ *     differently on purpose: the original writes `/kb/{kb}/docs/by-path/
+ *     {*path}` (router.rs:121) and never gives a bare `{name}` a multi-segment
+ *     meaning. A trailing `{name}` that swallowed `/` would make
+ *     `/api/artifacts/{id}` answer for `/api/artifacts/a/b`, which is a
+ *     different document and a 404 in the original;
+ *   - `{*name}` is only legal as the final segment (matchit returns
+ *     InvalidCatchAll otherwise, tree.rs:373);
+ *   - at most KBC_ROUTE_MAX_PARAMS parameters. The bound is enforced HERE,
+ *     at registration, and not at match time, because the alternative is the
+ *     one failure mode a routing layer must never have: a caller that shipped
+ *     nine params, got five, and read a wrong value as a right one. A
+ *     truncated match is a silent wrong answer; a refused registration is a
+ *     startup error naming the route. */
+static bool tmpl_well_formed(const char *t, size_t *n_params) {
+  if (t == NULL || t[0] != '/') return false;
+  size_t params = 0;
+  if (t[1] == '\0') {
+    *n_params = 0;
+    return true; /* "/" */
+  }
+  const char *s = t + 1;
+  for (;;) {
+    /* s is at the start of a segment. The three ways to leave the loop are the
+     * three ways a template can end, and they are checked where the segment
+     * that ends it is — a template that ENDS in `{name}` is well formed, which
+     * is the commonest shape there is, and only a literal '/' after it would
+     * be the trailing-slash error. */
+    if (*s == '{') {
+      const char *close = strchr(s, '}');
+      if (close == NULL || close == s + 1) return false; /* unclosed, or {} */
+      /* Counted here rather than at match time: see the note on
+       * KBC_ROUTE_MAX_PARAMS above. A catch-all counts like any other. */
+      if (++params > KBC_ROUTE_MAX_PARAMS) {
+        *n_params = params;
+        return false;
+      }
+      if (s[1] == '*') { /* catch-all ends the template */
+        *n_params = params;
+        return close[1] == '\0';
+      }
+      const char *inner_open = strchr(s + 1, '{');
+      if (inner_open != NULL && inner_open < close) return false; /* nested */
+      s = close + 1;
+      if (*s == '\0') { /* the template ends on this param */
+        *n_params = params;
+        return true;
+      }
+      if (*s != '/') return false; /* a param is a WHOLE segment */
+      s++;
+      continue;
+    }
+    if (*s == '}') return false; /* unmatched close */
+    if (*s == '\0' || *s == '/') return false; /* trailing slash / empty seg */
+    const char *slash = strchr(s, '/');
+    if (slash == NULL) {
+      *n_params = params;
+      return true; /* a final literal segment */
+    }
+    s = slash + 1;
+  }
+}
+
+/* Where a match's parameter values live.
+ *
+ * The values are COPIED out of the path rather than pointed at in place, and
+ * the reason is the header's promise that each value is NUL-terminated: an
+ * interior segment is not. In `/api/kb/notes/thing/abc` the bytes of `notes`
+ * are followed by '/', not by a NUL, so a pointer into the path would hand a
+ * handler a `const char *` that runs on into the next segment. A catch-all is
+ * always last and so is already terminated by the path itself, but it is
+ * copied too, so that every value has one lifetime and one owner.
+ *
+ * `scratch` is bounded by KBC_HTTP_MAX_REQUEST_LINE, which is exactly what a
+ * request line can be, so a request that arrived over a socket can never
+ * overflow it. A socketless caller may hand `kbc_httpd_handle` a longer path;
+ * a bind that would not fit fails the match, giving a 404, rather than
+ * truncating a value. That asymmetry is deliberate: a truncated value is a
+ * silently WRONG answer, and a 404 is a safe one. */
+typedef struct {
+  kbc_route_params p;
+  char *scratch;
+  size_t cap;
+  size_t used;
+} route_bind;
+
+static void bind_init(route_bind *b, char *scratch, size_t cap) {
+  memset(&b->p, 0, sizeof b->p);
+  b->scratch = scratch;
+  b->cap = cap;
+  b->used = 0;
+}
+
+/* Records one parameter. BOTH the name and the value are COPIED into the
+ * scratch and NUL-terminated.
+ *
+ * The value needs copying because an interior segment is not terminated in
+ * the path: in `/api/kb/notes/thing/abc` the bytes of `notes` are followed by
+ * '/', so a pointer into the path would run on into the next segment.
+ *
+ * The name needs it for a reason that is easy to miss, and that a test caught:
+ * the name lives inside the TEMPLATE, where it is followed by `}`. Handing a
+ * handler that pointer would make `strcmp(name, "kb")` read "kb}/thing/{id}",
+ * so a borrowed name is a name no handler can usefully compare. Copying both
+ * fields gives every one of them a single owner and a single lifetime.
+ *
+ * A repeated name is NOT deduplicated: `{a}/x/{a}` is two entries, because a
+ * handler that names a parameter twice means it, and collapsing them would
+ * make the count depend on the template's spelling rather than the request. */
+static bool bind_one(route_bind *b, const char *name, size_t nlen,
+                     const char *value, size_t vlen) {
+  if (b->p.n >= KBC_ROUTE_MAX_PARAMS) return false; /* unreachable: capped */
+  if (b->used + nlen + 1 + vlen + 1 > b->cap) return false; /* see above */
+  memcpy(b->scratch + b->used, name, nlen);
+  b->scratch[b->used + nlen] = '\0';
+  const char *name_copy = b->scratch + b->used;
+  b->used += nlen + 1;
+  memcpy(b->scratch + b->used, value, vlen);
+  b->scratch[b->used + vlen] = '\0';
+  b->p.v[b->p.n].name = name_copy;
+  b->p.v[b->p.n].value = b->scratch + b->used;
+  b->p.v[b->p.n].len = vlen;
+  b->p.n++;
+  b->used += vlen + 1;
+  return true;
+}
+
+/* Template against concrete path, binding the parameters it matches.
+ *
+ * Segment-for-segment, and the segment counts must agree:
+ * `/api/kb/{kb}/capture` does not match `/api/kb/notes` and does not match
+ * `/api/kb/notes/capture/x`, because a path one segment short of a template
+ * is not that route (the switch says the same about the id-shaped tails,
+ * httpd.c:2994-3000).
+ *
+ * Case-sensitive on the method and on every literal segment, as the original
+ * is: matchit compares bytes, and so does strcmp here. A `{name}` segment
+ * matches exactly one NON-EMPTY segment (matchit rejects an empty one:
+ * tree.rs:490-511 finds no value and backtracks), and `{*name}` matches a
+ * non-empty remainder that may contain `/`, which is how by-path and the
+ * artifact subtree work.
+ *
+ * `b` is left holding whatever was bound before a FAILED match, which is
+ * harmless because the caller resets it per candidate route and only reads it
+ * after a true return. */
+static bool tmpl_match(const char *t, const char *p, route_bind *b) {
+  if (t[0] != '/' || p[0] != '/') return false;
+  t++;
+  p++;
+  for (;;) {
+    if (*t == '\0') return *p == '\0';
+    if (*p == '\0') return false;
+    if (*t == '{') {
+      const char *close = strchr(t, '}');
+      if (close == NULL) return false;
+      if (t[1] == '*') {
+        if (close[1] != '\0' || *p == '\0') return false;
+        /* The catch-all takes the whole remainder, slashes and all. */
+        return bind_one(b, t + 2, (size_t)(close - t - 2), p, strlen(p));
+      }
+      /* One non-empty segment: it ends at the next '/', or at the end. */
+      const char *pslash = strchr(p, '/');
+      size_t plen = pslash != NULL ? (size_t)(pslash - p) : strlen(p);
+      if (plen == 0) return false;
+      if (!bind_one(b, t + 1, (size_t)(close - t - 1), p, plen)) return false;
+      p = pslash != NULL ? pslash + 1 : p + plen;
+      t = close + 1;
+      if (*t == '/') t++;
+      continue;
+    }
+    /* A literal segment. The two segment ends are independent — the template
+     * can run out first, or the path can — and each case has to be answered
+     * before advancing, because advancing past a NULL strchr result is the
+     * classic `NULL + 1` read. A path that ends inside a longer template is
+     * NOT a prefix match: `/api/registry/seg/kb/thing` is one segment short
+     * of `/api/registry/seg/{kb}/thing/{id}` and names no route. */
+    const char *tslash = strchr(t, '/');
+    size_t tlen = tslash != NULL ? (size_t)(tslash - t) : strlen(t);
+    const char *pslash = strchr(p, '/');
+    size_t plen = pslash != NULL ? (size_t)(pslash - p) : strlen(p);
+    if (tlen != plen) return false;
+    if (tlen != 0 && memcmp(t, p, tlen) != 0) return false;
+    if (tslash == NULL || pslash == NULL) return tslash == pslash;
+    t = tslash + 1;
+    p = pslash + 1;
+  }
+}
+
+/* A registered route's OWN admission, enforced from its `needs_auth` and from
+ * nothing else. It runs BEFORE check_auth, and that placement is the point: a
+ * route that declares needs_auth cannot be served by accident, because the
+ * flag on the matched row is the only thing consulted. Enforcement living
+ * anywhere else — a list beside the switch, a path prefix — is exactly how a
+ * registered route ends up public by omission.
+ *
+ * The ladder is check_auth's, called rather than restated, so a registered
+ * route cannot drift from the daemon's own: both carriers, Authorization
+ * first, and the same 401-for-none / 403-for-wrong split. With no token
+ * configured there is no secret to present, and the daemon's posture is
+ * loopback-only (kbc_config_bind_is_safe refuses a routable bind without one),
+ * so that is what admits. */
+static kbc_status reg_check_auth(const kbc_config *cfg, const kbc_request *req,
+                                 const req_ctx *ctx, kbc_response *out) {
+  if (cfg == NULL || cfg->token == NULL || cfg->token[0] == '\0') {
+    if (addr_is_loopback(req->client_addr)) return KBC_OK;
+    (void)kbc_response_error_json(out, 401, KBC_ERR_INVALID,
+                                  "a token is required: configure one, or "
+                                  "reach the daemon over loopback");
+    return KBC_ERR_INVALID;
+  }
+  presented p = read_presented(req->auth, ctx->x_kb_token);
+  auth_carrier carrier = CARRIER_NONE;
+  if (first_matching_carrier(&p, cfg->token, &carrier)) return KBC_OK;
+  if (!secret_is_set(&p.bearer) && !secret_is_set(&p.x_kb)) {
+    (void)kbc_response_error_json(
+        out, 401, KBC_ERR_INVALID,
+        "a token is required: send it as `Authorization: Bearer <token>` or "
+        "`X-Kb-Token: <token>`");
+    return KBC_ERR_INVALID;
+  }
+  (void)kbc_response_error_json(out, 403, KBC_ERR_INVALID, "invalid token");
+  return KBC_ERR_INVALID;
+}
+
+/* A match is a (method, template) row WITH a handler. A built-in row has a
+ * NULL handler and is therefore never returned here, which is what keeps the
+ * switch serving it: this is the whole of "additive". */
+typedef struct {
+  const kbc_route *route;
+  kbc_route_handler handler;
+  kbc_route_params params; /* the bound values; the storage is the caller's
+                            * scratch, valid for the handler call only */
+} reg_hit;
+
+/* Finds the route for (method, path) and binds its parameters.
+ *
+ * `b` is re-initialised PER CANDIDATE, not once for the whole scan: a route
+ * that matched its first two segments and then failed on the third would
+ * otherwise leave those two values behind for the next candidate to inherit,
+ * and the winning route would be handed parameters that belong to a route
+ * that lost. Only the values of the route that actually wins survive. */
+static bool registry_lookup(const char *m, const char *p, reg_hit *hit,
+                            char *scratch, size_t cap) {
+  route_bind b;
+  for (size_t i = 0; i < g_view_n; i++) {
+    if (g_handlers[i] == NULL) continue;
+    if (strcmp(g_view[i].method, m) != 0) continue;
+    bind_init(&b, scratch, cap);
+    if (!tmpl_match(g_view[i].path, p, &b)) continue;
+    hit->route = &g_view[i];
+    hit->handler = g_handlers[i];
+    hit->params = b.p;
+    return true;
+  }
+  return false;
+}
+
+kbc_status kbc_httpd_routes_add(const kbc_route_entry *routes, size_t n,
+                                kbc_err *err) {
+  if (n > 0 && routes == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "kbc_httpd_routes_add: routes");
+  /* Validate everything before taking the lock or writing anything, so a
+   * rejected batch leaves the table exactly as it was. */
+  for (size_t i = 0; i < n; i++) {
+    const kbc_route_entry *e = &routes[i];
+    if (e->method == NULL || e->method[0] == '\0')
+      return kbc_err_set(err, KBC_ERR_INVALID, "route %zu: no method", i);
+    if (e->summary == NULL)
+      return kbc_err_set(err, KBC_ERR_INVALID, "route %zu: no summary", i);
+    size_t n_params = 0;
+    if (!tmpl_well_formed(e->path, &n_params)) {
+      /* Too many parameters is its OWN message, and it is checked before the
+       * generic one, because "not a valid path template" would send someone
+       * looking for a syntax error in a template that is perfectly well
+       * formed. The cap is the reason this is refused at all rather than
+       * truncated at match time. */
+      if (n_params > KBC_ROUTE_MAX_PARAMS)
+        return kbc_err_set(err, KBC_ERR_INVALID,
+                           "route %zu: %s has %zu parameters, over the "
+                           "KBC_ROUTE_MAX_PARAMS limit of %d",
+                           i, e->path != NULL ? e->path : "(null)", n_params,
+                           KBC_ROUTE_MAX_PARAMS);
+      return kbc_err_set(err, KBC_ERR_INVALID,
+                         "route %zu: %s is not a valid path template", i,
+                         e->path != NULL ? e->path : "(null)");
+    }
+  }
+  pthread_mutex_lock(&g_registry_mu);
+  if (g_registry_sealed) {
+    pthread_mutex_unlock(&g_registry_mu);
+    return kbc_err_set(err, KBC_ERR_CONFLICT,
+                       "kbc_httpd_routes_add: the daemon is serving; the route "
+                       "table is fixed once start-up is over");
+  }
+  for (size_t i = 0; i < n; i++) {
+    /* A duplicate is refused rather than resolved by array order: two
+     * handlers claiming one route is a bug, and "whichever registered first"
+     * is not an answer. The built-in rows are IN this space, so a subsystem
+     * cannot quietly take over a route the switch still serves. */
+    for (size_t j = 0; j < g_view_n; j++) {
+      if (strcmp(g_view[j].method, routes[i].method) == 0 &&
+          strcmp(g_view[j].path, routes[i].path) == 0) {
+        pthread_mutex_unlock(&g_registry_mu);
+        return kbc_err_set(err, KBC_ERR_INVALID,
+                           "route %zu: %s %s is already registered", i,
+                           routes[i].method, routes[i].path);
+      }
+    }
+    if (g_view_n >= KBC_ROUTE_VIEW_CAP) {
+      pthread_mutex_unlock(&g_registry_mu);
+      return kbc_err_set(err, KBC_ERR_NOMEM,
+                         "kbc_httpd_routes_add: the route table is full (%u "
+                         "rows); raise KBC_ROUTE_VIEW_CAP",
+                         KBC_ROUTE_VIEW_CAP);
+    }
+    g_view[g_view_n].method = routes[i].method;
+    g_view[g_view_n].path = routes[i].path;
+    g_view[g_view_n].summary = routes[i].summary;
+    g_view[g_view_n].needs_auth = routes[i].needs_auth;
+    g_handlers[g_view_n] = routes[i].handler;
+    g_view_n++;
+  }
+  pthread_mutex_unlock(&g_registry_mu);
+  return KBC_OK;
+}
+
+const kbc_route *kbc_httpd_routes(size_t *n_out) {
+  if (n_out != NULL) *n_out = g_view_n;
+  return g_view;
+}
+
 static kbc_status dispatch(kbc_app *app, const kbc_config *cfg,
                            const kbc_request *req, const req_ctx *ctx,
                            kbc_response *out, kbc_err *err, int64_t uptime_s) {
@@ -2756,6 +3251,46 @@ static kbc_status dispatch(kbc_app *app, const kbc_config *cfg,
   kbc_str_init(&local_hdrs);
   kbc_str *hdrs = &local_hdrs;
   kbc_status result = KBC_OK;
+  /* THE REGISTRY, consulted before the switch. A registered handler WINS; the
+   * switch keeps serving everything nobody has claimed, which is what makes
+   * registration additive — no route has to move out of the switch to be
+   * implemented, and a subsystem that ships a handler never touches this
+   * file again.
+   *
+   * It sits AFTER the two unauthenticated routes and BEFORE check_auth,
+   * because a registered route brings its own admission: reg_check_auth
+   * decides from the matched row's `needs_auth` and nothing else. Running the
+   * daemon's global ladder first would have applied the /api rule to routes
+   * the daemon knows nothing about, and would have left `needs_auth: false`
+   * unable to say anything at all.
+   *
+   * `ctx->unmatched` is deliberately NOT set: a registered route that
+   * matched is not a candidate for the origin fallback, however it answered. */
+  /* The bound parameter values live in a caller-owned buffer, sized to the
+   * request line because that is the most a path can be over a socket. It is
+   * a plain stack array, so nothing is allocated to pass a request's own
+   * parameters, and it dies with this frame — which is exactly the lifetime
+   * the handler is told its values have. */
+  char param_scratch[KBC_HTTP_MAX_REQUEST_LINE + 1];
+
+  reg_hit hit;
+  if (registry_lookup(m, p, &hit, param_scratch, sizeof param_scratch)) {
+    if (hit.route->needs_auth &&
+        kbc_failed(reg_check_auth(cfg, req, ctx, out))) {
+      goto done;
+    }
+    result = hit.handler(app, req, &hit.params, out, err);
+    /* A handler owns its response: status, content type and body are whatever
+     * it set, and `out` was already initialised for it. A handler that
+     * returns a failure WITHOUT having written a body is a bug in the
+     * handler, and the daemon's own answer for that is the 500 below rather
+     * than a 200 with an empty body. */
+    if (kbc_failed(result) && out->body.len == 0) {
+      kbc_str_clear(&out->body);
+      result = resp_error(out, 500, result, "%s %s: %s", m, p, err_msg(err, result));
+    }
+    goto done;
+  }
 
   if (is_get && strcmp(p, "/") == 0) {
     out->content_type = CT_TEXT;
@@ -4015,6 +4550,38 @@ static bool is_markdown(const char *path) {
   return e != NULL && (str_ieq(e, "md") || str_ieq(e, "markdown"));
 }
 
+static bool is_html_doc(const char *path) {
+  const char *e = path_ext(path);
+  return e != NULL && (str_ieq(e, "html") || str_ieq(e, "htm"));
+}
+
+/* The outbound pass every document leaving the daemon takes, and the ORDER
+ * matters: the prompt-template strip runs FIRST because it selects on
+ * `<template id="kb-prompt">`, an element the sanitiser would unwrap and
+ * thereby destroy the very attribute the selector matches on. Scrubbing
+ * afterwards would find nothing. Then the allowlist filter runs on what is
+ * left.
+ *
+ * `peer`/`xff` are the connection's own view of the client. kb-c's frozen
+ * config has no trusted-proxy list, so the chain is empty and
+ * kbc_html_looks_non_loopback answers "remote" for anything but a loopback
+ * peer — which FAILS CLOSED, and is the right default for a document that is
+ * about to be handed to a browser. */
+static kbc_status outbound_html(kbc_str *out, const char *src, size_t len,
+                                const char *peer, const char *xff,
+                                kbc_err *err) {
+  kbc_str scrubbed;
+  kbc_str_init(&scrubbed);
+  kbc_status st = kbc_html_scrub_outbound(peer, xff, NULL, 0, src, len,
+                                          &scrubbed, err);
+  if (st == KBC_OK) {
+    st = kbc_html_sanitize(scrubbed.ptr != NULL ? scrubbed.ptr : "",
+                           scrubbed.len, out, err);
+  }
+  kbc_str_free(&scrubbed);
+  return st;
+}
+
 /* Renders a `.md` body to a complete page, appended to `out`.
  *
  * `body` (the source) and `out` (the page) are SEPARATE buffers, and must be:
@@ -4499,6 +5066,25 @@ static void serve_artifact_origin(conn *c, const http_req *r) {
     }
     ct = "text/html; charset=utf-8";
     body = page;
+  } else if (strcmp(ct, "text/html; charset=utf-8") == 0) {
+    /* THE SURFACE THAT MATTERS. ADR-009: the artifact subdomain sends
+     * `frame-ancestors` and NO `sandbox`, so a script in a document served
+     * here EXECUTES with the origin's own privileges. There is no header that
+     * fixes that, which is why the bytes are filtered instead. A `.md` is
+     * still rendered rather than filtered, for the reason given at the
+     * parent-origin branch above. */
+    kbc_str clean;
+    kbc_str_init(&clean);
+    st = outbound_html(&clean, body.ptr != NULL ? body.ptr : "", body.len,
+                       c->peer, NULL, &err);
+    kbc_str_free(&body);
+    if (kbc_failed(st)) {
+      kbc_str_free(&clean);
+      kbc_str_free(&hdrs);
+      origin_plain(c, 500, "html sanitize failed");
+      return;
+    }
+    body = clean;
   }
   origin_file(c, ct, &body, html_branch ? &hdrs : NULL);
   kbc_str_free(&hdrs);
@@ -4748,6 +5334,67 @@ static kbc_status route_artifact_bytes(kbc_app *app, kbc_arena *a,
   if (md && !download) {
     st = render_markdown_page(&src, out, err);
     kbc_str_free(&src);
+    if (kbc_failed(st)) return st;
+  } else if (is_html_doc(art.path)) {
+    /* An HTML artifact goes out FILTERED on this origin too, and not only
+     * because the subdomain needs it. The `sandbox` CSP two lines below is a
+     * containment measure, not a sanitiser: it is a header, so it is a
+     * property of this route rather than of the bytes, and a header is exactly
+     * what a document can leave without. A `.md` is deliberately NOT filtered
+     * here — its raw-HTML passthrough is documented in markdown.h and the
+     * sandbox is what contains it — but the allowlist would strip the
+     * renderer's own doctype and stylesheet, so filtering it would break the
+     * page rather than protect it. */
+    /* NULL peer: this handler is reached through the socketless seam as well
+     * as the socket, and a request whose origin cannot be established is
+     * treated as remote — kbc_html_looks_non_loopback fails closed, which is
+     * the property that makes "redact when in doubt" safe. NULL XFF because
+     * kb-c never consults the header at all (P7, addr_is_loopback): a
+     * spoofed X-Forwarded-For must never buy anything, and there is no
+     * trusted-proxy list in the frozen config to walk it against. */
+    kbc_str clean;
+    kbc_str_init(&clean);
+    st = outbound_html(&clean, src.ptr != NULL ? src.ptr : "", src.len, NULL,
+                       NULL, err);
+    kbc_str_free(&src);
+    if (kbc_failed(st)) {
+      kbc_str_free(&clean);
+      return st;
+    }
+    /* The allowlist is ammonia's, and it has no `html`, `head`, `body` or
+     * doctype in it (html.c:395-413), so what comes back is the document's
+     * CONTENT and not a document. Served as that, it is a bare fragment: no
+     * doctype puts the browser in quirks mode, where the box model, table
+     * layout and vertical alignment are all a decade out of date, and no
+     * `<head>` means no `<title>` either, so the tab, the bookmark and the
+     * window history all say "". Neither is a parser difference — it is the
+     * difference between handing a browser a document and handing it some
+     * markup — and it is repaired HERE, in the serve path, because the
+     * allowlist is right: it is a filter, and a filter that grew a doctype
+     * would be a filter that manufactured a token it was asked to remove.
+     *
+     * The envelope is this daemon's, and it is the minimum a page needs: the
+     * charset declaration (the bytes are UTF-8 whatever the source claimed),
+     * and the document's own name as the title, escaped because it is text
+     * and a title element is parsed as markup. */
+    st = kbc_str_puts(out, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+                           "<meta charset=\"utf-8\">\n<title>");
+    if (!kbc_failed(st) && art.title != NULL) {
+      for (const char *t = art.title; *t != '\0' && !kbc_failed(st); t++) {
+        switch (*t) {
+          case '&': st = kbc_str_puts(out, "&amp;"); break;
+          case '<': st = kbc_str_puts(out, "&lt;"); break;
+          case '>': st = kbc_str_puts(out, "&gt;"); break;
+          default: st = kbc_str_putc(out, *t); break;
+        }
+      }
+    }
+    if (!kbc_failed(st)) {
+      st = kbc_str_puts(out, "</title>\n</head>\n<body>\n");
+    }
+    if (!kbc_failed(st)) st = kbc_str_append(out, clean.ptr, clean.len);
+    if (!kbc_failed(st)) st = kbc_str_puts(out, "\n</body>\n</html>\n");
+    kbc_str_free(&clean);
     if (kbc_failed(st)) return st;
   } else {
     /* `?download=1` is a download: the SOURCE, not the page. A caller asking
@@ -6441,6 +7088,12 @@ kbc_httpd *kbc_httpd_start(kbc_app *app, const kbc_config *cfg, kbc_err *err) {
       return NULL;
     }
   }
+  /* SEAL THE ROUTE TABLE. From here the workers exist and can be dispatching,
+   * so kbc_httpd_routes_add must refuse: that refusal is what makes the
+   * dispatcher's lock-free read of g_view correct. Cleared again in
+   * kbc_httpd_stop, so a test that stops its daemon can register again. */
+  atomic_store(&g_registry_sealed, true);
+
 
   h->sub_id = kbc_app_subscribe(app, httpd_on_event, h);
   h->subscribed = true;
@@ -6475,6 +7128,12 @@ void kbc_httpd_stop(kbc_httpd *h) {
   for (int i = 0; i < h->started_threads; i++) {
     (void)pthread_join(h->threads[i], NULL);
   }
+  /* UNSEAL the route table, AFTER the joins above: until the last worker has
+   * been reaped a request can still be reading g_view, so the table stays
+   * sealed across the whole of stop. Once it is clear, registration is safe
+   * again, which is what lets a test stop its daemon and register another
+   * route. */
+  atomic_store(&g_registry_sealed, false);
   if (h->w != NULL) {
     for (int i = 0; i < h->workers; i++) {
       free(h->w[i].sse);
@@ -6522,56 +7181,12 @@ int kbc_httpd_port(const kbc_httpd *h) { return h != NULL ? h->port : 0; }
  * KB_SPA_DIST and KBC_METRICS_DETAILED; see kbc_httpd_start. */
 /* ------------------------------------------------------ (6) route export --
  *
- * Two of these rows are ORIGIN-scoped rather than path-scoped, and the path
- * column says so: a request is routed by its `Host:` before it is routed by
- * its path (`routes/dispatch.rs:46-50`). They are listed with `needs_auth`
- * false because the Host is chosen by the client and is therefore not
- * admission control — the same posture the original takes, where the origin
- * split sits outside the /api auth layer (`router.rs:1000-1025`). */
-
-const kbc_route KBC_ROUTES[] = {
-    {"GET", "/api/health", "liveness, version, uptime, indexed doc count",
-     false},
-    {"GET", "/api/identity",
-     "resolved identity and its source; attribution, not authorization", true},
-    {"GET", "/api/kbs", "configured corpora with doc counts, ?kb= filters one",
-     true},
-    {"GET", "/api/stats", "daemon counters as JSON", true},
-    {"GET", "/api/search", "search, ?q=&kb=&kind=&mode=&limit=&offset=", true},
-    {"GET", "/api/artifacts", "list artifacts, ?kb=&kind=&limit=&offset=",
-     true},
-    {"GET", "/api/artifacts/{id}", "one artifact, ?source=1 adds the raw text",
-     true},
-    {"GET", "/api/kb/{kb}/artifact/{id}",
-     "artifact bytes, sandboxed CSP + nosniff, ?download=1 attaches", true},
-    {"GET", "/api/kb/{kb}/notes/{id}/links",
-     "a document's outgoing wikilinks (state resolved|ambiguous|dangling, an "
-     "ambiguous one carries no ids) and its backlinks",
-     true},
-    {"GET", "/api/kb/{kb}/backlinks/{id}",
-     "documents linking to any artifact, notes first then by title; nothing "
-     "linking here is an empty array, not a 404",
-     true},
-    {"GET", "/api/kb/{kb}/wikilinks/suggest",
-     "[[ autocomplete over titles and basenames, ?q= required, ?limit= <= 50",
-     true},
-    {"POST", "/api/kb/{kb}/capture",
-     "multipart upload into the corpus: `files` parts, or a `url`/`text` share "
-     "with none; 201 with the created ids and source-relative paths, at most "
-     "50 files and 10 MiB each, and a `url` is recorded, never fetched",
-     true},
-    {"POST", "/api/reindex", "synchronous full rescan, answers 202", true},
-    {"GET", "/api/events",
-     "server-sent event stream; Last-Event-ID replays, and an unusable cursor "
-     "gets a synthetic `gap` frame instead (a stalled client gets `lag`)",
-     true},
-    {"GET", "/metrics", "Prometheus text exposition 0.0.4, no-store", true},
-    {"GET", "/", "plain-text API banner (no reader UI in this port)", false},
-    {"GET", "*", "parent-origin static files from KB_SPA_DIST, else 404",
-     false},
-    {"GET", "<id>.artifacts.localhost/*",
-     "artifact subdomain: one origin per artifact, canonicalised under the "
-     "corpus root",
-     false},
-};
-const size_t KBC_ROUTES_LEN = sizeof KBC_ROUTES / sizeof KBC_ROUTES[0];
+ * KBC_ROUTES and KBC_ROUTES_LEN are a VIEW over the registry's storage, not
+ * a second copy of it: KBC_ROUTES is g_view[0] and the length is the built-in
+ * row count, which is exactly what both symbols meant before the registry
+ * existed. The live count — built-ins plus everything any subsystem has
+ * registered — is kbc_httpd_routes()'s, and it reads the same array, so the
+ * two cannot disagree about any row they share. See the registry section for
+ * why the length is fixed at link time. */
+const kbc_route *const KBC_ROUTES = g_view;
+const size_t KBC_ROUTES_LEN = KBC_ROUTE_SEED_LEN;

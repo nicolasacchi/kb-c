@@ -25,9 +25,11 @@
 
 #include <sqlite3.h>
 
+#include "kbc/log.h"
 #include "kbc/mem.h"
 #include "kbc/store.h"
 #include "kbc/types.h"
+
 
 /* ------------------------------------------------------------- layout ---- */
 
@@ -38,6 +40,171 @@ struct kbc_store {
    * `const kbc_store *` without casting the const away (-Wcast-qual). */
   atomic_int *version;
 };
+
+/* --------------------------------------------------------- fk checking --- */
+
+/* `PRAGMA foreign_keys` is a CONNECTION setting, not part of a table's
+ * definition, so no CREATE TABLE in the ladder can carry it and none of them
+ * does: a file written by a connection that had it off — an older kb-c, a
+ * `sqlite3` on a command line, a backup restored halfway, any writer that was
+ * not this binary — holds rows the edges were never asked to reject.
+ * `foreign_key_check` is a PRAGMA, so no rung of the ladder runs it either,
+ * and a volume can therefore sit at the CURRENT version holding orphaned rows
+ * and kb-c will call it migrated and current. That state is reachable, and
+ * the store tests plant it on purpose.
+ *
+ * WARN AND CONTINUE. The tempting alternative is to refuse the open, on the
+ * argument this file already makes for a volume ahead of the binary: better
+ * a hard error than a daemon that fails later, on the first query. That
+ * analogy does not survive contact with what an orphan IS, and two things
+ * about this schema decide it.
+ *
+ * 1. THE ORPHANS ARE INERT. Every read of a child row in this file is keyed
+ *    by a doc_id that came out of an artifact that exists: the only two
+ *    statements that touch `chunks` or `comments` for a caller are the count
+ *    and the fetch inside kbc_store_list_chunks and kbc_store_list_comments,
+ *    and both bind ?1 to a doc_id the caller already resolved. A chunk row
+ *    whose parent was deleted with the pragma off is unreachable, not wrong:
+ *    it is invisible to search and to every listing, and it costs bytes and a
+ *    little space. The one read that does NOT pre-resolve is
+ *    `kbc_store_list_comment_docs`, which takes DISTINCT doc_id straight off
+ *    the comments table; httpd.c's anchor pass looks each of those up, gets a
+ *    miss, and drops the anchors — which is exactly what a deleted document
+ *    already does. `list_index_runs(NULL)` can name a corpus that is not in
+ *    `sources`: a real wrong answer, one row in one listing, not a corpus
+ *    answered wrongly.
+ * 2. REFUSING IS UNRECOVERABLE THROUGH kb-c. There is no repair verb, and
+ *    deciding which side of an orphan is wrong is a decision this layer
+ *    cannot make — the parent may be gone for good (drop the child) or merely
+ *    invisible (restore it) — so a refusal is a daemon that will not start
+ *    until the operator leaves the product for `sqlite3` and edits rows by
+ *    hand. kb-c would be trading a listed, invisible defect for an outage, on
+ *    a volume whose search results are correct.
+ *
+ * What this does instead is make the defect impossible to miss and impossible
+ * to misreport: EVERY violating row is logged, one line each, carrying the
+ * child row's own key value. Never a count and never a prefix — a reader that
+ * stops at the first calls a three-edge volume a one-edge one, the operator
+ * fixes that one, and finds the rest next week.
+ *
+ * READ-ONLY BY CONSTRUCTION. The pragma walks the child tables and probes the
+ * parent index; it writes nothing, and nothing below deletes, updates or
+ * repairs. A check that repaired as a side effect would be making the
+ * delete-the-child-or-restore-the-parent decision silently, on every open.
+ */
+
+/* The child column that names a violating row, per child table. Matched
+ * against the table name the pragma reports and never interpolated blindly:
+ * a table with no entry here is reported by rowid alone rather than by a
+ * statement assembled from a name the schema chose. These three are the whole
+ * of the foreign keys the ladder creates (v1's chunks and comments onto
+ * artifacts, v5's index_runs onto sources), so this list and the schema are
+ * two views of the same three edges. */
+static const struct {
+  const char *table;
+  const char *column;
+} FK_CHILD_KEYS[] = {
+    {"chunks", "doc_id"},
+    {"comments", "doc_id"},
+    {"index_runs", "corpus"},
+};
+
+/* The child row's own key value, with the COLUMN it came from, so the log
+ * line can say `doc_id='gone00000001'` rather than a bare rowid the operator
+ * would have to go and look up. False when FK_CHILD_KEYS does not know the
+ * table, or when the lookup found no row (a row deleted between the pragma's
+ * read and this one) — both fall back to naming the rowid alone, which is
+ * still a real identification, just a weaker one. */
+static bool fk_child_key(const kbc_store *s, const char *table,
+                         sqlite3_int64 rowid, const char **col_out,
+                         char *out, size_t cap) {
+  if (table == NULL) return false;
+  for (size_t i = 0; i < sizeof FK_CHILD_KEYS / sizeof FK_CHILD_KEYS[0]; i++) {
+    if (strcmp(table, FK_CHILD_KEYS[i].table) != 0) continue;
+    /* Both identifiers come from FK_CHILD_KEYS, never from the pragma's
+     * output, so this statement cannot carry anything user-supplied. */
+    char sql[128];
+    (void)snprintf(sql, sizeof sql, "SELECT %s FROM %s WHERE rowid = ?1;",
+                   FK_CHILD_KEYS[i].column, FK_CHILD_KEYS[i].table);
+    sqlite3_stmt *k = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &k, NULL) != SQLITE_OK) return false;
+    bool got = false;
+    if (sqlite3_bind_int64(k, 1, rowid) == SQLITE_OK &&
+        sqlite3_step(k) == SQLITE_ROW) {
+      const unsigned char *t = sqlite3_column_text(k, 0);
+      if (t != NULL) {
+        (void)snprintf(out, cap, "%s", (const char *)t);
+        *col_out = FK_CHILD_KEYS[i].column;
+        got = true;
+      }
+    }
+    (void)sqlite3_finalize(k);
+    return got;
+  }
+  return false;
+}
+
+/* Runs the check and reports. Called on EVERY open — see the call site for
+ * why that is not only on a version change — and it returns void by design:
+ * there is no status here that could turn a violation into a failed open,
+ * because the argument above is that a violation is not a reason to fail.
+ * A check that cannot RUN is a different thing entirely and is reported as
+ * such, because "unchecked" and "checked and clean" must never read the same.
+ */
+static void report_foreign_key_violations(const kbc_store *s,
+                                         const char *db_path) {
+  sqlite3_stmt *q = NULL;
+  if (sqlite3_prepare_v2(s->db, "PRAGMA foreign_key_check;", -1, &q, NULL) !=
+      SQLITE_OK) {
+    KBC_LOGE("store: foreign_key_check did not run on %s: %s — this volume's "
+             "edges are UNCHECKED, which is not the same as checked and clean",
+             db_path, sqlite3_errmsg(s->db));
+    return;
+  }
+
+  size_t n = 0;
+  for (;;) {
+    int step = sqlite3_step(q);
+    if (step == SQLITE_DONE) break;
+    if (step != SQLITE_ROW) {
+      /* Stop counting here rather than reporting a total that is a lie: the
+       * rows already logged are real, the number is not. */
+      KBC_LOGE("store: foreign_key_check stopped after %zu of an unknown "
+               "number of rows on %s: %s",
+               n, db_path, sqlite3_errmsg(s->db));
+      (void)sqlite3_finalize(q);
+      return;
+    }
+
+    const char *table = (const char *)sqlite3_column_text(q, 0);
+    sqlite3_int64 rowid = sqlite3_column_int64(q, 1);
+    const char *parent = (const char *)sqlite3_column_text(q, 2);
+    int fkid = sqlite3_column_int(q, 3);
+
+    char key[256];
+    const char *col = NULL;
+    if (fk_child_key(s, table, rowid, &col, key, sizeof key)) {
+      KBC_LOGE("store: foreign key violation: %s rowid %lld -> %s#%d: "
+               "%s='%s' names a row that is not there",
+               table ? table : "?", (long long)rowid, parent ? parent : "?",
+               fkid, col, key);
+    } else {
+      KBC_LOGE("store: foreign key violation: %s rowid %lld -> %s#%d",
+               table ? table : "?", (long long)rowid, parent ? parent : "?",
+               fkid);
+    }
+    n++;
+  }
+  (void)sqlite3_finalize(q);
+
+  if (n > 0) {
+    KBC_LOGW("store: %zu foreign key violation(s) in %s. Every one is listed "
+             "above. Nothing was repaired and nothing was written: kb-c will "
+             "not decide for you whether the child row or the missing parent "
+             "is the wrong one.",
+             n, db_path);
+  }
+}
 
 static const char *const SCHEMA_V1 =
     "CREATE TABLE IF NOT EXISTS artifacts ("
@@ -653,6 +820,19 @@ kbc_store *kbc_store_open(const kbc_config *cfg, kbc_err *err) {
     kbc_store_close(s);
     return NULL;
   }
+
+  /* AFTER the ladder, and on EVERY open rather than only on a version change:
+   * a volume does not have to be migrated to become inconsistent. A writer
+   * with `foreign_keys` off can orphan a row at any time, and the version
+   * table says nothing about that — it records what RAN, not what is
+   * consistent. Gating this on `have < BINARY_EPOCH` would check a volume
+   * once, on the open that first migrates it, and never again for the life of
+   * the install, which is the state most opens are.
+   *
+   * On kb-c's own handle, where `foreign_keys` is ON, so the pragma means what
+   * it says. It reports and returns: no status can turn a violation into a
+   * failed open, and nothing here writes or repairs. */
+  report_foreign_key_violations(s, cfg->db_path);
   return s;
 }
 
@@ -1768,6 +1948,75 @@ kbc_status kbc_store_forget_metas(kbc_store *s, const char *corpus,
   kbc_status fin = finalize(err, s, q, st);
   unlock(s);
   return st != KBC_OK ? st : fin;
+}
+
+/* The facets a document declares, as two PARALLEL lists. The pairing is the
+ * whole contract: index i of `keys` is the key of index i of `values`, which
+ * is why the rows are pushed in lockstep and a failed push aborts rather than
+ * continuing — a list that drifted out of step would report a key against
+ * somebody else's value, and a caller cannot detect that from the shape.
+ *
+ * ORDER BY key, then value. The key alone is NOT a total order: `kb-tags` is
+ * one row per value of a multi-valued facet, so a document declaring
+ * `kb-tags="search, index"` has two rows under the same key, and without the
+ * tiebreak their order is whatever the index happened to return. Two daemons
+ * that ingested the same file would then disagree on ORDER while agreeing on
+ * every value — the diff nobody can read.
+ *
+ * A document with no facets is KBC_OK and two empty lists, NOT
+ * KBC_ERR_NOTFOUND. "This document declares no facets" is the answer most
+ * documents give, and returning an error for it would make a caller
+ * distinguish the ordinary case by catching a failure. Nothing here consults
+ * whether the document or the corpus exists either: doc_metas is path-keyed
+ * and carries no foreign key, so a path nobody has ingested reads as zero
+ * rows, which is the same true statement as "this path declares no facets".
+ */
+kbc_status kbc_store_get_metas(kbc_store *s, const char *corpus,
+                               const char *path, kbc_strlist *keys,
+                               kbc_strlist *values, kbc_err *err) {
+  if (s == NULL || keys == NULL || values == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "get_metas: null argument");
+  kbc_status st = require_text(err, "meta corpus", corpus, 255);
+  if (st == KBC_OK)
+    st = require_text(err, "meta path", path, KBC_MAX_PATH_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "SELECT key, value FROM doc_metas"
+               " WHERE corpus = ?1 AND path = ?2"
+               " ORDER BY key ASC, value ASC;",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, corpus);
+  if (st == KBC_OK) st = bind_text(err, s, q, 2, path);
+  for (;;) {
+    const int step = (st == KBC_OK) ? sqlite3_step(q) : SQLITE_DONE;
+    if (step == SQLITE_DONE) break;
+    if (step != SQLITE_ROW) {
+      st = sql_fail(err, s, "get metas: step", step);
+      break;
+    }
+    const char *key = (const char *)sqlite3_column_text(q, 0);
+    const char *value = (const char *)sqlite3_column_text(q, 1);
+    /* Both are NOT NULL in the schema, so a NULL here is a damaged file
+     * rather than a state any writer can produce. Refuse it: pushing a NULL
+     * is rejected downstream, and reporting a key with no value would break
+     * the pairing silently instead of loudly. */
+    if (key == NULL || value == NULL) {
+      st = kbc_err_set(err, KBC_ERR_INTERNAL,
+                       "get metas: null key or value for %s/%s", corpus, path);
+      break;
+    }
+    st = kbc_strlist_push(keys, key);
+    if (st != KBC_OK) break;
+    st = kbc_strlist_push(values, value);
+    if (st != KBC_OK) break;
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  unlock(s);
+  return st;
 }
 
 /* The documents carrying (key, value), as KBC_OWN paths. ONE indexed query,

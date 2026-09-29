@@ -3,8 +3,10 @@
 
 #include "kbc_test.h"
 
+#include <fcntl.h>
 #include <pthread.h>
 #include <sqlite3.h>
+#include <unistd.h>
 
 #include "kbc/store.h"
 #include "kbc/types.h"
@@ -1803,6 +1805,222 @@ KBC_TEST(metas_replace_drops_a_value_the_document_no_longer_declares) {
   kbc_test_rmrf(root);
 }
 
+/* The read side round-trips what the write side stores, as PARALLEL lists,
+ * and the pairing is the assertion. Checking the keys and the values as two
+ * independent sets would pass an implementation that returned the right keys
+ * against the wrong values, which is the only way this function can be wrong
+ * and still look right. */
+KBC_TEST(metas_read_back_the_pairs_replace_wrote) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "m.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  static const char *const keys[] = {"author", "kb-tags"};
+  static const char *const vals[] = {"nik", "search, index"};
+  KBC_CHECK_OK(kbc_store_replace_metas(s, "kb", "a.md", keys, vals, 2, &err));
+
+  kbc_strlist k;
+  kbc_strlist v;
+  kbc_strlist_init(&k);
+  kbc_strlist_init(&v);
+  KBC_CHECK_OK(kbc_store_get_metas(s, "kb", "a.md", &k, &v, &err));
+  KBC_CHECK_MSG(k.len == 2 && v.len == 2,
+                "get_metas returned %zu keys and %zu values; the lists are "
+                "parallel and a difference means a row lost half itself",
+                k.len, v.len);
+  if (k.len == 2 && v.len == 2) {
+    /* SORTED BY KEY, whatever order they were written in: `author` < `kb-tags`
+     * and the input lists them the other way round, so an unordered SELECT
+     * that happened to return insertion order would fail here. */
+    KBC_CHECK_EQ_STR(k.items[0], "author");
+    KBC_CHECK_EQ_STR(v.items[0], "nik");
+    KBC_CHECK_EQ_STR(k.items[1], "kb-tags");
+    KBC_CHECK_EQ_STR(v.items[1], "search, index");
+  }
+  kbc_strlist_free(&k);
+  kbc_strlist_free(&v);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* A multi-valued facet is ONE row per value under the SAME key, so the key
+ * alone is not a total order and the two rows can come back in either order.
+ * They must come back in the same order every time, or two daemons that
+ * ingested the same document disagree on ORDER while agreeing on every value
+ * — a diff nobody can read, and one that makes the parity harness useless for
+ * the thing it was built to check.
+ *
+ * Written in the ALREADY-SORTED order, so a reader that simply echoed what it
+ * was given cannot pass: reversing the input is what forces the reader's
+ * ORDER BY to be the thing under test. */
+KBC_TEST(metas_a_multi_valued_facet_comes_back_in_a_stable_order) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "m.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  /* Reverse-sorted on the way in, so insertion order and the required order
+ * disagree: index, search, then alpha. */
+  static const char *const keys[] = {"kb-tags", "kb-tags", "kb-tags"};
+  static const char *const vals[] = {"search", "index", "alpha"};
+  KBC_CHECK_OK(kbc_store_replace_metas(s, "kb", "a.md", keys, vals, 3, &err));
+
+  static const char *const want[] = {"alpha", "index", "search"};
+  kbc_strlist k;
+  kbc_strlist v;
+  kbc_strlist_init(&k);
+  kbc_strlist_init(&v);
+  KBC_CHECK_OK(kbc_store_get_metas(s, "kb", "a.md", &k, &v, &err));
+  KBC_CHECK_MSG(k.len == 3, "three values of one facet read back as %zu rows",
+                k.len);
+  for (size_t i = 0; i < k.len && i < 3; i++) {
+    KBC_CHECK_MSG(strcmp(k.items[i], "kb-tags") == 0,
+                  "row %zu has key \"%s\"; one facet is one key", i, k.items[i]);
+    KBC_CHECK_MSG(strcmp(v.items[i], want[i]) == 0,
+                  "row %zu is \"%s\", wanted \"%s\" — the values of a "
+                  "multi-valued facet are not in a stable order",
+                  i, v.items[i], want[i]);
+  }
+  kbc_strlist_free(&k);
+  kbc_strlist_free(&v);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* TWO KINDS OF NOTHING, and the difference between them is the contract.
+ *
+ * A document that declares no facets, and a corpus that does not exist, both
+ * read as zero rows — and both must be KBC_OK with two empty lists, because
+ * the overwhelmingly common case for this function is a document with no
+ * facets, and a caller that had to catch an error to distinguish it would
+ * have to treat the ordinary path as exceptional. `docs_with_meta` already
+ * makes the same promise for the same reason ("a filter that matches nothing
+ * must never look like a filter that was ignored"), and this is the read
+ * twin of that.
+ *
+ * A NOT_FOUND here would be actively wrong for the second case: doc_metas is
+ * keyed by path and carries no foreign key, so a path nobody has ingested
+ * genuinely has no facets, and saying "not found" would be a claim about the
+ * document the store cannot support. */
+KBC_TEST(metas_a_document_with_no_facets_is_empty_and_not_an_error) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "m.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_strlist k;
+  kbc_strlist v;
+
+  /* A path that was never ingested, in a corpus that does not exist. */
+  kbc_strlist_init(&k);
+  kbc_strlist_init(&v);
+  KBC_CHECK_OK(kbc_store_get_metas(s, "nosuch", "never.md", &k, &v, &err));
+  /* Success leaves `err` UNTOUCHED, not filled: a caller branching on the
+   * status must not be able to find a stale message from an earlier call and
+   * read it as this one's. The buffer is still whatever the previous call
+   * left, so this asserts nothing was written rather than that it was
+   * cleared — which is the guarantee the store actually makes. */
+  KBC_CHECK_MSG(err.msg[0] == '\0',
+                "a successful get_metas wrote \"%s\" into err", err.msg);
+  KBC_CHECK_EQ_INT((long long)k.len, 0);
+  KBC_CHECK_EQ_INT((long long)v.len, 0);
+  kbc_strlist_free(&k);
+  kbc_strlist_free(&v);
+
+  /* A path that WAS ingested, and declared nothing — the common case, and the
+   * one a NOT_FOUND would turn into an error on every such document. */
+  KBC_CHECK_OK(kbc_store_replace_metas(s, "kb", "plain.md", NULL, NULL, 0, &err));
+  kbc_strlist_init(&k);
+  kbc_strlist_init(&v);
+  KBC_CHECK_OK(kbc_store_get_metas(s, "kb", "plain.md", &k, &v, &err));
+  KBC_CHECK_MSG(err.msg[0] == '\0',
+                "a successful get_metas wrote \"%s\" into err", err.msg);
+  KBC_CHECK_EQ_INT((long long)k.len, 0);
+  KBC_CHECK_EQ_INT((long long)v.len, 0);
+  kbc_strlist_free(&k);
+  kbc_strlist_free(&v);
+
+  /* One path's facets do not leak into another's. `b.md` was never written,
+   * so if `a.md` had leaked into it the lists would be non-empty — and a
+   * query that forgot the path predicate would pass every assertion above. */
+  static const char *const keys[] = {"tags"};
+  static const char *const vals[] = {"rust"};
+  KBC_CHECK_OK(kbc_store_replace_metas(s, "kb", "a.md", keys, vals, 1, &err));
+  kbc_strlist_init(&k);
+  kbc_strlist_init(&v);
+  KBC_CHECK_OK(kbc_store_get_metas(s, "kb", "b.md", &k, &v, &err));
+  KBC_CHECK_EQ_INT((long long)k.len, 0);
+  kbc_strlist_free(&k);
+  kbc_strlist_free(&v);
+
+  /* The same facet key in two corpora stays separate, which is the corpus
+   * half of the same predicate. */
+  KBC_CHECK_OK(kbc_store_replace_metas(s, "other", "a.md", keys, vals, 1, &err));
+  kbc_strlist_init(&k);
+  kbc_strlist_init(&v);
+  KBC_CHECK_OK(kbc_store_get_metas(s, "other", "a.md", &k, &v, &err));
+  KBC_CHECK_MSG(k.len == 1, "the other corpus's facet read back as %zu rows",
+                k.len);
+  kbc_strlist_free(&k);
+  kbc_strlist_free(&v);
+
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* A path validated the same way the writers validate it, so a hostile
+ * argument is rejected at the boundary rather than bound into the query. A
+ * reader that skipped validation would return an empty list for a path no
+ * document can have, which is indistinguishable from "no facets". */
+KBC_TEST(metas_reject_a_path_no_writer_would_have_accepted) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "m.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_strlist k;
+  kbc_strlist v;
+  kbc_strlist_init(&k);
+  kbc_strlist_init(&v);
+  KBC_CHECK_ERR(kbc_store_get_metas(s, "", "a.md", &k, &v, &err),
+                KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(err);
+  kbc_strlist_init(&k);
+  kbc_strlist_init(&v);
+  KBC_CHECK_ERR(kbc_store_get_metas(s, "kb", "", &k, &v, &err),
+                KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(err);
+  /* The lists are untouched by a rejected call, so a caller that ignores the
+ * status and reads the lists anyway gets the previous answer, not a partial
+ * one. */
+  KBC_CHECK_EQ_INT((long long)k.len, 0);
+  kbc_strlist_free(&k);
+  kbc_strlist_free(&v);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
 /* A path is corpus-relative, so the same relative path under two corpora is
  * two documents and a facet filter is scoped to its corpus. */
 KBC_TEST(metas_are_scoped_to_their_corpus) {
@@ -2225,6 +2443,55 @@ static bool column_exists(sqlite3 *h, const char *table, const char *col) {
   return found;
 }
 
+/* Runs `sql` and reports whether SQLite REFUSED it. This is the assertion
+ * that tells a shipped ALTER from a wrong fold, and column_exists cannot:
+ * a fold puts `abandoned_at` in the CREATE that introduces `moves`, so on a
+ * volume that volume already HAS the column and every existence check above
+ * passes — while the real question, "what does the new code do against a
+ * database the OLD code wrote", is never asked. Against a genuine v11 file
+ * the post-migration query must FAIL, and if it does not, the step under
+ * test did not run.
+ *
+ * A non-NULL return is the refusal. sqlite3_prepare_v2 is where "no such
+ * column" surfaces, so stepping is not reached and `q` stays NULL. */
+static bool query_refused(sqlite3 *h, const char *sql) {
+  sqlite3_stmt *q = NULL;
+  int rc = sqlite3_prepare_v2(h, sql, -1, &q, NULL);
+  if (q != NULL) (void)sqlite3_finalize(q);
+  return rc != SQLITE_OK;
+}
+
+/* Every row `PRAGMA foreign_key_check` reports, as "table:rowid->parent#fkid"
+ * strings. The four columns are (table, rowid, parent, fkid) — rowid is the
+ * SECOND and the parent name the THIRD, and reading them the other way round
+ * produces rows that look plausible and name no parent at all, which is the
+ * failure this comment exists to prevent.
+ *
+ * The FULL list, deliberately: `foreign_key_check` returns one row per
+ * offending edge, and a reader that stops at the first reports a database as
+ * having one problem when it has nine — so the operator fixes one, re-runs,
+ * and finds eight more. This helper exists to make truncation impossible to
+ * write: a caller that wants the count gets the count, and a caller that
+ * wants the rows cannot get a prefix without saying so. */
+static size_t foreign_key_violations(sqlite3 *h, char out[][96], size_t cap) {
+  sqlite3_stmt *q = NULL;
+  size_t n = 0;
+  if (sqlite3_prepare_v2(h, "PRAGMA foreign_key_check;", -1, &q, NULL) !=
+      SQLITE_OK)
+    return 0;
+  while (sqlite3_step(q) == SQLITE_ROW && n < cap) {
+    const unsigned char *tbl = sqlite3_column_text(q, 0);
+    sqlite3_int64 rowid = sqlite3_column_int64(q, 1);
+    const unsigned char *par = sqlite3_column_text(q, 2);
+    int fkid = sqlite3_column_int(q, 3);
+    (void)snprintf(out[n], 96, "%s:%lld->%s#%d", tbl ? (const char *)tbl : "?",
+                   (long long)rowid, par ? (const char *)par : "?", fkid);
+    n++;
+  }
+  (void)sqlite3_finalize(q);
+  return n;
+}
+
 /* One INTEGER out of the first row `sql` returns for `arg`, and whether that
  * row exists at all. `*isnull` separates SQL NULL from the value 0, which is
  * the whole distinction every assertion about an unset stamp is making: a
@@ -2494,6 +2761,7 @@ KBC_TEST(a_v11_volume_gains_the_abandon_column_and_keeps_its_stamps) {
   KBC_CHECK_MSG(!column_exists(raw, "moves", "abandoned_at"),
                 "the fixture already has abandoned_at, so the upgrade proves "
                 "nothing");
+
   (void)sqlite3_close(raw);
 
   kbc_err err;
@@ -2529,6 +2797,21 @@ KBC_TEST(a_v11_volume_gains_the_abandon_column_and_keeps_its_stamps) {
   if (raw != NULL) {
     KBC_CHECK_MSG(column_exists(raw, "moves", "abandoned_at"),
                   "the v12 step recorded its version without adding the column");
+    /* THE FOLD DETECTOR, on the UPGRADED volume. The v12 replay query — the
+     * one `kbc_store_list_incomplete_moves` actually runs, `abandoned_at`
+     * included — must now be ACCEPTED. column_exists above can be satisfied by
+     * a fold, because under a fold the column is born in the CREATE that
+     * introduces `moves` and every shape check reads back fine; what a fold
+     * cannot do is fix a volume the OLD binary wrote, since that file already
+     * has its `moves` and no later step will touch it. So the assertion that
+     * separates the two is behavioural, on a file the old code produced. */
+    KBC_CHECK_MSG(!query_refused(raw,
+                                 "SELECT old_id FROM moves"
+                                 " WHERE completed_at IS NULL AND"
+                                 " abandoned_at IS NULL;"),
+                  "the upgraded volume still refuses the v12 replay query, so "
+                  "this step is not an ALTER — check the ladder for a fold "
+                  "into the CREATE that introduces moves");
     bool isnull = false;
     int64_t v = 0;
     KBC_CHECK_MSG(raw_one_i64(raw,
@@ -2693,6 +2976,450 @@ KBC_TEST(moves_declares_the_rust_columns_plus_the_one_kb_c_adds) {
                 "move and a finished one are indistinguishable");
 
   (void)sqlite3_close(raw);
+  kbc_test_rmrf(root);
+}
+
+/* `PRAGMA foreign_keys` is a CONNECTION setting, not part of a table's
+ * definition, so it is not folded into any CREATE and cannot be: a file
+ * written by a connection that had it off, or by a tool that never turns it
+ * on, is a file whose edges were never enforced. `foreign_key_check` is the
+ * only way to find that out, and it is a PRAGMA, so nothing in the ladder
+ * runs it — the schema can be at the current version and still be internally
+ * inconsistent.
+ *
+ * THE PROPERTY UNDER TEST IS THE COUNT, and it is the count because a
+ * reader that stops at the first row is worse than no reader: it reports one
+ * problem, the operator fixes that one, re-runs, and finds the next. So this
+ * plants THREE orphaned edges of two different kinds and asserts three rows
+ * come back — a first-row-only implementation fails here, and a test that
+ * planted one orphan could not tell the two apart.
+ *
+ * The orphans are written with foreign_keys explicitly OFF, which is the
+ * whole point: they are the rows the pragma's absence let in. `comments` and
+ * `chunks` are chosen because both are `ON DELETE CASCADE` from
+ * `artifacts(id)` (v1), so a cascade is what would normally have removed
+ * them, and a delete that ran without the pragma leaves exactly this. */
+KBC_TEST(foreign_key_check_reports_every_orphaned_edge_not_the_first) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_store_close(s);
+
+  sqlite3 *raw = raw_open(root, "kb.db");
+  KBC_CHECK_NOT_NULL(raw);
+  if (raw == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  /* The premise: a database with no violations at all. Without this the
+   * count below could be satisfied by a helper that returns rows from a
+   * healthy file. */
+  char rows[8][96];
+  KBC_CHECK_MSG(foreign_key_violations(raw, rows, 8) == 0,
+                "a freshly migrated store already reports FK violations, so "
+                "the orphans planted below prove nothing");
+
+  /* The pragma is per-connection, and this one is the writer that never
+   * enforced the edges — which is the only way to produce the state the check
+   * exists to find. */
+  raw_exec(raw, "PRAGMA foreign_keys = OFF;");
+  /* Two children of a parent that does not exist, in two different tables,
+   * plus a second chunk — three rows, so "returns the first" and "returns
+   * all" are different answers. */
+  raw_exec(raw,
+           "INSERT INTO chunks(doc_id, ord, text)"
+           " VALUES('gone00000001',0,'a');"
+           "INSERT INTO chunks(doc_id, ord, text)"
+           " VALUES('gone00000001',1,'b');"
+           "INSERT INTO comments(id, doc_id, anchor, author, body,"
+           " created_at, resolved)"
+           " VALUES('k-aaaaaa','gone00000002','#a','me','body','2024',0);");
+  raw_exec(raw, "PRAGMA foreign_keys = ON;");
+
+  size_t n = foreign_key_violations(raw, rows, 8);
+  KBC_CHECK_MSG(n == 3,
+                "foreign_key_check reported %zu offending rows, wanted 3 — a "
+                "reader that stops at the first calls a three-edge database a "
+                "one-edge one",
+                n);
+
+  /* Each violation names the CHILD table it sits in and the parent table the
+   * edge points at, which is the pair an operator needs to find it. A count of
+   * 3 drawn from three rows of ONE table would satisfy the assertion above
+   * and say nothing about where to look, so the split is checked: two from
+   * `chunks`, one from `comments`, every one naming `artifacts` as the parent
+   * it fails to find.
+   *
+   * NOT the missing key value: the pragma reports the child's rowid, not the
+   * absent parent id, so there is nothing in the row to match against a
+   * literal. Asserting one would be asserting a SQLite feature that is not
+   * there. */
+  int seen_chunks = 0;
+  int seen_comments = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (strncmp(rows[i], "chunks:", 7) == 0) seen_chunks++;
+    if (strncmp(rows[i], "comments:", 9) == 0) seen_comments++;
+    KBC_CHECK_MSG(strstr(rows[i], "->artifacts#") != NULL,
+                  "violation %zu (%s) does not name artifacts as the parent "
+                  "it fails to find",
+                  i, rows[i]);
+  }
+  KBC_CHECK_MSG(seen_chunks == 2, "the two orphan chunks read back as %d",
+                seen_chunks);
+  KBC_CHECK_MSG(seen_comments == 1, "the orphan comment read back as %d",
+                seen_comments);
+
+  /* And the same database, repaired, reads clean. A check that always
+   * returned three would pass every assertion above. */
+  raw_exec(raw, "DELETE FROM chunks WHERE doc_id LIKE 'gone%';");
+  raw_exec(raw, "DELETE FROM comments WHERE doc_id LIKE 'gone%';");
+  KBC_CHECK_EQ_INT((long long)foreign_key_violations(raw, rows, 8), 0);
+
+  (void)sqlite3_close(raw);
+  kbc_test_rmrf(root);
+}
+
+/* The FK report leaves the store through the LOGGER, and the logger has no
+ * sink hook — it writes to stderr and the default level (INFO) prints ERROR
+ * unconditionally. So "did the open report this" is only observable by
+ * capturing the descriptor across the open, which is what these two helpers
+ * do. */
+typedef struct {
+  int saved_fd;
+  char path[KBC_TEST_PATH_MAX];
+} stderr_capture;
+
+static void stderr_capture_begin(stderr_capture *c, const char *root) {
+  c->saved_fd = -1;
+  c->path[0] = '\0';
+  size_t rl = strlen(root);
+  if (rl + sizeof "/log.txt" > sizeof c->path) return;
+  memcpy(c->path, root, rl);
+  memcpy(c->path + rl, "/log.txt", sizeof "/log.txt");
+  c->saved_fd = dup(STDERR_FILENO);
+  int fd = open(c->path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0) {
+    if (c->saved_fd >= 0) (void)close(c->saved_fd);
+    c->saved_fd = -1;
+    return;
+  }
+  (void)dup2(fd, STDERR_FILENO);
+  (void)close(fd);
+}
+
+/* Restores stderr and hands back the captured text; the caller frees it. NULL
+ * when the capture never started, which every assertion below treats as a
+ * failure rather than as an empty log. */
+static char *stderr_capture_end(stderr_capture *c) {
+  fflush(stderr);
+  if (c->saved_fd >= 0) {
+    (void)dup2(c->saved_fd, STDERR_FILENO);
+    (void)close(c->saved_fd);
+    c->saved_fd = -1;
+  }
+  char *text = kbc_test_read_file(c->path);
+  kbc_test_rmrf(c->path);
+  return text;
+}
+
+/* How many times `needle` appears. Counting rather than matching is the point:
+ * the property under test is that FOUR rows come back, and `strstr` alone
+ * cannot tell one line from four. */
+static int count_occurrences(const char *hay, const char *needle) {
+  if (hay == NULL || needle == NULL) return 0;
+  size_t len = strlen(needle);
+  int n = 0;
+  for (const char *p = hay; (p = strstr(p, needle)) != NULL; p += len) n++;
+  return n;
+}
+
+/* THE BEHAVIOUR TEST for the guard in kbc_store_open. kb-c WARN AND CONTINUES
+ * on a foreign key violation: the store opens, serves, and reports every
+ * offending row.
+ *
+ * WHY "STILL SERVES" IS THE ASSERTION AND NOT A DETAIL. The alternative the
+ * guard rejected was refusing to open, which would have made this test assert
+ * a NULL store instead. Both are defensible; what is not defensible is a
+ * volume whose search results are correct and whose only defect is a handful
+ * of unreachable rows, taking the whole daemon down with no in-product way
+ * back — kb-c ships no repair verb, and deciding whether the child row or the
+ * missing parent is the wrong one is a decision the store layer must not make
+ * on every open.
+ *
+ * FOUR orphans across THREE tables, planted by a writer with the pragma off,
+ * on a volume that is ALREADY AT THE CURRENT VERSION. The version not moving
+ * is load-bearing, not incidental: it is what makes this an acceptance test
+ * for "runs on EVERY open" rather than for "runs after a migration". A guard
+ * wired into the ladder's migration branch would pass a test that migrated and
+ * fail this one, which is the whole trap.
+ */
+KBC_TEST(an_open_reports_every_orphaned_row_and_still_serves) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_MSG(s != NULL, "first open failed: %s", err.msg);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  int64_t first_version = kbc_store_schema_version(s);
+  kbc_store_close(s);
+
+  sqlite3 *raw = raw_open(root, "kb.db");
+  KBC_CHECK_NOT_NULL(raw);
+  if (raw == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  /* The premise: the open above did not move the version, so the reopen below
+   * takes the ladder's early return and runs no migration at all. */
+  KBC_CHECK_MSG(raw_version(raw) == first_version,
+                "the fixture volume moved from %lld while being created",
+                (long long)first_version);
+
+  /* The pragma is per-connection, and this is the writer that never enforced
+ * the edges — which is the only way to reach the state the guard exists for. */
+  raw_exec(raw, "PRAGMA foreign_keys = OFF;");
+  raw_exec(raw,
+           "INSERT INTO sources(slug, path, added_at, paused)"
+           " VALUES('kb','/corpus',0,0);"
+           /* Two chunks on ONE dangling doc_id: two violating rows that report
+            * the same key value, so an implementation that de-duplicates by
+            * key would show one line where there are two. */
+           "INSERT INTO chunks(doc_id, ord, text)"
+           " VALUES('gone00000001',0,'a');"
+           "INSERT INTO chunks(doc_id, ord, text)"
+           " VALUES('gone00000001',1,'b');"
+           "INSERT INTO comments(id, doc_id, anchor, author, body,"
+           " created_at, resolved)"
+           " VALUES('k-aaaaaa','gone00000002','#a','me','body','2024',0);"
+           /* And one row of the third kind: a child of `sources`, not of
+            * `artifacts`, so a guard that only knows one edge misses it. */
+           "INSERT INTO index_runs(id, corpus, started_at, finished_at,"
+           " ok_count, err_count)"
+           " VALUES('r-ccccc','nosuch',1,2,0,1);");
+  raw_exec(raw, "PRAGMA foreign_keys = ON;");
+  char rows[8][96];
+  KBC_CHECK_MSG(foreign_key_violations(raw, rows, 8) == 4,
+                "the fixture holds %zu violations, wanted 4 — the assertions "
+                "below would be measuring a different fixture",
+                foreign_key_violations(raw, rows, 8));
+  (void)sqlite3_close(raw);
+
+  /* THE OPEN. Captured, because the report is a log and the log is stderr. */
+  stderr_capture cap;
+  stderr_capture_begin(&cap, root);
+  kbc_err_reset(&err);
+  s = open_at(root, "kb.db", &err);
+  char *log = stderr_capture_end(&cap);
+
+  /* (1) Warn and continue: the store is open and usable. */
+  KBC_CHECK_MSG(s != NULL, "the open refused a volume with orphaned rows: %s",
+                err.msg);
+  if (s == NULL) {
+    free(log);
+    kbc_test_rmrf(root);
+    return;
+  }
+  /* (4) It ran on an open where the version did NOT change. */
+  KBC_CHECK_EQ_INT(kbc_store_schema_version(s), (long long)first_version);
+  int64_t n_art = -1;
+  KBC_CHECK_OK(kbc_store_count_artifacts(s, NULL, &n_art, &err));
+  KBC_CHECK_EQ_INT(n_art, 0);
+
+  /* (2) THE FULL ROW LIST CAME BACK — not a count, not a first row. The
+   * per-row lines are the ones ending in a colon; the summary line names the
+   * total and does not, so counting the colon form counts ROWS. */
+  KBC_CHECK_MSG(log != NULL, "stderr was not captured, so nothing was "
+                "observed about what the open reported");
+  KBC_CHECK_MSG(count_occurrences(log, "foreign key violation:") == 4,
+                "the open reported %d violating rows, wanted all 4 — a reader "
+                "that stops at the first calls a four-edge volume a one-edge "
+                "one. Captured log:\n%s",
+                count_occurrences(log, "foreign key violation:"),
+                log != NULL ? log : "(none)");
+
+  /* Each line names the offending row's OWN KEY, not a rowid the operator
+   * would have to go and look up — and the two chunks share a key, so the
+   * count of that key in the log is two, which is the assertion a
+   * de-duplicating or single-line reporter fails. */
+  KBC_CHECK_MSG(count_occurrences(log, "doc_id='gone00000001'") == 2,
+                "the two chunk rows on gone00000001 produced %d lines, wanted "
+                "2. Captured log:\n%s",
+                count_occurrences(log, "doc_id='gone00000001'"),
+                log != NULL ? log : "(none)");
+  KBC_CHECK_MSG(count_occurrences(log, "doc_id='gone00000002'") == 1,
+                "the comment row on gone00000002 produced %d lines, wanted 1",
+                count_occurrences(log, "doc_id='gone00000002'"));
+  /* The `sources` edge, which has no artifact to name: the corpus IS the key
+   * the row is missing, so it is what the line has to carry. */
+  KBC_CHECK_MSG(count_occurrences(log, "corpus='nosuch'") == 1,
+                "the index_runs row for corpus 'nosuch' produced %d lines, "
+                "wanted 1",
+                count_occurrences(log, "corpus='nosuch'"));
+
+  /* All three child tables named, so a count drawn from three rows of ONE
+   * table cannot satisfy the count above. */
+  KBC_CHECK_MSG(count_occurrences(log, "chunks rowid") == 2,
+                "the log names chunks %d times, wanted 2",
+                count_occurrences(log, "chunks rowid"));
+  KBC_CHECK_MSG(count_occurrences(log, "comments rowid") == 1,
+                "the log names comments %d times, wanted 1",
+                count_occurrences(log, "comments rowid"));
+  KBC_CHECK_MSG(count_occurrences(log, "index_runs rowid") == 1,
+                "the log names index_runs %d times, wanted 1",
+                count_occurrences(log, "index_runs rowid"));
+
+  /* And the total, so an operator reading only the tail still learns the
+ * size of the job. */
+  KBC_CHECK_MSG(strstr(log != NULL ? log : "", "4 foreign key violation(s)") !=
+                    NULL,
+                "the summary line does not carry the count. Captured log:\n%s",
+                log != NULL ? log : "(none)");
+
+  /* (3) NOTHING WAS WRITTEN AND NOTHING WAS REPAIRED. A check that deletes
+   * the orphan as a side effect would be making the delete-the-child-or-
+   * restore-the-parent decision silently, on every open. */
+  raw = raw_open(root, "kb.db");
+  KBC_CHECK_NOT_NULL(raw);
+  if (raw != NULL) {
+    KBC_CHECK_MSG(foreign_key_violations(raw, rows, 8) == 4,
+                  "after the open the volume holds %zu violations, wanted the "
+                  "same 4 — the open repaired, and a check must not repair",
+                  foreign_key_violations(raw, rows, 8));
+    int64_t n_ver = raw_version(raw);
+    KBC_CHECK_MSG(n_ver == first_version,
+                  "the open recorded a new schema version (%lld -> %lld), so "
+                  "it wrote to the volume",
+                  (long long)first_version, (long long)n_ver);
+    (void)sqlite3_close(raw);
+  }
+
+  free(log);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* THE OTHER HALF: a healthy volume must come back CLEAN, and — the part a
+ * report-everything implementation gets wrong by accident — UNCHANGED. The
+ * check runs on every open, so the thing it must never do is touch the file
+ * it is inspecting.
+ *
+ * The volume is made LARGE on purpose, with a recursive CTE rather than 20k
+ * round trips through the public API: `foreign_key_check` is a full walk of
+ * every child table with an index probe per row, so a check that only ever
+ * sees a fixture of two rows has proved nothing about the case it will meet.
+ * Measured separately on a 20,000-document volume (160,000 chunk rows): the
+ * check costs ~100 ms median and IS essentially the whole of open there — see
+ * the report. This test asserts the behaviour at that shape, not a wall-clock
+ * bound, which would be a flaky assertion about the machine rather than about
+ * the code.
+ */
+KBC_TEST(a_healthy_volume_opens_clean_and_unchanged_at_scale) {
+  enum { DOCS = 2000, CHUNKS_PER_DOC = 8, COMMENTS = 500, RUNS = 200 };
+
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+
+  kbc_err_reset(&err);
+  kbc_store *s = open_at(root, "kb.db", &err);
+  KBC_CHECK_MSG(s != NULL, "first open failed: %s", err.msg);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_store_close(s);
+
+  sqlite3 *raw = raw_open(root, "kb.db");
+  KBC_CHECK_NOT_NULL(raw);
+  if (raw == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  /* Every row written here SATISFIES its foreign key: the parents exist, so
+ * the volume the open is about to check is genuinely clean and a green
+ * report means what it says. */
+  char fill[4096];
+  (void)snprintf(fill, sizeof fill,
+                 "PRAGMA foreign_keys = ON;"
+                 "INSERT INTO sources(slug, path, added_at, paused)"
+                 " VALUES('kb','/corpus',0,0);"
+                 "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL"
+                 " SELECT i+1 FROM n WHERE i+1 < %d)"
+                 " INSERT INTO artifacts(id, corpus, path, title, kind,"
+                 " mtime_ns, size_bytes, content_hash, heading_count, summary)"
+                 " SELECT printf('%%012x',i+1),'kb',printf('doc/%%05d.md',i),"
+                 " 'T',0,1,100,i,0,'s' FROM n;"
+                 "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL"
+                 " SELECT i+1 FROM n WHERE i+1 < %d)"
+                 " INSERT INTO chunks(doc_id, ord, text)"
+                 " SELECT printf('%%012x',(i/%d)+1), i%%%d,"
+                 " 'chunk text padding padding padding' FROM n;"
+                 "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL"
+                 " SELECT i+1 FROM n WHERE i+1 < %d)"
+                 " INSERT INTO comments(id, doc_id, anchor, author, body,"
+                 " created_at, resolved)"
+                 " SELECT printf('k%%011x',i+1),printf('%%012x',(i%%%d)+1),"
+                 " '#a','me','b','2024',0 FROM n;"
+                 "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL"
+                 " SELECT i+1 FROM n WHERE i+1 < %d)"
+                 " INSERT INTO index_runs(id, corpus, started_at, finished_at,"
+                 " ok_count, err_count)"
+                 " SELECT printf('r%%011x',i+1),'kb',i,i+1,1,0 FROM n;"
+                 "ANALYZE;",
+                 (int)DOCS, (int)(DOCS * CHUNKS_PER_DOC), (int)CHUNKS_PER_DOC,
+                 (int)CHUNKS_PER_DOC, (int)COMMENTS, (int)DOCS, (int)RUNS);
+  raw_exec(raw, fill);
+  char rows[8][96];
+  KBC_CHECK_MSG(foreign_key_violations(raw, rows, 8) == 0,
+                "the fixture volume is not clean, so a clean report from the "
+                "open below would mean nothing");
+  (void)sqlite3_close(raw);
+
+  stderr_capture cap;
+  stderr_capture_begin(&cap, root);
+  kbc_err_reset(&err);
+  s = open_at(root, "kb.db", &err);
+  char *log = stderr_capture_end(&cap);
+
+  KBC_CHECK_MSG(s != NULL, "a healthy volume failed to open: %s", err.msg);
+  if (s == NULL) {
+    free(log);
+    kbc_test_rmrf(root);
+    return;
+  }
+  KBC_CHECK_MSG(strstr(log != NULL ? log : "", "foreign key") == NULL,
+                "a healthy volume produced FK output. Captured log:\n%s",
+                log != NULL ? log : "(none)");
+
+  int64_t n_art = -1;
+  KBC_CHECK_OK(kbc_store_count_artifacts(s, NULL, &n_art, &err));
+  KBC_CHECK_EQ_INT(n_art, DOCS);
+  free(log);
+  kbc_store_close(s);
+
+  /* UNCHANGED: the same rows, and no new schema version recorded. A guard
+   * that wrote anything — a repair, a touch, a re-record of the version —
+   * would move one of these. */
+  raw = raw_open(root, "kb.db");
+  KBC_CHECK_NOT_NULL(raw);
+  if (raw != NULL) {
+    KBC_CHECK_EQ_INT((long long)foreign_key_violations(raw, rows, 8), 0);
+    KBC_CHECK_EQ_INT((long long)raw_version(raw), CURRENT_SCHEMA);
+    (void)sqlite3_close(raw);
+  }
+
   kbc_test_rmrf(root);
 }
 
@@ -4631,6 +5358,14 @@ static const kbc_test_case cases[] = {
        metas_a_key_nobody_carries_returns_no_rows},
       {"metas_replace_drops_a_value_the_document_no_longer_declares",
        metas_replace_drops_a_value_the_document_no_longer_declares},
+      {"metas_read_back_the_pairs_replace_wrote",
+       metas_read_back_the_pairs_replace_wrote},
+      {"metas_a_multi_valued_facet_comes_back_in_a_stable_order",
+       metas_a_multi_valued_facet_comes_back_in_a_stable_order},
+      {"metas_a_document_with_no_facets_is_empty_and_not_an_error",
+       metas_a_document_with_no_facets_is_empty_and_not_an_error},
+      {"metas_reject_a_path_no_writer_would_have_accepted",
+       metas_reject_a_path_no_writer_would_have_accepted},
       {"metas_are_scoped_to_their_corpus", metas_are_scoped_to_their_corpus},
       {"metas_a_null_value_asks_for_the_key_with_any_value",
        metas_a_null_value_asks_for_the_key_with_any_value},
@@ -4670,6 +5405,12 @@ static const kbc_test_case cases[] = {
        a_v10_volume_gains_moves_and_keeps_every_row_it_had},
       {"moves_declares_the_rust_columns_plus_the_one_kb_c_adds",
        moves_declares_the_rust_columns_plus_the_one_kb_c_adds},
+      {"foreign_key_check_reports_every_orphaned_edge_not_the_first",
+       foreign_key_check_reports_every_orphaned_edge_not_the_first},
+      {"an_open_reports_every_orphaned_row_and_still_serves",
+       an_open_reports_every_orphaned_row_and_still_serves},
+      {"a_healthy_volume_opens_clean_and_unchanged_at_scale",
+       a_healthy_volume_opens_clean_and_unchanged_at_scale},
       {"a_rekey_carries_a_comments_id_created_at_and_resolution",
        a_rekey_carries_a_comments_id_created_at_and_resolution},
       {"a_rekey_moves_the_artifact_row_and_every_table_that_names_it",

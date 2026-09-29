@@ -86,8 +86,32 @@ if(KBC_BUILD_TESTS)
     add_test(NAME ${test_name} COMMAND ${test_name})
     set_tests_properties(${test_name} PROPERTIES TIMEOUT 300)
   endforeach()
+  # kbc_parity.c is deliberately NOT named test_*.c, so the glob above does
+  # not take it. It is not a unit test of kb-c; it is the gate that runs the
+  # cross-implementation diff against the Rust daemon, and it takes minutes
+  # because it starts both daemons and waits for both to finish indexing.
+  # Sweeping it into the fast lane would hide exactly the thing it exists to
+  # surface. The name is the separation.
+  set(KBCPARITY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tools/kbcparity")
+  add_executable(kbc_parity tests/kbc_parity.c)
+  target_link_libraries(kbc_parity PRIVATE kbc_testing)
+  target_compile_definitions(kbc_parity PRIVATE
+    KBCPARITY_DEFAULT_DIR="${KBCPARITY_DIR}")
+  # Exit 77 is the automake skip convention and means the comparison could
+  # not be performed: no Rust binary, no kb-c binary, a daemon that never
+  # came up, a corpus whose SHA256SUMS does not verify. SKIP_RETURN_CODE
+  # makes ctest print "***Skipped" with the harness's own explanation above
+  # it, so a gate that did not run can never be read as one that passed.
+  add_test(NAME kbc_parity COMMAND kbc_parity "${KBCPARITY_DIR}")
+  set_tests_properties(kbc_parity PROPERTIES
+    SKIP_RETURN_CODE 77
+    TIMEOUT 1800
+    # The suite brings up its own daemons on ephemeral loopback ports in its
+    # own sandbox. Without the lock, `ctest -j` starts a second copy
+    # underneath the first and the two daemons race for the corpus.
+    RESOURCE_LOCK kbc_parity)
   list(LENGTH KBC_TEST_SOURCES KBC_TEST_COUNT)
-  message(STATUS "kb-c: ${KBC_SOURCE_COUNT} sources, ${KBC_TEST_COUNT} test binaries")
+  message(STATUS "kb-c: ${KBC_SOURCE_COUNT} sources, ${KBC_TEST_COUNT} test binaries + kbc_parity")
 endif()
 
 install(TARGETS kbc_cli RUNTIME DESTINATION bin)

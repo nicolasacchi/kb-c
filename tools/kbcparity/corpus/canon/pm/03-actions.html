@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<title>INC-0315 · Action Items</title>
+<link rel="stylesheet" href="style.css"/>
+</head><body data-page="3">
+
+<header class="head">
+  <span class="sev">SEV-1</span>
+  <span class="id"><b>INC-0315</b> · checkout-api · 2024-03-15</span>
+  <span class="pg">page <b>4</b> / 4</span>
+</header>
+
+<section class="hero">
+  <p class="eyebrow">Page 04 — Action Items</p>
+  <h1>Five fixes, three priorities</h1>
+  <p class="lede">All P0 items must ship within 14 days. P1 items go to the platform-quality backlog with named owners. P2 items are noted for the next quarterly review.</p>
+</section>
+
+<section class="section">
+  <h2>Action items</h2>
+  <table>
+    <thead><tr><th style="width:60px">pri</th><th>action</th><th style="width:160px">owner</th><th style="width:90px">due</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="pri p0">P0</span></td>
+        <td><span class="dot bad"></span><b>Patch flags-lib bootstrap to coerce string booleans.</b><br/><small style="color:var(--muted)">Land coerce() unification, add bootstrap regression tests, ship to all consumers.</small></td>
+        <td><span class="own">e.tanaka</span></td>
+        <td><span class="own">+3d</span></td>
+      </tr>
+      <tr>
+        <td><span class="pri p0">P0</span></td>
+        <td><span class="dot bad"></span><b>Flip pool.enabled default to true.</b><br/><small style="color:var(--muted)">Audit all *.enabled defaults across the platform; document the &ldquo;safe default&rdquo; rule.</small></td>
+        <td><span class="own">a.singh</span></td>
+        <td><span class="own">+5d</span></td>
+      </tr>
+      <tr>
+        <td><span class="pri p0">P0</span></td>
+        <td><span class="dot bad"></span><b>Add fast-burn alert at 5-minute window.</b><br/><small style="color:var(--muted)">Detect-time was 11min; target is &lt;5min for SEV-1 candidates. Tune alert thresholds.</small></td>
+        <td><span class="own">j.morales</span></td>
+        <td><span class="own">+10d</span></td>
+      </tr>
+      <tr>
+        <td><span class="pri p1">P1</span></td>
+        <td><span class="dot warn"></span>Auto-revert config pushes when SLO burn-rate spikes within 2 minutes of deploy.</td>
+        <td><span class="own">platform-team</span></td>
+        <td><span class="own">+30d</span></td>
+      </tr>
+      <tr>
+        <td><span class="pri p1">P1</span></td>
+        <td><span class="dot warn"></span>Static analysis to flag <code>?? false</code> on bootstrap reads of <code>*.enabled</code> flags.</td>
+        <td><span class="own">k.olson</span></td>
+        <td><span class="own">+30d</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>What went well</h2>
+  <ul style="max-width:640px">
+    <li>SLO burn-rate alert fired correctly &mdash; the alerting infrastructure worked as designed.</li>
+    <li>e.tanaka recalled the morning&rsquo;s push and pulled the diff within a minute of the team focusing on flags. Memory aids beat dashboards.</li>
+    <li>Status page updates were timely &mdash; comms team had no follow-ups.</li>
+  </ul>
+
+  <h2>What didn&rsquo;t</h2>
+  <ul style="max-width:640px">
+    <li>11-minute time-to-detect is unacceptable for SEV-1. We have the data, we don&rsquo;t alert on it fast enough.</li>
+    <li>Two bugs that had coexisted for over a year. The seams between components are under-tested.</li>
+    <li>Initial hypothesis (DB saturation) cost ~10 min &mdash; the inverted graph was the right signal, we just missed it.</li>
+  </ul>
+
+  <div class="callout">
+    <b>retrospective</b>
+    The team rated the post-incident response 4.5/5 and pre-incident defenses 2/5. Both numbers feel right. Ship the P0s and the next one of these will be a near-miss instead of an outage.
+  </div>
+</section>
+
+<nav class="pagenav">
+  <a class="prev" href="02-cause.html"><div class="dir">← prev</div><div class="ttl">03 · Root Cause</div></a>
+  <a class="next disabled"><div class="dir">end →</div><div class="ttl">—</div></a>
+</nav>
+
+<script>
+  try { window.parent.postMessage({ type: 'pm:page', page: 3, of: 4, file: '03-actions.html' }, '*'); } catch(_) {}
+</script>
+</body></html>

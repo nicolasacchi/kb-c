@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Visualizing the Borrow Checker</title>
+<style>
+  :root {
+    --bg: #0d0e12;
+    --panel: #16171d;
+    --border: #25262e;
+    --text: #e8e8ec;
+    --muted: #8a8a93;
+    --accent: oklch(0.74 0.13 290);
+    --owner: oklch(0.78 0.14 165);
+    --borrow-mut: oklch(0.78 0.16 30);
+    --borrow-shared: oklch(0.78 0.13 240);
+    --conflict: oklch(0.7 0.2 25);
+    --font: 'Geist', -apple-system, system-ui, sans-serif;
+    --mono: 'Geist Mono', ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text); font-family: var(--font); overflow: hidden; }
+  body { display: grid; grid-template-rows: 56px 1fr; }
+
+  .top {
+    display: flex; align-items: center; gap: 18px;
+    padding: 0 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .top h1 { font-size: 14px; font-weight: 500; margin: 0; letter-spacing: -0.005em; }
+  .top .sub { font-family: var(--mono); font-size: 11px; color: var(--muted); letter-spacing: 0.04em; text-transform: uppercase; margin-left: auto; }
+  .legend { display: flex; gap: 14px; font-family: var(--mono); font-size: 11px; }
+  .leg { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; }
+
+  .stage {
+    position: relative;
+    overflow: hidden;
+  }
+  .canvas {
+    position: absolute; inset: 0;
+    background:
+      linear-gradient(var(--border) 1px, transparent 1px) 0 0 / 24px 24px,
+      linear-gradient(90deg, var(--border) 1px, transparent 1px) 0 0 / 24px 24px,
+      var(--bg);
+    background-blend-mode: normal;
+    opacity: 1;
+  }
+  .canvas::before { content: ''; position: absolute; inset: 0; background: var(--bg); opacity: 0.85; pointer-events: none; }
+
+  .scope {
+    position: absolute;
+    border: 1.5px solid var(--accent);
+    background: color-mix(in oklch, var(--accent) 10%, transparent);
+    border-radius: 8px;
+    padding: 10px 12px 12px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text);
+    cursor: grab;
+    user-select: none;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.3);
+    min-width: 200px;
+  }
+  .scope:active { cursor: grabbing; }
+  .scope.is-conflict { border-color: var(--conflict); background: color-mix(in oklch, var(--conflict) 14%, transparent); animation: shake 0.3s; }
+  @keyframes shake { 0%,100%{transform:translateX(0)} 25%{transform:translateX(-4px)} 75%{transform:translateX(4px)} }
+  .scope-h {
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-size: 10.5px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.06em;
+    margin-bottom: 6px;
+  }
+  .scope-h .badge {
+    padding: 1px 5px; border-radius: 3px;
+    background: color-mix(in oklch, var(--accent) 18%, var(--bg));
+    color: var(--accent); font-size: 10px;
+  }
+  .scope.kind-owner .scope-h .badge { background: color-mix(in oklch, var(--owner) 18%, var(--bg)); color: var(--owner); }
+  .scope.kind-borrow-mut .scope-h .badge { background: color-mix(in oklch, var(--borrow-mut) 18%, var(--bg)); color: var(--borrow-mut); }
+  .scope.kind-borrow-shared .scope-h .badge { background: color-mix(in oklch, var(--borrow-shared) 18%, var(--bg)); color: var(--borrow-shared); }
+  .scope.kind-owner { border-color: var(--owner); background: color-mix(in oklch, var(--owner) 10%, transparent); }
+  .scope.kind-borrow-mut { border-color: var(--borrow-mut); background: color-mix(in oklch, var(--borrow-mut) 10%, transparent); }
+  .scope.kind-borrow-shared { border-color: var(--borrow-shared); background: color-mix(in oklch, var(--borrow-shared) 10%, transparent); }
+
+  .scope-code {
+    font-family: var(--mono); font-size: 12px; color: var(--text); line-height: 1.45;
+  }
+  .scope-resize {
+    position: absolute; right: 4px; bottom: 4px;
+    width: 12px; height: 12px;
+    background:
+      linear-gradient(135deg, transparent 50%, var(--muted) 50%, var(--muted) 60%, transparent 60%, transparent 75%, var(--muted) 75%, var(--muted) 85%, transparent 85%);
+    cursor: nwse-resize;
+    opacity: 0.6;
+  }
+
+  .check-panel {
+    position: absolute; right: 24px; bottom: 24px; top: 24px;
+    width: 320px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    display: flex; flex-direction: column;
+    gap: 14px;
+    box-shadow: 0 12px 30px rgba(0,0,0,0.4);
+  }
+  .check-h { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0; }
+  .check-status {
+    padding: 12px 14px;
+    border-radius: 6px;
+    font-family: var(--mono); font-size: 12px; line-height: 1.5;
+  }
+  .check-status.ok { background: color-mix(in oklch, var(--owner) 14%, var(--bg)); color: var(--owner); border: 1px solid color-mix(in oklch, var(--owner) 30%, var(--border)); }
+  .check-status.err { background: color-mix(in oklch, var(--conflict) 16%, var(--bg)); color: var(--conflict); border: 1px solid color-mix(in oklch, var(--conflict) 35%, var(--border)); }
+  .check-status .label { font-weight: 600; display: block; margin-bottom: 4px; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .check-rules { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+  .check-rules li {
+    display: grid; grid-template-columns: 14px 1fr; gap: 8px;
+    color: var(--muted);
+  }
+  .check-rules li.hit { color: var(--text); }
+  .check-rules li.fail { color: var(--conflict); }
+  .check-rules li::before {
+    content: ''; width: 14px; height: 14px;
+    border: 1.5px solid var(--muted);
+    border-radius: 50%;
+    align-self: center;
+  }
+  .check-rules li.hit::before { background: var(--owner); border-color: var(--owner); }
+  .check-rules li.fail::before { background: var(--conflict); border-color: var(--conflict); }
+
+  .add-row { display: flex; gap: 6px; margin-top: auto; }
+  .add-btn {
+    flex: 1;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    border-radius: 6px;
+    font-family: var(--mono);
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .add-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+  .arrow-layer { position: absolute; inset: 0; pointer-events: none; }
+</style>
+</head>
+<body>
+<header class="top">
+  <h1>Visualizing the Borrow Checker</h1>
+  <div class="legend">
+    <span class="leg"><span class="swatch" style="background: var(--owner)"></span> owner</span>
+    <span class="leg"><span class="swatch" style="background: var(--borrow-mut)"></span> &amp;mut</span>
+    <span class="leg"><span class="swatch" style="background: var(--borrow-shared)"></span> &amp;</span>
+    <span class="leg"><span class="swatch" style="background: var(--conflict)"></span> conflict</span>
+  </div>
+  <span class="sub">drag scopes · resize to extend lifetime</span>
+</header>
+<main class="stage">
+  <div class="canvas"></div>
+  <svg class="arrow-layer" id="arrows"></svg>
+
+  <div class="scope kind-owner" data-id="own" style="left: 60px; top: 40px; width: 280px; height: 400px;">
+    <div class="scope-h"><span>scope · owner</span><span class="badge">let v</span></div>
+    <div class="scope-code">
+      let mut v = vec![1, 2, 3];<br/>
+      v.push(4);<br/>
+      <span style="color: var(--muted)">// owns until end of scope</span><br/>
+      drop(v);
+    </div>
+    <div class="scope-resize"></div>
+  </div>
+
+  <div class="scope kind-borrow-shared" data-id="b1" style="left: 380px; top: 80px; width: 240px; height: 130px;">
+    <div class="scope-h"><span>borrow · shared</span><span class="badge">&amp;v</span></div>
+    <div class="scope-code">
+      let r1 = &amp;v;<br/>
+      let r2 = &amp;v;<br/>
+      println!("{:?}", r1);
+    </div>
+    <div class="scope-resize"></div>
+  </div>
+
+  <div class="scope kind-borrow-mut" data-id="b2" style="left: 380px; top: 260px; width: 240px; height: 130px;">
+    <div class="scope-h"><span>borrow · mutable</span><span class="badge">&amp;mut v</span></div>
+    <div class="scope-code">
+      let m = &amp;mut v;<br/>
+      m.push(99);<br/>
+      <span style="color: var(--muted)">// exclusive access</span>
+    </div>
+    <div class="scope-resize"></div>
+  </div>
+
+  <aside class="check-panel">
+    <h2 class="check-h">borrow checker · live</h2>
+    <div class="check-status ok" id="status">
+      <span class="label">verdict</span>
+      <span id="verdict-text">no conflicts. compiles.</span>
+    </div>
+    <div>
+      <h2 class="check-h" style="margin-bottom: 8px">rules</h2>
+      <ul class="check-rules" id="rules">
+        <li class="hit">at most one &amp;mut at a time</li>
+        <li class="hit">&amp; and &amp;mut don't overlap</li>
+        <li class="hit">borrows ⊆ owner's lifetime</li>
+        <li>NLL: borrows end at last use</li>
+      </ul>
+    </div>
+    <div style="font-family: var(--mono); font-size: 11px; color: var(--muted); line-height: 1.5; padding: 12px 0; border-top: 1px solid var(--border);">
+      <strong style="color: var(--text)">try it:</strong> drag the &amp;mut box so it overlaps the &amp; box.
+      The compiler complains.
+    </div>
+    <div class="add-row">
+      <button class="add-btn" id="add-shared">+ &amp; borrow</button>
+      <button class="add-btn" id="add-mut">+ &amp;mut borrow</button>
+    </div>
+  </aside>
+</main>
+<script>
+  const stage = document.querySelector('.stage');
+  const arrows = document.getElementById('arrows');
+  const verdict = document.getElementById('verdict-text');
+  const status = document.getElementById('status');
+
+  let dragTarget = null, resizeTarget = null, off = {x: 0, y: 0}, startSize = {};
+
+  stage.addEventListener('pointerdown', (e) => {
+    const scope = e.target.closest('.scope');
+    if (!scope) return;
+    if (e.target.classList.contains('scope-resize')) {
+      resizeTarget = scope;
+      startSize = { x: e.clientX, y: e.clientY, w: scope.offsetWidth, h: scope.offsetHeight };
+    } else {
+      dragTarget = scope;
+      const r = scope.getBoundingClientRect();
+      off = { x: e.clientX - r.left, y: e.clientY - r.top };
+    }
+    scope.setPointerCapture(e.pointerId);
+  });
+  stage.addEventListener('pointermove', (e) => {
+    if (dragTarget) {
+      const sr = stage.getBoundingClientRect();
+      dragTarget.style.left = (e.clientX - sr.left - off.x) + 'px';
+      dragTarget.style.top = (e.clientY - sr.top - off.y) + 'px';
+      check();
+    } else if (resizeTarget) {
+      const dx = e.clientX - startSize.x;
+      const dy = e.clientY - startSize.y;
+      resizeTarget.style.width = Math.max(180, startSize.w + dx) + 'px';
+      resizeTarget.style.height = Math.max(80, startSize.h + dy) + 'px';
+      check();
+    }
+  });
+  stage.addEventListener('pointerup', () => { dragTarget = null; resizeTarget = null; });
+
+  function rectOf(el) { const r = el.getBoundingClientRect(); const sr = stage.getBoundingClientRect(); return { x: r.left - sr.left, y: r.top - sr.top, w: r.width, h: r.height, right: r.right - sr.left, bottom: r.bottom - sr.top, cx: r.left - sr.left + r.width/2, cy: r.top - sr.top + r.height/2 }; }
+  function intersects(a, b) { return !(a.right < b.x || b.right < a.x || a.bottom < b.y || b.bottom < a.y); }
+
+  function check() {
+    const owner = document.querySelector('[data-id="own"]');
+    const muts = [...document.querySelectorAll('.kind-borrow-mut')];
+    const shareds = [...document.querySelectorAll('.kind-borrow-shared')];
+    const ro = rectOf(owner);
+    let conflict = null;
+
+    document.querySelectorAll('.scope').forEach(s => s.classList.remove('is-conflict'));
+
+    // Rule: borrows must be inside owner
+    [...muts, ...shareds].forEach(b => {
+      const rb = rectOf(b);
+      if (!intersects(ro, rb)) { b.classList.add('is-conflict'); conflict = `borrow ${b.querySelector('.badge').textContent} outlives owner`; }
+    });
+
+    // Rule: at most one &mut, no overlap with &
+    for (let i = 0; i < muts.length; i++) {
+      const ri = rectOf(muts[i]);
+      for (let j = i+1; j < muts.length; j++) {
+        if (intersects(ri, rectOf(muts[j]))) {
+          muts[i].classList.add('is-conflict'); muts[j].classList.add('is-conflict');
+          conflict = 'two &mut borrows overlap — pick one';
+        }
+      }
+      shareds.forEach(s => {
+        if (intersects(ri, rectOf(s))) {
+          muts[i].classList.add('is-conflict'); s.classList.add('is-conflict');
+          conflict = '&mut and & overlap — exclusive vs shared';
+        }
+      });
+    }
+
+    drawArrows();
+    if (conflict) {
+      status.className = 'check-status err';
+      verdict.textContent = 'error[E0502]: ' + conflict;
+    } else {
+      status.className = 'check-status ok';
+      verdict.textContent = 'no conflicts. compiles.';
+    }
+  }
+
+  function drawArrows() {
+    arrows.innerHTML = '';
+    const ro = rectOf(document.querySelector('[data-id="own"]'));
+    document.querySelectorAll('.kind-borrow-mut, .kind-borrow-shared').forEach(b => {
+      const rb = rectOf(b);
+      const conflict = b.classList.contains('is-conflict');
+      const color = conflict ? 'oklch(0.7 0.2 25)' : (b.classList.contains('kind-borrow-mut') ? 'oklch(0.78 0.16 30)' : 'oklch(0.78 0.13 240)');
+      const path = `M ${ro.right} ${ro.cy} C ${(ro.right+rb.x)/2} ${ro.cy}, ${(ro.right+rb.x)/2} ${rb.cy}, ${rb.x} ${rb.cy}`;
+      const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      p.setAttribute('d', path);
+      p.setAttribute('stroke', color);
+      p.setAttribute('stroke-width', '1.5');
+      p.setAttribute('stroke-dasharray', conflict ? '4 3' : '0');
+      p.setAttribute('fill', 'none');
+      arrows.appendChild(p);
+    });
+  }
+
+  let nextId = 10;
+  document.getElementById('add-shared').onclick = () => addBorrow('shared');
+  document.getElementById('add-mut').onclick = () => addBorrow('mut');
+  function addBorrow(kind) {
+    const el = document.createElement('div');
+    el.className = 'scope kind-borrow-' + kind;
+    el.dataset.id = 'x' + (nextId++);
+    el.style.cssText = `left: 380px; top: ${100 + Math.random()*200}px; width: 220px; height: 110px;`;
+    el.innerHTML = `<div class="scope-h"><span>borrow · ${kind}</span><span class="badge">${kind === 'mut' ? '&amp;mut v' : '&amp;v'}</span></div><div class="scope-code">let r = &amp;${kind === 'mut' ? 'mut ' : ''}v;<br/>r.${kind === 'mut' ? 'push(0)' : 'len()'};</div><div class="scope-resize"></div>`;
+    stage.appendChild(el);
+    check();
+  }
+
+  check();
+  window.addEventListener('resize', check);
+</script>
+</body>
+</html>
