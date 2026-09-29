@@ -380,11 +380,11 @@ KBC_TEST(embedder_health_and_embed) {
   if (e == NULL) {
     return;
   }
-  KBC_CHECK_MSG(kbc_embedder_healthy(e), "a spawned sidecar is not healthy");
-  /* No handshake has run yet, so the dimension is not known. */
-  KBC_CHECK_EQ_INT(kbc_embedder_dim(e), 0);
-
-  /* restart() runs the health handshake; the dim comes from it. */
+  /* start() handshakes, so the sidecar is trusted and its dim is known before
+   * the first embed. (It used to be the restart() below that established
+   * both; that is what left the model unknown for the life of the object.) */
+  KBC_CHECK_MSG(kbc_embedder_healthy(e), "a sidecar that handshook is not healthy");
+  KBC_CHECK_EQ_INT(kbc_embedder_dim(e), 3);
   kbc_err_reset(&err);
   KBC_CHECK_OK(kbc_embedder_restart(e, &err));
   KBC_CHECK_EQ_INT(kbc_embedder_dim(e), 3);
@@ -641,7 +641,6 @@ KBC_TEST(embedder_restart_recovers) {
   KBC_CHECK_ERR(kbc_embedder_embed(e, a, texts, 1, 0, &out, &err),
                 KBC_ERR_PARSE);
   KBC_CHECK_MSG(!kbc_embedder_healthy(e), "unhealthy after a junk reply");
-  KBC_CHECK_EQ_INT(kbc_embedder_dim(e), 0);
 
   /* Still broken before the marker appears: restart re-runs the handshake,
    * which this fake answers, so the embedder is trusted again — and is
@@ -725,6 +724,416 @@ KBC_TEST(embedder_start_rejects_bad_argv) {
   KBC_CHECK_MSG(!kbc_embedder_healthy(NULL), "NULL embedder looks healthy");
   KBC_CHECK_EQ_INT(kbc_embedder_dim(NULL), 0);
   kbc_embedder_stop(NULL); /* must be safe */
+}
+
+/* A sidecar that answers a request with TWO lines in one write, the way the
+ * real kb-embedder does when it pushes its unsolicited `ready` and replies in
+ * the same breath. One read() returns both; the client must return the first
+ * and KEEP the second.
+ *
+ * This is the test the old single-line fakes could never have found: with
+ * only one line per reply, the tail past the newline is always empty and the
+ * bug is invisible. Here it is the whole point. */
+static void make_burst_fake(const char *path) {
+  static char script[8192];
+  sbuf b = {script, sizeof script, 0};
+  sb_add(&b, "#!/bin/sh\n");
+  sb_add(&b, "while IFS= read -r line; do\n");
+  sb_add(&b, "  case \"$line\" in\n");
+  sb_add(&b, "  *health*) printf '%s\\n' '{\"ok\":true,\"dim\":3,"
+             "\"model\":\"burst-model\"}' ;;\n");
+  sb_add(&b, "  *embed*) printf '%s\\n%s\\n' "
+             "'{\"kind\":\"ready\",\"dim\":3,\"model\":\"burst-model\"}' "
+             "'{\"ok\":true,\"dim\":3,\"vectors\":[[1.5,-2.25,3]]}' ;;\n");
+  sb_add(&b, "  esac\n");
+  sb_add(&b, "done\n");
+  kbc_test_write_file(path, script);
+  KBC_CHECK_MSG(chmod(path, 0755) == 0, "chmod %s: %s", path, strerror(errno));
+}
+
+/* Every embed must succeed. A lost second line means the client waits out
+ * the full 30 s deadline, returns KBC_ERR_TIMEOUT and reaps a child that
+ * answered correctly — and only intermittently, because it depends on how the
+ * kernel happened to split the write. So the loop runs many times: one pass
+ * proves nothing about a race. */
+KBC_TEST(embedder_does_not_lose_a_line_that_shared_a_read) {
+  char *dir = case_dir("embed-burst");
+  if (dir == NULL) {
+    return;
+  }
+  char script[KBC_TEST_PATH_MAX];
+  KBC_CHECK_NOT_NULL(join_path(script, sizeof script, dir, "burst.sh"));
+  make_burst_fake(script);
+  const char *argv[2] = {script, NULL};
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_embedder *e = kbc_embedder_start(argv, &err);
+  KBC_CHECK_NOT_NULL(e);
+  if (e == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(4096);
+  KBC_CHECK_NOT_NULL(a);
+  const char *texts[1] = {"alpha"};
+  for (int i = 0; i < 40; i++) {
+    float *out = NULL;
+    kbc_err_reset(&err);
+    kbc_status st = kbc_embedder_embed(e, a, texts, 1, 0, &out, &err);
+    KBC_CHECK_MSG(st == KBC_OK,
+                  "embed %d failed (%s: %s): a line that shared a read with "
+                  "another was discarded, so the client waited out its "
+                  "deadline for a reply it had already read",
+                  i, kbc_status_str(st), err.msg);
+    if (st == KBC_OK) {
+      KBC_CHECK_NOT_NULL(out);
+      if (out != NULL) {
+        KBC_CHECK_EQ_DBL(out[0], 1.5, 0.0);
+      }
+    }
+  }
+  KBC_CHECK_MSG(kbc_embedder_healthy(e),
+                "the sidecar was reaped after a lost line; it answered every "
+                "request");
+
+  kbc_arena_free(a);
+  kbc_embedder_stop(e);
+  check_no_zombie("embedder_does_not_lose_a_line_that_shared_a_read");
+  kbc_test_rmrf(dir);
+}
+
+/* The same burst on the very first exchange, which is where the production
+ * sidecar actually does it: the unsolicited `ready` and the answer to our
+ * probe arrive together, before we have ever sent anything. */
+KBC_TEST(embedder_handshake_survives_a_burst_on_the_first_read) {
+  char *dir = case_dir("embed-burst-handshake");
+  if (dir == NULL) {
+    return;
+  }
+  char script[KBC_TEST_PATH_MAX];
+  KBC_CHECK_NOT_NULL(join_path(script, sizeof script, dir, "burst.sh"));
+  /* This one answers health with a ready AND a second line, so start's
+   * handshake has to keep the one it did not want. */
+  make_fake(script, "while IFS= read -r line; do\n"
+                    "  case \"$line\" in\n"
+                    "  *health*) printf '%s\\n%s\\n' "
+                    "'{\"kind\":\"ready\",\"dim\":3,\"model\":\"burst-model\"}' "
+                    "'{\"ok\":true,\"dim\":3}' ;;\n"
+                    "  *embed*) printf '%s\\n' '{\"ok\":true,\"dim\":3,"
+                    "\"vectors\":[[1.5,-2.25,3]]}' ;;\n"
+                    "  esac\n"
+                    "done\n");
+  const char *argv[2] = {script, NULL};
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_embedder *e = kbc_embedder_start(argv, &err);
+  KBC_CHECK_NOT_NULL(e);
+  if (e == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+  /* start() handshakes, so the model is known and the sidecar is trusted. */
+  char model[160];
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embedder_model(e, model, sizeof model, &err));
+  KBC_CHECK_EQ_STR(model, "burst-model");
+  KBC_CHECK_EQ_INT(kbc_embedder_dim(e), 3);
+  KBC_CHECK_MSG(kbc_embedder_healthy(e), "unhealthy after a burst handshake");
+
+  /* The drained line's tail is still buffered, so the FIRST embed is not
+   * confused by it. Whatever it is, the exchange must succeed and land the
+   * right floats. */
+  kbc_arena *a = kbc_arena_new(1024);
+  const char *texts[1] = {"alpha"};
+  float *out = NULL;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embedder_embed(e, a, texts, 1, 0, &out, &err));
+  if (out != NULL) {
+    KBC_CHECK_EQ_DBL(out[0], 1.5, 0.0);
+  }
+
+  kbc_arena_free(a);
+  kbc_embedder_stop(e);
+  check_no_zombie("embedder_handshake_survives_a_burst_on_the_first_read");
+  kbc_test_rmrf(dir);
+}
+
+/* A restart must not splice the dead child's buffered bytes into the new
+ * child's stream. The marker flips the second generation to a sidecar with a
+ * DIFFERENT dim, so a stale line from generation one shows up as a shape
+ * mismatch rather than silently plausible floats. */
+KBC_TEST(embedder_restart_discards_the_previous_childs_residual) {
+  char *dir = case_dir("embed-residual-restart");
+  if (dir == NULL) {
+    return;
+  }
+  char script[KBC_TEST_PATH_MAX];
+  char marker[KBC_TEST_PATH_MAX];
+  KBC_CHECK_NOT_NULL(join_path(script, sizeof script, dir, "flip.sh"));
+  KBC_CHECK_NOT_NULL(join_path(marker, sizeof marker, dir, "second"));
+  static char body[8192];
+  sbuf b = {body, sizeof body, 0};
+  sb_add(&b, "M='");
+  sb_add(&b, marker);
+  sb_add(&b, "'\n");
+  sb_add(&b, "while IFS= read -r line; do\n");
+  sb_add(&b, "  case \"$line\" in\n");
+  sb_add(&b, "  *health*)\n");
+  sb_add(&b, "    if [ -f \"$M\" ]; then\n");
+  sb_add(&b, "      printf '%s\\n' '{\"ok\":true,\"dim\":2,\"model\":"
+             "\"model-two\"}'\n");
+  sb_add(&b, "    else\n");
+  sb_add(&b, "      printf '%s\\n' '{\"ok\":true,\"dim\":3,\"model\":"
+             "\"model-one\"}'\n");
+  sb_add(&b, "    fi ;;\n");
+  sb_add(&b, "  *embed*)\n");
+  sb_add(&b, "    if [ -f \"$M\" ]; then\n");
+  sb_add(&b, "      printf '%s\\n' '{\"ok\":true,\"dim\":2,\"vectors\":"
+             "[[7,8]]}'\n");
+  sb_add(&b, "    else\n");
+  /* Two lines: the first is the reply we want, the second must be kept and
+   * then DISCARDED with the child, not replayed to generation two. */
+  sb_add(&b, "      printf '%s\\n%s\\n' '{\"ok\":true,\"dim\":3,\"vectors\":"
+             "[[1.5,-2.25,3]]}' '{\"ok\":true,\"dim\":2,\"vectors\":[[7,8]]}'\n");
+  sb_add(&b, "    fi ;;\n");
+  sb_add(&b, "  esac\n");
+  sb_add(&b, "done\n");
+  make_fake(script, body);
+
+  const char *argv[2] = {script, NULL};
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_embedder *e = kbc_embedder_start(argv, &err);
+  KBC_CHECK_NOT_NULL(e);
+  if (e == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+  char model[160];
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embedder_model(e, model, sizeof model, &err));
+  KBC_CHECK_EQ_STR(model, "model-one");
+  kbc_arena *a = kbc_arena_new(1024);
+  const char *texts[1] = {"alpha"};
+  float *out = NULL;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embedder_embed(e, a, texts, 1, 0, &out, &err));
+  /* Generation one left a line buffered that nobody asked for. */
+  kbc_test_write_file(marker, "second generation\n");
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embedder_restart(e, &err));
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embedder_model(e, model, sizeof model, &err));
+  KBC_CHECK_EQ_STR(model, "model-two");
+  KBC_CHECK_EQ_INT(kbc_embedder_dim(e), 2);
+  out = NULL;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embedder_embed(e, a, texts, 1, 0, &out, &err));
+  if (out != NULL) {
+    /* Generation two's own floats. A spliced stale line would fail the
+     * dim_hint check or hand back generation one's three-wide vector. */
+    KBC_CHECK_EQ_DBL(out[0], 7.0, 0.0);
+    KBC_CHECK_EQ_DBL(out[1], 8.0, 0.0);
+  }
+
+  kbc_arena_free(a);
+  kbc_embedder_stop(e);
+  check_no_zombie("embedder_restart_discards_the_previous_childs_residual");
+  kbc_test_rmrf(dir);
+}
+
+/* start() completes a handshake before returning, so a caller that has just
+ * constructed an embedder already knows the model and can trust the sidecar.
+ * Without it the model is unknown for the life of the object and the query
+ * lane refuses to key anything. */
+KBC_TEST(embedder_start_handshakes_and_knows_the_model) {
+  char *dir = case_dir("embed-start-hs");
+  if (dir == NULL) {
+    return;
+  }
+  char script[KBC_TEST_PATH_MAX];
+  KBC_CHECK_NOT_NULL(join_path(script, sizeof script, dir, "good.sh"));
+  make_fake(script, "while IFS= read -r line; do\n"
+                    "  case \"$line\" in\n"
+                    "  *health*) printf '%s\\n' '{\"ok\":true,\"dim\":3,"
+                    "\"model\":\"startup-model\"}' ;;\n"
+                    "  *embed*) printf '%s\\n' '{\"ok\":true,\"dim\":3,"
+                    "\"vectors\":[[1.5,-2.25,3]]}' ;;\n"
+                    "  esac\n"
+                    "done\n");
+  const char *argv[2] = {script, NULL};
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_embedder *e = kbc_embedder_start(argv, &err);
+  KBC_CHECK_NOT_NULL(e);
+  if (e == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+  /* No restart() call: everything below must already be true. */
+  char model[160];
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embedder_model(e, model, sizeof model, &err));
+  KBC_CHECK_EQ_STR(model, "startup-model");
+  KBC_CHECK_EQ_INT(kbc_embedder_dim(e), 3);
+  KBC_CHECK_MSG(kbc_embedder_healthy(e),
+                "a sidecar that handshook during start is not healthy");
+  /* The handshake cost exactly one request, and a first embed works without
+   * any further setup. */
+  kbc_arena *a = kbc_arena_new(512);
+  const char *texts[1] = {"alpha"};
+  float *out = NULL;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embedder_embed(e, a, texts, 1, 0, &out, &err));
+  if (out != NULL) {
+    KBC_CHECK_EQ_DBL(out[0], 1.5, 0.0);
+  }
+  kbc_arena_free(a);
+  kbc_embedder_stop(e);
+  check_no_zombie("embedder_start_handshakes_and_knows_the_model");
+  kbc_test_rmrf(dir);
+}
+
+/* A sidecar that will not handshake is a DEGRADED start, not a failed one:
+ * PORT_PLAN's contract is "no vector lane without a healthy sidecar", and
+ * kbc_app degrades the vector lane everywhere else, so one broken sidecar must
+ * not stop the daemon serving keyword search. The embedder comes back
+ * untrusted with no model, and restart is the recovery path. */
+KBC_TEST(embedder_start_degrades_when_no_handshake) {
+  char *dir = case_dir("embed-start-degraded");
+  if (dir == NULL) {
+    return;
+  }
+  char script[KBC_TEST_PATH_MAX];
+  KBC_CHECK_NOT_NULL(join_path(script, sizeof script, dir, "junk.sh"));
+  make_fake(script, "while IFS= read -r line; do\n"
+                    "  case \"$line\" in\n"
+                    "  *health*) printf '%s\\n' 'not json at all' ;;\n"
+                    "  esac\n"
+                    "done\n");
+  const char *argv[2] = {script, NULL};
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_embedder *e = kbc_embedder_start(argv, &err);
+  KBC_CHECK_MSG(e != NULL,
+                "a sidecar that will not handshake failed the whole start; it "
+                "should degrade to an untrusted embedder");
+  if (e == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+  KBC_CHECK_MSG(!kbc_embedder_healthy(e),
+                "an embedder whose handshake failed reports healthy");
+  char model[160];
+  memset(model, 'x', sizeof model);
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_embedder_model(e, model, sizeof model, &err),
+                KBC_ERR_NOTFOUND);
+  KBC_CHECK_MSG(model[0] == '\0',
+                "a degraded start left \"%s\" as the model", model);
+  /* The child that failed its handshake was reaped, so stop() finds nothing
+ * left to wait for. */
+  kbc_embedder_stop(e);
+  check_no_zombie("embedder_start_degrades_when_no_handshake");
+  kbc_test_rmrf(dir);
+}
+
+/* How many descriptors this process holds open. Read from /proc rather than
+ * guessed, so the assertion is about the process and not about a model of it.
+ * Returns -1 if /proc is unavailable, which the caller treats as "cannot
+ * check" rather than as a failure. */
+static int open_fd_count(void) {
+  DIR *d = opendir("/proc/self/fd");
+  if (d == NULL) {
+    return -1;
+  }
+  int n = 0;
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    if (ent->d_name[0] != '.') {
+      n++;
+    }
+  }
+  (void)closedir(d);
+  return n;
+}
+
+/* Every start/stop pair must release both pipe ends. A leaked write end on the
+ * child's stdin does not merely waste a descriptor: it keeps the pipe open, so
+ * closing our copy never delivers EOF, the child never exits on its own, and
+ * every stop burns the whole 2 s reap grace before the SIGKILL fallback. That
+ * was most of this suite's wall time — about 2 s per embedder — and it grows
+ * without bound in a long-lived daemon that restarts its sidecar.
+ *
+ * Counting fds rather than timing the stop: the descriptor count is exact and
+ * the test cannot flake on a loaded machine. */
+KBC_TEST(embedder_start_stop_does_not_leak_descriptors) {
+  char *dir = case_dir("embed-fdleak");
+  if (dir == NULL) {
+    return;
+  }
+  char script[KBC_TEST_PATH_MAX];
+  KBC_CHECK_NOT_NULL(join_path(script, sizeof script, dir, "good.sh"));
+  make_fake(script, "while IFS= read -r line; do\n"
+                    "  case \"$line\" in\n"
+                    "  *health*) printf '%s\\n' '{\"ok\":true,\"dim\":3,"
+                    "\"model\":\"leak-model\"}' ;;\n"
+                    "  *embed*) printf '%s\\n' '{\"ok\":true,\"dim\":3,"
+                    "\"vectors\":[[1.5,-2.25,3]]}' ;;\n"
+                    "  esac\n"
+                    "done\n");
+  const char *argv[2] = {script, NULL};
+  kbc_err err;
+
+  /* Warm up once: the first cycle can legitimately differ (the shell's own
+   * fds, lazy allocations) and we are measuring the steady state. */
+  kbc_err_reset(&err);
+  kbc_embedder *warm = kbc_embedder_start(argv, &err);
+  KBC_CHECK_NOT_NULL(warm);
+  if (warm == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+  kbc_embedder_stop(warm);
+  int before = open_fd_count();
+  if (before < 0) {
+    kbc_test_rmrf(dir); /* no /proc: nothing to assert against */
+    return;
+  }
+
+  enum { kCycles = 12 };
+  for (int i = 0; i < kCycles; i++) {
+    kbc_err_reset(&err);
+    kbc_embedder *e = kbc_embedder_start(argv, &err);
+    KBC_CHECK_NOT_NULL(e);
+    if (e == NULL) {
+      break;
+    }
+    kbc_embedder_stop(e);
+  }
+  int after = open_fd_count();
+  KBC_CHECK_MSG(after <= before,
+                "%d start/stop cycles grew the descriptor count from %d to "
+                "%d; the pipe ends are not being closed",
+                kCycles, before, after);
+  /* Restarts are the unbounded case: a long-lived daemon that keeps its
+   * sidecar alive would leak on every one of them. */
+  kbc_err_reset(&err);
+  kbc_embedder *e = kbc_embedder_start(argv, &err);
+  KBC_CHECK_NOT_NULL(e);
+  if (e != NULL) {
+    for (int i = 0; i < kCycles; i++) {
+      kbc_err_reset(&err);
+      KBC_CHECK_OK(kbc_embedder_restart(e, &err));
+    }
+    kbc_embedder_stop(e);
+  }
+  int after_restarts = open_fd_count();
+  KBC_CHECK_MSG(after_restarts <= before,
+                "%d restarts grew the descriptor count from %d to %d",
+                kCycles, before, after_restarts);
+
+  kbc_test_rmrf(dir);
 }
 
 /* --------------------------------------------------------- query cache -- */
@@ -1428,31 +1837,19 @@ KBC_TEST(embedder_model_is_notfound_before_a_handshake) {
     return;
   }
 
-  /* Before any handshake: NOTFOUND, and the buffer is EMPTIED rather than
-   * left holding whatever the caller had. A half-filled name is a valid C
-   * string that is not the model's name. */
+  /* start() handshakes, so the name is already known here — a fresh start is
+   * NOT the "unknown" case any more, which is the point of the D2 fix. */
   char out[64];
-  memset(out, 'x', sizeof out);
-  kbc_err_reset(&err);
-  KBC_CHECK_ERR(kbc_embedder_model(e, out, sizeof out, &err), KBC_ERR_NOTFOUND);
-  KBC_CHECK_ERR_MSG(err);
-  KBC_CHECK_MSG(out[0] == '\0',
-                "a failed model read left \"%s\" in the caller's buffer; a "
-                "half-filled name would key a cache entry under it",
-                out);
-
-  /* After a good handshake the name is readable. */
-  kbc_err_reset(&err);
-  KBC_CHECK_OK(kbc_embedder_restart(e, &err));
-  memset(out, 'x', sizeof out);
   kbc_err_reset(&err);
   KBC_CHECK_OK(kbc_embedder_model(e, out, sizeof out, &err));
   KBC_CHECK_EQ_STR(out, "some-model");
 
-  /* Now break it and restart: the model must NOT still be the old child's.
-   * That child is gone, and its name is not a fact about whatever loads
-   * next — serving it would key the new sidecar's vectors under the old
-   * model's name, which is precisely the collision the key prevents. */
+  /* Now break it and restart. This is the ONLY way to reach "unknown", and
+   * that is right: a live child exists only while some child has handshook.
+   * The model must NOT still be the old child's — it is gone, and its name is
+   * not a fact about whatever loads next. Serving it would key the new
+   * sidecar's vectors under the old model's name, which is precisely the
+   * collision the key exists to prevent. */
   kbc_test_write_file(marker, "broken now\n");
   kbc_err_reset(&err);
   KBC_CHECK_ERR(kbc_embedder_restart(e, &err), KBC_ERR_PARSE);
@@ -1551,23 +1948,36 @@ KBC_TEST(query_cache_null_cache_embeds_every_time) {
   kbc_test_rmrf(dir);
 }
 
-/* An embedder that has not handshook cannot key a cache entry, and asking for
- * one is an error rather than a query silently stored under an empty model. */
-KBC_TEST(query_cache_refuses_to_cache_before_a_handshake) {
+/* An embedder with no model cannot key a cache entry, and asking for one is an
+ * error rather than a query silently stored under a model nobody chose.
+ *
+ * The only way to be in that state is a handshake that failed, so this walks
+ * a live embedder into it with a marker rather than starting one there. */
+KBC_TEST(query_cache_refuses_to_cache_without_a_known_model) {
   char *dir = case_dir("qc-query-unknown");
   if (dir == NULL) {
     return;
   }
   char script[KBC_TEST_PATH_MAX];
-  KBC_CHECK_NOT_NULL(join_path(script, sizeof script, dir, "junk.sh"));
-  /* A sidecar that answers EMBED but whose health we never ran: it has not
-   * handshook, so no model is known, yet an uncached embed still works. */
-  make_fake(script, "while IFS= read -r line; do\n"
-                    "  case \"$line\" in\n"
-                    "  *embed*) printf '%s\\n' '{\"ok\":true,\"dim\":3,"
-                    "\"vectors\":[[1.5,-2.25,3]]}' ;;\n"
-                    "  esac\n"
-                    "done\n");
+  char marker[KBC_TEST_PATH_MAX];
+  KBC_CHECK_NOT_NULL(join_path(script, sizeof script, dir, "flip.sh"));
+  KBC_CHECK_NOT_NULL(join_path(marker, sizeof marker, dir, "broken"));
+  static char body[8192];
+  sbuf b = {body, sizeof body, 0};
+  sb_add(&b, "M='");
+  sb_add(&b, marker);
+  sb_add(&b, "'\n");
+  sb_add(&b, "while IFS= read -r line; do\n");
+  sb_add(&b, "  case \"$line\" in\n");
+  sb_add(&b, "  *health*)\n");
+  sb_add(&b, "    if [ -f \"$M\" ]; then printf '%s\\n' 'not json at all';\n");
+  sb_add(&b, "    else printf '%s\\n' '{\"ok\":true,\"dim\":3,"
+             "\"model\":\"known-model\"}'; fi ;;\n");
+  sb_add(&b, "  *embed*) printf '%s\\n' '{\"ok\":true,\"dim\":3,\"vectors\":"
+             "[[1.5,-2.25,3]]}' ;;\n");
+  sb_add(&b, "  esac\n");
+  sb_add(&b, "done\n");
+  make_fake(script, body);
   const char *argv[2] = {script, NULL};
   kbc_err err;
   kbc_err_reset(&err);
@@ -1585,23 +1995,34 @@ KBC_TEST(query_cache_refuses_to_cache_before_a_handshake) {
     kbc_test_rmrf(dir);
     return;
   }
+  /* Sanity: with a model, the same query caches. */
+  kbc_query_outcome warm;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embed_query(e, c, a, "a query", &warm, &err));
+  KBC_CHECK_MSG(!warm.cache_hit, "the first query was a hit");
+  KBC_CHECK_EQ_INT(kbc_query_cache_len(c), 1);
+
+  /* Break the sidecar, so the restart fails its handshake and the model goes
+   * unknown. The cache still holds the old entry; the query lane must refuse
+   * rather than serve it or store a new vector under an empty model. */
+  kbc_test_write_file(marker, "broken now\n");
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_embedder_restart(e, &err), KBC_ERR_PARSE);
   kbc_query_outcome o;
   memset(&o, 0xff, sizeof o);
   kbc_err_reset(&err);
   KBC_CHECK_ERR(kbc_embed_query(e, c, a, "a query", &o, &err), KBC_ERR_NOTFOUND);
   KBC_CHECK_ERR_MSG(err);
-  KBC_CHECK_NULL(o.vec);
-  KBC_CHECK_MSG(kbc_query_cache_len(c) == 0,
-                "a query on an unhandshaked embedder cached %zu entries",
+  KBC_CHECK_MSG(o.vec == NULL, "a refused query handed back a vector");
+  KBC_CHECK_MSG(!o.cache_hit, "a refused query reported a cache hit");
+  KBC_CHECK_MSG(kbc_query_cache_len(c) == 1,
+                "a refused query changed the cache to %zu entries",
                 kbc_query_cache_len(c));
-  /* A NULL cache is not a special case, so the same query embeds anyway. */
-  kbc_err_reset(&err);
-  KBC_CHECK_OK(kbc_embed_query(e, NULL, a, "a query", &o, &err));
 
   kbc_arena_free(a);
   kbc_query_cache_free(c);
   kbc_embedder_stop(e);
-  check_no_zombie("query_cache_refuses_to_cache_before_a_handshake");
+  check_no_zombie("query_cache_refuses_to_cache_without_a_known_model");
   kbc_test_rmrf(dir);
 }
 
@@ -1695,6 +2116,18 @@ int main(void) {
                        {"embedder_silent_on_embed", embedder_silent_on_embed},
                        {"embedder_start_rejects_bad_argv",
                         embedder_start_rejects_bad_argv},
+                       {"embedder_does_not_lose_a_line_that_shared_a_read",
+                        embedder_does_not_lose_a_line_that_shared_a_read},
+                       {"embedder_handshake_survives_a_burst_on_the_first_read",
+                        embedder_handshake_survives_a_burst_on_the_first_read},
+                       {"embedder_restart_discards_the_previous_childs_residual",
+                        embedder_restart_discards_the_previous_childs_residual},
+                       {"embedder_start_handshakes_and_knows_the_model",
+                        embedder_start_handshakes_and_knows_the_model},
+                       {"embedder_start_degrades_when_no_handshake",
+                        embedder_start_degrades_when_no_handshake},
+                       {"embedder_start_stop_does_not_leak_descriptors",
+                        embedder_start_stop_does_not_leak_descriptors},
                        {"query_cache_two_models_same_dim_do_not_share",
                         query_cache_two_models_same_dim_do_not_share},
                        {"query_cache_hit_skips_sidecar_and_reports_zero_ms",
@@ -1721,8 +2154,8 @@ int main(void) {
                         embedder_model_refuses_a_short_buffer},
                        {"query_cache_null_cache_embeds_every_time",
                         query_cache_null_cache_embeds_every_time},
-                       {"query_cache_refuses_to_cache_before_a_handshake",
-                        query_cache_refuses_to_cache_before_a_handshake},
+                       {"query_cache_refuses_to_cache_without_a_known_model",
+                        query_cache_refuses_to_cache_without_a_known_model},
                        {"query_cache_reput_does_not_grow",
                         query_cache_reput_does_not_grow},
                        {"query_cache_embed_ms_is_zero_only_on_a_hit",

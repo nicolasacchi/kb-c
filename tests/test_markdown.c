@@ -518,7 +518,7 @@ KBC_TEST(code_span_content_is_escaped) {
   static const char attrs[] = "`<a href=\"x\">` and `a & b`\n";
   render_str(attrs, &p);
   body = body_of(&p);
-  KBC_CHECK(has(body, "<code>&lt;a href=\"x\"&gt;</code>"));
+  KBC_CHECK(has(body, "<code>&lt;a href=&quot;x&quot;&gt;</code>"));
   KBC_CHECK(has(body, "<code>a &amp; b</code>"));
   KBC_CHECK(!has(body, "<a href=\"x\">"));
   free_page(&p);
@@ -550,7 +550,7 @@ KBC_TEST(unterminated_tag_does_not_swallow_the_document) {
   kbc_markdown_page p;
   render_str(md, &p);
   const char *body = body_of(&p);
-  KBC_CHECK_MSG(has(body, "&lt;a title=\""), "escaped as text: %s", body);
+  KBC_CHECK_MSG(has(body, "&lt;a title=&quot;"), "escaped as text: %s", body);
   KBC_CHECK_MSG(has(body, "VISIBLE CONTENT"), "content intact: %s", body);
   KBC_CHECK_MSG(!has(body, "<a title="), "an unclosed tag became markup: %s",
                 body);
@@ -765,7 +765,7 @@ KBC_TEST(callout_type_cannot_break_out_of_the_class) {
   const char *body = body_of(&p);
   KBC_CHECK_MSG(!has(body, "kb-callout"),
                 "the type escaped into the class attribute: %s", body);
-  KBC_CHECK_MSG(has(body, "[!note\" onclick=\"alert(1)] T"),
+  KBC_CHECK_MSG(has(body, "[!note&quot; onclick=&quot;alert(1)] T"),
                 "the marker must survive as the literal text it is: %s", body);
   KBC_CHECK(has(body, "<blockquote>"));
   free_page(&p);
@@ -986,6 +986,577 @@ KBC_TEST(pathological_inline_input_is_bounded_not_quadratic) {
   free(md);
 }
 
+/* CommonMark §6.5: the alt attribute "contains a plain string", and a
+ * label's BYTES are not that — `![a *b*](i)` is `alt="a b"`, not
+ * `alt="a *b*"`. Before the fix the raw label was escaped into the
+ * attribute verbatim, so every inline construct inside an image label
+ * reached the page as its own markup: an unclosed emphasis, an unterminated
+ * code span, a stray backslash. The reference (comrak, which forces every
+ * node under an image to plain text) produces the text on all of these. */
+KBC_TEST(image_alt_is_the_labels_text_not_its_bytes) {
+  kbc_markdown_page p;
+
+  render_str("![a *b*](i)\n", &p);
+  KBC_CHECK_MSG(has(body_of(&p), "<img src=\"i\" alt=\"a b\" />"),
+                "emphasis in a label is markup, not alt text: %s", body_of(&p));
+  KBC_CHECK_MSG(!has(body_of(&p), "alt=\"a *b*\""),
+                "the raw label reached the attribute: %s", body_of(&p));
+  free_page(&p);
+
+  render_str("![a `c`](i)\n", &p);
+  KBC_CHECK(has(body_of(&p), "alt=\"a c\""));
+  free_page(&p);
+
+  /* A backslash escape is a literal CHARACTER, so the backslash is markup
+   * too and the alt carries the character alone. */
+  render_str("![a \\[x\\]](i)\n", &p);
+  KBC_CHECK(has(body_of(&p), "alt=\"a [x]\""));
+  free_page(&p);
+
+  /* Spec example 574: a nested image contributes its own alt. Its own alt is
+   * computed by this same call one level down, so the nesting is not bounded
+   * to one. */
+  render_str("![foo ![bar](/url)](/url2)\n", &p);
+  KBC_CHECK_MSG(has(body_of(&p), "<img src=\"/url2\" alt=\"foo bar\" />"),
+                "a nested image inlines its alt: %s", body_of(&p));
+  free_page(&p);
+  render_str("![a ![b *c*](j) d](i)\n", &p);
+  KBC_CHECK(has(body_of(&p), "alt=\"a b c d\""));
+  free_page(&p);
+
+  /* A link in a label keeps its TEXT and loses its anchor, and so does raw
+   * HTML — comrak escapes an inline tag under an image rather than passing
+   * it through, so a document that quotes `<b>` in an alt gets the literal
+   * text and not a bold run inside an attribute. */
+  render_str("![a [b](c) d](i)\n", &p);
+  KBC_CHECK(has(body_of(&p), "alt=\"a b d\""));
+  free_page(&p);
+  render_str("![a <b>c</b>](i)\n", &p);
+  KBC_CHECK_MSG(has(body_of(&p), "alt=\"a &lt;b&gt;c&lt;/b&gt;\""),
+                "raw HTML in a label is escaped text: %s", body_of(&p));
+  free_page(&p);
+
+  /* Either kind of line break is ONE space in the alt — the two trailing
+   * spaces a hard break swallows are still swallowed — and the double space
+   * an author wrote is NOT collapsed, because nothing here trims. */
+  render_str("![a  \nb](i)\n", &p);
+  KBC_CHECK(has(body_of(&p), "alt=\"a b\""));
+  free_page(&p);
+  render_str("![a\nb](i)\n", &p);
+  KBC_CHECK(has(body_of(&p), "alt=\"a b\""));
+  free_page(&p);
+  render_str("![a &  b](i)\n", &p);
+  KBC_CHECK(has(body_of(&p), "alt=\"a &amp;  b\""));
+  free_page(&p);
+
+  /* The strip does not re-escape: `esc` has already run over every one of
+   * these bytes, and a second pass over `&` is what would leave the alt
+   * reading `a &amp; b`. The `"` still has to be escaped, because the raw
+   * label's was not — the quote is what ends the attribute. */
+  render_str("![a \"b\" c](i)\n", &p);
+  KBC_CHECK_MSG(has(body_of(&p), "alt=\"a &quot;b&quot; c\""),
+                "a quote in a label must not close the alt: %s", body_of(&p));
+  KBC_CHECK_MSG(!has(body_of(&p), "alt=\"a \"b\""),
+                "the alt broke out of its attribute: %s", body_of(&p));
+  free_page(&p);
+
+  /* An entity in a label stays a pass-through, exactly as it does in a
+   * paragraph and for the reason the header gives: the document said
+   * `&amp;` and the browser is what resolves it. */
+  render_str("![a &amp; b](i)\n", &p);
+  KBC_CHECK(has(body_of(&p), "alt=\"a &amp; b\""));
+  free_page(&p);
+}
+
+/* CommonMark §6.6's raw HTML is a GRAMMAR, and an attribute name is
+ * `[A-Za-z_:][A-Za-z0-9_.:-]*`. `raw_tag` used to be a quote-tracking search
+ * for the next `>`, so `<a b@c>` and `<a @click="x">` came out as live tags:
+ * a passthrough that accepts bytes the original escapes, on the one path the
+ * `render.unsafe = true` contract and the kb-prompt template both depend on.
+ * Each assertion below is a shape, checked in both directions: what the
+ * grammar ACCEPTS must still pass through untouched, and only what it
+ * rejects becomes text. */
+KBC_TEST(a_raw_tag_attribute_name_must_parse) {
+  kbc_markdown_page p;
+
+  /* The accept set. `_` and `:` are the two first characters the rule
+   * admits beyond a letter, and `<div :prop="y">` is the shape the report
+   * that found this used to show the two renderers AGREEING, so it has to
+   * keep agreeing. */
+  static const char *const pass[] = {
+      "<a b=\"1\">\n",   "<a b = \"1\">\n", "<a b='1'>\n",
+      "<a b=1>\n",       "<a b>\n",         "<a _x=\"1\">\n",
+      "<a :x=\"1\">\n",   "<a data-x=\"1\">\n", "<a x-y.z:w=\"1\">\n",
+      "<a b c=\"1\">\n", "<a/>\n",          "<a />\n",
+      "<a b=\"1\"/>\n",  "<a b=\"1>\">\n",   "<div :prop=\"y\">\n",
+      "<div prop=y>\n",  "<img src=x onerror=alert(1)>\n\nafter\n",
+      "</a>\n",          "</a >\n",
+  };
+  for (size_t i = 0; i < sizeof pass / sizeof pass[0]; i++) {
+    render_str(pass[i], &p);
+    KBC_CHECK_MSG(!has(body_of(&p), "&lt;"),
+                  "the grammar ACCEPTS this and it must pass through: %s -> %s",
+                  pass[i], body_of(&p));
+    free_page(&p);
+  }
+
+  /* The reject set. Every one of these is `&lt;…&gt;` in the reference, and
+   * a name that does not start with a letter, `_` or `:` is the rule. */
+  static const char *const fail[] = {
+      "<a b@c>\n",       "<a @click=\"x\">\n", "<a 1b=\"1\">\n",
+      "<a b\"1\">\n",    "<a =\"1\">\n",       "<a b=\"1\"@c>\n",
+      "<a 1>\n",        "<a b=>\n",          "<a b=\"1\"c=\"2\">\n",
+      "<a //>\n",       "<a / >\n",
+  };
+  for (size_t i = 0; i < sizeof fail / sizeof fail[0]; i++) {
+    render_str(fail[i], &p);
+    KBC_CHECK_MSG(has(body_of(&p), "&lt;a ") || has(body_of(&p), "&lt;div "),
+                  "the grammar REJECTS this and it must be text: %s -> %s",
+                  fail[i], body_of(&p));
+    free_page(&p);
+  }
+
+  /* A closing tag carries no attributes at all, so `</a b="1">` is text. */
+  render_str("</a b=\"1\">\n", &p);
+  KBC_CHECK_MSG(has(body_of(&p), "&lt;/a b=&quot;1&quot;&gt;"),
+                "a closing tag takes no attributes: %s", body_of(&p));
+  free_page(&p);
+
+  /* A tag may still SPAN lines — the spec's whitespace is `space_or_tab |
+   * newline` — and an unquoted value still may not swallow the newline, so
+   * a tag that never closes is still bounded rather than eating the rest of
+   * the paragraph. */
+  render_str("<a\nb=\"1\">\n", &p);
+  KBC_CHECK_MSG(!has(body_of(&p), "&lt;a"),
+                "a newline is whitespace inside a tag: %s", body_of(&p));
+  free_page(&p);
+  render_str("<a b=\"1\n\nVISIBLE CONTENT\n", &p);
+  KBC_CHECK_MSG(has(body_of(&p), "&lt;a b=&quot;1"),
+                "an unclosed tag is still text: %s", body_of(&p));
+  KBC_CHECK(has(body_of(&p), "VISIBLE CONTENT"));
+  free_page(&p);
+
+  /* Type 6 is decided by the tag NAME and nothing else, so tightening the
+   * grammar must not have demoted `<div @click="x">` from a block to a
+   * paragraph. That one is a block in the original. */
+  render_str("<div @click=\"x\">\n\npara\n", &p);
+  KBC_CHECK_MSG(has(body_of(&p), "<div @click=\"x\">"),
+                "a block tag is a block whatever its attributes say: %s",
+                body_of(&p));
+  free_page(&p);
+
+  /* And the passthrough itself is untouched: well-formed raw HTML still
+   * reaches the page as markup, which is the contract, not a bug. */
+  render_str("<span class=\"x\">hi</span>\n", &p);
+  KBC_CHECK(has(body_of(&p), "<span class=\"x\">hi</span>"));
+  free_page(&p);
+}
+
+/* A backtick run that never closes is not a code span, it is literal text,
+ * and the `]` after it still ends the label. The label scanner used to
+ * abort the whole construct on one, so a single stray backtick anywhere in
+ * a label lost the link or the image — `[a`](b)` came out as literal text
+ * where the original has `<a href="b">a`</a>`. */
+KBC_TEST(a_stray_backtick_in_a_label_is_not_a_code_span) {
+  kbc_markdown_page p;
+
+  render_str("[a`](b)\n", &p);
+  KBC_CHECK_MSG(has(body_of(&p), "<a href=\"b\">a`</a>"),
+                "an unclosed backtick must not lose the link: %s", body_of(&p));
+  free_page(&p);
+
+  render_str("![a`](i)\n", &p);
+  KBC_CHECK_MSG(has(body_of(&p), "<img src=\"i\" alt=\"a`\" />"),
+                "an unclosed backtick must not lose the image: %s",
+                body_of(&p));
+  free_page(&p);
+
+  /* The rule is about CLOSING, not about counting: one backtick, two, and
+   * a code span that does close all behave the way the label scan says. */
+  render_str("[a``](b)\n", &p);
+  KBC_CHECK(has(body_of(&p), "<a href=\"b\">a``</a>"));
+  free_page(&p);
+  render_str("[a `b](c)\n", &p);
+  KBC_CHECK(has(body_of(&p), "<a href=\"c\">a `b</a>"));
+  free_page(&p);
+  /* A `]` INSIDE a closed code span still is not the end of the label, which
+   * is the other half of the same test and the reason the scan skips. */
+  render_str("[a `]b`](c)\n", &p);
+  KBC_CHECK(has(body_of(&p), "<a href=\"c\">a <code>]b</code></a>"));
+  free_page(&p);
+  /* And in prose, a `]` after an unclosed backtick is still just a `]`. */
+  render_str("a `b] c\n", &p);
+  KBC_CHECK(has(body_of(&p), "<p>a `b] c</p>"));
+  free_page(&p);
+}
+/* A hard line break is two trailing spaces, and it has to survive in EVERY
+ * block that feeds a paragraph's own lines. The blockquote arm trimmed its
+ * content with `trim`, which stripped them, so a quote asked for a break and
+ * got a soft one — the one context each of the earlier passes had tested a
+ * break in except, which is how it stayed. */
+KBC_TEST(a_hard_line_break_survives_in_a_blockquote) {
+  kbc_markdown_page p;
+
+  render_str("> a  \n> b\n", &p);
+  KBC_CHECK_MSG(has(body_of(&p), "<p>a<br />\nb</p>"),
+                "two trailing spaces in a quote are a hard break: %s",
+                body_of(&p));
+  free_page(&p);
+
+  /* The mid-paragraph case that already worked, so the fix is not "strip the
+   * spaces": the break is still a break where a line follows it. */
+  render_str("> a  \n> b  \n> c\n", &p);
+  KBC_CHECK(has(body_of(&p), "<p>a<br />\nb<br />\nc</p>"));
+  free_page(&p);
+
+  /* And the two spaces are a break, not literal text, in a list and at top
+   * level — the same rule in every context. */
+  render_str("- a  \n  b\n", &p);
+  KBC_CHECK(has(body_of(&p), "<li>a<br />\nb</li>"));
+  free_page(&p);
+  render_str("a  \nb\n", &p);
+  KBC_CHECK(has(body_of(&p), "<p>a<br />\nb</p>"));
+  free_page(&p);
+}
+
+/* A GFM table's header + delimiter pair interrupts a paragraph. The
+ * interrupt test lived in `starts_block`, which sees ONE line and so cannot
+ * know whether the next is the delimiter row — which is why a table could
+ * only ever open at a block boundary, and `item\n| a | b |\n|---|---|` came
+ * out as one paragraph. */
+KBC_TEST(a_table_can_interrupt_a_paragraph) {
+  kbc_markdown_page p;
+
+  render_str("item\n| a | b |\n|---|---|\n| 1 | 2 |\n", &p);
+  KBC_CHECK_MSG(has(body_of(&p), "<p>item</p>"),
+                "the text above the table stays its own paragraph: %s",
+                body_of(&p));
+  KBC_CHECK(has(body_of(&p), "<table>"));
+  KBC_CHECK(has(body_of(&p), "<th>a</th>"));
+  KBC_CHECK(has(body_of(&p), "<td>2</td>"));
+  /* The header alone is not a table, with or without a paragraph above it:
+   * the DELIMITER row is what makes the pair, and that is the whole reason
+   * the test needs the next line. */
+  free_page(&p);
+  render_str("item\n| a | b |\n", &p);
+  KBC_CHECK_MSG(!has(body_of(&p), "<table>"),
+                "a header row with no delimiter row is not a table: %s",
+                body_of(&p));
+  free_page(&p);
+  render_str("| a | b |\n|---|---|\n| 1 | 2 |\n", &p);
+  KBC_CHECK(has(body_of(&p), "<table>"));
+  free_page(&p);
+}
+
+/* A `<li>` gets a newline after it when its FIRST BLOCK is not a paragraph.
+ * The test was the item's first LINE, so a setext heading — whose underline
+ * is the block's SECOND line — read as a paragraph and came out
+ * `<li><h1>title</h1>`. A GFM task mark is the same shape: it is only a
+ * task marker when the content starts with a paragraph, so `- [x] t\n  ===`
+ * is a heading whose text is `[x] t` and carries no checkbox. */
+KBC_TEST(li_newline_when_the_first_block_is_not_a_paragraph) {
+  kbc_markdown_page p;
+
+  render_str("- t\n  ===\n- u\n", &p);
+  KBC_CHECK_MSG(has(body_of(&p), "<li>\n<h1>t</h1>"),
+                "a setext heading as the item's first block needs the newline: %s",
+                body_of(&p));
+  free_page(&p);
+  render_str("- t\n  ---\n- u\n", &p);
+  KBC_CHECK(has(body_of(&p), "<li>\n<h2>t</h2>"));
+  free_page(&p);
+
+  /* The task mark is text when the first block is a heading, not a checkbox:
+   * the mark is read only where a paragraph can follow it on the `<li>` line. */
+  render_str("- [x] t\n  ===\n", &p);
+  KBC_CHECK_MSG(!has(body_of(&p), "type=\"checkbox\""),
+                "a task mark before a heading is literal text: %s",
+                body_of(&p));
+  KBC_CHECK(has(body_of(&p), "<h1>[x] t</h1>"));
+  free_page(&p);
+  /* And it IS a checkbox when the item does start with a paragraph. */
+  render_str("- [x] a\n- u\n", &p);
+  KBC_CHECK(has(body_of(&p), "<li><input type=\"checkbox\" checked=\"\""));
+  free_page(&p);
+  /* A tight item whose first block IS a paragraph keeps the text on the
+   * `<li>` line — the one case the newline rule is not for. */
+  render_str("- a\n  b\n- c\n", &p);
+  KBC_CHECK(has(body_of(&p), "<li>a\nb</li>"));
+  free_page(&p);
+}
+
+/* A paragraph's LAST line loses its trailing spaces, including the two that
+ * would be a hard line break: with nothing after it the break is not a
+ * break, and the original strips them rather than emitting a `<br />` or the
+ * spaces. Mid-paragraph they are a break and stay one. */
+KBC_TEST(a_trailing_hard_break_marker_is_stripped) {
+  kbc_markdown_page p;
+
+  render_str("a  \n", &p);
+  KBC_CHECK_MSG(has(body_of(&p), "<p>a</p>"),
+                "a hard break at the end of a paragraph is not a break: %s",
+                body_of(&p));
+  KBC_CHECK(!has(body_of(&p), "<br />"));
+  free_page(&p);
+  render_str("- a  \n", &p);
+  KBC_CHECK(has(body_of(&p), "<li>a</li>"));
+  free_page(&p);
+  /* Mid-paragraph it is still a break: this is not "the spaces are gone". */
+  render_str("a  \nb\n", &p);
+  KBC_CHECK(has(body_of(&p), "<p>a<br />\nb</p>"));
+  free_page(&p);
+  /* A single trailing space is stripped the same way. */
+  render_str("a \n", &p);
+  KBC_CHECK(has(body_of(&p), "<p>a</p>"));
+  free_page(&p);
+}
+
+/* The space BETWEEN two emphasis runs is ordinary inline text.
+ *
+ * `emphasis_run` renders the text between a pair by recursing into
+ * `md_inline` on exactly those bytes, so the separator in `*a* *b*` reaches
+ * the end of a run as a whole one-space run with nothing after it. A flush
+ * that dropped the pending spaces at the end of a run — the shape a fix for
+ * the trailing hard-break marker takes — therefore ate it, and every pair of
+ * adjacent emphasis runs rendered glued together. Whether spaces are
+ * TRAILING is a property of the paragraph, not of the run, and this is the
+ * case that says the two were confused. */
+KBC_TEST(the_space_between_two_emphasis_runs_is_text) {
+  kbc_markdown_page p;
+
+  render_str("*a* *b*\n", &p);
+  KBC_CHECK_MSG(has(body_of(&p), "<em>a</em> <em>b</em>"),
+                "the separator between two runs must survive: %s",
+                body_of(&p));
+  free_page(&p);
+  /* Any order, any delimiter, and inside a paragraph rather than a heading —
+   * this is the shape that made a golden document a STRUCT_DIFF. */
+  render_str("**a** *b*\n", &p);
+  KBC_CHECK(has(body_of(&p), "<strong>a</strong> <em>b</em>"));
+  free_page(&p);
+  render_str("_a_ __b__\n", &p);
+  KBC_CHECK(has(body_of(&p), "<em>a</em> <strong>b</strong>"));
+  free_page(&p);
+  render_str("x *b* **c** y\n", &p);
+  KBC_CHECK(has(body_of(&p), "x <em>b</em> <strong>c</strong> y"));
+  free_page(&p);
+  render_str("# *b* **c**\n", &p);
+  KBC_CHECK(has(body_of(&p), "<h1><em>b</em> <strong>c</strong></h1>"));
+  free_page(&p);
+  /* More than one space is more than one space. */
+  render_str("*a*  *b*\n", &p);
+  KBC_CHECK(has(body_of(&p), "<em>a</em>  <em>b</em>"));
+  free_page(&p);
+}
+
+/* CR is a line ending (CommonMark §2.1), so a CR-only document is not one
+ * line. `line_at` split on `\n` alone and stripped a trailing `\r`, so every
+ * construct in such a document — headings, quotes, lists, hard breaks —
+ * collapsed into a single paragraph. */
+KBC_TEST(a_cr_only_document_has_its_lines) {
+  kbc_markdown_page p;
+
+  render_str("a\rb\r# h\r", &p);
+  KBC_CHECK_MSG(has(body_of(&p), "<p>a\nb</p>"),
+                "a bare CR ends a line: %s", body_of(&p));
+  KBC_CHECK_MSG(has(body_of(&p), "<h1>h</h1>"),
+                "and a heading after one is a heading: %s", body_of(&p));
+  free_page(&p);
+
+  /* A hard break is a break there too, which is the same `line_at`. */
+  render_str("a  \rb\r", &p);
+  KBC_CHECK(has(body_of(&p), "<p>a<br />\nb</p>"));
+  free_page(&p);
+
+  /* CRLF is still ONE terminator and the CR is still not part of the line —
+   * the case that already worked, so the change did not break it. */
+  render_str("a\r\nb\r\n", &p);
+  KBC_CHECK(has(body_of(&p), "<p>a\nb</p>"));
+  free_page(&p);
+  /* A CRLF document's title is still its first h1. */
+  render_str("a\r\n# T\r\n", &p);
+  KBC_CHECK_MSG(p.title != NULL && strcmp(p.title, "T") == 0,
+                "CRLF title: %s", p.title == NULL ? "(null)" : p.title);
+  free_page(&p);
+  /* And a CR-ONLY document's title is NOT its heading: the original finds
+   * the title by splitting the source on `\n` (markdown.rs:250) and trimming,
+   * while the parser it hands the document to treats a bare CR as a line
+   * ending. The two are the reference's own asymmetry, and the renderer
+   * inherits it rather than papering over it. */
+  render_str("a\rb\r# h\r", &p);
+  KBC_CHECK_MSG(p.title != NULL && strcmp(p.title, "Untitled") == 0,
+                "the title scan splits on LF only: %s",
+                p.title == NULL ? "(null)" : p.title);
+  free_page(&p);
+}
+
+/* A link destination may not contain a line ending, inside angle brackets
+ * or not (CommonMark example 491), so `[a](<foo\nbar>)` is not a link at all.
+ * The scan ran to the `>` regardless and the construct succeeded with the
+ * newline percent-encoded into the href. */
+KBC_TEST(a_link_destination_cannot_span_a_line) {
+  kbc_markdown_page p;
+
+  render_str("[a](<foo\nbar>)\n", &p);
+  KBC_CHECK_MSG(!has(body_of(&p), "<a "),
+                "a destination with a newline in it is not a link: %s",
+                body_of(&p));
+  KBC_CHECK(!has(body_of(&p), "%0A"));
+  free_page(&p);
+  render_str("![a](<x\ny>)\n", &p);
+  KBC_CHECK(!has(body_of(&p), "<img "));
+  free_page(&p);
+  /* The bare form already refused, and a destination on ONE line is still a
+   * link: this is about the line ending, not about angle brackets. */
+  render_str("[a](b)\n", &p);
+  KBC_CHECK(has(body_of(&p), "<a href=\"b\">a</a>"));
+  free_page(&p);
+  render_str("[a](<b>)\n", &p);
+  KBC_CHECK(has(body_of(&p), "<a href=\"b\">a</a>"));
+  free_page(&p);
+}
+
+/* A comment opens with `<!--` and a processing instruction with `<?` — four
+ * and two bytes. The guards were one byte too long each, so a line that was
+ * nothing but its own opener fell through to a paragraph and was ESCAPED,
+ * which is the sequence a comment most often starts on and the one whose
+ * escaping is what stops the comment being reinterpreted downstream. */
+KBC_TEST(a_bare_html_comment_opener_is_a_block) {
+  kbc_markdown_page p;
+
+  render_str("<!--\nx\n-->\n", &p);
+  KBC_CHECK_MSG(has(body_of(&p), "<!--\nx\n-->"),
+                "a bare `<!--` opens an HTML block: %s", body_of(&p));
+  KBC_CHECK_MSG(!has(body_of(&p), "&lt;!--"),
+                "and is not escaped into the prose: %s", body_of(&p));
+  free_page(&p);
+
+  render_str("<?\nx\n?>\n", &p);
+  KBC_CHECK_MSG(has(body_of(&p), "<?\nx\n?>"),
+                "a bare `<?` opens an HTML block: %s", body_of(&p));
+  free_page(&p);
+
+  /* A comment with content, and one inline, both unchanged: the fix is the
+   * exact length of each opener, not a widening of the class. */
+  render_str("<!-- Foo -->\n", &p);
+  KBC_CHECK(has(body_of(&p), "<!-- Foo -->"));
+  free_page(&p);
+  render_str("a <!-- c --> b\n", &p);
+  KBC_CHECK(has(body_of(&p), "<p>a <!-- c --> b</p>"));
+  free_page(&p);
+  /* A `<` that is not an opener is still a paragraph, and `<?php` — longer
+   * than the bare form, so it always worked — still is. */
+  render_str("a < b\n", &p);
+  KBC_CHECK(has(body_of(&p), "<p>a &lt; b</p>"));
+  free_page(&p);
+  render_str("<?php echo 1; ?>\n", &p);
+  KBC_CHECK(has(body_of(&p), "<?php echo 1; ?>"));
+  free_page(&p);
+}
+
+/* A setext underline that arrives as a blockquote's LAZY continuation is
+ * text, not a heading: a lazy line carries no `>`, so it cannot be the
+ * underline of a paragraph inside the quote. The arm appended it unmarked
+ * and `md_para` — which sees a flat buffer with no record of which lines
+ * carried a marker — read `===` as an underline and closed the paragraph as
+ * an `<h1>` inside the quote. */
+KBC_TEST(a_lazy_underline_in_a_quote_is_not_a_heading) {
+  kbc_markdown_page p;
+
+  render_str("> foo\nbar\n===\n", &p);
+  KBC_CHECK_MSG(!has(body_of(&p), "<h1>"),
+                "a lazy `===` is not a heading: %s", body_of(&p));
+  KBC_CHECK(has(body_of(&p), "<p>foo\nbar\n===</p>"));
+  free_page(&p);
+
+  /* A lazy `---` leaves the quote instead: it is a thematic break, and a
+   * thematic break cannot be inside a paragraph. */
+  render_str("> foo\nbar\n---\n", &p);
+  KBC_CHECK(has(body_of(&p), "<blockquote>\n<p>foo\nbar</p>\n</blockquote>"));
+  KBC_CHECK(has(body_of(&p), "<hr />"));
+  free_page(&p);
+
+  /* An explicit `> ---` IS the heading it looks like — the arm can see the
+   * difference, which is what the fix rests on. */
+  render_str("> foo\n> ===\n", &p);
+  KBC_CHECK(has(body_of(&p), "<h1>foo</h1>"));
+  free_page(&p);
+  render_str("> t\n> ===\n", &p);
+  KBC_CHECK(has(body_of(&p), "<h1>t</h1>"));
+  free_page(&p);
+}
+
+/* The page is a function of the document and of nothing else.
+ *
+ * `kbc_markdown_render` builds its output buffers as locals of its own, and
+ * `md_para` renders a paragraph through the sink `md_blocks` was HANDED
+ * rather than one of its own — so a flag on that struct is a byte of
+ * uninitialised stack, and whatever the frame below happened to hold decides
+ * the output. It did: the same source at `-O3` and under ASan rendered
+ * `Foo\nBar` as `<h2>Foo\nBar</h2>`, and under TSan as `<h2>Foo Bar</h2>`,
+ * because TSan happened to leave a non-zero byte in the slot. Neither
+ * sanitizer reports an uninitialised read, so a green lane proved nothing.
+ *
+ * So this asks the question a test can actually ask: render the same
+ * documents twice, from two call stacks deliberately filled with different
+ * bytes, and require one answer. `poison_below` recurses so its frames sit
+ * BELOW the frame `kbc_markdown_render` is about to occupy — filling the
+ * caller's own frame would be above it and prove nothing. */
+static void poison_below(int depth, unsigned char fill) {
+  volatile unsigned char buf[1024];
+  for (size_t i = 0; i < sizeof buf; i++) buf[i] = fill;
+  if (depth > 0) poison_below(depth - 1, fill);
+  (void)buf[0];
+}
+
+static void render_over_poison(const char *md, unsigned char fill, char *dst,
+                               size_t cap) {
+  kbc_markdown_page p;
+  kbc_err err;
+  memset(&p, 0, sizeof p);
+  poison_below(12, fill);
+  kbc_err_reset(&err);
+  /* No arena: `render_str` takes the same NULL and hands the page back
+   * `free`-owned, which is what lets `free_page` below be `free_page`. */
+  KBC_CHECK_OK(kbc_markdown_render(md, strlen(md), NULL, &p, &err));
+  snprintf(dst, cap, "%s", body_of(&p));
+  free_page(&p);
+}
+
+KBC_TEST(the_page_does_not_depend_on_the_callers_stack) {
+  /* The three shapes the uninitialised flag used to decide: a soft break
+   * (a newline written as a space), a hard break (the same, plus the two
+   * spaces), and the raw-tag passthrough (escaped instead of passed
+   * through). Each is stated once, as the bytes a reader of the page gets. */
+  static const struct {
+    const char *md;
+    const char *want;
+  } cases[] = {
+      {"Foo\nBar\n---\n\nBaz\nQux\n===\n",
+       "<h2>Foo\nBar</h2>\n<h1>Baz\nQux</h1>\n"},
+      {"> a  \n> b\n", "<blockquote>\n<p>a<br />\nb</p>\n</blockquote>\n"},
+      {"<span class=\"x\">hi</span>\n", "<p><span class=\"x\">hi</span></p>\n"},
+      /* A tag that SPANS lines is one tag: the newline is the spec's
+       * `space_or_tab | newline` whitespace. No closing tag is invented —
+       * that is the author's business — so this `want` stops at `</p>`. */
+      {"<a\nb=\"1\">\n", "<p><a\nb=\"1\"></p>\n"},
+      {"- a  \n  b\n", "<ul>\n<li>a<br />\nb</li>\n</ul>\n"},
+  };
+  char clean[4096], dirty[4096];
+  for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+    render_over_poison(cases[i].md, 0x00, clean, sizeof clean);
+    render_over_poison(cases[i].md, 0xFF, dirty, sizeof dirty);
+    KBC_CHECK_MSG(strcmp(clean, dirty) == 0,
+                  "case %zu renders two ways from the same document: "
+                  "<<%s>> vs <<%s>>",
+                  i, clean, dirty);
+    KBC_CHECK_MSG(strncmp(clean, cases[i].want, strlen(cases[i].want)) == 0,
+                  "case %zu: got <<%s>> want <<%s>>", i, clean,
+                  cases[i].want);
+  }
+}
+
+
 
 
 int main(void) {
@@ -1074,6 +1645,30 @@ int main(void) {
        tight_item_starts_a_non_paragraph_block_on_its_own_line},
       {"pathological_inline_input_is_bounded_not_quadratic",
        pathological_inline_input_is_bounded_not_quadratic},
+      {"image_alt_is_the_labels_text_not_its_bytes",
+       image_alt_is_the_labels_text_not_its_bytes},
+      {"a_raw_tag_attribute_name_must_parse",
+       a_raw_tag_attribute_name_must_parse},
+      {"a_stray_backtick_in_a_label_is_not_a_code_span",
+       a_stray_backtick_in_a_label_is_not_a_code_span},
+      {"a_hard_line_break_survives_in_a_blockquote",
+       a_hard_line_break_survives_in_a_blockquote},
+      {"a_table_can_interrupt_a_paragraph", a_table_can_interrupt_a_paragraph},
+      {"li_newline_when_the_first_block_is_not_a_paragraph",
+       li_newline_when_the_first_block_is_not_a_paragraph},
+      {"a_trailing_hard_break_marker_is_stripped",
+       a_trailing_hard_break_marker_is_stripped},
+      {"the_space_between_two_emphasis_runs_is_text",
+       the_space_between_two_emphasis_runs_is_text},
+      {"a_cr_only_document_has_its_lines", a_cr_only_document_has_its_lines},
+      {"a_link_destination_cannot_span_a_line",
+       a_link_destination_cannot_span_a_line},
+      {"a_bare_html_comment_opener_is_a_block",
+       a_bare_html_comment_opener_is_a_block},
+      {"a_lazy_underline_in_a_quote_is_not_a_heading",
+       a_lazy_underline_in_a_quote_is_not_a_heading},
+      {"the_page_does_not_depend_on_the_callers_stack",
+       the_page_does_not_depend_on_the_callers_stack},
       {NULL, NULL},
   };
   return kbc_test_run("markdown", cases);

@@ -73,10 +73,20 @@ typedef struct {
   int64_t db_bytes;
   /* The query-embedding cache. A cache nobody can read is a cache nobody can
    * tell is working, and the hit ratio is the only evidence the thing does
-   * anything at all. `query_cache_drops` counts whole-cache invalidations —
-   * a sidecar that failed a query and is no longer healthy — which is the
-   * number that distinguishes "the cache is cold" from "the cache is being
-   * thrown away". */
+   * anything at all.
+   *
+   * `query_cache_drops` counts query embeds that MISSED and then FAILED, so
+   * nothing was written back. It is deliberately not an invalidation count:
+   * there is no whole-cache invalidation, because there does not need to be
+   * one. The cache key carries the model, a restart that fails to handshake
+   * leaves the model unknown and the next embed refuses rather than keying
+   * under a stale name, and a restart that succeeds with a different model is
+   * a legitimate miss on a different key.
+   *
+   * The three together account for every search: hits + misses + drops is the
+   * number of queries run, and that identity is what the concurrency test
+   * asserts. A counter set that does not sum to the work done is a counter
+   * set nobody can reason from. */
   int64_t query_cache_hits;
   int64_t query_cache_misses;
   int64_t query_cache_drops;

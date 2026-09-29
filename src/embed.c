@@ -96,6 +96,14 @@ struct kbc_embedder {
    * "we have not asked yet" (KBC_ERR_NOTFOUND) — a caller must be able to
    * tell those apart, or it will cache vectors under a key it never chose. */
   _Atomic bool handshaked;
+  /* Bytes read from the pipe AFTER the newline of the line just consumed, not
+   * yet returned to a caller. One read() routinely returns several protocol
+   * lines at once — the sidecar pushes its unsolicited `ready` unprompted and
+   * can answer in the same breath — so whatever follows the newline has to be
+   * kept, or the next read_line() waits out its whole deadline for a line
+   * that has already been read and discarded. Guarded by `mu`, like every
+   * other pipe access, so exactly one thread moves bytes in or out. */
+  kbc_str residual;
 };
 
 typedef enum {
@@ -115,15 +123,52 @@ static int64_t now_ms(void) {
 }
 
 /* Reads one newline-terminated line into `out` (appended; cleared by caller).
- * Handles short reads and a line that arrives in pieces. */
-static line_res read_line(int fd, kbc_str *out, int timeout_ms) {
+ * Handles short reads and a line that arrives in pieces.
+ *
+ * The pipe is a byte stream and `read()` is free to return as much as it
+ * likes, so a single call routinely lands several protocol lines at once. The
+ * bytes after the newline we return are moved into `e->residual` and prepended
+ * to the next call, so a chunk carrying N lines costs one read and loses none.
+ * Before this, the tail was simply dropped by setting `out->len` to the offset
+ * of the first newline — which is why a sidecar that pushed its unsolicited
+ * `ready` and then answered in the same breath had its answer discarded and
+ * the caller waited out the full 30 s deadline before reaping a child that had
+ * answered correctly.
+ *
+ * `req == NULL` on the exchange side is not special here: the residual is
+ * state on the embedder, not on a particular call, so a pure read picks up
+ * exactly where the previous one left off. That matters for the handshake
+ * drain, which reads a line purely to keep it from being mistaken for the
+ * next request's reply.
+ *
+ * Caller holds `mu`, so the residual needs no lock of its own. */
+static line_res read_line(kbc_embedder *e, kbc_str *out, int timeout_ms) {
   const int64_t deadline = now_ms() + (int64_t)timeout_ms;
+
+  if (e->residual.len > 0) {
+    if (kbc_failed(kbc_str_append(out, e->residual.ptr, e->residual.len))) {
+      return LR_IO;
+    }
+    kbc_str_clear(&e->residual);
+  }
   for (;;) {
     if (out->len > 0) {
-      const char *nl =
-          (const char *)memchr(out->ptr, '\n', out->len);
+      const char *nl = (const char *)memchr(out->ptr, '\n', out->len);
       if (nl != NULL) {
-        size_t n = (size_t)(nl - out->ptr);
+        /* The newline's offset, BEFORE the CR is folded away. The tail has to
+         * start at raw+1, not at the shortened n+1: on a \r\n line those
+         * differ by one, and using the short one would prepend the CR to the
+         * NEXT line's data. */
+        const size_t raw = (size_t)(nl - out->ptr);
+        const size_t tail = out->len - raw - 1;
+        kbc_str_clear(&e->residual);
+        if (tail > 0 && kbc_failed(kbc_str_append(&e->residual,
+                                                 out->ptr + raw + 1, tail))) {
+          /* The line itself is intact, but losing the tail is the exact bug
+           * this function exists to remove, so it is an error, not a shrug. */
+          return LR_IO;
+        }
+        size_t n = raw;
         if (n > 0 && out->ptr[n - 1] == '\r') {
           n--;
         }
@@ -133,6 +178,9 @@ static line_res read_line(int fd, kbc_str *out, int timeout_ms) {
       }
     }
     if (out->len >= KBC_EMBED_LINE_MAX) {
+      /* The partial line stays in `out` for the caller to report; the
+       * residual is dropped because this stream is finished either way. */
+      kbc_str_clear(&e->residual);
       return LR_TOOLONG;
     }
     int64_t left = deadline - now_ms();
@@ -143,7 +191,7 @@ static line_res read_line(int fd, kbc_str *out, int timeout_ms) {
       left = KBC_EMBED_POLL_SLICE_MS;
     }
     struct pollfd pfd;
-    pfd.fd = fd;
+    pfd.fd = e->out_fd;
     pfd.events = POLLIN;
     pfd.revents = 0;
     int pr = poll(&pfd, 1, (int)left);
@@ -160,7 +208,7 @@ static line_res read_line(int fd, kbc_str *out, int timeout_ms) {
       continue;
     }
     char buf[KBC_EMBED_READ_CHUNK];
-    ssize_t got = read(fd, buf, sizeof buf);
+    ssize_t got = read(e->out_fd, buf, sizeof buf);
     if (got > 0) {
       if (kbc_failed(kbc_str_append(out, buf, (size_t)got))) {
         return LR_IO;
@@ -229,6 +277,11 @@ static void reap_kill(kbc_embedder *e) {
   }
   e->pid = -1;
   close_fds(e);
+  /* Any buffered bytes belonged to the child that just died. Handing them to
+   * the next one would splice a dead stream's reply into a live stream's,
+   * which is the same class of silent corruption as the loss this buffer was
+   * added to prevent. */
+  kbc_str_clear(&e->residual);
 }
 
 /* Close stdin, poll for exit up to grace_ms, then SIGKILL. */
@@ -241,6 +294,9 @@ static void reap_graceful(kbc_embedder *e, int grace_ms) {
     (void)close(e->out_fd);
     e->out_fd = -1;
   }
+  /* Same reason as in reap_kill: this function returns early on the graceful
+   * paths without reaching it, and the bytes are just as dead either way. */
+  kbc_str_clear(&e->residual);
   if (e->pid <= 0) {
     return;
   }
@@ -320,9 +376,20 @@ static kbc_status spawn(kbc_embedder *e, kbc_err *err) {
   /* parent: the child's ends are CLOEXEC-closed by exec; close them now. */
   (void)close(in_pipe[0]);
   (void)close(out_pipe[1]);
-
+  /* The PARENT's own ends must go too, and not before the dup below.
+   * O_CLOEXEC only closes them across an exec, and the parent never execs, so
+   * leaving them open keeps a second write end on the child's stdin alive for
+   * the life of the daemon. Two consequences, both measured here:
+   * reap_graceful's close of `in_fd` never produces an EOF for the child, so
+   * every stop and every failed handshake burns the full 2 s grace before the
+   * SIGKILL fallback — about 2 s per embedder in this suite, which was most
+   * of its wall time — and every restart leaks two fds. The dup shares the
+   * same open file description, so closing the originals leaves `in_fd` and
+   * `out_fd` fully functional. */
   int wfd = fcntl(in_pipe[1], F_DUPFD, 3);
   int rfd = fcntl(out_pipe[0], F_DUPFD, 3);
+  (void)close(in_pipe[1]);
+  (void)close(out_pipe[0]);
   if (wfd < 0 || rfd < 0) {
     int saved = errno;
     if (wfd >= 0) {
@@ -331,8 +398,6 @@ static kbc_status spawn(kbc_embedder *e, kbc_err *err) {
     if (rfd >= 0) {
       (void)close(rfd);
     }
-    (void)close(in_pipe[1]);
-    (void)close(out_pipe[0]);
     e->pid = pid;
     reap_kill(e);
     return kbc_err_set(err, KBC_ERR_IO, "dup sidecar pipe above fd 2: %s",
@@ -361,7 +426,7 @@ static kbc_status exchange_raw(kbc_embedder *e, const kbc_str *req,
       return st;
     }
   }
-  switch (read_line(e->out_fd, line, timeout_ms)) {
+  switch (read_line(e, line, timeout_ms)) {
     case LR_OK:
       return KBC_OK;
     case LR_TIMEOUT:
@@ -382,13 +447,14 @@ static kbc_status exchange_raw(kbc_embedder *e, const kbc_str *req,
   }
 }
 
-/* Forward declarations: the envelope helpers live below, with the rest of the
- * wire-format code. */
+/* Forward declarations: the envelope helpers and the handshake live below,
+ * with the rest of the wire-format code. `handshake` is here because
+ * kbc_embedder_start runs one before it returns. */
 static const char *reply_kind(const kbc_json *j);
 static kbc_status sidecar_error(const char *msg, kbc_err *err);
 static size_t reply_dim(const kbc_json *j, bool *bad);
 static kbc_status note_model(kbc_embedder *e, const kbc_json *j, kbc_err *err);
-
+static kbc_status handshake(kbc_embedder *e, kbc_err *err);
 
 /* Request ids are ours to allocate; the sidecar only echoes them, so all this
  * has to guarantee is that two in-flight requests never share one. */
@@ -547,6 +613,27 @@ kbc_embedder *kbc_embedder_start(const char *const *argv, kbc_err *err) {
     free(e);
     return NULL;
   }
+  /* Handshake before handing the embedder back. Without it the model is
+   * unknown for the life of the object, so the query lane refuses to key a
+   * vector at all, and `kbc_embedder_healthy` would claim a sidecar nobody
+   * has heard from yet. It is also the only moment the sidecar's unsolicited
+   * `ready` is guaranteed to be absorbed.
+   *
+   * A handshake that FAILS is a DEGRADED start, not a failed one, and that
+   * is PORT_PLAN's contract rather than a convenience: the plan says "no
+   * vector lane without a healthy sidecar", and `kbc_app` degrades the vector
+   * lane everywhere else — a NULL embed, an unhealthy embed and a NULL
+   * vecstore all leave keyword search working. Failing app_open here would
+   * mean one broken sidecar takes the whole daemon down, so the child is
+   * reaped, the embedder is returned marked unhealthy, and
+   * kbc_embedder_restart remains the recovery path. */
+  st = handshake(e, err);
+  if (kbc_failed(st)) {
+    (void)pthread_mutex_lock(&e->mu);
+    reap_graceful(e, KBC_EMBED_STOP_GRACE_MS);
+    (void)pthread_mutex_unlock(&e->mu);
+    atomic_store(&e->healthy, false);
+  }
   return e;
 }
 
@@ -564,6 +651,7 @@ void kbc_embedder_stop(kbc_embedder *e) {
   free(e->args);
   (void)pthread_mutex_destroy(&e->mu);
   (void)pthread_mutex_destroy(&e->mmu);
+  kbc_str_free(&e->residual);
   free(e);
 }
 
@@ -806,7 +894,11 @@ static kbc_status handshake(kbc_embedder *e, kbc_err *err) {
     if (e->out_fd >= 0) {
       kbc_err scratch;
       kbc_err_reset(&scratch);
-      (void)read_line(e->out_fd, &drain, KBC_EMBED_DRAIN_TIMEOUT_MS);
+      /* Goes through read_line, not a raw read: the drained line's TAIL is
+       * already in the residual if the sidecar sent more than one line, and
+       * throwing that away here would reintroduce the same loss one layer
+       * up. */
+      (void)read_line(e, &drain, KBC_EMBED_DRAIN_TIMEOUT_MS);
     }
     (void)pthread_mutex_unlock(&e->mu);
     kbc_str_free(&drain);

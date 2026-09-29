@@ -18,6 +18,9 @@
  *      sandbox` the serving route sets, not here. Do not "fix" it by
  *      escaping or stripping: either silently breaks the prompt invariant
  *      the Rust module documents at length.
+ *      What passes through is what CommonMark's raw-HTML GRAMMAR accepts:
+ *      `<a @click="x">` is not a tag, and rendering it as one is a
+ *      passthrough the original never had.
  *   2. kb-c links no syntax highlighter, so a code block carries the
  *      container chrome and NO inline token colours. markdown.rs pairs
  *      comrak with syntect; the stylesheet's comment about "syntect supplies
@@ -66,11 +69,16 @@
  * bounded looks and not a multiple of that. `bare_autolink` has no bound at
  * all and does not need one: it stops at whitespace, `<` or `"`, all of
  * which also stop the next candidate, so consecutive scans are disjoint and
- * sum to the length of the input rather than a multiple of it. The block
- * layer is a different matter and is bounded by being line-oriented: every
- * backward walk there is over one line, with the single exception of
- * `html_kind`, which takes a whole line as its input and so is the block
- * layer's one unbounded-line case — it carries its own budget for that. */
+ * sum to the length of the input rather than a multiple of it.
+ *
+ * The block layer is a different matter and is bounded by being
+ * line-oriented: every backward walk there is over one line, with TWO
+ * exceptions. `html_kind` takes a whole line as its input and so is one
+ * unbounded-line case — it carries its own budget for that. `table_starts`
+ * needs the line AFTER the one it is asked about, because a GFM table is a
+ * header row plus a delimiter row and the PAIR is what interrupts a
+ * paragraph; it is bounded at exactly two lines, so a call on every line of
+ * the document still sums to twice the input. */
 #define MD_DELIM_SCAN 4096u
 #define MD_LINK_SCAN 4096u
 #define MD_SCHEME_MAX 32u
@@ -83,11 +91,15 @@
 #define MD_TAG_SCAN 65536u
 #define MD_SCAN_BUDGET_PER_BYTE 4u
 /* Recursion ceiling for nested blockquotes, lists and emphasis. Past it a
- * quote's content is escaped as text, a list falls back to a paragraph and
- * an emphasis run is emitted literally, so the output stays well-formed
- * instead of blowing the C stack on a hostile document. The two fallbacks do
- * not agree with the reference renderer and are documented at their sites;
- * this ceiling is not negotiable, only what happens past it is. */
+ * quote's lines are rendered as an ordinary paragraph, a list's content
+ * likewise, and an emphasis or strikethrough run is emitted as the literal
+ * text it looks like, so the output stays well-formed instead of blowing the
+ * C stack on a hostile document. FOUR sites consult it — `emphasis_run`,
+ * `strikethrough`, `md_list` and the blockquote arm in `md_blocks` — and
+ * none of their fallbacks agrees with the reference renderer; each is
+ * documented at its site as a KNOWN BOUNDED LIMIT naming the shape its own
+ * fallback takes. This ceiling is not negotiable, only what happens past it
+ * is. */
 #define MD_MAX_DEPTH 24u
 /* Table columns per row. A wider row keeps its first MD_MAX_CELLS cells;
  * the table stays well-formed and the tail is dropped rather than trusted. */
@@ -105,6 +117,8 @@
 
 #include "kbc/markdown.h"
 #include "kbc/mem.h"
+#include "kbc/parse.h" /* kbc_fm_fence: the frontmatter fence predicate, owned
+                        * by the reader so the two parsers cannot disagree */
 
 /* Charge a construct scan for the bytes it ACTUALLY looked at, and report
  * whether the run can still afford the look. Charging the window instead
@@ -375,6 +389,14 @@ typedef struct {
    * a pipe by escaping it "including inside other inline spans", so the
    * backslash in `x\|y` goes away in a cell and stays everywhere else. */
   bool in_table_cell;
+  /* True while an image's ALT TEXT is being rendered. CommonMark calls the
+   * alt "a plain string", and comrak takes that literally: everything under
+   * an image node renders as escaped text, so a nested image contributes its
+   * own alt rather than its markup, and raw HTML in a label is ESCAPED
+   * instead of passed through (`![a <b>c</b>](i)` is `alt="a &lt;b&gt;c
+   * &lt;/b&gt;"`). Three sites read this — the raw-tag passthrough and the
+   * two line-break shapes — and nothing else does. */
+  bool plain;
 } sink;
 
 static void put(sink *s, const char *p, size_t n) {
@@ -391,12 +413,26 @@ static void chr(sink *s, char c) {
 
 /* A sink over a fresh buffer. The block layer buffers whole lines into one
  * before handing them to the inline pass, and reusing the same sticky
- * out-of-memory contract keeps a single failure path for the file. */
+ * out-of-memory contract keeps a single failure path for the file.
+ *
+ * EVERY field goes here, and that is the whole point of the function: the
+ * file had three sites that built a sink by hand — setting `oom` and `out`
+ * and leaving the three flags to whatever the caller's frame happened to
+ * hold. `in_table_cell` was lost outright when `plain` was added (this line
+ * was edited, not appended to), so it was left to the stack on every path
+ * through the file. `kbc_markdown_render`'s own three sinks are the ones
+ * that matter: `md_para` and the setext arm hand the CALLER's sink straight to
+ * `md_inline`, and the blockquote arm recurses into `md_blocks` with it, so
+ * the whole document is rendered through a struct whose flags had never been
+ * written. A field added to `sink` is now initialised by construction, and
+ * `the_page_does_not_depend_on_the_callers_stack` in tests/test_markdown.c
+ * is what keeps it that way. */
 static void sink_init(sink *s) {
   kbc_str_init(&s->out);
   s->oom = false;
   s->ends_tight_para = false;
   s->in_table_cell = false;
+  s->plain = false;
 }
 
 /* The forward declarations the two halves of the renderer need. `autolink`,
@@ -436,14 +472,25 @@ static char lower_c(char c) {
 
 /* -------------------------------------------------------------- escapes -- */
 
-/* Text and code. `"` needs no escape in either, which is why the two
- * functions differ at all. */
+/* Text and code. The two differ only in the controls: `esc_attr` also drops
+ * C0 and DEL, because an attribute value is a place where a stray control
+ * changes what the parser sees, while in text it only changes what a reader
+ * sees and dropping it would be a silent edit to the document.
+ *
+ * `"` IS escaped here, in both, which it was not until this file had to
+ * agree with the original on a document whose text it had just decided was
+ * TEXT: `![a @click="x"](i)` is not a tag, and the reference writes its
+ * escapes as `&lt;a @click=&quot;x&quot;&gt;`. An unescaped `"` cannot break
+ * out of anything in text, so this is fidelity rather than safety — but a
+ * byte-comparison of the two renderers sees it, and 11 CommonMark examples
+ * are the difference. */
 static void esc(sink *s, const char *p, size_t n) {
   for (size_t i = 0; i < n; i++) {
     switch (p[i]) {
       case '&': lit(s, "&amp;"); break;
       case '<': lit(s, "&lt;"); break;
       case '>': lit(s, "&gt;"); break;
+      case '"': lit(s, "&quot;"); break;
       default: chr(s, p[i]);
     }
   }
@@ -476,14 +523,24 @@ typedef struct {
   size_t next; /* the offset of the line after this one */
 } line_t;
 
+/* One line. CommonMark §2.1 makes CR, LF and CRLF all line endings, so a
+ * bare CR terminates a line here exactly as a bare LF does. It did not:
+ * only `\n` was a terminator and a trailing `\r` was stripped, so a
+ * CR-only document came through as ONE line and every construct in it —
+ * headings, quotes, lists, hard breaks — collapsed into a paragraph. A
+ * CRLF is still one terminator and the CR is still not part of the line. */
 static void line_at(const char *s, size_t n, size_t pos, line_t *out) {
   size_t e = pos;
-  while (e < n && s[e] != '\n') e++;
-  size_t len = e - pos;
-  if (len > 0 && s[pos + len - 1] == '\r') len--;
+  while (e < n && s[e] != '\n' && s[e] != '\r') e++;
   out->p = s + pos;
-  out->n = len;
-  out->next = (e < n) ? e + 1u : n;
+  out->n = e - pos;
+  if (e >= n) {
+    out->next = n;
+  } else if (s[e] == '\r' && e + 1u < n && s[e + 1u] == '\n') {
+    out->next = e + 2u;
+  } else {
+    out->next = e + 1u;
+  }
 }
 
 static bool blank(const line_t *l) {
@@ -531,7 +588,10 @@ static void strip_columns(const char **p, size_t *n, size_t want) {
 /* The same, for a paragraph's own line — except that two or more trailing
  * spaces are a HARD line break (§6) and have to survive to the inline pass.
  * Trimming them was what made `md_inline`'s `<br />` branch unreachable
- * from every block context: a document asking for a break got a soft one. */
+ * from the block contexts that feed a paragraph's own lines. The callers
+ * that must use this and not `trim` are `md_para` and the blockquote arm in
+ * `md_blocks`; a container that buffers its lines (a list item's body) has
+ * already had them trimmed once, which is why it does not appear here. */
 static void trim_para_line(const char *p, size_t n, const char **out,
                            size_t *out_n) {
   size_t a = 0;
@@ -707,80 +767,52 @@ typedef struct {
   size_t body_len;
 } fm_split;
 
-/* A leading UTF-8 BOM — common from Windows editors — would otherwise defeat
- * the `---` test at byte 0 and dump the whole frontmatter block into the
- * body as visible text. It is dropped before anything looks. */
-static size_t bom(const char *s, size_t n) {
-  return (n >= 3 && (unsigned char)s[0] == 0xEFu &&
-          (unsigned char)s[1] == 0xBBu && (unsigned char)s[2] == 0xBFu)
-             ? 3u
-             : 0u;
-}
-
-/* Splits a leading `---` block off `s` and reads ONE key from it: `title`.
+/* `bom` and the `---` fence are ONE predicate, owned by parse.c, because the
+ * two parsers used to hold separate copies of it and drift — that drift is
+ * what let a document carry facets the index read and a body the page did
+ * not. `kbc_fm_fence` skips a leading BOM, requires the opener at byte 0
+ * after it, closes only on a trimmed `---` (`...` is NOT a close), and
+ * returns false when the fence never closes, because an unclosed `---` is a
+ * thematic break and guessing would swallow the whole document. On a false
+ * return it still reports the BOM, so the body is the BOM-stripped source.
  *
- * This is not a second frontmatter parser. parse.c's `front_matter` owns the
- * `kb-*` facets and the index reads them from there; it is file-static, it
- * fills a kbc_metas, and it hands back neither the body offset nor a title,
- * both of which this file needs. So the fence scan below is the smallest
- * thing that answers those two questions, and it is written to agree with
- * parse.c's rule exactly where they overlap: a fence on the first line, a
- * trimmed `---` (trailing space included) to close, and — the edge the
- * original calls out at markdown.rs:230 — a leading `---` that never closes
- * is a THEMATIC BREAK, not frontmatter, because guessing would swallow the
- * whole document.
+ * The prototype is in include/kbc/parse.h, which this file includes: a
+ * symbol declared only in a comment in a .c file is a worse state than the
+ * duplication it was written to remove. */
+
+/* Reads the `title:` key out of the leading `---` block `kbc_fm_fence` found.
+ *
+ * This is not a second frontmatter PARSER. The fence itself — where the block
+ * is, where the body resumes — is parse.c's, and only that. What remains here
+ * is the one key this file needs and the index does not: `kbc_fm_fence`
+ * hands back offsets, and `title` is the renderer's own precedence input, so
+ * reading it stays here. The `kb-*` facets are still parse.c's alone.
  *
  * `title` is cleared, then filled if and only if the block carries a
  * `title:` key with a non-empty value. A later duplicate wins, as in the
  * original. */
 static kbc_status frontmatter(const char *s, size_t n, fm_split *out,
                               kbc_str *title) {
-  size_t b = bom(s, n);
+  size_t bom_len = 0, block_start = 0, block_end = 0, body_off = 0;
+  bool fenced =
+      kbc_fm_fence(s, n, &bom_len, &block_start, &block_end, &body_off);
   /* The BOM is dropped whether or not a block follows, as the original does
    * at markdown.rs:236: with no frontmatter the body is the source, and a
    * document that still begins with a BOM renders a stray U+FEFF in front of
-   * its first heading. */
-  out->body = s + b;
-  out->body_len = n - b;
+   * its first heading. `kbc_fm_fence` reports the BOM either way, so the body
+   * is `body_off` whether or not a block was found. */
+  out->body = s + body_off;
+  out->body_len = n - body_off;
   kbc_str_clear(title);
+  if (!fenced) return KBC_OK; /* a thematic break, not metadata */
 
-  const char *t = s + b;
-  size_t tn = n - b;
-  if (tn < 4 || t[0] != '-' || t[1] != '-' || t[2] != '-') return KBC_OK;
-  size_t after;
-  if (t[3] == '\n') {
-    after = 4;
-  } else if (t[3] == '\r' && tn >= 5 && t[4] == '\n') {
-    after = 5;
-  } else {
-    return KBC_OK;
-  }
-
-  size_t pos = after, block_end = 0, body = 0;
-  bool closed = false;
-  while (pos < tn) {
-    line_t l;
-    line_at(t, tn, pos, &l);
-    const char *q;
-    size_t qn;
-    trim(l.p, l.n, &q, &qn);
-    if (qn == 3 && q[0] == '-' && q[1] == '-' && q[2] == '-') {
-      block_end = pos;
-      body = l.next;
-      closed = true;
-      break;
-    }
-    pos = l.next;
-  }
-  if (!closed) return KBC_OK; /* a thematic break, not metadata */
-
-  out->body = t + body;
-  out->body_len = tn - body;
-
-  pos = after;
+  /* The key loop walks ABSOLUTE offsets into `s`: `block_start`/`block_end`
+   * are offsets the shared predicate reports from byte 0, so there is no
+   * second base to keep in step. */
+  size_t pos = block_start;
   while (pos < block_end) {
     line_t l;
-    line_at(t, tn, pos, &l);
+    line_at(s, n, pos, &l);
     pos = l.next;
     const char *q;
     size_t qn;
@@ -820,7 +852,26 @@ static kbc_status frontmatter(const char *s, size_t n, fm_split *out,
  * shell snippet becomes the title of the page that quotes it. The escape
  * hatch is not "title your page with a code sample". Everything else is
  * the original's rule — the line is trimmed, the marker is exactly `# `
- * (so `## x` and `#x` are not titles), and the rest must be non-empty. */
+ * (so `## x` and `#x` are not titles), and the rest must be non-empty.
+ *
+ * The lines here are `\n`-delimited, NOT `line_at`'s, and the difference is
+ * the reference's own: it finds the title by splitting the source on `\n`
+ * (markdown.rs:250) and trimming, while the block parser it then hands the
+ * document to treats a bare CR as a line ending too. So a CR-only document
+ * is ONE line to the title scan and several to the renderer: it renders the
+ * `# h` as a heading and still calls the page Untitled. Using `line_at` here
+ * instead made the two agree on the heading and disagree on the title, which
+ * is not what the original does on either count. */
+static void line_at_lf(const char *s, size_t n, size_t pos, line_t *out) {
+  size_t e = pos;
+  while (e < n && s[e] != '\n') e++;
+  size_t len = e - pos;
+  if (len > 0 && s[pos + len - 1] == '\r') len--;
+  out->p = s + pos;
+  out->n = len;
+  out->next = (e < n) ? e + 1u : n;
+}
+
 static kbc_status first_h1(const char *s, size_t n, kbc_str *out, bool *found) {
   *found = false;
   size_t pos = 0;
@@ -828,7 +879,7 @@ static kbc_status first_h1(const char *s, size_t n, kbc_str *out, bool *found) {
   size_t fl = 0;
   while (pos < n) {
     line_t l;
-    line_at(s, n, pos, &l);
+    line_at_lf(s, n, pos, &l);
     pos = l.next;
     const char *q;
     size_t qn;
@@ -1088,10 +1139,54 @@ static void rewrite_callouts(sink *s, const char *src, size_t n) {
  * having, and because four scanners bounding the same class of thing the
  * same way is easier to keep true than four different rules.
  *
+ * THE ATTRIBUTE WALK IS A GRAMMAR, NOT A SEARCH FOR `>`. It used to be the
+ * latter — a quote-tracking scan that accepted any bytes at all between the
+ * tag name and the `>` — which is how `<a b@c>` and `<a @click="x">` became
+ * live tags. They are not tags: CommonMark's `attrname` is
+ * `[A-Za-z_:][A-Za-z0-9_.:-]*`, and comrak escapes both of those to text
+ * while passing `<a _x="1">` and `<div :prop="y">` through, so the rule is
+ * the first character, not the presence of an `=`. A passthrough that
+ * accepts `<a @click="x">` is a passthrough the `render.unsafe = true`
+ * contract never promised, and the fix is in the direction of emitting less
+ * markup, never more.
+ *
+ * This is the INLINE and type-7 grammar. A type-6 block start is decided by
+ * the tag NAME alone — `html_kind` returns before it ever gets here — which
+ * is why `<div @click="x">` on its own line is still a block, exactly as the
+ * original has it.
+
+ * The newline rule is unchanged and is the reason the quoted-value scan
+ * below stops at one: CommonMark lets a tag span lines, this renderer's
+ * inline pass does not, and `raw_tag`'s callers pass it one line.
+ *
  * A `<` that does not close within its allowance is escaped as text, which is
  * the right failure in both directions: a tag that never closes would
  * otherwise swallow the rest of the document into one attribute value, the
  * worst malformed page this file could emit. */
+
+/* A byte that may appear in an `attrname` after its first. */
+static bool attr_char(unsigned char c) {
+  return alnum(c) || c == '_' || c == ':' || c == '.' || c == '-';
+}
+
+/* A byte an UNQUOTED `attrvalue` may not contain: the spec's
+ * "any character except ... whitespace, `"`, `'`, `=`, `<`, `>`, `` ` ``"
+ * plus the C0 controls and DEL, which `esc_attr` drops for the same reason
+ * it drops them elsewhere. */
+static bool unquoted_stop(unsigned char c) {
+  /* `<= 0x20`, not `< 0x20`: the space is the byte this predicate exists
+   * for. `<img src=x onerror=y>` is two attributes, and an unquoted value
+   * that ran to the next `=` would read `src` as `x onerror`. */
+  return c <= 0x20u || c == 0x7fu || c == '"' || c == '\'' || c == '=' ||
+         c == '<' || c == '>' || c == '`';
+}
+
+/* Whitespace INSIDE a tag, which is the spec's `space_or_tab | newline` and
+ * not `sp()`: `<a\nb="1">` is one tag, and the original has it as one. An
+ * unquoted value still cannot swallow the newline — `unquoted_stop` says so
+ * — so a tag that never closes is still bounded. */
+static bool tag_sp(char c) { return c == ' ' || c == '\t' || c == '\n'; }
+
 static size_t raw_tag(const char *p, size_t n, size_t i, size_t *budget) {
   size_t k = i + 1;
   if (k < n && p[k] == '!') {
@@ -1134,29 +1229,63 @@ static size_t raw_tag(const char *p, size_t n, size_t i, size_t *budget) {
     scan_spend(budget, limit - k);
     return 0;
   }
-  if (k < n && p[k] == '/') k++;
+  /* `</a>` is a CLOSING tag and carries no attributes, so it gets a
+   * different tail from `<a …>`; the name is the same either way. */
+  bool closing = (k < n && p[k] == '/');
+  if (closing) k++;
   if (k >= n || !alpha((unsigned char)p[k])) return 0;
   k++;
   while (k < n && (alnum((unsigned char)p[k]) || p[k] == '-')) k++;
-  if (k < n && p[k] != '>' && p[k] != '/' && !sp((unsigned char)p[k])) return 0;
   size_t base = k;
   size_t limit = scan_limit(budget, k, n, MD_TAG_SCAN);
-  char quote = 0;
-  for (; k < limit; k++) {
-    char c = p[k];
-    if (quote != 0) {
-      if (c == quote) quote = 0;
-      continue;
+  /* `whitespace* "/"? ">"` closes the tag. Anything else starts an
+   * attribute, an attribute that does not parse ends the tag, and — the
+   * rule `<a b="1"c="2">` turns on — two attributes need whitespace between
+   * them: `attributes` is `( whitespace+ attribute )*`, so a name may not
+   * start where a value ended. */
+  bool first = true;
+  for (;;) {
+    size_t before = k;
+    while (k < limit && tag_sp(p[k])) k++;
+    if (!closing && k < limit && p[k] == '/') {
+      /* `"/"?` is the last thing before the `>`: `<a / >` and `<a //>` are
+       * not tags. */
+      if (k + 1 < limit && p[k + 1] == '>') {
+        scan_spend(budget, k + 2 - base);
+        return k + 2;
+      }
+      break;
     }
-    if (c == '"' || c == '\'') {
-      quote = c;
-      continue;
-    }
-    if (c == '>') {
+    if (k < limit && p[k] == '>') {
       scan_spend(budget, k + 1 - base);
       return k + 1;
     }
-    if (c == '<' || c == '\n') break;
+    if (closing || k >= limit || (!first && k == before)) break;
+    if (!(alpha((unsigned char)p[k]) || p[k] == '_' || p[k] == ':')) break;
+    first = false;
+    k++;
+    while (k < limit && attr_char((unsigned char)p[k])) k++;
+    /* `= value` is optional, and so is the whitespace around it. */
+    size_t w = k;
+    while (w < limit && tag_sp(p[w])) w++;
+    if (w < limit && p[w] == '=') {
+      w++;
+      while (w < limit && tag_sp(p[w])) w++;
+      if (w >= limit) break;
+      if (p[w] == '"' || p[w] == '\'') {
+        char q = p[w];
+        size_t d = w + 1;
+        while (d < limit && p[d] != q) d++;
+        if (d >= limit) break;
+        w = d + 1;
+      } else {
+        size_t d = w;
+        while (d < limit && !unquoted_stop((unsigned char)p[d])) d++;
+        if (d == w) break;
+        w = d;
+      }
+      k = w;
+    }
   }
   scan_spend(budget, k - base);
   return 0;
@@ -1274,6 +1403,7 @@ static void esc_title(sink *s, const char *p, size_t n) {
 }
 
 static void md_inline(sink *s, const char *p, size_t n, int depth);
+static void alt_text(sink *s, const char *p, size_t n, int depth);
 
 /* An HTML entity, passed through unchanged: the document said `&amp;` and
  * re-escaping it would change what the page says. Every scan is capped at
@@ -1337,12 +1467,16 @@ static size_t inline_link(const char *p, size_t n, size_t i, const char **lbl,
       continue;
     }
     if (p[k] == '`') {
-      /* A `]` inside a code span is not the end of the label. */
+      /* A `]` inside a code span is not the end of the label — but a
+       * backtick run that never closes is not a code span either, it is
+       * literal text, and the `]` after it still ends the label. Aborting
+       * the label on one is what made `[a`](b)` and `![a`](i)` render as
+       * literal text: one stray backtick anywhere in a label lost the whole
+       * construct, link or image. */
       size_t r = 0;
       while (k + r < n && p[k + r] == '`') r++;
       size_t j = code_span_end(p, n, k, r, budget);
-      if (j == 0) break;
-      k = j + r;
+      k = (j != 0) ? j + r : k + r;
       continue;
     }
     if (p[k] == '[') depth++;
@@ -1366,7 +1500,19 @@ static size_t inline_link(const char *p, size_t n, size_t i, const char **lbl,
   size_t ds = k;
   if (k < tail && p[k] == '<') {
     k++;
-    while (k < tail && p[k] != '>') k++;
+    /* A link destination may not contain a line ending, inside angle
+     * brackets or not (CommonMark example 491): `[a](<foo\nbar>)` is not a
+     * link at all, and the original writes it back as text. Scanning to the
+     * `>` regardless made the construct succeed with the newline
+     * percent-encoded into the href, so a document that meant to show the
+     * syntax got a link to a destination containing `%0A`. */
+    while (k < tail && p[k] != '>') {
+      if (p[k] == '\n') {
+        scan_spend(budget, k - base);
+        return 0;
+      }
+      k++;
+    }
     if (k >= tail) {
       scan_spend(budget, k - base);
       return 0;
@@ -1798,6 +1944,12 @@ static size_t emphasis_run(sink *s, const char *p, size_t n, size_t i, int depth
 static size_t strikethrough(sink *s, const char *p, size_t n, size_t i,
                            int depth, size_t *budget) {
   if (i + 2 > n || p[i + 1] != '~' || p[i + 2] == '~') return 0;
+  /* KNOWN BOUNDED LIMIT — the depth cap's FALLBACK SHAPE, strikethrough
+   * half, and the second of the four sites `MD_MAX_DEPTH` guards. The run is
+   * left as the literal `~~` it looks like, where the reference wraps it in
+   * a `<del>`. Same trade and same reason as `emphasis_run` above: the
+   * recursion is what is capped, and the shape past the cap is what
+   * diverges. */
   if (depth >= (int)MD_MAX_DEPTH) return 0;
   bool before_ws = i == 0 || sp((unsigned char)p[i - 1]);
   bool after_ws = (i + 2 >= n) || sp((unsigned char)p[i + 2]);
@@ -1909,7 +2061,7 @@ static void md_inline(sink *s, const char *p, size_t n, int depth) {
     if (c == '\\' && i + 1 < n && p[i + 1] == '\n') {
       /* The other half of a hard line break: a backslash at the end of a
        * line is one, exactly as two trailing spaces are. */
-      lit(s, "<br />\n");
+      if (s->plain) chr(s, ' '); else lit(s, "<br />\n");
       i += 2;
       continue;
     }
@@ -1974,7 +2126,13 @@ static void md_inline(sink *s, const char *p, size_t n, int depth) {
       }
       size_t te = raw_tag(p, n, i, &budget);
       if (te != 0) {
-        put(s, p + i, te - i);
+        /* An image's alt is plain TEXT, so a raw tag inside its label is
+         * escaped rather than passed through — comrak's `HtmlInline` under
+         * an image escapes the literal, and `![a <b>c</b>](i)` is
+         * `alt="a &lt;b&gt;c&lt;/b&gt;"`. Outside one it is the
+         * `render.unsafe` passthrough the contract promises. */
+        if (s->plain) esc(s, p + i, te - i);
+        else put(s, p + i, te - i);
         i = te;
         continue;
       }
@@ -1992,7 +2150,7 @@ static void md_inline(sink *s, const char *p, size_t n, int depth) {
         lit(s, "<img src=\"");
         esc_url(s, dest, dest_n);
         lit(s, "\" alt=\"");
-        esc_attr(s, lbl, lbl_n);
+        alt_text(s, lbl, lbl_n, depth);
         lit(s, "\"");
         if (ttl_n > 0) {
           lit(s, " title=\"");
@@ -2087,7 +2245,12 @@ static void md_inline(sink *s, const char *p, size_t n, int depth) {
        * one and stays a newline in the source of the paragraph. The spaces
        * are held back rather than written as they are scanned, because a
        * hard break swallows them and the original does not emit them. */
-      if (sp_pending >= 2u) {
+      /* Under an image the break is a space in the alt text, which is what
+       * comrak writes for both a hard and a soft break; the two spaces the
+       * hard break swallowed are still swallowed. */
+      if (s->plain) {
+        chr(s, ' ');
+      } else if (sp_pending >= 2u) {
         lit(s, "<br />\n");
       } else {
         while (sp_pending > 0) {
@@ -2108,10 +2271,96 @@ static void md_inline(sink *s, const char *p, size_t n, int depth) {
     esc(s, &c, 1);
     i++;
   }
+  /* End of the run: whatever spaces are still pending are ordinary text and
+   * are written out. They are NOT dropped here, and the reason is a
+   * mechanism one, not a preference: `emphasis_run` renders the text
+   * BETWEEN a pair by recursing into `md_inline` with exactly those bytes,
+   * so the separator in `*a* *b*` arrives here as a whole one-space run
+   * with nothing after it. Discarding pending spaces at the end of a run
+   * therefore ate the space between adjacent emphasis runs, which is what
+   * a change meant to strip a paragraph's trailing hard-break marker
+   * actually did. Whether the spaces are TRAILING is a property of the
+   * PARAGRAPH, not of the run, so `md_para` decides it once, where it knows
+   * the paragraph ended. */
   while (sp_pending > 0) {
     chr(s, ' ');
     sp_pending--;
   }
+}
+
+/* An image's alt attribute: the PLAIN TEXT of its label, which is not the
+ * same string as the label's bytes. `![a *b*](i)` is `alt="a b"` and not
+ * `alt="a *b*"`; the emphasis is markup and the alt is not. CommonMark
+ * §6.5 says "a plain string" and comrak gets there by rendering the label
+ * with every node forced to plain text — its `ChildRendering::Plain`, which
+ * under an image turns Text, Code and HtmlInline into escaped text, turns
+ * either kind of line break into one space, and renders every other node
+ * (emphasis, a link, a nested image) as nothing, so only the text beneath
+ * it survives. That is what the `plain` flag on the sink does here, at the
+ * three sites `md_inline` consults it.
+ *
+ * So the label is rendered and the markup is stripped back off, which is
+ * why there is a plain-text extractor at all: reusing `md_inline` is what
+ * keeps the two passes from disagreeing about what a code span or a
+ * strikethrough run is. The one tag that is not simply dropped is a nested
+ * `<img>`, whose own alt this same call has already computed one level
+ * down — inlining it is what makes `![foo ![bar](/url)](/url2]` an
+ * `alt="foo bar"` rather than an `alt="foo"` with an image swallowed whole.
+ *
+ * The bytes `md_inline` produced are ALREADY escaped, so this does not
+ * escape them again: a second pass over `&` is what would turn `![a & b](i)`
+ * into an alt reading `a &amp; b`. What is still owed is the `"` that ends
+ * the attribute, which `esc` leaves alone — `![a "b" c](i)` must not close
+ * the alt on its first quote. */
+static void alt_text(sink *s, const char *p, size_t n, int depth) {
+  sink t;
+  sink_init(&t);
+  t.plain = true;
+  /* GFM §4.10's cell rule is about the label's own bytes, so it carries
+   * into the alt exactly as it would into a paragraph. */
+  t.in_table_cell = s->in_table_cell;
+  md_inline(&t, p, n, depth + 1);
+  if (t.oom) {
+    s->oom = true;
+    kbc_str_free(&t.out);
+    return;
+  }
+  const char *h = t.out.ptr;
+  size_t hn = t.out.len;
+  for (size_t i = 0; i < hn; i++) {
+    char c = h[i];
+    if (c == '<') {
+      /* Every `<` left in the rendered label opens a construct this file
+       * emitted: text `<` was escaped, and a raw tag was escaped too when
+       * `plain` is set. So this can walk to the `>` without worrying about
+       * a `<` that is really text. */
+      size_t gt = i + 1;
+      while (gt < hn && h[gt] != '>') gt++;
+      if (gt - i > 4 && lower_c(h[i + 1]) == 'i' && lower_c(h[i + 2]) == 'm' &&
+          lower_c(h[i + 3]) == 'g' && sp((unsigned char)h[i + 4])) {
+        /* The nested image's alt, which is itself already escaped. `esc_url`
+         * and `esc_attr` leave no bare `"` in a src or a title, so the one
+         * this finds is the delimiter the emitter wrote. */
+        for (size_t a = i + 5; a + 6 <= gt; a++) {
+          if (h[a] == ' ' && memcmp(h + a + 1, "alt=\"", 5) == 0) {
+            for (size_t b = a + 6; b < gt && h[b] != '"'; b++) chr(s, h[b]);
+            break;
+          }
+        }
+      }
+      i = (gt < hn) ? gt : hn - 1;
+      continue;
+    }
+    if (c == '\n') {
+      chr(s, ' ');
+      continue;
+    }
+    unsigned char u = (unsigned char)c;
+    if (u < 0x20u || u == 0x7fu) continue;
+    if (c == '"') lit(s, "&quot;");
+    else chr(s, c);
+  }
+  kbc_str_free(&t.out);
 }
 
 /* -------------------------------------------------------------- blocks -- */
@@ -2165,6 +2414,27 @@ static bool starts_block(const char *p, size_t n) {
   return hk == 1 || hk == 2 || hk == 6;
 }
 
+/* Drops the spaces at the very end of a buffered block of text. A
+ * paragraph's last line carries them as the marker of a hard line break, and
+ * at the end there is no following line for that break to reach, so the
+ * original strips them: `a␠␠` is `a`, not `a␠␠` and not `a<br />`. The
+ * decision lives here, in the one function that knows the paragraph ended,
+ * rather than in `md_inline`'s end-of-run flush — `emphasis_run` renders the
+ * text between a pair by recursing into `md_inline` on exactly those bytes,
+ * so the space in `*a* *b*` reaches the end of a run as a whole one-space
+ * run and a flush that dropped pending spaces ate it. */
+static void strip_trailing_spaces(sink *text) {
+  while (text->out.len > 0 && text->out.ptr[text->out.len - 1] == ' ') {
+    text->out.len--;
+    text->out.ptr[text->out.len] = '\0';
+  }
+}
+/* Does a GFM table open at this line? A header row plus a delimiter row of
+ * the same width. GFM lets the pair interrupt a paragraph, and the test
+ * needs the NEXT line, which `starts_block` — one line at a time — cannot
+ * see, so `md_para` asks this directly instead. Defined after `row_cells`. */
+static bool table_starts(const char *src, size_t n, size_t pos);
+
 /* Consumes a paragraph: every line until a blank one, a line that starts a
  * new block, or a setext underline. The underline closes the paragraph it
  * follows WHATEVER that paragraph's length — CommonMark §4.3 has no
@@ -2200,7 +2470,10 @@ static size_t md_para(sink *s, const char *src, size_t n, size_t pos,
          * the container stack where the line is, which is the container
          * parsing this block layer does not do. Chosen, not missed: the
          * alternative is a second, partial model of block structure
-         * threaded through every block function. Two corpus documents. */
+         * threaded through every block function. The blockquote arm, which
+         * CAN see which of its lines carried a `>`, handles its own case
+         * there. Two corpus documents. */
+        strip_trailing_spaces(&text);
         lit(s, sv == 1 ? "<h1>" : "<h2>");
         md_inline(s, text.out.ptr != NULL ? text.out.ptr : "", text.out.len,
                   depth + 1);
@@ -2212,6 +2485,11 @@ static size_t md_para(sink *s, const char *src, size_t n, size_t pos,
     }
     if (count > 0) {
       if (starts_block(t, tn)) break;
+      /* A GFM table's header + delimiter pair interrupts a paragraph. This
+       * has to be a separate test from `starts_block`, which sees one line
+       * and cannot know whether the NEXT one is the delimiter row — which
+       * is why a table could only ever start at a block boundary. */
+      if (table_starts(src, n, cur)) break;
       chr(&text, '\n');
     }
     trim_para_line(l.p, l.n, &t, &tn);
@@ -2225,6 +2503,16 @@ static size_t md_para(sink *s, const char *src, size_t n, size_t pos,
     return cur;
   }
   if (!tight) lit(s, "<p>");
+  /* A paragraph's LAST line loses its trailing spaces, including the two
+   * that would be a hard line break: with nothing after it, the break is
+   * not a break, and the original strips them rather than emitting either
+   * a `<br />` or the spaces. This is decided HERE and not at the end of
+   * `md_inline`, because `emphasis_run` renders the text between a pair by
+   * recursing into `md_inline` on exactly those bytes: the separator in
+   * `*a* *b*` reaches the end of a run as a whole one-space run, and
+   * dropping pending spaces there ate it. Whether spaces are TRAILING is a
+   * property of the paragraph, and only the paragraph knows. */
+  strip_trailing_spaces(&text);
   md_inline(s, text.out.ptr != NULL ? text.out.ptr : "", text.out.len,
             depth + 1);
   if (!tight) lit(s, "</p>");
@@ -2341,6 +2629,32 @@ static size_t row_cells(const char *p, size_t n, const char **starts,
   return count;
 }
 
+/* The header/delimiter pair test, without emitting anything: the same two
+ * `row_cells` calls `md_table` makes, and the same two rejections. Split out
+ * so that `md_para` can ask "would a table open here?" without writing a
+ * table into the sink to find out. */
+static bool table_starts(const char *src, size_t n, size_t pos) {
+  const char *hs[MD_MAX_CELLS];
+  size_t hl[MD_MAX_CELLS];
+  bool delim = false;
+  line_t head;
+  line_at(src, n, pos, &head);
+  const char *ht;
+  size_t htn;
+  trim(head.p, head.n, &ht, &htn);
+  size_t hcols = row_cells(ht, htn, hs, hl, &delim);
+  if (hcols == 0 || hcols > MD_MAX_CELLS) return false;
+  line_t sep;
+  line_at(src, n, head.next, &sep);
+  const char *st;
+  size_t stn;
+  trim(sep.p, sep.n, &st, &stn);
+  const char *ss[MD_MAX_CELLS];
+  size_t sl[MD_MAX_CELLS];
+  bool is_sep = false;
+  size_t scols = row_cells(st, stn, ss, sl, &is_sep);
+  return is_sep && scols == hcols;
+}
 static size_t md_table(sink *s, const char *src, size_t n, size_t pos,
                        int depth) {
   const char *hs[MD_MAX_CELLS];
@@ -2668,9 +2982,9 @@ static size_t md_list(sink *s, const char *src, size_t n, size_t pos,
      * newline then `<blockquote>`, `<h1>`, `<pre>` or a nested `<ul>`, and
      * writes `<li>text` for the one case where a paragraph can follow it
      * directly. Getting this wrong glued the block tag to the `<li>`:
-     * `<li><blockquote>`. The test is the item's own first line, since a
-     * later block in the same item is already preceded by a block that
-     * ended itself. */
+     * `<li><blockquote>`. The test is the item's own first BLOCK, so a
+     * later block in the same item needs no test: it is already preceded by
+     * a block that ended itself. */
     /* An item with no content at all has no first block, so it gets no
      * newline either: the original writes `<li></li>`, not `<li>\n</li>`. */
     bool para_first = true;
@@ -2682,12 +2996,31 @@ static size_t md_list(sink *s, const char *src, size_t n, size_t pos,
       trim(fl.p, fl.n, &ft, &ftn);
       para_first = ftn == 0 ||
                    (columns(fl.p, fl.n) < 4u && !starts_block(ft, ftn));
+      /* A setext HEADING is a paragraph's underline on the SECOND line, so
+       * testing the first line alone read `- t\n  ---` as a paragraph and
+       * wrote `<li><h2>t</h2>`. The underline is the block's second line,
+       * and it makes the block a heading, which is not a paragraph. */
+      if (para_first) {
+        line_t sl;
+        line_at(bp, bn, fl.next, &sl);
+        if (sl.next > fl.next) {
+          const char *st;
+          size_t stn;
+          trim(sl.p, sl.n, &st, &stn);
+          if (setext(st, stn) > 0) para_first = false;
+        }
+      }
     }
+    /* GFM task list item: the checkbox goes INSIDE the <li>, which is where
+     * the stylesheet's `li input[type="checkbox"]` rule expects to find it.
+     * The marker is only a task marker when the item's content STARTS with a
+     * paragraph — `- [x] a\n  ---` is a heading whose text is `[x] a`, and
+     * the original writes no checkbox for it. The mark is therefore read
+     * only when `para_first` holds, and left in the text otherwise. */
+    if (!para_first) tm = 0;
     lit(s, "<li>");
     if (tm == 0 && (loose || !para_first)) chr(s, '\n');
     if (tm > 0) {
-      /* GFM task item: the checkbox goes INSIDE the <li>, which is where the
-       * stylesheet's `li input[type="checkbox"]` rule expects to find it. */
       lit(s, "<input type=\"checkbox\"");
       if (checked) lit(s, " checked=\"\"");
       lit(s, " disabled=\"\" /> ");
@@ -2774,18 +3107,30 @@ static bool html_name_is(const char *name, size_t n, const char *list) {
  * the same multiple-of-the-input the inline pass holds itself to. */
 static int html_kind(const char *p, size_t n) {
   if (n < 2 || p[0] != '<') return 0;
-  if (n >= 5 && memcmp(p + 1, "!--", 3) == 0) return 2;
+  /* The lengths here are the EXACT length of each opener, not one more: a
+   * comment is `<` `!` `-` `-` (4 bytes) and a processing instruction is
+   * `<` `?` (2). The guards were one byte too long each, so a line that was
+   * nothing but its own opener — `<!--` on a line, `<?` on a line — fell
+   * through to a paragraph, and a comment that started on the byte sequence
+   * a comment most often starts on was escaped rather than passed through.
+   * That is the security-relevant one: the escaping is what stops the
+   * comment being reinterpreted downstream. */
+  if (n >= 4 && memcmp(p + 1, "!--", 3) == 0) return 2;
   if (n >= 4 && p[1] == '!' && (p[2] == '[' || p[2] == 'D')) return 1;
-  if (n >= 3 && p[1] == '?') return 1;
+  if (n >= 2 && p[1] == '?') return 1;
   size_t ns = p[1] == '/' ? 2u : 1u;
   if (ns >= n || !alpha((unsigned char)p[ns])) return 0;
   size_t ne = ns;
   while (ne < n && (alnum((unsigned char)p[ne]) || p[ne] == '-')) ne++;
   if (html_name_is(p + ns, ne - ns, MD_RAW_TEXT_TAGS)) return 1;
+  /* Type 6 is decided by the tag NAME and nothing else — not even whether
+   * the tag is well formed. `<div @click="x">` on its own line is a block
+   * in the original, and checking completeness first would have stopped
+   * being true the moment `raw_tag` learned what an attribute name is. */
+  if (html_name_is(p + ns, ne - ns, MD_BLOCK_TAGS)) return 6;
   size_t budget = n * MD_SCAN_BUDGET_PER_BYTE + MD_TAG_SCAN;
   size_t te = raw_tag(p, n, 0, &budget);
   if (te == 0) return 0;
-  if (html_name_is(p + ns, ne - ns, MD_BLOCK_TAGS)) return 6;
   /* Type 7: a complete tag and nothing else on the line. A tag with text
    * beside it is a paragraph whose inline raw tags pass through, which is
    * both what the original does and what keeps a sentence mentioning
@@ -2964,6 +3309,17 @@ static void md_blocks(sink *s, const char *src, size_t n, int depth, bool tight)
 
     if (t[0] == '>') {
       if (depth >= (int)MD_MAX_DEPTH) {
+        /* KNOWN BOUNDED LIMIT — the depth cap's FALLBACK SHAPE, quote half,
+         * and the THIRD of the three sites `MD_MAX_DEPTH` guards. `md_para`
+         * renders the quote's own lines as a paragraph and never looks for
+         * the matching `>`, so a document of thirty `>` characters comes out
+         * as thirty literal `>` characters in one `<p>` where the original
+         * has one more `<blockquote>` than this one. Same trade as the list
+         * cap and for the same reason — the arm recurses into `md_blocks`,
+         * and a hostile document of nested quotes is a C stack overflow,
+         * which is a crash and not a rendering difference — and the same
+         * caveat: the cap is not what diverges, the shape of the fallback
+         * is. The text is emitted, not dropped, so nothing is lost. */
         pos = md_para(s, src, n, pos, depth, false);
         continue;
       }
@@ -2977,16 +3333,57 @@ static void md_blocks(sink *s, const char *src, size_t n, int depth, bool tight)
         /* The `>` is matched after the line's own indentation, not at
          * column 0: an indented quote is still a quote, and testing the raw
          * byte made `  > x` re-enter here forever with its indent intact. */
-        const char *cp;
-        size_t cn;
-        trim(c.p, c.n, &cp, &cn);
+        const char *cp = c.p;
+        size_t cn = c.n;
+        while (cn > 0 && sp((unsigned char)*cp)) { cp++; cn--; }
         if (cn == 0 || cp[0] != '>') {
           /* Lazy continuation: an unmarked line directly under a quote line
-           * stays in the quote, as CommonMark specifies. */
+           * stays in the quote, as CommonMark specifies. It is a paragraph
+           * continuation and nothing else, which is what the next test
+           * says: a lazy line that LOOKS like a setext underline is text,
+           * not a heading. `> foo\nbar\n===` is one paragraph reading
+           * `foo bar ===`, and `> foo\nbar\n---` is a paragraph followed by
+           * a thematic break OUTSIDE the quote. The arm used to append the
+           * line unmarked, so `md_para` — which sees a flat buffer with no
+           * record of which lines carried a `>` — read `===` as an underline
+           * and closed the paragraph as an `<h1>` inside the quote. The
+           * same shape reaches a list item through `item_body`, which is
+           * what the KNOWN BOUNDED LIMIT in `md_para` documents; here the
+           * quote arm can see the difference itself, so it makes it. */
+          const char *st;
+          size_t stn;
+          trim(cp, cn, &st, &stn);
+          if (setext(st, stn) > 0) {
+            /* The underline belongs to the paragraph only if it was marked
+             * with a `>`. An unmarked one leaves the quote. */
+            if (rule(cp, cn)) break;
+            /* Otherwise it is literal text: emit it so `md_para` keeps it
+             * as a paragraph line, by breaking the paragraph's own test.
+             * The line goes in with its `=` escaped, which `md_inline`
+             * unescapes, so the text is the one the document wrote. */
+            if (inner.out.len > 0) chr(&inner, '\n');
+            put(&inner, "\\", 1);
+            put(&inner, cp, cn);
+            cur = c.next;
+            continue;
+          }
           if (starts_block(cp, cn)) break;
         } else {
           dequote(&cp, &cn);
         }
+        /* The content keeps its LEADING indent and its trailing spaces: the
+         * `>` probe above is leading-only, and `dequote` has already removed
+         * the marker and the one space behind it. Nothing is trimmed here.
+         *
+         * Two trailing spaces are a hard line break, so they must reach
+         * `md_inline`; `trim` used to run on this content and stripped them,
+         * which is why `> a␠␠\n> b` rendered as a soft break — a defect in the
+         * one block context every earlier pass had tested a break in except.
+         * A leading space is equally load-bearing and was nearly as bad: it
+         * is what makes `>   b` the lazy continuation of the list item on the
+         * line above rather than a sibling of it, so the content is handed on
+         * as `dequote` left it. `md_para` applies `trim_para_line` per line
+         * once the buffer is re-parsed, which is where that belongs. */
         if (inner.out.len > 0) chr(&inner, '\n');
         put(&inner, cp, cn);
         cur = c.next;
@@ -3189,22 +3586,30 @@ kbc_status kbc_markdown_render(const char *src, size_t len, kbc_arena *a,
   }
   strip_controls(&title);
 
-  /* The callout pre-pass, then the block renderer over whatever it left. */
+  /* The callout pre-pass, then the block renderer over whatever it left.
+   *
+   * All three sinks go through `sink_init`, and that is load-bearing rather
+   * than tidy. `md_para` renders a paragraph through the sink `md_blocks` was
+   * HANDED — it buffers the lines into a sink of its own and then calls
+   * `md_inline` on the caller's — and the blockquote arm recurses into
+   * `md_blocks` with the same sink, so these three flags decided the output
+   * of every line of prose in the document. They were being set by hand, to
+   * `oom` and `out` only, so the other three were whatever the frame below
+   * had left in them: one build rendered `Foo\nBar` as `<h2>Foo Bar</h2>`
+   * and the next as `<h2>Foo\nBar</h2>`, and nothing in the source said
+   * which. */
   sink pre;
-  pre.oom = false;
-  kbc_str_init(&pre.out);
+  sink_init(&pre);
   rewrite_callouts(&pre, fm.body, fm.body_len);
 
   sink body;
-  body.oom = false;
-  kbc_str_init(&body.out);
+  sink_init(&body);
   md_blocks(&body, pre.out.ptr != NULL ? pre.out.ptr : "", pre.out.len, 0,
             false);
   kbc_str_free(&pre.out);
 
   sink page;
-  page.oom = false;
-  kbc_str_init(&page.out);
+  sink_init(&page);
   /* The wrapper, byte for byte as markdown.rs:441-456 builds it, including
    * the three quirks a byte comparison catches: no newline after the
    * viewport meta, no self-closing slash on <meta charset>, and the
