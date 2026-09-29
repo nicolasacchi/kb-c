@@ -1301,11 +1301,18 @@ typedef struct {
   const char *corpus;
   const char *id;
   const char *query;
-  long port;
+  const char *body;
+  const char *anchor;
+  const char *author;
+  const char *path;
+  const char *output;
   const char *out;
+  long port;
   size_t limit;
   size_t queries;
   size_t repeats;
+  size_t n;
+  unsigned long long seed;
   bool has_limit;
   bool has_queries;
   bool has_repeats;
@@ -1313,6 +1320,8 @@ typedef struct {
   bool has_port;
   bool has_kb;
   bool has_mode;
+  bool has_n;
+  bool has_seed;
   bool source;
   bool all;
   bool force;
@@ -1412,6 +1421,8 @@ static void parse_verb(const flag_def *defs, int argc, char **argv, int start,
       o->has_bind = true;
     } else if (strcmp(s, "--corpus") == 0) {
       o->corpus = value;
+    } else if (strcmp(s, "--artifact-id") == 0) {
+      o->id = value;
     } else if (strcmp(s, "--limit") == 0) {
       o->limit = parse_bounded(value, "--limit", 1, KBC_MAX_HITS);
       o->has_limit = true;
@@ -1433,6 +1444,31 @@ static void parse_verb(const flag_def *defs, int argc, char **argv, int start,
       o->all = true;
     } else if (strcmp(s, "--force") == 0) {
       o->force = true;
+    } else if (strcmp(s, "--body") == 0) {
+      o->body = value;
+    } else if (strcmp(s, "--anchor") == 0) {
+      o->anchor = value;
+    } else if (strcmp(s, "--author") == 0) {
+      o->author = value;
+    } else if (strcmp(s, "--path") == 0) {
+      o->path = value;
+    } else if (strcmp(s, "--output") == 0) {
+      o->output = value;
+    } else if (strcmp(s, "--n") == 0) {
+      o->n = parse_bounded(value, "--n", 1, 1000000);
+      o->has_n = true;
+    } else if (strcmp(s, "--seed") == 0) {
+      /* Base 0: the Rust's own default is written `0xb33f` and the README
+       * tells operators to pass it that way, so a decimal-only parse would
+       * reject the value the documentation hands them. */
+      char *endp = NULL;
+      errno = 0;
+      unsigned long long v = strtoull(value, &endp, 0);
+      if (endp == value || *endp != '\0' || errno != 0) {
+        die_user("--seed: %s is not a number", value);
+      }
+      o->seed = v;
+      o->has_seed = true;
     } else if (strcmp(s, "--foreground") == 0) {
       o->foreground = true;
     }
@@ -1472,6 +1508,31 @@ static const flag_def FLAGS_BACKUP[] = { { "--out", true },
 static const flag_def FLAGS_RESTORE[] = { { "--kb", true },
                                            { "--force", false },
                                            { NULL, false } };
+/* `comments` — the Rust's flag surface, minus what has no kb-c
+ * counterpart. `--kb` narrows to one corpus; `--path`/`--artifact-id` name
+ * the document (either, never both); `--limit` caps the listing the way the
+ * Rust's `?limit=` does. `--daemon` is absent because the daemon's own
+ * route table has no review endpoints: this port's comments are rows in
+ * the store, not a daemon-side review file, so the CLI reads the store
+ * directly and there is no endpoint to name. */
+static const flag_def FLAGS_COMMENTS[] = { { "--kb", true },
+                                           { "--path", true },
+                                           { "--artifact-id", true },
+                                           { "--limit", true },
+                                           { "--body", true },
+                                           { "--anchor", true },
+                                           { "--author", true },
+                                           { "--all", false },
+                                           { NULL, false } };
+/* `--kb` is the corpus whose NAME goes into each id: kb-c mints an id from
+ * (corpus, path) together (src/ids.c), so without the name there is no id to
+ * write and the scaffold would be unusable against a kb-c store. */
+static const flag_def FLAGS_BENCH_INIT[] = { { "--kb", true },
+                                             { "--corpus", true },
+                                             { "--output", true },
+                                             { "--n", true },
+                                             { "--seed", true },
+                                             { NULL, false } };
 
 static int cmd_search(int argc, char **argv, int start) {
   opts o;
@@ -2350,6 +2411,15 @@ cleanup:
 /* --------------------------------------------------------------- daemon ---- */
 
 static volatile sig_atomic_t g_stop;
+/* The pid-file lifecycle, implemented with `daemon stop` far below because
+ * that is where its contract is written down. Declared here so `cmd_daemon`
+ * can run the check BEFORE it forks: a double start has to fail the command
+ * the operator ran, and a check made only in the child would be reported by
+ * a process that already exited 0. */
+static char *daemon_pid_path(void);
+static long read_daemon_pid(const char *path);
+static bool pid_is_alive(long pid);
+static void daemon_write_pidfile(const char *path);
 
 static void on_stop_signal(int sig) {
   (void)sig;
@@ -2405,12 +2475,40 @@ static int cmd_daemon(int argc, char **argv, int start) {
 
   kbc_log_init(cfg->log_level, cfg->json_logs);
 
+  /* The pid file is named before the fork so the parent can run the
+   * double-start check and the child can own the file. The check happens in
+   * the PARENT deliberately: `kbc daemon` returns 0 the moment it forks, so
+   * a check made only in the child would be reported by a process that had
+   * already told the operator it succeeded. */
+  char *pid_path = daemon_pid_path();
+  long recorded = read_daemon_pid(pid_path);
+  if (recorded != 0 && recorded != (long)getpid() && pid_is_alive(recorded)) {
+    kbc_str msg;
+    kbc_str_init(&msg);
+    line_puts(&msg, "another kb daemon is already running (pid ");
+    {
+      char pidbuf[24];
+      (void)snprintf(pidbuf, sizeof pidbuf, "%ld", recorded);
+      line_puts(&msg, pidbuf);
+    }
+    line_puts(&msg, ", file: ");
+    put_shown(&msg, pid_path);
+    line_puts(&msg, "); use `kbc daemon stop` to terminate it first");
+    die_user("%s", msg.ptr);
+  }
+
   if (!o.foreground) {
     pid_t pid = fork();
     if (pid < 0) {
       die_io("fork: %s", strerror(errno));
     }
     if (pid > 0) {
+      /* The parent exits here and the child needs `pid_path`, so this is the
+       * parent's only chance to free it. `die_*` above exit without reaching
+       * this, which is a bounded one-shot leak on a path that ends the
+       * process, but the ordinary success path is not that and should not
+       * leak either — LeakSanitizer is right about this one. */
+      free(pid_path);
       return EXIT_OK;
     }
     if (setsid() < 0) {
@@ -2443,6 +2541,9 @@ static int cmd_daemon(int argc, char **argv, int start) {
     kbc_app_close(app);
     exit(status_exit(KBC_ERR_IO, &e, "httpd"));
   }
+  /* AFTER the bind, so a daemon that failed to start leaves no pid file
+   * claiming a process that is not there. */
+  daemon_write_pidfile(pid_path);
   kbc_app_stats stats;
   if (kbc_failed(kbc_app_stats_get(app, &stats, &e))) {
     memset(&stats, 0, sizeof stats);
@@ -2470,6 +2571,10 @@ static int cmd_daemon(int argc, char **argv, int start) {
     (void)nanosleep(&ts, NULL);
   }
   KBC_LOGI("shutting down");
+  /* Remove the pid file on the clean path, so `kbc daemon stop` finding one
+   * means a daemon really is running. A crash leaves it behind and the next
+   * start prunes it — that is the whole reason the staleness check exists. */
+  (void)unlink(pid_path);
   kbc_httpd_stop(h);
   kbc_app_stop_watcher(app);
   kbc_app_close(app);
@@ -3505,6 +3610,844 @@ static int cmd_restore(int argc, char **argv, int start) {
   return EXIT_OK;
 }
 
+/* kb-c's indexable set, matching is_indexable() in src/app.c. Duplicated
+ * rather than shared because that helper is file-local to app.c and this
+ * file may not reach into app internals; the two lists must stay in step,
+ * and this comment is where a reader looks when they stop matching. */
+static bool is_bench_indexable(const char *rel) {
+  size_t n = strlen(rel);
+  static const char *const exts[] = { ".html", ".htm", ".md", ".markdown",
+                                      NULL };
+  for (size_t i = 0; exts[i] != NULL; i++) {
+    size_t el = strlen(exts[i]);
+    if (n <= el) {
+      continue;
+    }
+    size_t k = 0;
+    bool same = true;
+    for (size_t j = n - el; j < n; j++, k++) {
+      char c = rel[j];
+      if (c >= 'A' && c <= 'Z') {
+        c = (char)(c - 'A' + 'a');
+      }
+      if (c != exts[i][k]) {
+        same = false;
+        break;
+      }
+    }
+    if (same) {
+      return true;
+    }
+  }
+  return false;
+}
+
+
+/* -------------------------------------------------------------- comments ---
+ *
+ * `kbc comments list|add|resolve|unresolve` — the four subcommands the Rust's
+ * 1,683-line `comments.rs` reduces to, once the store's actual surface is
+ * what has to be served.
+ *
+ * WHY THIS IS NOT AN HTTP CLIENT. Every verb in the Rust talks to the daemon
+ * (`GET /api/kb/{kb}/reviews`, `POST .../resolve`, and a dozen more), because
+ * in the Rust a comment is a field inside a per-artifact `.review` JSON
+ * file that only the daemon reads and writes. kb-c has no review file and no
+ * review routes — `KBC_ROUTES` in src/httpd.c lists thirteen endpoints, and
+ * not one of them is a review endpoint — and `src/httpd.c` is not this file.
+ * What kb-c does have is `comments` as a TABLE (src/store.c: the Rust's own
+ * DDL, unchanged) behind three frozen functions: add, list-by-doc,
+ * set-resolved.
+ * So this verb opens the store and calls those three. A CLI that dialled a
+ * route the daemon does not serve would return 404 on every invocation,
+ * which is not a port, it is a broken one.
+ *
+ * The consequence, stated rather than hidden: the Rust's review-file verbs —
+ * `export`, `apply`, `import`, `verdict`, `keep`, `reanchor`, `edit`,
+ * `delete`, `inbox`, the attachment pair, and `watch` — have no counterpart
+ * here and are not built. Each needs state kb-c does not store (a review
+ * file, a proposal queue, a reply tree, an attachment blob, or an SSE
+ * comments.updated event the daemon never publishes). They are missing
+ * because the surface is missing, not because the parsing was hard.
+ *
+ * A live daemon holding the same db is not a conflict: the store runs WAL
+ * with a 5s busy_timeout (src/store.c:552), so a reader and this writer
+ * serialise rather than deadlock. This is the same posture `backup` takes
+ * when it VACUUMs INTO a db the daemon has open.
+ */
+
+/* The store, opened the way `backup` opens one: from the resolved config, so
+ * `--config` and $HOME both reach it. */
+static kbc_store *open_comment_store(void) {
+  kbc_err e;
+  kbc_err_reset(&e);
+  kbc_store *s = kbc_store_open(load_config(), &e);
+  if (s == NULL) {
+    fail_status(e.status != KBC_OK ? e.status : KBC_ERR_IO, &e, "comments",
+                NULL);
+  }
+  return s;
+}
+
+/* The document a comment hangs off, from `--artifact-id` or `--path`.
+ *
+ * `--path` is resolved through `kbc_store_get_artifact_by_path`, the frozen
+ * (corpus, relative path) -> row lookup the watcher itself uses. The Rust
+ * resolves `--path` over HTTP through `/lookup`, which can answer
+ * `ambiguous` with a candidate list; there is no such ambiguity here,
+ * because (corpus, path) is UNIQUE in the store — one path is one row. A
+ * miss is therefore always NOTFOUND, never a choice, and the Rust's
+ * "matched N artifacts, pick one" branch has nothing to say here.
+ */
+static char *comment_doc_id(kbc_store *s, const opts *o) {
+  if (o->id != NULL && o->path != NULL) {
+    die_user("use either --artifact-id or --path, not both");
+  }
+  if (o->id == NULL && o->path == NULL) {
+    die_user("comments needs a document: pass --artifact-id ID or "
+             "--path FILE");
+  }
+  if (o->id != NULL) {
+    if (!kbc_id_is_valid(o->id)) {
+      die_user("--artifact-id %s: an id is %u lowercase hex chars", o->id,
+               KBC_MAX_ID_LEN);
+    }
+    return xstrdup(o->id);
+  }
+  kbc_arena *a = kbc_arena_new(4096);
+  if (a == NULL) {
+    die_io("out of memory");
+  }
+  const kbc_config *cfg = load_config();
+  const char *kb = o->has_kb ? o->kb : NULL;
+  if (kb == NULL) {
+    if (cfg->ncorpora != 1) {
+      kbc_arena_free(a);
+      die_user("--path needs --kb: %zu corpora are configured",
+               cfg->ncorpora);
+    }
+    kb = cfg->corpora[0].name;
+  }
+  if (!kb_name_ok(kb)) {
+    kbc_arena_free(a);
+    die_user("invalid kb %s: a corpus name must be 1-%u bytes of [a-z0-9_-]",
+             kb, KBC_MAX_KB_NAME);
+  }
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  kbc_err e;
+  kbc_err_reset(&e);
+  kbc_status st = kbc_store_get_artifact_by_path(s, a, kb, o->path, &art, &e);
+  if (kbc_failed(st)) {
+    kbc_arena_free(a);
+    fail_status(st, &e, "comments", NULL);
+  }
+  /* art.id is ARENA-owned and dies with `a`, so the id is copied out. */
+  char *id = xstrdup(art.id);
+  kbc_arena_free(a);
+  return id;
+}
+
+/* One comment as the JSON the listing emits. Field names follow the Rust's
+ * review row (`id`, `artifact_id`, `author`, `anchor`, `body`,
+ * `created_at`, `status`) so a consumer written against the Rust's `--json`
+ * keeps working; `status` is spelled from kb-c's `resolved` bit. */
+static void comment_json(kbc_str *out, const kbc_comment *c,
+                         const char *doc_id) {
+  (void)kbc_str_puts(out, "{\"id\":");
+  (void)kbc_str_append_json_string(out, c->id, strlen(c->id));
+  (void)kbc_str_puts(out, ",\"artifact_id\":");
+  (void)kbc_str_append_json_string(out, doc_id, strlen(doc_id));
+  (void)kbc_str_puts(out, ",\"author\":");
+  (void)kbc_str_append_json_string(out, c->author, strlen(c->author));
+  (void)kbc_str_puts(out, ",\"anchor\":");
+  (void)kbc_str_append_json_string(out, c->anchor, strlen(c->anchor));
+  (void)kbc_str_puts(out, ",\"body\":");
+  (void)kbc_str_append_json_string(out, c->body, strlen(c->body));
+  (void)kbc_str_puts(out, ",\"created_at\":");
+  (void)kbc_str_append_json_string(out, c->created_at, strlen(c->created_at));
+  (void)kbc_str_printf(out, ",\"status\":\"%s\"}",
+                       c->resolved ? "resolved" : "open");
+}
+
+/* One table cell: the value ESCAPED, truncated to `max` bytes (0 = no
+ * limit), then left-padded to `width` columns.
+ *
+ * Escaping is not decoration. A comment body and an author are operator
+ * input, and the listing prints them raw into a terminal: without
+ * kbc_json_escape a body carrying ESC could repaint the operator's screen
+ * and one carrying a newline would forge an extra table row — a comment
+ * turning into a fake comment id in the operator's own listing. Rule 9.
+ *
+ * The truncation is on the ESCAPED text, not the raw, so a cut can never
+ * land inside an escape sequence and leave half of it on the line. */
+static void cell(kbc_str *out, const char *s, size_t max, size_t width) {
+  kbc_str esc;
+  kbc_str_init(&esc);
+  if (kbc_failed(kbc_json_escape(&esc, s, strlen(s)))) {
+    kbc_str_free(&esc);
+    die_user("%s", "out of memory escaping a value for output");
+  }
+  size_t n = esc.len;
+  bool cut = max > 0 && n > max;
+  if (cut) {
+    n = max;
+  }
+  (void)kbc_str_append(out, esc.ptr, n);
+  kbc_str_free(&esc);
+  if (cut) {
+    (void)kbc_str_puts(out, "...");
+    n += 3;
+  }
+  /* Pad to the column, but never TRUNCATE to it: a value wider than its
+   * column shifts the rest of the row right, which is ugly and harmless,
+   * whereas cutting would lose data the operator cannot otherwise see. */
+  for (size_t p = n; p < width; p++) {
+    (void)kbc_str_putc(out, ' ');
+  }
+  if (width > 0) {
+    (void)kbc_str_putc(out, ' ');
+  }
+}
+
+/* The Rust's `kb comments list` table: KB, ARTIFACT, STATUS, AUTHOR, ANCHOR,
+ * BODY. kb-c has no KB column to print — a comment's row carries a doc id,
+ * and the doc's corpus is one `get_artifact` away, not in the comment — so
+ * the column is dropped rather than filled with a constant.
+ *
+ * The empty case prints `(no open comments)` / `(no comments)` exactly as
+ * the Rust does, which is the one line a script can grep for. */
+static int comments_list(int argc, char **argv, int start) {
+  opts o;
+  parse_verb(FLAGS_COMMENTS, argc, argv, start, &o);
+  kbc_store *s = open_comment_store();
+  char *doc = comment_doc_id(s, &o);
+  size_t limit = o.has_limit ? o.limit : 50;
+
+  kbc_arena *a = kbc_arena_new(8192);
+  if (a == NULL) {
+    free(doc);
+    kbc_store_close(s);
+    die_io("out of memory");
+  }
+  kbc_comment *rows = NULL;
+  size_t n = 0;
+  kbc_err e;
+  kbc_err_reset(&e);
+  kbc_status st = kbc_store_list_comments(s, a, doc, limit, &rows, &n, &e);
+  if (kbc_failed(st)) {
+    kbc_arena_free(a);
+    free(doc);
+    kbc_store_close(s);
+    fail_status(st, &e, "comments list", NULL);
+  }
+
+  /* `--all` includes resolved comments. Without it an already-addressed
+   * comment drops off the list, which is the Rust's `status` filter: the
+ * default is the open ones, `--all` is every one. */
+  size_t shown = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (!o.all && rows[i].resolved) {
+      continue;
+    }
+    shown++;
+  }
+  if (g_json) {
+    kbc_str out;
+    kbc_str_init(&out);
+    (void)kbc_str_puts(&out, "{\"ok\":true,\"artifact_id\":");
+    (void)kbc_str_append_json_string(&out, doc, strlen(doc));
+    (void)kbc_str_puts(&out, ",\"comments\":[");
+    size_t at = 0;
+    for (size_t i = 0; i < n; i++) {
+      if (!o.all && rows[i].resolved) {
+        continue;
+      }
+      if (at++ > 0) {
+        (void)kbc_str_putc(&out, ',');
+      }
+      comment_json(&out, &rows[i], doc);
+    }
+    (void)kbc_str_puts(&out, "]}");
+    emit_line(&out);
+  } else if (shown == 0) {
+    printf("(no %scomments)\n", o.all ? "" : "open ");
+  } else {
+    printf("%-14s %-9s %-8s %-24s %s\n", "COMMENT", "STATUS", "AUTHOR",
+           "ANCHOR", "BODY");
+    for (size_t i = 0; i < n; i++) {
+      if (!o.all && rows[i].resolved) {
+        continue;
+      }
+      kbc_str line;
+      kbc_str_init(&line);
+      cell(&line, rows[i].id, 0, 14);
+      cell(&line, rows[i].resolved ? "resolved" : "open", 0, 9);
+      cell(&line, rows[i].author, 0, 8);
+      cell(&line, rows[i].anchor, 24, 24);
+      cell(&line, rows[i].body, 60, 0);
+      emit_line(&line);
+    }
+  }
+  kbc_arena_free(a);
+  free(doc);
+  kbc_store_close(s);
+  return EXIT_OK;
+}
+
+/* `kbc comments add --artifact-id ID|--path FILE --body TEXT
+ *   [--anchor A] [--author X]`
+ *
+ * Defaults are the Rust's: `--anchor file` and `--author claude`
+ * (CommentsAction::Add). The Rust's other add-time flags — `--page`,
+ * `--choice-json`, `--attach` — write columns and tables the store's
+ * `comments` DDL does not have, so they are not accepted rather than
+ * accepted and dropped.
+ *
+ * The store mints the comment id itself and does not hand it back, so the
+ * confirmation reports the count, not an id the caller cannot verify. */
+static int comments_add(int argc, char **argv, int start) {
+  opts o;
+  parse_verb(FLAGS_COMMENTS, argc, argv, start, &o);
+  if (o.body == NULL) {
+    die_user("comments add needs --body TEXT");
+  }
+  if (o.body[0] == '\0') {
+    die_user("comments add: --body is empty");
+  }
+  if (o.npos > 0) {
+    die_user("comments add takes no positional argument (the document is "
+             "--artifact-id or --path)");
+  }
+  const char *anchor = o.anchor != NULL ? o.anchor : "file";
+  const char *author = o.author != NULL ? o.author : "claude";
+  if (anchor[0] == '\0') {
+    die_user("comments add: --anchor is empty");
+  }
+  if (author[0] == '\0') {
+    die_user("comments add: --author is empty");
+  }
+  kbc_store *s = open_comment_store();
+  char *doc = comment_doc_id(s, &o);
+  kbc_err e;
+  kbc_err_reset(&e);
+  kbc_status st = kbc_store_add_comment(s, doc, anchor, author, o.body, &e);
+  if (kbc_failed(st)) {
+    free(doc);
+    kbc_store_close(s);
+    fail_status(st, &e, "comments add", NULL);
+  }
+  kbc_str line;
+  kbc_str_init(&line);
+  if (g_json) {
+    line_puts(&line, "{\"ok\":true,\"artifact_id\":");
+    put_shown(&line, doc);
+    line_puts(&line, ",\"added\":1}");
+  } else {
+    line_puts(&line, "added 1 comment to ");
+    put_shown(&line, doc);
+  }
+  emit_line(&line);
+  free(doc);
+  kbc_store_close(s);
+  return EXIT_OK;
+}
+
+/* `kbc comments resolve|unresolve --artifact-id ID|--path FILE
+ *   <comment_id>`
+ *
+ * The Rust takes the comment id as a trailing positional after kb and
+ * artifact_id, and offers `--all` to flip every comment on the document in
+ * one daemon round trip. There is no round trip here and no bulk call in the
+ * frozen store, so `--all` is not offered: pretending one UPDATE per
+ * comment is the atomic `resolve_all` endpoint would be a lie about what
+ * happened if the process died halfway.
+ *
+ * The comment id is a positional, so the document comes from the flags —
+ * which is the same shape the Rust's own `Reply`/`Edit`/`Delete`/
+ * `Reanchor` subcommands use for exactly this reason ("comment_id is the
+ * sole positional (it is required, so it can't trail the optional
+ * kb/artifact positionals without ambiguity)"). */
+static int comments_set_resolved(int argc, char **argv, int start,
+                                 bool resolved) {
+  opts o;
+  parse_verb(FLAGS_COMMENTS, argc, argv, start, &o);
+  const char *verb = resolved ? "resolve" : "unresolve";
+  if (o.npos == 0) {
+    die_user("comments %s needs a <comment_id>", verb);
+  }
+  if (o.npos > 1) {
+    die_user("comments %s takes one <comment_id>", verb);
+  }
+  const char *cid = o.positional[0];
+  if (!kbc_id_is_valid(cid)) {
+    die_user("<comment_id> %s: an id is %u lowercase hex chars", cid,
+             KBC_MAX_ID_LEN);
+  }
+  if (o.body != NULL) {
+    die_user("comments %s takes no --body", verb);
+  }
+  kbc_store *s = open_comment_store();
+  char *doc = comment_doc_id(s, &o);
+  kbc_err e;
+  kbc_err_reset(&e);
+  /* The document is resolved and checked first so `resolve` on a comment of
+   * some OTHER document reports the mismatch rather than silently flipping
+   * a row the caller did not name. */
+  kbc_arena *a = kbc_arena_new(4096);
+  if (a == NULL) {
+    free(doc);
+    kbc_store_close(s);
+    die_io("out of memory");
+ }
+  kbc_comment *rows = NULL;
+  size_t n = 0;
+  kbc_err_reset(&e);
+  kbc_status st = kbc_store_list_comments(s, a, doc, KBC_MAX_HITS, &rows, &n, &e);
+  if (kbc_failed(st)) {
+    kbc_arena_free(a);
+    free(doc);
+    kbc_store_close(s);
+    fail_status(st, &e, verb, NULL);
+  }
+  bool found = false;
+  for (size_t i = 0; i < n; i++) {
+    if (strcmp(rows[i].id, cid) == 0) {
+      found = true;
+      break;
+    }
+  }
+  kbc_arena_free(a);
+  if (!found) {
+    /* NOTFOUND, so fail_status classifies this as the user error it is: the
+     * caller named a comment that is not on the document they named. The
+     * message is assembled through a kbc_str because both operands are
+     * operator-supplied and must be escaped before they reach a terminal. */
+    kbc_str msg;
+    kbc_str_init(&msg);
+    line_puts(&msg, "comment ");
+    put_shown(&msg, cid);
+    line_puts(&msg, " is not on document ");
+    put_shown(&msg, doc);
+    kbc_err nf;
+    kbc_err_reset(&nf);
+    kbc_err_set(&nf, KBC_ERR_NOTFOUND, "%s", msg.ptr);
+    kbc_str_free(&msg);
+    free(doc);
+    kbc_store_close(s);
+    fail_status(KBC_ERR_NOTFOUND, &nf, verb, NULL);
+  }
+  kbc_err_reset(&e);
+  st = kbc_store_set_comment_resolved(s, cid, resolved, &e);
+  if (kbc_failed(st)) {
+    free(doc);
+    kbc_store_close(s);
+    fail_status(st, &e, verb, NULL);
+  }
+  kbc_str line;
+  kbc_str_init(&line);
+  if (g_json) {
+    line_puts(&line, "{\"ok\":true,\"comment_id\":");
+    put_shown(&line, cid);
+    line_puts(&line, ",\"status\":");
+    put_shown(&line, resolved ? "resolved" : "open");
+    line_puts(&line, "}");
+  } else {
+    line_puts(&line, resolved ? "resolved " : "unresolved ");
+    put_shown(&line, cid);
+  }
+  emit_line(&line);
+  free(doc);
+  kbc_store_close(s);
+  return EXIT_OK;
+}
+
+static int cmd_comments(int argc, char **argv, int start, const char *sub) {
+  if (sub == NULL) {
+    die_user("comments needs a subcommand: list, add, resolve, unresolve");
+  }
+  if (strcmp(sub, "list") == 0) {
+    return comments_list(argc, argv, start);
+  }
+  if (strcmp(sub, "add") == 0) {
+    return comments_add(argc, argv, start);
+  }
+  if (strcmp(sub, "resolve") == 0) {
+    return comments_set_resolved(argc, argv, start, true);
+  }
+  if (strcmp(sub, "unresolve") == 0) {
+    return comments_set_resolved(argc, argv, start, false);
+  }
+  die_user("unknown comments subcommand %s (list, add, resolve, unresolve)",
+           sub);
+}
+
+/* ----------------------------------------------------------- daemon stop ---
+ *
+ * `kbc daemon stop` — terminate a running `kbc daemon`.
+ *
+ * THE PID FILE IS THE WHOLE CONTRACT, and kb-c's `kbc daemon` did not have
+ * one until this verb needed it, so `cmd_daemon` above now writes and
+ * removes it around the same lifecycle the Rust's does (daemon.rs: the
+ * `run()` doc comment). The Rust's rules, kept because each one is a
+ * failure somebody already hit:
+ *
+ *   - the file is written AFTER the listener binds, so a daemon that failed
+ *     to bind leaves no pid file claiming a process that is not there;
+ *   - a start refuses when the file names a LIVE pid other than our own, and
+ *     prunes it when that pid is dead (a crash leaves the file behind);
+ *   - the own-pid case counts as stale. In a container the daemon is pid 1,
+ *     so after a hard kill the next boot is ALSO pid 1 and `kill -0 1`
+ *     succeeds — without this the daemon would refuse to start forever;
+ *   - a clean exit removes the file, so `stop` finding one means a daemon is
+ *     genuinely running.
+ *
+ * `stop` sends SIGTERM and polls for up to 10 s, printing the Rust's two
+ * progress lines. It never sends SIGKILL: a daemon draining in-flight
+ * requests is doing the right thing, and escalating under it would turn a
+ * slow shutdown into data loss. The timeout message names the pid so the
+ * operator can escalate themselves, exactly as the Rust's does.
+ *
+ * Exit classes, this binary's convention and not the Rust's blanket 1:
+ *   0  the daemon exited
+ *   1  no pid file, an unreadable one, a stale one, or a pid that is not a
+ *      comment-shaped id — the user asked to stop something that is not
+ *      running, which is a usage error, not a daemon failure
+ *   2  the signal could not be sent, or the daemon ignored SIGTERM for 10 s
+ */
+static char *daemon_pid_path(void) {
+  const kbc_config *cfg = load_config();
+  if (cfg->data_dir == NULL || cfg->data_dir[0] == '\0') {
+    die_user("no data_dir configured: pass --config PATH or set HOME");
+  }
+  return join2(cfg->data_dir, "kb-daemon.pid");
+}
+
+/* `kill -0`, which reports existence without delivering anything. EPERM
+ * means the process is there and merely not ours to signal — still alive,
+ * and treating it as dead would let two daemons believe they own the store. */
+static bool pid_is_alive(long pid) {
+  if (kill((pid_t)pid, 0) == 0) {
+    return true;
+  }
+  return errno == EPERM;
+}
+
+/* The recorded pid, or 0 when the file is absent, unreadable, or holds
+ * something that is not a bare positive decimal — the three ways a pid file
+ * is stale, since nothing else ever writes this one. */
+static long read_daemon_pid(const char *path) {
+  kbc_str s;
+  kbc_str_init(&s);
+  kbc_err e;
+  kbc_err_reset(&e);
+  if (kbc_failed(kbc_str_read_file(path, &s, &e))) {
+    kbc_str_free(&s);
+    return 0;
+  }
+  long pid = 0;
+  for (size_t i = 0; i < s.len; i++) {
+    unsigned char c = (unsigned char)s.ptr[i];
+    if (c == '\n' || c == '\r' || c == ' ' || c == '\t') {
+      continue;
+    }
+    if (c < '0' || c > '9') {
+      pid = 0;
+      break;
+    }
+    pid = pid * 10 + (long)(c - '0');
+    if (pid > 0x7fffffffL) {
+      pid = 0;
+      break;
+    }
+  }
+  kbc_str_free(&s);
+  return pid > 0 ? pid : 0;
+}
+
+/* Called by cmd_daemon once the listener is up. See the banner above for
+ * why each branch exists. */
+static void daemon_write_pidfile(const char *path) {
+  long existing = read_daemon_pid(path);
+  long ours = (long)getpid();
+  if (existing != 0 && existing != ours && pid_is_alive(existing)) {
+    die_user("another kb daemon is already running (pid %ld, file: %s); "
+             "use `kbc daemon stop` to terminate it first",
+             existing, path);
+  }
+  char buf[32];
+  int n = snprintf(buf, sizeof buf, "%ld\n", ours);
+  if (n < 0 || (size_t)n >= sizeof buf) {
+    die_io("the pid does not fit in %zu bytes", sizeof buf);
+  }
+  kbc_err e;
+  kbc_err_reset(&e);
+  if (kbc_failed(kbc_str_write_file_atomic(path, buf, (size_t)n, &e))) {
+    fail_status(e.status != KBC_OK ? e.status : KBC_ERR_IO, &e, "pid file",
+                NULL);
+  }
+}
+
+static int cmd_daemon_stop(void) {
+  char *path = daemon_pid_path();
+  long pid = read_daemon_pid(path);
+  /* `die_user`/`die_io` exit the process, so nothing below frees `path` on
+   * these two paths: freeing first and then naming it in the message is a
+   * use-after-free that happens to read freed heap. */
+  if (pid == 0) {
+    die_user("no kb-daemon.pid at %s (daemon not running, or pid file "
+             "missing)",
+             path);
+  }
+  if (!pid_is_alive(pid)) {
+    /* Prune it, as the Rust does, so the next start does not have to
+     * rediscover the same corpse — and report it as the user error it is. */
+    (void)unlink(path);
+    die_user("pid %ld is dead; removed the stale file at %s", pid, path);
+  }
+  if (kill((pid_t)pid, SIGTERM) != 0) {
+    int saved = errno;
+    free(path);
+    die_io("send SIGTERM to pid %ld: %s", pid, strerror(saved));
+  }
+  if (!g_json) {
+    fprintf(stderr, "sent SIGTERM to kb daemon pid %ld; waiting for exit\n",
+            pid);
+  }
+  /* 10 s, polled every 100 ms — the Rust's deadline and interval. A daemon
+   * that drains in-flight requests and then exits lands here in well under a
+   * second; the full ten is only reached by one that is genuinely stuck. */
+  for (int waited = 0; waited < 100; waited++) {
+    if (!pid_is_alive(pid)) {
+      (void)unlink(path);
+      if (g_json) {
+        kbc_str line;
+        kbc_str_init(&line);
+        line_puts(&line, "{\"ok\":true,\"pid\":");
+        (void)kbc_str_printf(&line, "%ld}", pid);
+        emit_line(&line);
+      } else {
+        printf("kb daemon pid %ld exited cleanly\n", pid);
+      }
+      free(path);
+      return EXIT_OK;
+    }
+    struct timespec ts = { 0, 100 * 1000 * 1000 };
+    (void)nanosleep(&ts, NULL);
+  }
+  free(path);
+  die_io("kb daemon pid %ld did not exit within 10 s — still alive after "
+         "SIGTERM. Investigate (its graceful-shutdown drain may be stuck on "
+         "in-flight requests) or send SIGKILL manually: kill -9 %ld",
+         pid, pid);
+}
+
+/* ------------------------------------------------------------ bench init ---
+ *
+ * `kbc bench init --corpus DIR --output PATH [--n 40] [--seed 0xb33f]`
+ *
+ * Scaffolds a `queries.jsonl` labelled-query file by sampling N artifacts
+ * from a corpus directory, one JSON object per line, each with an empty
+ * `query` for the operator to fill in and a `relevant` array pre-seeded
+ * with the sampled file's artifact id. This is the Rust's
+ * BenchAction::Init, and it is a MEASUREMENT tool, not a product one: its
+ * only consumer is `bench run`, which is the recall@k bake-off harness the
+ * plan's R1 gate is built on. It is built here because the plan names it as
+ * not-done and it is the first half of the quality gate — but it is built
+ * for that reason and no other.
+ *
+ * Two things differ from the Rust, both forced by kb-c:
+ *
+ *   - the id. The Rust mints it with `ArtifactId::from_path(rel)` — a bare
+ *     SHA-256 of the relative path. kb-c's id is `kbc_id_for_artifact`,
+ *     which hashes (corpus, path) together precisely so ("kb","a/b") and
+ *     ("k","b/a") cannot collide (src/ids.c). A scaffold carrying Rust
+ *     ids would name rows that do not exist in a kb-c store, so the id
+ *     written here is kb-c's. `--kb NAME` says which corpus the paths are
+ * *     relative to, because without it there is no id to write.
+ *   - the sampled extension set. The Rust samples `.html`/`.htm`; kb-c
+ *     indexes `.html`, `.htm`, `.md` and `.markdown` (is_indexable in
+ *     src/app.c) and a markdown corpus is the common case here, so
+ *     sampling HTML alone would find nothing to scaffold.
+ *
+ * The sampler is SplitMix64 + a partial Fisher-Yates, ported exactly: same
+ * seed, same scaffold, so a labeller and a collaborator start from one set.
+ */
+static void splitmix64_next(unsigned long long *state,
+                           unsigned long long *out) {
+  *state += 0x9e3779b97f4a7c15ull;
+  unsigned long long z = *state;
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+  *out = z ^ (z >> 31);
+}
+
+/* Recursive collect of indexable files, as corpus-relative paths. Depth is
+ * bounded: a corpus is user data and a symlink loop or a pathological tree
+ * must not turn a scaffolder into a hang. */
+static void collect_indexable(const char *root, const char *rel,
+                              kbc_strlist *out, unsigned depth) {
+  if (depth > 32) {
+    return;
+  }
+  char *dir = rel[0] != '\0' ? path_join(root, rel) : xstrdup(root);
+  DIR *d = opendir(dir);
+  if (d == NULL) {
+    free(dir);
+    return;
+  }
+  kbc_strlist names;
+  kbc_strlist_init(&names);
+  struct dirent *de;
+  while ((de = readdir(d)) != NULL) {
+    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+      continue;
+    }
+    (void)kbc_strlist_push(&names, de->d_name);
+  }
+  (void)closedir(d);
+  /* Sorted, because readdir order is filesystem order and the sample must
+   * not drift with it. */
+  kbc_strlist_sort(&names);
+  for (size_t i = 0; i < names.len; i++) {
+    char *child_rel = rel[0] != '\0' ? path_join(rel, names.items[i])
+                                     : xstrdup(names.items[i]);
+    char *child_abs = path_join(dir, names.items[i]);
+    struct stat st;
+    /* lstat, not stat: a symlink is not followed. A corpus is untrusted
+     * input (rule 9) and a link out of the tree would sample files the
+     * corpus does not contain — and on a link cycle it would not
+     * return. */
+    if (lstat(child_abs, &st) == 0) {
+      if (S_ISDIR(st.st_mode)) {
+        collect_indexable(root, child_rel, out, depth + 1);
+      } else if (S_ISREG(st.st_mode) && is_bench_indexable(child_rel)) {
+        (void)kbc_strlist_push(out, child_rel);
+      }
+    }
+    free(child_abs);
+    free(child_rel);
+  }
+  kbc_strlist_free(&names);
+  free(dir);
+}
+
+static int cmd_bench_init(int argc, char **argv, int start) {
+  opts o;
+  parse_verb(FLAGS_BENCH_INIT, argc, argv, start, &o);
+  const kbc_config *cfg = load_config();
+  const char *kb = o.has_kb ? o.kb : NULL;
+  const char *corpus = o.corpus;
+  if (kb == NULL && corpus == NULL) {
+    die_user("bench init needs --kb NAME or --corpus DIR");
+  }
+  if (kb == NULL) {
+    if (cfg->ncorpora != 1) {
+      die_user("bench init needs --kb NAME: %zu corpora are configured",
+               cfg->ncorpora);
+    }
+    kb = cfg->corpora[0].name;
+  }
+  if (!kb_name_ok(kb)) {
+    die_user("invalid kb %s: a corpus name must be 1-%u bytes of [a-z0-9_-]",
+             kb, KBC_MAX_KB_NAME);
+  }
+  if (corpus == NULL) {
+    const kbc_corpus_cfg *cc = kbc_config_corpus(cfg, kb);
+    if (cc == NULL) {
+      die_user("no corpus named %s in the config", kb);
+    }
+    corpus = cc->path;
+  }
+  if (o.output == NULL) {
+    die_user("bench init needs --output PATH");
+  }
+  if (kbc_path_exists(o.output)) {
+    die_user("refusing to overwrite %s; delete it first if you really want to "
+             "re-scaffold (labelled query sets are easy to lose)",
+             o.output);
+  }
+  char *expanded = expand_tilde(o.output);
+  char *out_path = bounded_path("bench init --output", expanded);
+  free(expanded);
+
+  struct stat cst;
+  if (stat(corpus, &cst) != 0) {
+    free(out_path);
+    die_user("corpus dir does not exist: %s", corpus);
+  }
+  if (!S_ISDIR(cst.st_mode)) {
+    free(out_path);
+    die_user("corpus path is not a directory: %s", corpus);
+  }
+
+  kbc_strlist rels;
+  kbc_strlist_init(&rels);
+  collect_indexable(corpus, "", &rels, 0);
+  if (rels.len == 0) {
+    kbc_strlist_free(&rels);
+    free(out_path);
+    die_user("no .html/.htm/.md/.markdown files under %s; bench init needs at "
+             "least one artifact",
+             corpus);
+  }
+
+  /* Partial Fisher-Yates over the sorted list: shuffle only as far as `n`
+   * and take the prefix. O(n) regardless of corpus size, and identical for
+   * a given seed because `rels` is sorted and the PRNG is the Rust's. */
+  size_t want = o.has_n ? o.n : 40;
+  if (want > rels.len) {
+    want = rels.len;
+  }
+  unsigned long long state = o.has_seed ? o.seed : 0xb33full;
+  for (size_t i = 0; i < want; i++) {
+    unsigned long long r = 0;
+    splitmix64_next(&state, &r);
+    size_t pick = i + (size_t)(r % (unsigned long long)(rels.len - i));
+    char *tmp = rels.items[i];
+    rels.items[i] = rels.items[pick];
+    rels.items[pick] = tmp;
+  }
+
+  kbc_str buf;
+  kbc_str_init(&buf);
+  for (size_t i = 0; i < want; i++) {
+    char id[KBC_MAX_ID_LEN + 1];
+    kbc_id_for_artifact(id, kb, rels.items[i]);
+    (void)kbc_str_puts(&buf, "{\"query\":\"\",\"relevant\":[");
+    (void)kbc_str_append_json_string(&buf, id, strlen(id));
+    (void)kbc_str_puts(&buf, "],\"notes\":");
+    kbc_str note;
+    kbc_str_init(&note);
+    (void)kbc_str_puts(&note, "scaffold: ");
+    (void)kbc_str_append(&note, rels.items[i], strlen(rels.items[i]));
+    (void)kbc_str_append_json_string(&buf, note.ptr, note.len);
+    kbc_str_free(&note);
+    /* One object per line: the jsonl contract the Rust's serialiser keeps
+     * by using to_string rather than to_string_pretty. */
+    (void)kbc_str_puts(&buf, "}\n");
+  }
+  kbc_err e;
+  kbc_err_reset(&e);
+  kbc_status st = kbc_str_write_file_atomic(out_path, buf.ptr, buf.len, &e);
+  kbc_str_free(&buf);
+  if (kbc_failed(st)) {
+    kbc_strlist_free(&rels);
+    free(out_path);
+    fail_status(st, &e, "bench init", NULL);
+  }
+  if (!g_json) {
+    printf("scaffolded %zu query rows from %zu artifacts in %s\n", want,
+           rels.len, corpus);
+    printf("  -> %s\n", out_path);
+    printf("  next: fill in each line's empty `query` field with the phrase "
+           "to evaluate.\n");
+  }
+  kbc_strlist_free(&rels);
+  free(out_path);
+  return EXIT_OK;
+}
+
 /* ------------------------------------------------------------------ help --- */
 
 static void usage(FILE *out) {
@@ -3517,6 +4460,7 @@ static void usage(FILE *out) {
           "its last value.\n"
           "verbs:\n"
           "  daemon [--bind ADDR] [--port N] [--foreground]\n"
+          "  daemon stop             (SIGTERM the running daemon, wait 10s)\n"
           "  add <dir> --kb NAME\n"
           "  search <query> [--kb NAME] [--mode hybrid|keyword|semantic]"
           " [--limit N]\n"
@@ -3524,13 +4468,27 @@ static void usage(FILE *out) {
           "  reindex [--kb NAME]\n"
           "  list [--kb NAME] [--limit N]\n"
           "  status\n"
+          "  comments list (--artifact-id ID | --path FILE) [--all]"
+          " [--limit N]\n"
+          "  comments add (--artifact-id ID | --path FILE) --body TEXT"
+          " [--anchor A] [--author X]\n"
+          "  comments resolve <comment_id> (--artifact-id ID | --path"
+          " FILE)\n"
+          "  comments unresolve <comment_id> (--artifact-id ID | --path"
+          " FILE)\n"
           "  bench [--queries N] [--repeat N] [--corpus DIR]\n"
+          "  bench init (--kb NAME | --corpus DIR) --output PATH [--n N]"
+          " [--seed S]\n"
           "  backup <kb> [--out PATH]\n"
           "  backup --all            (one tarball per corpus; no --out)\n"
           "  restore <tarball> --kb NAME [--force]\n"
           "  config show\n"
           "  token generate\n"
-          "  version\n");
+          "  version\n"
+          "\n"
+          "comments verbs read the store directly: kb-c has no review-file\n"
+          "routes, so its comments are table rows, not daemon-side state.\n"
+          "That is why they take no --daemon.\n");
 }
 
 /* ------------------------------------------------------------------ main --- */
@@ -3606,6 +4564,58 @@ int main(int argc, char **argv) {
     int rc = cmd_token_generate(argc, argv, start);
     free_config();
     return rc;
+  }
+  /* A verb's SUBCOMMAND, found by skipping only the three global flags (and
+   * their values). The looser "first token not starting with -" rule this
+   * used above is wrong for a verb that has both subcommands and
+   * value-taking flags: in `kbc daemon --bind 10.0.0.1` the address is not a
+   * subcommand, and treating it as one would make the verb unreachable. */
+  const char *subcmd = NULL;
+  int subcmd_at = -1;
+  for (int k = start; k < argc; k++) {
+    const char *t = argv[k];
+    if (strcmp(t, "--json") == 0) {
+      continue;
+    }
+    if (strcmp(t, "--daemon") == 0 || strcmp(t, "--config") == 0) {
+      k++;
+      continue;
+    }
+    if (t[0] == '-') {
+      break; /* a verb flag: everything after belongs to that verb */
+    }
+    subcmd = t;
+    subcmd_at = k;
+    break;
+  }
+  if (strcmp(verb, "comments") == 0) {
+    int rc = cmd_comments(argc, argv, subcmd_at < 0 ? start : subcmd_at + 1,
+                          subcmd);
+    free_config();
+    return rc;
+  }
+  if (strcmp(verb, "bench") == 0 && subcmd != NULL &&
+      strcmp(subcmd, "init") == 0) {
+    int rc = cmd_bench_init(argc, argv, subcmd_at + 1);
+    free_config();
+    return rc;
+  }
+  if (strcmp(verb, "daemon") == 0 && subcmd != NULL &&
+      strcmp(subcmd, "stop") == 0) {
+    if (subcmd_at + 1 < argc) {
+      die_user("daemon stop takes no arguments");
+    }
+    int rc = cmd_daemon_stop();
+    free_config();
+    return rc;
+  }
+  /* A verb that HAS subcommands and was given one it does not have is a
+   * usage error, not a silently-ignored token. `kbc bench discover` is the
+   * live example: discover is a labelling aid over `kbc search`, which this
+   * binary already has, so it is not ported and saying so beats running a
+   * search the operator did not ask for. */
+  if (subcmd != NULL && strcmp(verb, "bench") == 0) {
+    die_user("unknown bench subcommand %s (init)", subcmd);
   }
 
   int rc;

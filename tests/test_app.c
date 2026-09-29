@@ -44,6 +44,10 @@ kbc_status kbc_app_delete_path(kbc_app *app, const char *corpus,
  * kbc_app_stats_get like every other counter; only the capacity is app.c's
  * own function, declared here on the same terms as kbc_app_delete_path. */
 size_t kbc_app_query_cache_capacity(const kbc_app *app);
+/* The enrichment registry (app.h) and its seam kbc_enrich_run are declared in
+ * the header now, so nothing is redeclared here. The context is opaque to
+ * these tests: their own hooks take their state in `user` and never read it,
+ * and the daemon builds the real one. */
 
 #define CORPUS_A "alpha"
 #define CORPUS_B "beta"
@@ -1605,6 +1609,385 @@ KBC_TEST(the_graph_boost_is_off_by_default_and_reorders_when_configured) {
   order_of_hits(f.app, "verdigris", CORPUS_A, again, sizeof again);
   KBC_CHECK_EQ_STR(again, off);
 
+  fx_teardown(&f);
+}
+
+/* ------------------------------------------------- enrichment registry --- */
+
+/* The resolution ladder, reached through the edge hook. A note writes
+ * [[b]] — the way an Obsidian corpus is written — and the document on disk is
+ * `b.md`. The ladder's path tier takes the target with the final extension
+ * elided, so this resolves; an exact-path lookup cannot answer it at all,
+ * because no path on disk is called `notes/b`. Before the ladder was wired
+ * into the edge write this link was a pending row that nothing ever drained,
+ * which is the whole gap links.h was written to close. */
+KBC_TEST(a_link_naming_a_document_without_its_extension_is_an_edge) {
+  fixture f;
+  fx_setup_empty(&f);
+  char dir[KBC_TEST_PATH_MAX];
+  char p[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_err_reset(&err);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  join(dir, sizeof dir, f.corpus_a, "notes");
+  kbc_test_mkdir_p(dir);
+  join(p, sizeof p, dir, "a.md");
+  kbc_test_write_file(p, "# Linker\n\nSee [[b]] for the burrows.\n");
+  join(p, sizeof p, dir, "b.md");
+  kbc_test_write_file(p, "# Linked\n\nThe chronicle mentions quokka burrows.\n");
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  kbc_store *store = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(store);
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(store, CORPUS_A, &err), 1);
+  /* A link that resolved is not waiting for anything: the pending table is
+   * for targets that name no document, and this one names one. */
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(store, &err), 0);
+  static const char *const want[] = {"notes/b.md"};
+  uint32_t deg[1] = {9};
+  KBC_CHECK_OK(kbc_store_edge_degrees_for(store, CORPUS_A, want, 1, deg, &err));
+  KBC_CHECK_EQ_INT(deg[0], 1);
+
+  kbc_store_close(store);
+  fx_teardown(&f);
+}
+
+/* enrich.rs:1095 — only Resolution::One is an EDGE. A bare `deploy` is
+ * answered by ops/deploy.md and infra/deploy.md alike, and that answer is
+ * AMBIGUOUS: the edge is dropped rather than resolved to whichever of the two
+ * the walk happened to reach first, because such an edge flips on the next
+ * reindex. The same document also links two targets that DO resolve, so the
+ * case cannot pass by resolving nothing at all. */
+KBC_TEST(an_ambiguous_link_target_is_not_an_edge) {
+  fixture f;
+  fx_setup_empty(&f);
+  char dir[KBC_TEST_PATH_MAX];
+  char p[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_err_reset(&err);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  /* Distinct titles, so the answer `deploy` gets is the BASENAME tier's and
+   * not the title tier's: two documents called deploy.md is the shape a
+   * corpus actually has. */
+  join(dir, sizeof dir, f.corpus_a, "ops");
+  kbc_test_mkdir_p(dir);
+  join(p, sizeof p, dir, "deploy.md");
+  kbc_test_write_file(p, "# Deploy Ops\n\nThe rollout is staged by hand.\n");
+  join(dir, sizeof dir, f.corpus_a, "infra");
+  kbc_test_mkdir_p(dir);
+  join(p, sizeof p, dir, "deploy.md");
+  kbc_test_write_file(p, "# Deploy Infra\n\nThe rollout is staged by hand.\n");
+  join(p, sizeof p, f.corpus_a, "shared.md");
+  kbc_test_write_file(p, "# Shared\n\nBoth runbooks mention it.\n");
+  /* A root-level document, so `deploy` is the target as written: from
+   * notes/deploy.md the parser would have made it notes/deploy, and the
+   * basename tier would never see it. */
+  join(p, sizeof p, f.corpus_a, "index.md");
+  kbc_test_write_file(p,
+                      "# Index\n\n"
+                      "See [both](deploy) and [one](infra/deploy.md) and "
+                      "[note](shared.md).\n");
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  kbc_store *store = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(store);
+  /* Two edges, not three and not one. */
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(store, CORPUS_A, &err), 2);
+  /* The ambiguous target left no edge and no pending row either: a pending
+   * link is drained by an exact (corpus, dst_path) match, so a row named
+   * `deploy` would wait for a path that is never written. */
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(store, &err), 0);
+  static const char *const want[] = {"infra/deploy.md", "ops/deploy.md",
+                                      "shared.md"};
+  uint32_t deg[3] = {9, 9, 9};
+  KBC_CHECK_OK(
+      kbc_store_edge_degrees_for(store, CORPUS_A, want, 3, deg, &err));
+  KBC_CHECK_EQ_INT(deg[0], 1); /* named by path */
+  KBC_CHECK_EQ_INT(deg[1], 0); /* named, but only by the ambiguous target */
+  KBC_CHECK_EQ_INT(deg[2], 1);
+
+  kbc_store_close(store);
+  fx_teardown(&f);
+}
+
+/* The single-file path runs the same hook, against the LIVE INDEX as its
+ * candidate set — and the index has not been told about the document this
+ * call ingested, so that one is patched in before the ladder is built. Both
+ * halves are observable: a watcher event that adds a link must produce the
+ * edge without a full scan, and the fresh document must be able to resolve
+ * ITSELF, which is the row the index cannot have.
+ *
+ * The second half of the case is the sharper one. a.md is edited to a new
+ * title and links to that new title; the index still carries the old one, so
+ * a ladder built from the index alone would answer `[[Quokka]]` with nothing
+ * and record a pending link. */
+KBC_TEST(a_single_file_reindex_resolves_against_the_index_and_itself) {
+  fixture f;
+  fx_setup_empty(&f);
+  char p[KBC_TEST_PATH_MAX];
+  kbc_err err;
+  kbc_err_reset(&err);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  /* b.md first, and a full pass, so the index knows a document to link to. */
+  join(p, sizeof p, f.corpus_a, "b.md");
+  kbc_test_write_file(p, "# Linked\n\nThe chronicle mentions quokka burrows.\n");
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  /* a.md arrives as a watcher event and names b without its extension, and
+   * itself: a document naming itself is not a backlink. */
+  join(p, sizeof p, f.corpus_a, "a.md");
+  kbc_test_write_file(p, "# Linker\n\nSee [[b]] and [[a]].\n");
+  KBC_CHECK_OK(kbc_app_reindex_file(f.app, CORPUS_A, "a.md", &err));
+
+  kbc_store *store = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(store);
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(store, CORPUS_A, &err), 1);
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(store, &err), 0);
+  static const char *const want[] = {"a.md", "b.md"};
+  uint32_t deg[2] = {9, 9};
+  KBC_CHECK_OK(kbc_store_edge_degrees_for(store, CORPUS_A, want, 2, deg, &err));
+  KBC_CHECK_EQ_INT(deg[0], 0); /* named itself, so no self edge */
+  KBC_CHECK_EQ_INT(deg[1], 1);
+
+  /* The edit: a new title, and a link to exactly that title. A title is
+   * matched WHOLE, so the index's stale "# Linker" answers `[[Quokka]]` with
+   * nothing at all. */
+  kbc_test_write_file(p, "# Quokka\n\nSee [[Quokka]] and [[b]].\n");
+  KBC_CHECK_OK(kbc_app_reindex_file(f.app, CORPUS_A, "a.md", &err));
+  KBC_CHECK_EQ_INT(kbc_store_edge_count(store, CORPUS_A, &err), 1);
+  /* A target the stale title could not answer is a PENDING link, so a
+   * pending row here is the signature of an unpatched candidate set. */
+  KBC_CHECK_EQ_INT(kbc_store_pending_count(store, &err), 0);
+  KBC_CHECK_OK(kbc_store_edge_degrees_for(store, CORPUS_A, want, 2, deg, &err));
+  KBC_CHECK_EQ_INT(deg[0], 0);
+  KBC_CHECK_EQ_INT(deg[1], 1);
+
+  kbc_store_close(store);
+  fx_teardown(&f);
+}
+
+/* The registry's contract, driven with hooks of the test's own. None of it is
+ * observable from the daemon's single edge-record hook: a prefilter nothing
+ * fails, and a hook that fails is the only way to get one. */
+typedef struct {
+  char log[64];
+  size_t n;
+  kbc_store *st; /* the store hook_writes puts its row in */
+} hook_log;
+
+static void hook_note(hook_log *h, char c) {
+  if (h->n + 2u < sizeof h->log) {
+    h->log[h->n++] = c;
+    h->log[h->n] = '\0';
+  }
+}
+
+static bool hook_yes(const kbc_enrich_ctx *ctx, void *user) {
+  (void)ctx;
+  (void)user;
+  return true;
+}
+
+static bool hook_no(const kbc_enrich_ctx *ctx, void *user) {
+  (void)ctx;
+  (void)user;
+  return false;
+}
+
+/* One recording hook per letter. The runner takes function pointers, so four
+ * hooks that all record need four functions; the macro keeps them one line
+ * each instead of four copies that can drift. */
+#define HOOK_RECORDER(letter)                                                 \
+  static kbc_status hook_##letter(const kbc_enrich_ctx *ctx, void *user,     \
+                                  kbc_err *err) {                             \
+    (void)ctx;                                                                \
+    (void)err;                                                                \
+    hook_note((hook_log *)user, #letter[0]);                                  \
+    return KBC_OK;                                                            \
+  }
+HOOK_RECORDER(a)
+HOOK_RECORDER(b)
+HOOK_RECORDER(c)
+HOOK_RECORDER(d)
+#undef HOOK_RECORDER
+
+/* A hook that fails: it records that it RAN, writes nothing, and returns an
+ * error with no error slot of its own. A registry that stopped at the first
+ * failure, or that handed one to its caller, is caught by what follows. */
+static kbc_status hook_fails(const kbc_enrich_ctx *ctx, void *user,
+                             kbc_err *err) {
+  (void)ctx;
+  (void)err;
+  hook_log *h = (hook_log *)user;
+  hook_note(h, 'x');
+  return kbc_err_set(NULL, KBC_ERR_IO, "hook %s refused on purpose", "x");
+}
+
+/* A hook that writes a row and succeeds, so the store state the run leaves
+ * behind is a real thing to read rather than a log line. */
+static kbc_status hook_writes(const kbc_enrich_ctx *ctx, void *user,
+                              kbc_err *err) {
+  (void)ctx;
+  hook_log *h = (hook_log *)user;
+  const char letter = h->n == 0 ? 'a' : 'c';
+  char slug[32];
+  char path[32];
+  /* Both the slug AND the path name the letter: `sources.path` is unique, so
+   * two hooks sharing one path collide and the second one fails — which the
+   * registry would (correctly) swallow, leaving this test asserting nothing.
+   * A hook that fails quietly is exactly what the case above is about, so it
+   * must not be able to happen here. */
+  int n = snprintf(slug, sizeof slug, "hook-%c", letter);
+  int w = snprintf(path, sizeof path, "/nowhere-%c", letter);
+  hook_note(h, letter);
+  if (n < 0 || (size_t)n >= sizeof slug || w < 0 || (size_t)w >= sizeof path) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "hook row does not fit");
+  }
+  kbc_source src;
+  memset(&src, 0, sizeof src);
+  src.corpus = slug;
+  src.path = path;
+  src.added_at = 0;
+  src.paused = false;
+  return kbc_store_put_source(h->st, &src, err);
+}
+
+/* The two rows hook_writes leaves, as slugs joined by '|'. */
+static void written_slugs(kbc_store *st, char *out, size_t cap) {
+  kbc_arena *a = kbc_arena_new(4096u);
+  KBC_CHECK_NOT_NULL(a);
+  out[0] = '\0';
+  if (a == NULL) return;
+  kbc_source *rows = NULL;
+  size_t n = 0;
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_store_list_sources(st, a, 100, &rows, &n, &err));
+  size_t off = 0;
+  for (size_t i = 0; i < n; i++) {
+    int w = snprintf(out + off, cap - off, "%s%s", i == 0 ? "" : "|",
+                     rows[i].corpus ? rows[i].corpus : "?");
+    if (w < 0 || (size_t)w >= cap - off) {
+      KBC_CHECK_MSG(false, "slugs do not fit in %zu bytes", cap);
+      break;
+    }
+    off += (size_t)w;
+  }
+  kbc_arena_free(a);
+}
+
+/* REGISTRATION ORDER IS RUN ORDER (enrich.rs:118-133). The assertion is on
+ * the sequence, not on each hook having run: a runner that ran all three in
+ * the wrong order passes "each one ran". */
+KBC_TEST(hooks_run_in_registration_order) {
+  fixture f;
+  fx_setup_empty(&f);
+  kbc_err err;
+  kbc_err_reset(&err);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  hook_log h;
+  memset(&h, 0, sizeof h);
+  static const char *const names[] = {"first", "second", "third", "fourth"};
+  kbc_enrich_prefilter_fn pre[] = {hook_yes, hook_yes, hook_yes, hook_yes};
+  kbc_enrich_fn fns[] = {hook_b, hook_c, hook_a, hook_d};
+  void *users[] = {&h, &h, &h, &h};
+  /* The context is opaque here and stays unread: these hooks take their
+   * state in `user`, and the daemon's own context is built by the pass. */
+  kbc_enrich_ctx *ctx = (kbc_enrich_ctx *)(void *)&h;
+  KBC_CHECK_OK(kbc_enrich_run(4, names, pre, fns, users, ctx, &err));
+  KBC_CHECK_EQ_STR(h.log, "bcad");
+
+  kbc_store *store = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(store);
+  kbc_store_close(store);
+  fx_teardown(&f);
+}
+
+/* `interested` is the pre-filter (enrich.rs:106-108): a hook that says no is
+ * never called, so it costs nothing beyond the answer. */
+KBC_TEST(an_uninterested_hook_is_never_called) {
+  fixture f;
+  fx_setup_empty(&f);
+  kbc_err err;
+  kbc_err_reset(&err);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  hook_log h;
+  memset(&h, 0, sizeof h);
+  static const char *const names[] = {"skipped", "ran"};
+  kbc_enrich_prefilter_fn pre[] = {hook_no, hook_yes};
+  kbc_enrich_fn fns[] = {hook_a, hook_c};
+  void *users[] = {&h, &h};
+  kbc_enrich_ctx *ctx = (kbc_enrich_ctx *)(void *)&h;
+  KBC_CHECK_OK(kbc_enrich_run(2, names, pre, fns, users, ctx, &err));
+  /* Not "both ran": the first one must be absent, and the second present. */
+  KBC_CHECK_EQ_STR(h.log, "c");
+
+  kbc_store *store = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(store);
+  kbc_store_close(store);
+  fx_teardown(&f);
+}
+
+/* BEST-EFFORT (enrich.rs:14-24). A hook that fails is logged and stepped
+ * over: the run still reports success to its caller, the hooks after it still
+ * run, and the store keeps exactly the rows the hooks that succeeded wrote —
+ * the failed hook's own write is not there, and the successful ones are not
+ * rolled back. */
+KBC_TEST(a_failing_hook_does_not_fail_the_run_or_half_write_the_store) {
+  fixture f;
+  fx_setup_empty(&f);
+  kbc_err err;
+  kbc_err_reset(&err);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_store *store = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(store);
+  if (store == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  hook_log h;
+  memset(&h, 0, sizeof h);
+  h.st = store;
+  static const char *const names[] = {"writes", "fails", "writes-again"};
+  kbc_enrich_prefilter_fn pre[] = {hook_yes, hook_yes, hook_yes};
+  kbc_enrich_fn fns[] = {hook_writes, hook_fails, hook_writes};
+  void *users[] = {&h, &h, &h};
+  kbc_enrich_ctx *ctx = (kbc_enrich_ctx *)(void *)&h;
+  KBC_CHECK_OK(kbc_enrich_run(3, names, pre, fns, users, ctx, &err));
+  /* The hook's error stayed INSIDE the registry: the caller's err is
+   * untouched, which is what "a hook's failure is not the caller's" means
+   * at this boundary. */
+  KBC_CHECK_EQ_STR(err.msg, "");
+  /* The failing hook ran, and the one after it ran too. */
+  KBC_CHECK_EQ_STR(h.log, "axc");
+  char slugs[256];
+  written_slugs(store, slugs, sizeof slugs);
+  /* CORPUS_A is here because kbc_app_open registers every configured corpus
+   * as a source — that row is written by the composition root, not by a hook,
+   * and it is the same table the hooks below write into. The assertion is
+   * still "the failed hook's row is absent and the other two are present",
+   * which is what this string is checked for: hook-b is not in it. */
+  KBC_CHECK_EQ_STR(slugs, "alpha|hook-a|hook-c");
+
+  kbc_store_close(store);
   fx_teardown(&f);
 }
 
@@ -4331,6 +4714,491 @@ KBC_TEST(concurrent_queries_share_one_cache_and_the_counters_add_up) {
   fx_teardown(&f);
 }
 
+/* ------------------------------------------------- the store's ledgers --
+ *
+ * Four tables that a reindex pass is the writer for. Every case here reads
+ * the ROW back out of the store through its own public getter — a test that
+ * asserted a function had been called would pass with the write removed, and
+ * these four exist precisely because nobody was reading them.
+ */
+
+/* The runs of one corpus, copied out of the arena the store built them in.
+ * The ids are copied because a caller cannot hold a pointer into a freed
+ * arena, and the whole set is copied because the cases below must NOT assume
+ * an order: `started_at` is unix SECONDS, so two passes inside one second tie
+ * and list_index_runs falls back to the id — meaning "the first row" is not
+ * reliably "the newest pass". An assertion written against the wrong row is
+ * worse than no assertion, so these read every row and the cases below pick
+ * the one they mean. */
+#define RUNS_MAX 8u
+typedef struct {
+  char id[KBC_MAX_ID_LEN + 1];
+  char corpus[256];
+  int64_t started_at;
+  int64_t finished_at;
+  int64_t ok_count;
+  int64_t err_count;
+} run_row;
+
+typedef struct {
+  size_t n;
+  run_row r[RUNS_MAX];
+} run_summary;
+
+static bool read_runs(const kbc_config *cfg, const char *corpus,
+                      run_summary *out) {
+  memset(out, 0, sizeof *out);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = kbc_store_open(cfg, &err);
+  if (s == NULL) {
+    fprintf(stderr, "  store_open: %s\n", err.msg);
+    return false;
+  }
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  kbc_index_run *runs = NULL;
+  size_t n = 0;
+  if (a == NULL ||
+      kbc_failed(kbc_store_list_index_runs(s, a, corpus, 100, &runs, &n,
+                                           &err))) {
+    if (a != NULL) fprintf(stderr, "  list_index_runs: %s\n", err.msg);
+    kbc_arena_free(a);
+    kbc_store_close(s);
+    return false;
+  }
+  out->n = n < RUNS_MAX ? n : RUNS_MAX;
+  for (size_t i = 0; i < out->n; i++) {
+    snprintf(out->r[i].id, sizeof out->r[i].id, "%s",
+             runs[i].id ? runs[i].id : "");
+    snprintf(out->r[i].corpus, sizeof out->r[i].corpus, "%s",
+             runs[i].corpus ? runs[i].corpus : "");
+    out->r[i].started_at = runs[i].started_at;
+    out->r[i].finished_at = runs[i].finished_at;
+    out->r[i].ok_count = runs[i].ok_count;
+    out->r[i].err_count = runs[i].err_count;
+  }
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  return true;
+}
+
+/* The one run of this set that names `id`, or NULL. */
+static const run_row *find_run(const run_summary *s, const char *id) {
+  const size_t n = s->n < RUNS_MAX ? s->n : RUNS_MAX;
+  for (size_t i = 0; i < n; i++) {
+    if (strcmp(s->r[i].id, id) == 0) return &s->r[i];
+  }
+  return NULL;
+}
+
+/* The one run of this set carrying an error, or NULL. Exactly one run in a
+ * fixture of two passes can be the failed one, so "the row with the error" is
+ * a selection that does not depend on the order the store returned. */
+static const run_row *find_errored_run(const run_summary *s) {
+  const size_t n = s->n < RUNS_MAX ? s->n : RUNS_MAX;
+  const run_row *hit = NULL;
+  for (size_t i = 0; i < n; i++) {
+    if (s->r[i].err_count > 0) {
+      if (hit != NULL) return NULL; /* ambiguous: two errored runs */
+      hit = &s->r[i];
+    }
+  }
+  return hit;
+}
+
+/* Every id in the set is distinct. The id is the primary key, so a duplicate
+ * could not have been STORED — but a second pass whose id collided would have
+ * failed to open its row, which is a lost run rather than an error, so the
+ * count below is what actually catches it. This is the belt to that braces. */
+static bool run_ids_distinct(const run_summary *s) {
+  const size_t n = s->n < RUNS_MAX ? s->n : RUNS_MAX;
+  for (size_t i = 0; i < n; i++) {
+    for (size_t j = i + 1; j < n; j++) {
+      if (strcmp(s->r[i].id, s->r[j].id) == 0) return false;
+    }
+  }
+  return true;
+}
+
+/* The id shape store.h documents: "r-" and six base32 characters. Checked
+ * rather than assumed, because a run id that is not this shape is not a run
+ * id — list_index_runs orders by it and an operator reads it. */
+static bool run_id_is_well_formed(const char *id) {
+  if (id == NULL || strlen(id) != 8u) return false;
+  if (id[0] != 'r' || id[1] != '-') return false;
+  for (const char *p = id + 2; *p != '\0'; p++) {
+    if (strchr("0123456789abcdefghjkmnpqrstvwxyz", *p) == NULL) return false;
+  }
+  return true;
+}
+
+KBC_TEST(a_reindex_records_a_finished_run_for_every_configured_corpus) {
+  fixture f;
+  fx_setup(&f, true);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  /* One run per corpus, not one for the pass: `index_runs.corpus` is what the
+   * table is keyed by and what list_index_runs filters on, so a pass over two
+   * corpora that recorded one row would leave one of them with no run at all. */
+  run_summary ra, rb, rall;
+  if (!read_runs(f.cfg, CORPUS_A, &ra) || !read_runs(f.cfg, CORPUS_B, &rb) ||
+      !read_runs(f.cfg, NULL, &rall)) {
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK_EQ_INT(ra.n, 1);
+  KBC_CHECK_EQ_INT(rb.n, 1);
+  KBC_CHECK_EQ_INT(rall.n, 2);
+  KBC_CHECK_EQ_STR(ra.r[0].corpus, CORPUS_A);
+  KBC_CHECK_EQ_STR(rb.r[0].corpus, CORPUS_B);
+  KBC_CHECK_MSG(run_id_is_well_formed(ra.r[0].id),
+                "run id is not \"r-\" + 6 base32: \"%s\"", ra.r[0].id);
+  KBC_CHECK_MSG(run_id_is_well_formed(rb.r[0].id),
+                "run id is not \"r-\" + 6 base32: \"%s\"", rb.r[0].id);
+  /* The two runs of ONE pass must not collide: the id is the primary key, and
+   * a colliding pair means the second corpus silently has no run at all. */
+  KBC_CHECK_MSG(strcmp(ra.r[0].id, rb.r[0].id) != 0,
+                "both corpora of one pass minted the run id \"%s\"",
+                ra.r[0].id);
+
+  /* FINISHED, not in flight. A negative finished_at is the store's "this pass
+   * is still running", and a completed reindex that left it negative is a run
+   * row that will read as running for the life of the database. */
+  KBC_CHECK_MSG(ra.r[0].finished_at >= 0,
+                "a reindex that returned left run %s open (finished_at %lld)",
+                ra.r[0].id, (long long)ra.r[0].finished_at);
+  KBC_CHECK_MSG(rb.r[0].finished_at >= 0,
+                "a reindex that returned left run %s open (finished_at %lld)",
+                rb.r[0].id, (long long)rb.r[0].finished_at);
+  KBC_CHECK(ra.r[0].finished_at >= ra.r[0].started_at);
+  KBC_CHECK(rb.r[0].finished_at >= rb.r[0].started_at);
+
+  /* The counts are the documents of THAT corpus, not of the pass: alpha holds
+   * a.md, b.md, c.md and beta holds d.md. */
+  KBC_CHECK_EQ_INT(ra.r[0].ok_count, 3);
+  KBC_CHECK_EQ_INT(rb.r[0].ok_count, 1);
+  KBC_CHECK_EQ_INT(ra.r[0].err_count, 0);
+  KBC_CHECK_EQ_INT(rb.r[0].err_count, 0);
+
+  /* A second pass records a second run and does not disturb the first. */
+  const char *first_id = ra.r[0].id;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  run_summary ra2;
+  if (read_runs(f.cfg, CORPUS_A, &ra2)) {
+    KBC_CHECK_EQ_INT(ra2.n, 2);
+    KBC_CHECK_MSG(run_ids_distinct(&ra2),
+                  "two passes over one corpus did not produce two distinct "
+                  "run ids");
+    /* The first run is still readable, still finished, and still says what it
+     * said: a second pass must not rewrite the ledger of the first. */
+    const run_row *kept = find_run(&ra2, first_id);
+    KBC_CHECK_MSG(kept != NULL, "the first pass's run %s disappeared",
+                  first_id);
+    if (kept != NULL) {
+      KBC_CHECK_MSG(kept->finished_at >= 0, "the first run was reopened");
+      KBC_CHECK_EQ_INT(kept->ok_count, 3);
+      KBC_CHECK_EQ_INT(kept->err_count, 0);
+    }
+    /* Both runs are finished and both covered the corpus: nothing changed on
+     * disk, so the second pass accounted for three documents by deciding to
+     * leave them alone, which is what ok_count counts. */
+    for (size_t i = 0; i < ra2.n && i < RUNS_MAX; i++) {
+      KBC_CHECK_MSG(ra2.r[i].finished_at >= 0, "run %s is still open",
+                    ra2.r[i].id);
+      KBC_CHECK_EQ_INT(ra2.r[i].ok_count, 3);
+    }
+  }
+
+  fx_teardown(&f);
+}
+
+/* The failure case, and the reason the ledger is owned by a wrapper rather
+ * than by the body of the pass: a pass that dies still has to finish its run.
+ *
+ * The failure is injected by dropping doc_metas out from under a live store,
+ * so the pass reaches kbc_store_replace_metas and is refused mid-walk. It is
+ * deterministic (no lock race, no retries) and it lands in the middle of the
+ * document loop, which is where a "close on the way out" that somebody forgot
+ * would show up. */
+KBC_TEST(a_failed_reindex_leaves_a_finished_run_carrying_the_error) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  run_summary before;
+  if (!read_runs(f.cfg, CORPUS_A, &before)) {
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK_EQ_INT(before.n, 1);
+  char good_id[KBC_MAX_ID_LEN + 1];
+  snprintf(good_id, sizeof good_id, "%s", before.r[0].id);
+
+  db_side side;
+  memset(&side, 0, sizeof side);
+  if (!db_side_open(&side, f.cfg)) {
+    fx_teardown(&f);
+    return;
+  }
+  /* Change a file so the second pass has a changed row to reach the facets
+   * write with, and drop the table it writes to. */
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, "a.md");
+  kbc_test_write_file(p, "# Alpha Ledger\n\nThe ledger reconciles accruals and\naccruals.\n");
+  KBC_CHECK_OK(db_side_exec(&side, "DROP TABLE doc_metas;"));
+
+  kbc_err_reset(&err);
+  kbc_status s = kbc_app_reindex(f.app, &err);
+  KBC_CHECK_MSG(kbc_failed(s),
+                "a reindex the store refused reported KBC_OK (last error: %s)",
+                err.msg);
+  if (kbc_failed(s)) KBC_CHECK_ERR_MSG(err);
+  db_side_close(&side);
+
+  run_summary after;
+  if (read_runs(f.cfg, CORPUS_A, &after)) {
+    /* A second row: the failed pass opened one and closed it. */
+    KBC_CHECK_EQ_INT(after.n, 2);
+    KBC_CHECK_MSG(run_ids_distinct(&after),
+                  "the failed pass reused the previous run's id \"%s\"",
+                  good_id);
+    /* THE ASSERTION, and it is about the failed run specifically: selected by
+     * its error count rather than by position, because two passes inside one
+     * second have equal started_at and the store orders them by id. */
+    const run_row *bad = find_errored_run(&after);
+    KBC_CHECK_MSG(bad != NULL,
+                  "after a reindex the store refused, no run carries an error "
+                  "(%zu runs, all with err_count 0) — the failure was never "
+                  "recorded", after.n);
+    if (bad != NULL) {
+      KBC_CHECK_MSG(strcmp(bad->id, good_id) != 0,
+                    "the errored run is the FIRST pass's run %s, so the failed "
+                    "pass recorded nothing of its own",
+                    bad->id);
+      KBC_CHECK_MSG(run_id_is_well_formed(bad->id),
+                    "failed-pass run id is not \"r-\" + 6 base32: \"%s\"",
+                    bad->id);
+      /* A failed pass that leaves finished_at negative is indistinguishable,
+       * forever, from a pass that is still running — and "still running" is
+       * the one reading that is guaranteed to be a lie. */
+      KBC_CHECK_MSG(bad->finished_at >= 0,
+                    "the failed reindex left run %s OPEN (finished_at %lld); a "
+                    "run row nobody closed reads as a pass in progress forever",
+                    bad->id, (long long)bad->finished_at);
+      KBC_CHECK(bad->finished_at >= bad->started_at);
+      /* And the failure is COUNTED, not merely recorded as having happened: a
+       * finished run with err_count 0 claims the corpus is fully indexed,
+       * which is exactly what the caller was just told did not happen. */
+      KBC_CHECK_MSG(bad->err_count > 0,
+                    "the failed reindex closed run %s with err_count 0 and "
+ "ok_count %lld, which reads as a complete pass",
+                    bad->id, (long long)bad->ok_count);
+      /* The document it did account for before the store refused is still
+       * counted: a pass that ingested nothing reached no facet write, so
+       * ok_count 0 alongside the error is the honest reading, and a non-zero
+       * one would mean the pass got further than the assertion above thinks. */
+      KBC_CHECK(bad->ok_count < 3);
+    }
+    /* Nothing at all is left in flight, whichever row the failure landed on. */
+    for (size_t i = 0; i < after.n && i < RUNS_MAX; i++) {
+      KBC_CHECK_MSG(after.r[i].finished_at >= 0,
+                    "run %s is still open after a reindex returned",
+                    after.r[i].id);
+    }
+    /* And the first pass's finished run is untouched by the failure: closing
+     * the second must not rewrite the first. */
+    const run_row *kept = find_run(&after, good_id);
+    KBC_CHECK_MSG(kept != NULL, "the first pass's run %s disappeared", good_id);
+    if (kept != NULL) {
+      KBC_CHECK_EQ_INT(kept->err_count, 0);
+      KBC_CHECK_EQ_INT(kept->ok_count, 3);
+    }
+  }
+
+  fx_teardown(&f);
+}
+
+/* The property INSERT OR IGNORE exists for, asserted on the stored value. */
+KBC_TEST(a_reindex_does_not_move_the_first_seen_anchor) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  char id[KBC_MAX_ID_LEN + 1];
+  kbc_id_for_artifact(id, CORPUS_A, "a.md");
+
+  kbc_store *s = kbc_store_open(f.cfg, &err);
+  if (s == NULL) {
+    fprintf(stderr, "  store_open: %s\n", err.msg);
+    fx_teardown(&f);
+    return;
+  }
+  int64_t first = 0;
+  KBC_CHECK_OK(kbc_store_get_first_seen(s, id, &first, &err));
+  KBC_CHECK_MSG(first > 0, "a document indexed by a reindex has no first-seen "
+                "anchor (got %lld)", (long long)first);
+  kbc_store_close(s);
+
+  /* Overwrite the stored anchor with a sentinel through the database itself,
+   * so the assertion does not depend on the clock: a writer that REFRESHED
+   * the column would replace the sentinel with "now", and one that ignored
+   * the write would leave it. Only "ignored" is correct, and it is the only
+   * one of the three a same-second test could have told apart. */
+  db_side side;
+  memset(&side, 0, sizeof side);
+  if (!db_side_open(&side, f.cfg)) {
+    fx_teardown(&f);
+    return;
+  }
+  char sql[512];
+  snprintf(sql, sizeof sql,
+           "UPDATE doc_first_seen SET first_indexed_unix = 1 WHERE artifact_id"
+           " = '%s';",
+           id);
+  KBC_CHECK_OK(db_side_exec(&side, sql));
+  db_side_close(&side);
+
+  /* Edit the file, so the second pass really re-ingests the document rather
+   * than skipping it as unchanged — a pass that skipped it would prove
+   * nothing about the anchor. */
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f.corpus_a, "a.md");
+  kbc_test_write_file(p, "# Alpha Ledger\n\nThe ledger reconciles accruals and\naccruals again.\n");
+
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  s = kbc_store_open(f.cfg, &err);
+  if (s == NULL) {
+    fprintf(stderr, "  store_open: %s\n", err.msg);
+    fx_teardown(&f);
+    return;
+  }
+  int64_t after = 0;
+  KBC_CHECK_OK(kbc_store_get_first_seen(s, id, &after, &err));
+  KBC_CHECK_MSG(after == 1,
+                "a second reindex moved the first-indexed anchor of %s from 1 "
+                "to %lld; a \"created\" sort has to survive a reindex",
+                id, (long long)after);
+  kbc_store_close(s);
+
+  fx_teardown(&f);
+}
+
+/* The config declares corpora; the `sources` table is the runtime registry of
+ * the ones that are live. */
+KBC_TEST(opening_the_daemon_registers_every_configured_corpus_as_a_source) {
+  fixture f;
+  fx_setup(&f, true);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+
+  /* At OPEN, with no reindex: a corpus is live from the moment the daemon
+   * answers, not from the moment someone reindexes. */
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = kbc_store_open(f.cfg, &err);
+  if (s == NULL) {
+    fprintf(stderr, "  store_open: %s\n", err.msg);
+    fx_teardown(&f);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  kbc_source *list = NULL;
+  size_t n = 0;
+  KBC_CHECK_OK(kbc_store_list_sources(s, a, 100, &list, &n, &err));
+  KBC_CHECK_EQ_INT(n, 2);
+  bool saw_a = false, saw_b = false;
+  for (size_t i = 0; i < n; i++) {
+    if (strcmp(list[i].corpus, CORPUS_A) == 0) {
+      saw_a = true;
+      KBC_CHECK_EQ_STR(list[i].path, f.corpus_a);
+      KBC_CHECK_MSG(list[i].added_at > 0, "source %s has no added_at",
+                    list[i].corpus);
+      KBC_CHECK_MSG(!list[i].paused, "a freshly registered source is paused");
+    }
+    if (strcmp(list[i].corpus, CORPUS_B) == 0) {
+      saw_b = true;
+      KBC_CHECK_EQ_STR(list[i].path, f.corpus_b);
+    }
+  }
+  KBC_CHECK_MSG(saw_a, "corpus %s is configured but is not in `sources`",
+                CORPUS_A);
+  KBC_CHECK_MSG(saw_b, "corpus %s is configured but is not in `sources`",
+                CORPUS_B);
+
+  /* `paused` is the column the operator toggles, so it must survive the
+   * re-registration every open performs: put_source upserts `path` only, and a
+   * daemon that un-paused a corpus on every restart would make the flag
+   * impossible to set. */
+  KBC_CHECK_OK(kbc_store_set_source_paused(s, CORPUS_A, true, &err));
+  int64_t added_at = 0;
+  {
+    kbc_source one;
+    memset(&one, 0, sizeof one);
+    KBC_CHECK_OK(kbc_store_get_source(s, a, CORPUS_A, &one, &err));
+    added_at = one.added_at;
+    KBC_CHECK_MSG(one.paused, "the pause did not take");
+  }
+  kbc_arena_free(a);
+  kbc_store_close(s);
+
+  /* Reopen, which re-registers every configured corpus. */
+  kbc_err_reset(&err);
+  kbc_app_close(f.app);
+  f.app = kbc_app_open(f.cfg, &err);
+  if (f.app == NULL) fprintf(stderr, "  app_open: %s\n", err.msg);
+  KBC_CHECK_NOT_NULL(f.app);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+
+  s = kbc_store_open(f.cfg, &err);
+  if (s == NULL) {
+    fprintf(stderr, "  store_open: %s\n", err.msg);
+    fx_teardown(&f);
+    return;
+  }
+  a = kbc_arena_new(64u * 1024u);
+  kbc_source after;
+  memset(&after, 0, sizeof after);
+  KBC_CHECK_OK(kbc_store_get_source(s, a, CORPUS_A, &after, &err));
+  KBC_CHECK_MSG(after.paused,
+                "a restart un-paused %s; the pause is runtime operator intent "
+                "and re-registering the corpus must not clear it",
+                CORPUS_A);
+  KBC_CHECK_EQ_STR(after.path, f.corpus_a);
+  KBC_CHECK_MSG(after.added_at == added_at,
+                "added_at moved from %lld to %lld across a restart; it is when "
+                "the source was FIRST seen, not when it was last written",
+                (long long)added_at, (long long)after.added_at);
+  kbc_arena_free(a);
+  kbc_store_close(s);
+
+  fx_teardown(&f);
+}
+
 
 
 
@@ -4375,6 +5243,17 @@ int main(void) {
        removing_a_document_takes_its_edges_and_its_pending_links},
       {"the_graph_boost_is_off_by_default_and_reorders_when_configured",
        the_graph_boost_is_off_by_default_and_reorders_when_configured},
+      {"a_link_naming_a_document_without_its_extension_is_an_edge",
+       a_link_naming_a_document_without_its_extension_is_an_edge},
+      {"an_ambiguous_link_target_is_not_an_edge",
+       an_ambiguous_link_target_is_not_an_edge},
+      {"a_single_file_reindex_resolves_against_the_index_and_itself",
+       a_single_file_reindex_resolves_against_the_index_and_itself},
+      {"hooks_run_in_registration_order", hooks_run_in_registration_order},
+      {"an_uninterested_hook_is_never_called",
+       an_uninterested_hook_is_never_called},
+      {"a_failing_hook_does_not_fail_the_run_or_half_write_the_store",
+       a_failing_hook_does_not_fail_the_run_or_half_write_the_store},
     {"a_tag_filter_that_matches_nothing_returns_zero_rows",
      a_tag_filter_that_matches_nothing_returns_zero_rows},
     {"a_tag_and_a_cap_together_are_an_intersection",
@@ -4439,6 +5318,14 @@ int main(void) {
        a_populated_query_cache_is_released_when_the_app_closes},
       {"concurrent_queries_share_one_cache_and_the_counters_add_up",
        concurrent_queries_share_one_cache_and_the_counters_add_up},
+      {"a_reindex_records_a_finished_run_for_every_configured_corpus",
+       a_reindex_records_a_finished_run_for_every_configured_corpus},
+      {"a_failed_reindex_leaves_a_finished_run_carrying_the_error",
+       a_failed_reindex_leaves_a_finished_run_carrying_the_error},
+      {"a_reindex_does_not_move_the_first_seen_anchor",
+       a_reindex_does_not_move_the_first_seen_anchor},
+      {"opening_the_daemon_registers_every_configured_corpus_as_a_source",
+       opening_the_daemon_registers_every_configured_corpus_as_a_source},
       {NULL, NULL},
   };
   return kbc_test_run("app", cases);

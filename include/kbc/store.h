@@ -316,6 +316,19 @@ kbc_status kbc_store_retry_count_for_path(kbc_store *s, const char *corpus,
                                           const char *path,
                                           const char *content_hash,
                                           int64_t *out, kbc_err *err);
+/* No production caller yet, and deliberately so. The errors table IS written —
+ * by the quarantine gate, on every embed failure — but the surface that would
+ * LIST open errors or clear one is an operator route that is not built, so the
+ * rows accumulate and nothing in production reads them. They are not dead
+ * weight: `retry_count` is load-bearing for the gate, and these rows are the
+ * input the route will read. Add a caller when the route exists; do not add a
+ * synthetic one before it.
+ *
+ * In particular there is deliberately no "clear on a successful reindex" step.
+ * The gate reads this row on the next pass, so clearing it there un-gates the
+ * document, it takes a real embed, fails, returns at count 1, and a permanently
+ * failing document oscillates in and out of quarantine forever. Clearing is
+ * operator-only, and that is the whole point of it. */
 kbc_status kbc_store_clear_error(kbc_store *s, const char *corpus,
                                  const char *path, kbc_err *err);
 kbc_status kbc_store_list_errors(kbc_store *s, kbc_arena *a, const char *corpus,
@@ -323,7 +336,19 @@ kbc_status kbc_store_list_errors(kbc_store *s, kbc_arena *a, const char *corpus,
                                  kbc_error_row **out, size_t *n_out,
                                  kbc_err *err);
 
-/* -------------------------------------------------------- excluded files -- */
+/* -------------------------------------------------------- excluded files --
+ *
+ * SCHEMA ONLY, no production writer. `excluded_files` records durable operator
+ * intent, and the surface that writes it — an exclusions route, so an operator
+ * can keep one file out of the index — is not built. Nothing in kb-c creates
+ * an exclusion row, so the three functions below have no caller. That is a
+ * deliberate state and not an oversight: the writers are declared and
+ * implemented so that porting the exclusions surface is a route rather than a
+ * schema migration, and the ingest gate that would READ them is named in
+ * kbc_store_list_exclusions. What would not be defensible is inventing a
+ * writer now — an exclusion nobody sets is a feature nobody asked for, and a
+ * table with a writer nobody calls is the dead weight this port keeps trying
+ * to avoid. */
 
 /* Operator intent, keyed by the source-relative forward-slash path — the same
  * string the artifact id is hashed from, so an exclusion cannot be attached
@@ -355,7 +380,16 @@ kbc_status kbc_store_list_exclusions(kbc_store *s, kbc_arena *a, size_t limit,
  * (storage/sqlite.rs:6392) drops artifacts, chunks, comments, edges and
  * friends, and stops there; a user's reading history outliving the document
  * they read is the behaviour to preserve, and it is only assertable if the
- * tables exist. */
+ * tables exist.
+ *
+ * NO PRODUCTION WRITER, for the same reason and with the same force as the
+ * exclusions table above. The surfaces that create these rows are the SPA's
+ * timeline, the anchor route and the memory pin — stage 3 and stage 4, and not
+ * built. So kb-c writes no history row, no corkboard entry and no pin. They
+ * are the one place in this port where an EMPTY table is the correct and the
+ * TESTED state: `tests/test_app.c` proves a removal leaves them alone, and it
+ * could not prove that if the tables did not exist. A writer added before its
+ * surface exists would be a feature nobody asked for. */
 typedef struct {
   const char *artifact_id; /* ARENA */
   int64_t created_at;      /* unix seconds */

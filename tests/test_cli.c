@@ -20,8 +20,11 @@
 
 #include "kbc_test.h"
 
+#include <signal.h>
 #include <sys/wait.h>
+#include <time.h>
 
+#include "kbc/json.h"
 #include "kbc/store.h"
 
 /* ------------------------------------------------------------- helpers --- */
@@ -836,6 +839,789 @@ KBC_TEST(backing_up_an_unconfigured_corpus_fails) {
   world_down(&w);
 }
 
+/* ============================================================== comments ===
+ *
+ * These drive the real binary, because the contract is the exit code and the
+ * bytes on stdout. `comments` reads the store directly (kb-c has no review
+ * routes), so the world these need is exactly the one `world_up` already
+ * builds: one corpus `notes`, one artifact at path a.md with the id
+ * aaaaaaaaaaaa, and a store that really was written through the public API.
+ */
+
+#define DOC_A "aaaaaaaaaaaa"  /* the artifact world_up inserts */
+#define DOC_OTHER "bbbbbbbbbbbb" /* a well-formed id with no row behind it */
+
+/* `kbc comments add --artifact-id ID --body TEXT [--anchor A] [--author X]`.
+ * Returns the exit code; `out`, when non-NULL, receives stdout+stderr. */
+static int comments_add(const world *w, const char *doc, const char *body,
+                        const char *anchor, const char *author,
+                        kbc_str *out) {
+  argv_vec a = {NULL, 0, 0};
+  argv_push(&a, kbc_bin());
+  argv_push(&a, "comments");
+  argv_push(&a, "add");
+  argv_push(&a, "--artifact-id");
+  argv_push(&a, doc);
+  argv_push(&a, "--body");
+  argv_push(&a, body);
+  if (anchor != NULL) {
+    argv_push(&a, "--anchor");
+    argv_push(&a, anchor);
+  }
+  if (author != NULL) {
+    argv_push(&a, "--author");
+    argv_push(&a, author);
+  }
+  int rc = run_kbc(w->home, w->config, a.v, out);
+  argv_free(&a);
+  return rc;
+}
+
+/* `kbc comments list (--artifact-id ID | --path P) [--all]`. */
+static int comments_list(const world *w, const char *doc, bool all,
+                         kbc_str *out) {
+  argv_vec a = {NULL, 0, 0};
+  argv_push(&a, kbc_bin());
+  argv_push(&a, "comments");
+  argv_push(&a, "list");
+  if (doc != NULL) {
+    argv_push(&a, "--artifact-id");
+    argv_push(&a, doc);
+  }
+  if (all) {
+    argv_push(&a, "--all");
+  }
+  int rc = run_kbc(w->home, w->config, a.v, out);
+  argv_free(&a);
+  return rc;
+}
+
+/* `kbc comments resolve|unresolve <comment_id> --artifact-id ID`. */
+static int comments_set(const world *w, const char *verb, const char *cid,
+                        const char *doc, kbc_str *out) {
+  argv_vec a = {NULL, 0, 0};
+  argv_push(&a, kbc_bin());
+  argv_push(&a, "comments");
+  argv_push(&a, verb);
+  argv_push(&a, cid);
+  argv_push(&a, "--artifact-id");
+  argv_push(&a, doc);
+  int rc = run_kbc(w->home, w->config, a.v, out);
+  argv_free(&a);
+  return rc;
+}
+
+/* The single comment id in a `comments list --json` body, as a KBC_OWN
+ * string. Returns NULL when the body is not the expected shape or holds no
+ * comment, so a caller that gets NULL is told which half broke. Parsed with
+ * the same json.h the binary links, not by scanning for quotes: a scan would
+ * find the artifact_id field and hand back the document's id. */
+static char *first_comment_id(const char *json) {
+  kbc_arena *a = kbc_arena_new(4096);
+  if (a == NULL) {
+    return NULL;
+  }
+  kbc_err e;
+  kbc_err_reset(&e);
+  kbc_json *root = kbc_json_parse(a, json, strlen(json), &e);
+  if (root == NULL) {
+    kbc_arena_free(a);
+    return NULL;
+  }
+  const kbc_json *rows = kbc_json_get(root, "comments");
+  char *out = NULL;
+  if (rows != NULL && kbc_json_is(rows, KBC_JSON_ARR) &&
+      kbc_json_len(rows) > 0) {
+    const kbc_json *first = kbc_json_at(rows, 0);
+    /* kbc_json_str, not a direct union read: it type-checks, so a `comments`
+     * array of strings instead of objects yields NULL rather than a
+     * misread pointer. */
+    const char *text = kbc_json_str(first, "id", NULL);
+    if (text != NULL) {
+      out = strdup(text);
+    }
+  }
+  kbc_arena_free(a);
+  return out; /* KBC_OWN, or NULL */
+}
+
+/* How many lines of `s` start with a 12-hex token followed by a space — the
+ * shape of a `comments list` table row. Used to prove a body carrying a
+ * newline did not become a second row. */
+static size_t table_rows(const char *s) {
+  size_t rows = 0;
+  const char *p = s;
+  while ((p = strstr(p, "\n")) != NULL) {
+    p++;
+    size_t hex = 0;
+    while (hex < 12 && ((p[hex] >= '0' && p[hex] <= '9') ||
+                        (p[hex] >= 'a' && p[hex] <= 'f'))) {
+      hex++;
+    }
+    if (hex == 12 && p[12] == ' ') {
+      rows++;
+    }
+  }
+  return rows;
+}
+
+/* A comment written through the CLI must come back through `list`, with the
+ * body, the author and the anchor it was given. Every one of those three is
+ * a column the verb could drop on the floor and still exit 0, which is
+ * exactly the kind of bug an exit-code-only assertion cannot see. */
+KBC_TEST(a_comment_added_through_the_cli_is_listed_back_with_its_fields) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_EQ_INT(
+      comments_add(&w, DOC_A, "the second paragraph is wrong", "section:two",
+                   "you", NULL),
+      0);
+  /* --json, so the assertion is on the machine-readable contract and not on
+   * column widths this test would then be pinning for the wrong reason. */
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, &out, "--json", "comments", "list",
+                              "--artifact-id", DOC_A, NULL),
+                   0);
+  KBC_CHECK_MSG(strstr(out.ptr, "the second paragraph is wrong") != NULL,
+                "the comment body did not survive the round trip; got: %s",
+                out.ptr);
+  KBC_CHECK_MSG(strstr(out.ptr, "\"author\":\"you\"") != NULL,
+                "the author was not recorded; got: %s", out.ptr);
+  KBC_CHECK_MSG(strstr(out.ptr, "section:two") != NULL,
+                "the anchor was not recorded; got: %s", out.ptr);
+  KBC_CHECK_MSG(strstr(out.ptr, "\"status\":\"open\"") != NULL,
+                "a fresh comment must be open; got: %s", out.ptr);
+  kbc_str_free(&out);
+  world_down(&w);
+}
+
+/* The default listing shows OPEN comments; `--all` is the one that includes
+ * resolved ones. If the filter were dropped, both listings would be
+ * identical and the flag would be a lie; if it were inverted, the resolved
+ * comment would never be visible at all. Both directions are asserted. */
+KBC_TEST(resolve_takes_a_comment_out_of_the_default_listing_until_all_is_given) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  KBC_CHECK_EQ_INT(comments_add(&w, DOC_A, "please fix this", NULL, NULL, NULL),
+    0);
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, &out, "--json", "comments", "list",
+                              "--artifact-id", DOC_A, NULL),
+       0);
+  char *cid = first_comment_id(out.ptr);
+  KBC_CHECK_MSG(cid != NULL, "no comment was listed; got: %s", out.ptr);
+  kbc_str_free(&out);
+  if (cid == NULL) {
+    world_down(&w);
+    return;
+  }
+  KBC_CHECK_EQ_INT(comments_set(&w, "resolve", cid, DOC_A, NULL), 0);
+
+  kbc_str open_list;
+  kbc_str_init(&open_list);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, &open_list, "--json", "comments", "list",
+                              "--artifact-id", DOC_A, NULL),
+       0);
+  KBC_CHECK_MSG(strstr(open_list.ptr, "\"comments\":[]") != NULL,
+                "a resolved comment is still in the default listing; got: %s",
+              open_list.ptr);
+  kbc_str_free(&open_list);
+
+  kbc_str all;
+  kbc_str_init(&all);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, &all, "--json", "comments", "list",
+    "--artifact-id", DOC_A, "--all", NULL),
+         0);
+  KBC_CHECK_MSG(strstr(all.ptr, "\"status\":\"resolved\"") != NULL,
+ "--all did not surface the resolved comment; got: %s", all.ptr);
+  kbc_str_free(&all);
+  free(cid);
+  world_down(&w);
+}
+
+/* `resolve` names BOTH a comment and a document. A comment that belongs to a
+ * DIFFERENT document must be refused, not flipped: the caller's intent was
+ * "address the note on THIS page", and flipping a note three pages away
+ * because the id happened to exist is a silent wrong write. The check is
+ * only meaningful if the flip really did not happen, so that is asserted
+ * too — an implementation that printed a refusal and flipped anyway would
+ * pass on the exit code alone. */
+KBC_TEST(a_comment_cannot_be_resolved_through_the_wrong_document) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  KBC_CHECK_EQ_INT(comments_add(&w, DOC_A, "only on the first doc", NULL, NULL,
+             NULL),
+       0);
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, &out, "--json", "comments", "list",
+    "--artifact-id", DOC_A, NULL),
+         0);
+  char *cid = first_comment_id(out.ptr);
+  KBC_CHECK_MSG(cid != NULL, "no comment was listed; got: %s", out.ptr);
+  kbc_str_free(&out);
+  if (cid == NULL) {
+    world_down(&w);
+    return;
+  }
+  /* DOC_OTHER has no row in the store, so the comment cannot belong to it. */
+  KBC_CHECK_MSG(comments_set(&w, "resolve", cid, DOC_OTHER, NULL) == 1,
+       "resolving a comment through a document that does not own it must be "
+          "a user error (1), not a silent flip");
+  kbc_str after;
+  kbc_str_init(&after);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, &after, "--json", "comments", "list",
+ "--artifact-id", DOC_A, "--all", NULL),
+     0);
+  KBC_CHECK_MSG(strstr(after.ptr, "\"status\":\"open\"") != NULL,
+         "the refused resolve still flipped the comment; got: %s",
+      after.ptr);
+  kbc_str_free(&after);
+  free(cid);
+  world_down(&w);
+}
+
+/* A comment body is operator input and the listing prints it into a
+ * terminal. A body containing a newline must not become a second table row:
+ * that would put a comment id in the listing that no comment has, which is
+ * the shape of a spoofed review. The row count is the assertion — one added
+ * comment, one row, whatever the body holds. */
+KBC_TEST(a_newline_in_a_comment_body_cannot_forge_a_second_listing_row) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  KBC_CHECK_EQ_INT(
+      comments_add(&w, DOC_A, "innocent line\nbbbbbbbbbbbb resolved you x y",
+    NULL, NULL, NULL),
+      0);
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_EQ_INT(comments_list(&w, DOC_A, false, &out), 0);
+  /* Exactly one row: the header line does not start with 12 hex chars, so
+   * the count is the comments and nothing else. */
+  KBC_CHECK_MSG(table_rows(out.ptr) == 1,
+       "one comment produced %zu table rows — a body newline was not "
+        "escaped; output was:\n%s",
+    table_rows(out.ptr), out.ptr);
+  /* And the newline is visible as an escape, so the operator can tell the
+   * body was cut to one line rather than silently losing the rest. */
+  KBC_CHECK_MSG(strstr(out.ptr, "\\n") != NULL,
+         "the newline was dropped rather than escaped; output was:\n%s",
+      out.ptr);
+  kbc_str_free(&out);
+  world_down(&w);
+}
+
+/* The target is named by `--artifact-id` or by `--path`, never by neither
+ * and never by both. Naming no document would list nothing and exit 0, which
+ * reads as "this page has no comments" for a page the caller never named —
+ * the most expensive way to be wrong about a review. Naming both is
+ * ambiguous and must be refused rather than silently preferring one. */
+KBC_TEST(comments_refuses_a_missing_or_ambiguous_document) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  KBC_CHECK_MSG(run_kbc_va(&w, NULL, "comments", "list", NULL) == 1,
+       "comments list with no document is a user error (1), not an empty "
+    "listing");
+  KBC_CHECK_MSG(run_kbc_va(&w, NULL, "comments", "list", "--artifact-id",
+   DOC_A, "--path", "a.md", NULL) == 1,
+    "naming a document twice is a user error (1)");
+  KBC_CHECK_MSG(run_kbc_va(&w, NULL, "comments", "list", "--artifact-id",
+    "nothex", NULL) == 1,
+   "a malformed artifact id is a user error (1), not a lookup that finds "
+    "nothing");
+  /* --path is the ergonomic form and must reach the same row: a.md is the
+   * artifact world_up inserted, so a listing through it must be the same
+   * empty one a listing through the id gives. */
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, &out, "comments", "list", "--path", "a.md",
+          "--kb", "notes", NULL),
+  0);
+  KBC_CHECK_MSG(strstr(out.ptr, "(no open comments)") != NULL,
+         "--path did not resolve a.md to the artifact; got: %s", out.ptr);
+  kbc_str_free(&out);
+  world_down(&w);
+}
+
+/* ============================================================ bench init ===
+ *
+ * The scaffold is a MEASUREMENT artefact: one jsonl row per sampled
+ * artifact, each naming the artifact's real id so a later `bench run` can
+ * score against rows that exist. An id the store never minted would make
+ * every Recall@k figure silently zero, which is the failure this asserts
+ * against: the ids in the file are read back out of the store itself.
+ */
+
+/* One more indexable file and one that kb-c does not index, so the sampler's
+ * extension filter has something to exclude. */
+static void bench_corpus_files(world *w) {
+  char doc[KBC_TEST_PATH_MAX];
+  (void)path_join(doc, sizeof doc, w->corpus_dir, "b.md");
+  kbc_test_write_file(doc, "# second\n\nmore prose.\n");
+  (void)path_join(doc, sizeof doc, w->corpus_dir, "c.html");
+  kbc_test_write_file(doc, "<html><body>third</body></html>");
+  (void)path_join(doc, sizeof doc, w->corpus_dir, "d.txt");
+  kbc_test_write_file(doc, "not something kb-c indexes");
+}
+
+/* Re-index the corpus through the REAL binary, so the store holds ids the
+ * daemon genuinely minted rather than the hand-written `aaaaaaaaaaaa` that
+ * `world_up` inserts.
+ *
+ * This matters because the assertion below is that the scaffold names ids
+ * that EXIST. `world_up`'s placeholder id is not one the id minter would
+ * ever produce, so a scaffold naming it would be a scaffold the running
+ * daemon could never resolve — the exact failure the test is meant to
+ * catch, manufactured by the test world rather than found in the code.
+ * Indexing for real removes the discrepancy: whatever the minter decides an
+ * id is, the store and the scaffolder are working from the same one. */
+static void bench_index_corpus(const world *w) {
+  /* Drop `world_up`'s placeholder row first. It sits at a.md under an id the
+   * minter would never produce, and the reindex below correctly refuses to
+   * write a second row for a path that already has one (UNIQUE(corpus,
+   * path)) — so leaving it in place would make the reindex fail for a reason
+   * that has nothing to do with the code under test. */
+  kbc_config cfg;
+  memset(&cfg, 0, sizeof cfg);
+  size_t n = strlen(w->db) + 1u;
+  cfg.db_path = malloc(n);
+  if (cfg.db_path == NULL) {
+    kbc_test_fail(__FILE__, __LINE__, "bench_index_corpus: out of memory");
+    return;
+  }
+  memcpy(cfg.db_path, w->db, n);
+  kbc_err e;
+  kbc_err_reset(&e);
+  kbc_store *s = kbc_store_open(&cfg, &e);
+  free(cfg.db_path);
+  if (s == NULL) {
+    kbc_test_fail(__FILE__, __LINE__, "bench_index_corpus: store open: %s",
+                  e.msg);
+    return;
+  }
+  kbc_err_reset(&e);
+  if (kbc_failed(kbc_store_delete_artifact(s, DOC_A, &e))) {
+    kbc_test_fail(__FILE__, __LINE__,
+                  "bench_index_corpus: delete placeholder: %s", e.msg);
+  }
+  kbc_store_close(s);
+
+  kbc_str out;
+  kbc_str_init(&out);
+  int rc = run_kbc_va(w, &out, "reindex", "--kb", "notes", NULL);
+  if (rc != 0) {
+    kbc_test_fail(__FILE__, __LINE__,
+                  "bench_index_corpus: reindex exited %d; output was:\n%s",
+                  rc, out.ptr);
+  }
+  kbc_str_free(&out);
+}
+
+/* The id the STORE holds for a path, read through the public API rather than
+ * by recomputing the hash in the test. Recomputing would make the test agree
+ * with the implementation by construction; reading the row back makes it
+ * disagree if the two ever part company. */
+static char *stored_id_for_path(const char *db, const char *corpus,
+                                const char *rel) {
+  kbc_config cfg;
+  memset(&cfg, 0, sizeof cfg);
+  size_t n = strlen(db) + 1u;
+  cfg.db_path = malloc(n);
+  if (cfg.db_path == NULL) {
+    return NULL;
+  }
+  memcpy(cfg.db_path, db, n);
+  kbc_err e;
+  kbc_err_reset(&e);
+  kbc_store *s = kbc_store_open(&cfg, &e);
+  free(cfg.db_path);
+  if (s == NULL) {
+    return NULL;
+  }
+  /* The world stores one artifact at a.md; the id it was given is the
+   * contract, so the lookup below is only ever asked about that path. */
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  kbc_err_reset(&e);
+  char *out = NULL;
+  if (a != NULL &&
+      !kbc_failed(kbc_store_get_artifact_by_path(s, a, corpus, rel, &art, &e))) {
+    out = strdup(art.id);
+  }
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  return out; /* KBC_OWN, or NULL */
+}
+
+/* `kbc bench init --kb NAME --output PATH [--n N] [--seed S]`. */
+static int bench_init(const world *w, const char *out_path, const char *n,
+    const char *seed, kbc_str *out) {
+  argv_vec a = {NULL, 0, 0};
+  argv_push(&a, kbc_bin());
+  argv_push(&a, "bench");
+  argv_push(&a, "init");
+  argv_push(&a, "--kb");
+  argv_push(&a, "notes");
+  argv_push(&a, "--output");
+  argv_push(&a, out_path);
+  if (n != NULL) {
+    argv_push(&a, "--n");
+    argv_push(&a, n);
+  }
+  if (seed != NULL) {
+    argv_push(&a, "--seed");
+    argv_push(&a, seed);
+  }
+  int rc = run_kbc(w->home, w->config, a.v, out);
+  argv_free(&a);
+  return rc;
+}
+
+static size_t count_lines(const char *s) {
+  size_t n = 0;
+  for (const char *p = s; *p != '\0'; p++) {
+    if (*p == '\n') {
+      n++;
+    }
+  }
+  return n;
+}
+
+/* The scaffold's whole job is to name artifacts that EXIST, so that a later
+ * recall measurement has real ids to score. A row carrying an empty `query`
+ * and a real `relevant` id is the contract; a row carrying an id the store
+ * never minted would make every Recall@k figure quietly zero. The id is
+ * checked against the store, not against a hash recomputed here. */
+KBC_TEST(bench_init_scaffolds_one_row_per_artifact_naming_a_real_id) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  bench_corpus_files(&w);
+  bench_index_corpus(&w);
+  char out_path[KBC_TEST_PATH_MAX];
+  (void)path_join(out_path, sizeof out_path, w.root, "q.jsonl");
+  kbc_str out;
+  kbc_str_init(&out);
+  /* --n 2 from three indexable files: the count is the sampler honouring
+   * --n, and the file being a.md's row is the id being a real one. */
+  KBC_CHECK_EQ_INT(bench_init(&w, out_path, "2", "0xb33f", &out), 0);
+  kbc_str_free(&out);
+  char *scaffold = kbc_test_read_file(out_path);
+  KBC_CHECK_MSG(scaffold != NULL, "bench init wrote no file at %s", out_path);
+  if (scaffold == NULL) {
+    world_down(&w);
+    return;
+  }
+  KBC_CHECK_MSG(count_lines(scaffold) == 2,
+         "expected 2 scaffold rows, got %zu; file was:\n%s",
+   count_lines(scaffold), scaffold);
+  KBC_CHECK_MSG(strstr(scaffold, "\"query\":\"\"") != NULL,
+           "each row must carry an empty `query` for the operator to fill "
+        "in; file was:\n%s",
+        scaffold);
+  char *real_id = stored_id_for_path(w.db, "notes", "a.md");
+  KBC_CHECK_MSG(real_id != NULL, "could not read a.md's id back from the "
+                                 "store");
+  if (real_id != NULL) {
+    KBC_CHECK_MSG(strstr(scaffold, real_id) != NULL,
+       "the scaffold names no id the store holds for a.md (%s); file "
+          "was:\n%s",
+            real_id, scaffold);
+    free(real_id);
+  }
+  /* d.txt is not indexable, so it must never be sampled: a scaffold row for
+   * a file the daemon will not index is a query that can never be answered. */
+  KBC_CHECK_MSG(strstr(scaffold, "d.txt") == NULL,
+           "bench init sampled d.txt, which kb-c does not index; file "
+        "was:\n%s",
+        scaffold);
+  free(scaffold);
+  world_down(&w);
+}
+
+/* The same seed must scaffold the same set — that is the property that lets
+ * a labeller and a collaborator start from one file, and it is the reason
+ * the Rust inlines SplitMix64 rather than calling the platform RNG. A
+ * sampler that drew from the clock or from readdir order would pass the
+ * "did it write rows" test and fail this one. */
+KBC_TEST(the_same_seed_scaffolds_byte_identical_output) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  bench_corpus_files(&w);
+  char first[KBC_TEST_PATH_MAX];
+  char second[KBC_TEST_PATH_MAX];
+  (void)path_join(first, sizeof first, w.root, "one.jsonl");
+  (void)path_join(second, sizeof second, w.root, "two.jsonl");
+  KBC_CHECK_EQ_INT(bench_init(&w, first, "3", "0xb33f", NULL), 0);
+  KBC_CHECK_EQ_INT(bench_init(&w, second, "3", "0xb33f", NULL), 0);
+  char *a = kbc_test_read_file(first);
+  char *b = kbc_test_read_file(second);
+  KBC_CHECK_MSG(a != NULL && b != NULL, "bench init wrote no output");
+  if (a != NULL && b != NULL) {
+    KBC_CHECK_MSG(strcmp(a, b) == 0,
+      "the same seed produced two different scaffolds:\n--- one ---\n%s\n"
+  "--- two ---\n%s",
+                  a, b);
+  }
+  /* All three indexable files, so the sample is the whole corpus and the
+   * comparison is over a full set rather than a lucky subset. */
+  if (a != NULL) {
+    KBC_CHECK_MSG(count_lines(a) == 3, "expected 3 rows, got %zu:\n%s",
+      count_lines(a), a);
+  }
+  free(a);
+  free(b);
+  world_down(&w);
+}
+
+/* A labelled query set is the most expensive thing this tool touches: an
+ * operator has filled in every `query` field by hand. Overwriting it with a
+ * fresh empty scaffold would destroy hours of work with no undo, so the verb
+ * refuses — and the refusal must leave the file exactly as it was, which is
+ * asserted rather than assumed. */
+KBC_TEST(bench_init_refuses_to_overwrite_an_existing_query_set) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  bench_corpus_files(&w);
+  char out_path[KBC_TEST_PATH_MAX];
+  (void)path_join(out_path, sizeof out_path, w.root, "labelled.jsonl");
+  kbc_test_write_file(out_path, "{\"query\":\"atlas determinism\","
+             "\"relevant\":[\"aaaaaaaaaaaa\"]}\n");
+  KBC_CHECK_MSG(bench_init(&w, out_path, "2", "0xb33f", NULL) == 1,
+           "overwriting an existing query set is a user error (1)");
+  char *after = kbc_test_read_file(out_path);
+  KBC_CHECK_MSG(after != NULL &&
+        strstr(after, "atlas determinism") != NULL,
+      "the refused scaffold still modified the file; it now holds: %s",
+   after != NULL ? after : "(gone)");
+  free(after);
+  world_down(&w);
+}
+
+/* ========================================================== daemon stop ===
+ *
+ * The pid file is the entire mechanism `daemon stop` has: it reads a pid,
+ * signals it, and waits. Every case below is a state the file can be in,
+ * and each one has a different right answer — so each is asserted on what
+ * happened to the FILE as well as on the exit code, because "exited 1" is
+ * equally what a correct prune and a total failure would print.
+ */
+static char *pidfile_path(const world *w) {
+  static char path[KBC_TEST_PATH_MAX];
+  (void)path_join(path, sizeof path, w->state, "kb-daemon.pid");
+  return path;
+}
+
+static void write_pidfile(const world *w, const char *contents) {
+  kbc_test_write_file(pidfile_path(w), contents);
+}
+
+/* A pid that is certain not to be running: fork a child, let it exit, reap
+ * it. The kernel keeps the pid free until it wraps, so `kill -0` on it
+ * reports ESRCH — which is exactly the state a crashed daemon leaves behind.
+ * Naming a pid at random would be a coin flip against an unrelated process
+ * on the machine, and a test that signals a stranger's process is worse than
+ * no test. */
+static long a_dead_pid(void) {
+  pid_t p = fork();
+  if (p < 0) {
+    return -1;
+  }
+  if (p == 0) {
+    _exit(0);
+  }
+  int status = 0;
+  while (waitpid(p, &status, 0) < 0) {
+    if (errno != EINTR) {
+   return -1;
+    }
+  }
+  return (long)p;
+}
+
+/* No pid file means no daemon. That is a user error — the operator asked to
+ * stop something that is not running — and NOT a daemon failure, so it is
+ * exit 1. A `stop` that exited 0 here would let a deploy script believe it
+ * had stopped a daemon that was never up, and one that exited 2 would send
+ * the same script looking for a broken daemon. */
+KBC_TEST(daemon_stop_with_no_pid_file_is_a_user_error) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  KBC_CHECK_MSG(run_kbc_va(&w, NULL, "daemon", "stop", NULL) == 1,
+"daemon stop with nothing running is a user error (1), not a daemon "
+   "failure");
+  world_down(&w);
+}
+
+/* A crash leaves the pid file behind, and the next container boot can even
+ * reuse the pid. `stop` must prune the corpse rather than signal whatever
+ * now holds that number, so the assertion is on the FILE being gone — an
+ * implementation that merely reported the pid as dead and left it would
+  * leave the trap set for the next start. */
+KBC_TEST(daemon_stop_prunes_a_pid_file_naming_a_dead_process) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  long dead = a_dead_pid();
+  KBC_CHECK_MSG(dead > 0, "could not obtain a certainly-dead pid");
+ if (dead <= 0) {
+    world_down(&w);
+    return;
+  }
+  char buf[32];
+  (void)snprintf(buf, sizeof buf, "%ld\n", dead);
+  write_pidfile(&w, buf);
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_MSG(run_kbc_va(&w, &out, "daemon", "stop", NULL) == 1,
+        "stopping a dead pid is a user error (1), not a daemon failure");
+  KBC_CHECK_MSG(strstr(out.ptr, "dead") != NULL,
+           "the stale-pid report did not say the pid was dead; got: %s",
+        out.ptr);
+  KBC_CHECK_MSG(!kbc_path_exists(pidfile_path(&w)),
+ "the stale pid file was not pruned, so the next start inherits the "
+   "trap");
+  kbc_str_free(&out);
+  world_down(&w);
+}
+
+/* The real thing: start a daemon, stop it, and prove both halves. A `stop`
+ * that reported success without the process going away — or that signalled
+ * nothing and left the pid file — would pass a test that only checked the
+ * exit code, which is why the pid file's disappearance is asserted as well
+ * as the process being reaped. */
+KBC_TEST(a_running_daemon_is_stopped_and_leaves_no_pid_file) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  /* The daemon refuses to start without a token file — a pre-existing rule
+   * in cmd_daemon, not something `stop` introduced. */
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "token", "generate", NULL), 0);
+  /* Port 0 would be ideal but the config validator (src/config.c) rejects
+   * anything outside 1..65535, so a port is picked and a collision shows up
+   * as a daemon that never wrote its pid file — which the wait below turns
+   * into a clear failure rather than a hang. */
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "daemon", "--port", "47311", NULL), 0);
+  /* The daemon forks and returns; the pid file is written by the child once
+   * its listener is up, so the wait is for the file, not for the parent. */
+  bool up = false;
+  for (int i = 0; i < 100 && !up; i++) {
+    up = kbc_path_exists(pidfile_path(&w));
+    if (!up) {
+      struct timespec ts = { 0, 50 * 1000 * 1000 };
+      (void)nanosleep(&ts, NULL);
+    }
+  }
+  KBC_CHECK_MSG(up, "the daemon never wrote %s, so it did not start",
+           pidfile_path(&w));
+  if (!up) {
+    world_down(&w);
+    return;
+  }
+  char *pidtext = kbc_test_read_file(pidfile_path(&w));
+  KBC_CHECK_MSG(pidtext != NULL && pidtext[0] != '\0',
+           "the pid file is empty, so there is nothing for stop to signal");
+  long pid = pidtext != NULL ? strtol(pidtext, NULL, 10) : 0;
+  KBC_CHECK_MSG(pid > 0, "the pid file does not hold a pid: %s", pidtext);
+  free(pidtext);
+
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_MSG(run_kbc_va(&w, &out, "daemon", "stop", NULL) == 0,
+    "stopping a running daemon must exit 0; got output:\n%s", out.ptr);
+  KBC_CHECK_MSG(strstr(out.ptr, "exited cleanly") != NULL,
+   "stop did not report a clean exit; got:\n%s", out.ptr);
+  KBC_CHECK_MSG(!kbc_path_exists(pidfile_path(&w)),
+    "the daemon exited but left its pid file behind");
+  /* The process really is gone, not merely reported gone. */
+  if (pid > 0) {
+ KBC_CHECK_MSG(kill((pid_t)pid, 0) != 0 && errno == ESRCH,
+        "pid %ld is still alive after `daemon stop` reported a clean exit",
+    pid);
+  }
+  kbc_str_free(&out);
+  /* And the stop is not repeatable: the second one has nothing to stop. */
+  KBC_CHECK_MSG(run_kbc_va(&w, NULL, "daemon", "stop", NULL) == 1,
+       "a second stop must be a user error (1): the first removed the "
+    "pid file");
+  world_down(&w);
+}
+
+/* Two daemons on one store is the failure the pid file exists to prevent:
+ * both would reindex, both would hold the db, and the operator would see
+ * results that depend on which one answered. The second start must be
+* refused, and refused with the hint that names the way out. */
+KBC_TEST(a_second_daemon_is_refused_while_one_is_running) {
+  world w;
+  if (!world_up(&w, "notes")) {
+    world_down(&w);
+    return;
+  }
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "token", "generate", NULL), 0);
+  KBC_CHECK_EQ_INT(run_kbc_va(&w, NULL, "daemon", "--port", "47313", NULL), 0);
+  bool up = false;
+  for (int i = 0; i < 100 && !up; i++) {
+    up = kbc_path_exists(pidfile_path(&w));
+    if (!up) {
+      struct timespec ts = { 0, 50 * 1000 * 1000 };
+      (void)nanosleep(&ts, NULL);
+    }
+  }
+  KBC_CHECK_MSG(up, "the daemon never wrote its pid file, so it did not "
+        "start");
+  if (!up) {
+    world_down(&w);
+    return;
+  }
+  kbc_str out;
+  kbc_str_init(&out);
+  KBC_CHECK_MSG(run_kbc_va(&w, &out, "daemon", "--port", "47314", NULL) == 1,
+       "a second daemon on the same store must be refused (1)");
+  KBC_CHECK_MSG(strstr(out.ptr, "already running") != NULL,
+  "the refusal did not say a daemon was already running; got:\n%s",
+     out.ptr);
+  kbc_str_free(&out);
+  /* The first daemon is still the one holding the store — the refusal must
+   * not have disturbed it. */
+  KBC_CHECK_MSG(run_kbc_va(&w, NULL, "daemon", "stop", NULL) == 0,
+         "the first daemon was not stoppable after the refusal");
+  world_down(&w);
+}
+
+
 int main(void) {
   static const kbc_test_case cases[] = {
       {"a_backup_of_a_real_store_roots_the_archive_at_the_corpus",
@@ -858,6 +1644,30 @@ int main(void) {
        slates_ride_beside_the_corpus_and_are_never_clobbered},
       {"backing_up_an_unconfigured_corpus_fails",
        backing_up_an_unconfigured_corpus_fails},
+      {"a_comment_added_through_the_cli_is_listed_back_with_its_fields",
+       a_comment_added_through_the_cli_is_listed_back_with_its_fields},
+      {"resolve_takes_a_comment_out_of_the_default_listing_until_all_is_given",
+       resolve_takes_a_comment_out_of_the_default_listing_until_all_is_given},
+      {"a_comment_cannot_be_resolved_through_the_wrong_document",
+       a_comment_cannot_be_resolved_through_the_wrong_document},
+      {"a_newline_in_a_comment_body_cannot_forge_a_second_listing_row",
+       a_newline_in_a_comment_body_cannot_forge_a_second_listing_row},
+      {"comments_refuses_a_missing_or_ambiguous_document",
+       comments_refuses_a_missing_or_ambiguous_document},
+      {"bench_init_scaffolds_one_row_per_artifact_naming_a_real_id",
+       bench_init_scaffolds_one_row_per_artifact_naming_a_real_id},
+      {"the_same_seed_scaffolds_byte_identical_output",
+       the_same_seed_scaffolds_byte_identical_output},
+      {"bench_init_refuses_to_overwrite_an_existing_query_set",
+       bench_init_refuses_to_overwrite_an_existing_query_set},
+      {"daemon_stop_with_no_pid_file_is_a_user_error",
+       daemon_stop_with_no_pid_file_is_a_user_error},
+      {"daemon_stop_prunes_a_pid_file_naming_a_dead_process",
+       daemon_stop_prunes_a_pid_file_naming_a_dead_process},
+      {"a_running_daemon_is_stopped_and_leaves_no_pid_file",
+       a_running_daemon_is_stopped_and_leaves_no_pid_file},
+      {"a_second_daemon_is_refused_while_one_is_running",
+       a_second_daemon_is_refused_while_one_is_running},
       {NULL, NULL},
   };
   return kbc_test_run("cli", cases);

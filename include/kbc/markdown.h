@@ -51,7 +51,8 @@ extern "C" {
 #endif
 
 /* One rendered page: the full document, ready to write. Both fields are
- * KBC_OWN and the caller frees them with kbc_str_free.
+ * KBC_OWN `char *` and the caller frees them with `free()` — NOT
+ * kbc_str_free, which takes a `kbc_str *` this is not.
  *
  * `title` is the RAW title, the same string kbc_markdown_title returns. It is
  * NOT the text the page's <title> element carries: a title containing markup,
@@ -84,9 +85,29 @@ char *kbc_markdown_title(const char *src, size_t len);
  * KBC_ERR_PARSE and renders nothing: the caller must not serve half a page.
  *
  * Raw HTML in the source passes through, which is the original's
- * `render.unsafe = true` (markdown.rs:58). It is contained by the
- * `Content-Security-Policy: sandbox` the serving route sets, not by this
- * function, and the contract is written so the two are read together. */
+ * `render.unsafe = true` (markdown.rs:58). This function does not contain it
+ * and cannot: the contract is written so that the two halves are read
+ * together, because the containment is the serving route's and it DIFFERS BY
+ * SURFACE.
+ *
+ * The parent-origin route sends `Content-Security-Policy: sandbox`, so a
+ * document's scripts do not run there. The artifact subdomain sends only
+ * `frame-ancestors <parent>`, which is the original's design
+ * (routes/artifact.rs) and is a real boundary — but a DIFFERENT and weaker one.
+ * On the subdomain a hostile document's script DOES execute, and what contains
+ * it is origin isolation: the artifact id is part of the HOSTNAME, so each
+ * artifact is its own origin to a browser, and a script in one cannot reach
+ * another's DOM.
+ *
+ * That makes the subdomain's hostname scheme load-bearing rather than
+ * cosmetic, and it has one limit worth knowing: cookies are scoped to the
+ * REGISTRABLE domain, not the origin, so a document served at
+ * `abc.artifacts.localhost` can set a cookie that `def.artifacts.localhost`
+ * will send. Origin isolation holds for the DOM; it does not hold for
+ * anything cookie-carried. Today nothing authenticates on the subdomain, so
+ * nothing is carried — but a future change that puts a session cookie in play
+ * there invalidates the boundary, and that is the point at which the subdomain
+ * needs `sandbox` too. */
 kbc_status kbc_markdown_render(const char *src, size_t len, kbc_arena *a,
                                kbc_markdown_page *out, kbc_err *err);
 

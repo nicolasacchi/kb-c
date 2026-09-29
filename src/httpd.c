@@ -38,6 +38,7 @@
 #include "kbc/httpd.h"
 #include "kbc/json.h"
 #include "kbc/log.h"
+#include "kbc/markdown.h"
 
 #define KBC_EPOLL_MAX_EVENTS 64
 #define KBC_EPOLL_TIMEOUT_MS 200
@@ -832,8 +833,56 @@ static kbc_status route_stats(kbc_app *app, kbc_str *out, kbc_err *err) {
       (long long)st.index_docs, (long long)st.db_bytes);
 }
 
-static kbc_status artifact_json(kbc_str *out, const kbc_artifact *art,
-                                bool with_source) {
+/* Defined with the serving surface, below: the title of a `.md` comes from the
+ * renderer, and the renderer is not needed to serve bytes. */
+static bool is_markdown(const char *path);
+static const char *markdown_title_for(kbc_arena *a, const char *src,
+                                      size_t len, const char *fallback);
+
+/* The title to report for `art`, which for a `.md` is the RENDERER's and not
+ * the store's (see `markdown_title_for` for why the two disagree).
+ *
+ * `art->source` is only populated when the caller asked for it, and the
+ * artifact LIST never does. So a `.md` row in a list page has no source to
+ * read a title from, and this fetches one — into a THROWAWAY arena, freed
+ * before this returns. That bound is the whole reason it is a separate arena:
+ * a page of 50 markdown rows at the 16 MiB artifact ceiling would otherwise
+ * pin 800 MiB of source in the request arena to extract 50 short strings.
+ * Peak is one document.
+ *
+ * A fetch that fails, or a document the renderer will not title, leaves the
+ * store's title standing: a list row is a summary of the store's record, and
+ * one unreadable document must not empty the page. */
+static const char *artifact_title_for(kbc_app *app, kbc_arena *a,
+                                      const kbc_artifact *art) {
+  const char *stored = art->title != NULL ? art->title : "";
+  if (art->path == NULL || !is_markdown(art->path)) return stored;
+  if (art->source != NULL) {
+    return markdown_title_for(a, art->source, strlen(art->source), stored);
+  }
+  kbc_arena *scratch = kbc_arena_new(4096);
+  if (scratch == NULL) return stored;
+  kbc_artifact full;
+  memset(&full, 0, sizeof full);
+  kbc_err local;
+  kbc_err_reset(&local);
+  const char *t = stored;
+  if (!kbc_failed(kbc_app_get_artifact(app, scratch, art->id, true, &full,
+                                       &local)) &&
+      full.source != NULL) {
+    t = markdown_title_for(a, full.source, strlen(full.source), stored);
+  }
+  kbc_arena_free(scratch);
+  return t;
+}
+
+static kbc_status artifact_json(kbc_str *out, kbc_app *app, kbc_arena *a,
+                                const kbc_artifact *art, bool with_source) {
+  /* Resolved once, up front: for a `.md` this is the renderer's title, not
+   * the store's, so that a list row and the page it links to name the document
+   * the same way. `app` and `a` are passed in rather than read off `art`
+   * because `kbc_artifact` is a frozen record of the store's row. */
+  const char *title = artifact_title_for(app, a, art);
   kbc_status st = kbc_str_puts(out, "{\"id\":");
   if (kbc_failed(st)) return st;
   st = kbc_str_append_json_string(out, art->id, strlen(art->id));
@@ -854,8 +903,7 @@ static kbc_status artifact_json(kbc_str *out, const kbc_artifact *art,
   if (kbc_failed(st)) return st;
   st = kbc_str_puts(out, ",\"title\":");
   if (kbc_failed(st)) return st;
-  st = kbc_str_append_json_string(out, art->title ? art->title : "",
-                                  art->title ? strlen(art->title) : 0);
+  st = kbc_str_append_json_string(out, title, strlen(title));
   if (kbc_failed(st)) return st;
   st = kbc_str_puts(out, ",\"summary\":");
   if (kbc_failed(st)) return st;
@@ -1045,7 +1093,7 @@ static kbc_status route_artifacts(kbc_app *app, kbc_arena *a, const char *query,
       st = kbc_str_putc(out, ',');
       if (kbc_failed(st)) return st;
     }
-    st = artifact_json(out, &rows[i], false);
+    st = artifact_json(out, app, a, &rows[i], false);
     if (kbc_failed(st)) return st;
   }
   return kbc_str_printf(out, "],\"total\":%zu,\"limit\":%zu,\"offset\":%zu}",
@@ -1065,7 +1113,7 @@ static kbc_status route_artifact_one(kbc_app *app, kbc_arena *a, const char *id,
   memset(&art, 0, sizeof art);
   kbc_status st = kbc_app_get_artifact(app, a, id, with_source, &art, err);
   if (kbc_failed(st)) return st;
-  return artifact_json(out, &art, with_source);
+  return artifact_json(out, app, a, &art, with_source);
 }
 
 static kbc_status route_reindex(kbc_app *app, kbc_str *out, kbc_err *err) {
@@ -1768,13 +1816,17 @@ static kbc_status dispatch(kbc_app *app, const kbc_config *cfg,
                                            hdrs, &out->body, err);
       kbc_arena_free(a);
       if (kbc_failed(st)) {
-        /* The three answers are the original's: an unknown kb or id is a 404, a
+        /* The answers are the original's: an unknown kb or id is a 404, a
          * file that will not read is a 500 (`Io(_) => 500`), and a source that
-         * cannot be rendered under a text/html label is a 400. */
+         * cannot be rendered under a text/html label is a 400. An allocation
+         * failure is a 500 too, and saying 400 would be a lie about whose
+         * fault it is — a render that runs out of memory is the daemon's
+         * problem, not the caller's, and the renderer reports it as
+         * KBC_ERR_NOMEM precisely so this mapping can be honest. */
         kbc_str_clear(hdrs);
-        int status = st == KBC_ERR_NOTFOUND   ? 404
-                     : st == KBC_ERR_IO        ? 500
-                                                 : 400;
+        int status = st == KBC_ERR_NOTFOUND ? 404
+                     : st == KBC_ERR_IO || st == KBC_ERR_NOMEM ? 500
+                                                                : 400;
         result = resp_error(out, status, st, "%s", err_msg(err, st));
         goto done;
       }
@@ -2331,6 +2383,92 @@ static bool is_markdown(const char *path) {
   return e != NULL && (str_ieq(e, "md") || str_ieq(e, "markdown"));
 }
 
+/* Renders a `.md` body to a complete page, appended to `out`.
+ *
+ * `body` (the source) and `out` (the page) are SEPARATE buffers, and must be:
+ * the renderer reads its input while building its output, so handing it one
+ * buffer to read and write is a use-after-free wearing a plausible hat.
+ *
+ * A failure is RETURNED, never papered over by falling back to the raw source.
+ * That fallback is the specific thing this must not do. A route that serves
+ * raw bytes when the renderer fails passes every test whether or not the
+ * renderer works, which makes the renderer untestable in production — the one
+ * place its correctness has to hold. The caller decides the status; the page
+ * is either rendered or refused.
+ *
+ * The renderer's scratch arena is NULL, not the caller's: the result is
+ * copied into `out`, which the caller owns, and the caller's arena is dead
+ * before the response is written (both routes free theirs before the write
+ * path runs). Handing it an arena that is about to be freed would move the
+ * page into memory nobody owns past the end of the request. */
+static kbc_status render_markdown_page(const kbc_str *body, kbc_str *out,
+                                       kbc_err *err) {
+  kbc_markdown_page page;
+  memset(&page, 0, sizeof page);
+  /* The empty case is spelled "" EXPLICITLY, and the reason is worth writing
+   * down because it looks like noise and is not:
+   *
+   *   - `read_whole_file` appends to a `kbc_str` and appends nothing for a
+   *     zero-byte file, so `body->ptr` is NULL and `body->len` is 0. That is
+   *     a correct description of "no bytes" and a NULL `const char *` is NOT
+   *     how this API spells it.
+   *   - `kbc_markdown_render` rejects a NULL `src` as KBC_ERR_INVALID
+   *     ("markdown: src is NULL"), and the caller's status mapping sends
+   *     anything that is not NOTFOUND/IO/NOMEM to a 400.
+   *
+   * So passing `body->ptr` straight through turns an EMPTY DOCUMENT — a
+   * zero-byte `.md`, which is a real corpus state and not an exotic one —
+   * into a 400 "bad request" blaming the caller for a file the caller never
+   * wrote. Passing "" instead renders the empty shell the renderer documents
+   * ("an empty document is a document"). Do not "simplify" the ternary away:
+   * the two pointers are both correct descriptions of the same file and mean
+   * different things, and only one of them is a document. */
+  kbc_status st =
+      kbc_markdown_render(body->ptr != NULL ? body->ptr : "", body->len, NULL,
+                          &page, err);
+  if (kbc_failed(st)) return st;
+  st = kbc_str_append(out, page.html, strlen(page.html));
+  /* The page came back KBC_OWN because the arena was NULL. `out` is never
+   * aliased to it: the copy above already happened. */
+  free(page.html);
+  free(page.title);
+  return st;
+}
+
+/* The title the RENDERED page carries, for a `.md` — which is NOT always the
+ * title the store holds for the same document.
+ *
+ * The store's title is `kbc_parsed_title` (parse.c:1690): first h1, else a
+ * `<title>` element, else the first prose block, else the filename stem. The
+ * renderer implements the precedence the original applies at
+ * markdown.rs:433-438: frontmatter `title:`, else the first `# ` heading,
+ * else the literal "Untitled". Measured over one document each, the two agree
+ * only when a document has a single h1 and no frontmatter. A document with
+ * `title: X` in its frontmatter above an `# Y` heading is "Y" to the store
+ * and "X" to the page it is served as; a document with neither heading nor
+ * frontmatter is "notes/rfc" to the store and "Untitled" to the page.
+ *
+ * So a list row showing the store's title beside a page whose <title> is the
+ * renderer's is showing two names for one document. The served page is the
+ * renderer's, so the two JSON surfaces take the renderer's too: one document,
+ * one title, wherever it is named. A non-`.md` keeps the store's title, which
+ * is the only title it has.
+ *
+ * `src`/`len` are the document's bytes. A NULL `src`, a source that is not
+ * valid UTF-8, and one past the renderer's size limit all yield `fallback`:
+ * there is no title to derive, and the route that serves those bytes has
+ * already refused them. The copy is ARENA, matching every other string this
+ * file hands to a JSON writer. */
+static const char *markdown_title_for(kbc_arena *a, const char *src,
+                                      size_t len, const char *fallback) {
+  if (src == NULL) return fallback;
+  char *t = kbc_markdown_title(src, len);
+  if (t == NULL) return fallback;
+  char *copy = kbc_arena_strdup(a, t);
+  free(t); /* KBC_OWN, and the arena copy is what outlives this call */
+  return copy != NULL ? copy : fallback;
+}
+
 /* `kb_core::iframe::parse_artifact_id`: the LABEL between the host and the
  * configured subdomain suffix, with the four rejections that make a label safe
  * to map onto a filesystem — never empty, no leading or trailing dot, no "..",
@@ -2704,10 +2842,32 @@ static void serve_artifact_origin(conn *c, const http_req *r) {
     origin_plain(c, 500, "no headers");
     return;
   }
-  /* kb-c has no Markdown renderer yet (a separate port unit), so the markdown
-   * branch serves the source under the HTML branch's headers rather than a
-   * rendered page. Every other part of this branch — the UTF-8 refusal, the
-   * header set, the origin isolation — is the original's. */
+  /* A `.md` is served as the RENDERED PAGE here too, not as its source. The
+   * renderer passes raw HTML in the document straight through, and what
+   * contains it on THIS surface is the origin isolation above — one origin per
+   * artifact — rather than the parent route's `sandbox` CSP, which this
+   * surface does not send. `nosniff` (emitted by the write path on every
+   * response) is what stops the rendered page being sniffed into something
+   * else, and the `text/html` label below is now the truth about the body
+   * rather than a courtesy to the `.md` extension.
+   *
+   * A failure is a visible 500 and never a silent raw serve: the same
+   * reasoning as the parent route, and the status matches THIS surface's
+   * existing answer for a body it cannot serve as declared. */
+  if (md) {
+    kbc_str page;
+    kbc_str_init(&page);
+    st = render_markdown_page(&body, &page, &err);
+    kbc_str_free(&body);
+    if (kbc_failed(st)) {
+      kbc_str_free(&page);
+      kbc_str_free(&hdrs);
+      origin_plain(c, 500, "markdown render failed");
+      return;
+    }
+    ct = "text/html; charset=utf-8";
+    body = page;
+  }
   origin_file(c, ct, &body, html_branch ? &hdrs : NULL);
   kbc_str_free(&hdrs);
   kbc_str_free(&body);
@@ -2925,17 +3085,44 @@ static kbc_status route_artifact_bytes(kbc_app *app, kbc_arena *a,
     return kbc_err_set(err, KBC_ERR_INVALID, "path for %s exceeds %u bytes", id,
                        KBC_MAX_PATH_LEN);
   }
-  st = read_whole_file(abs, out, err);
+  /* The source is read into its OWN buffer, not into `out`. A `.md` is
+   * rendered, and the renderer reads its input while writing its output, so
+   * the bytes it consumes cannot be the bytes it is overwriting. */
+  kbc_str src;
+  kbc_str_init(&src);
+  st = read_whole_file(abs, &src, err);
   bool md = is_markdown(art.path);
+  bool download = query_int(query, "download") == 1;
   free(abs);
-  if (kbc_failed(st)) return st;
-  if (md && !is_utf8(out->ptr, out->len)) {
+  if (kbc_failed(st)) {
+    kbc_str_free(&src);
+    return st;
+  }
+  if (md && !is_utf8(src.ptr, src.len)) {
     /* A `.md` that is not valid UTF-8 cannot be rendered, and serving the raw
      * source under a text/html label is worse than refusing: 400, mirroring
-     * `docs.rs:1489-1493`. */
-    kbc_str_clear(out);
+     * `docs.rs:1489-1493`. Nothing is written to `out`, so the answer carries
+     * no bytes of the document at all. */
+    kbc_str_free(&src);
     return kbc_err_set(err, KBC_ERR_INVALID,
                        "markdown source is not valid UTF-8");
+  }
+  /* A `.md` is served as the RENDERED PAGE. The renderer deliberately passes
+   * raw HTML in the source straight through (markdown.h: "render.unsafe"),
+   * and what contains that is the `Content-Security-Policy: sandbox` set two
+   * lines below — the two are read together, and neither is safe without the
+   * other. A failure here is the caller's error to report, never a silent
+   * fall back to the raw bytes. */
+  if (md && !download) {
+    st = render_markdown_page(&src, out, err);
+    kbc_str_free(&src);
+    if (kbc_failed(st)) return st;
+  } else {
+    /* `?download=1` is a download: the SOURCE, not the page. A caller asking
+     * for the file wants the file. */
+    st = kbc_str_append(out, src.ptr, src.len);
+    kbc_str_free(&src);
+    if (kbc_failed(st)) return st;
   }
   /* Header order is the original's: Content-Type (carried on the response),
    * nosniff (emitted by the write path on every response), then the sandbox
@@ -2944,9 +3131,13 @@ static kbc_status route_artifact_bytes(kbc_app *app, kbc_arena *a,
                            "X-Kb-Artifact-Id: %s\r\n",
                       art.id);
   if (kbc_failed(st)) return st;
-  if (query_int(query, "download") != 1) return KBC_OK;
-  /* A rendered markdown download is `.html`, because the body is HTML and not
-   * `.md` source (`docs.rs:1545-1553`). */
+  if (!download) return KBC_OK;
+  /* A markdown download keeps the `.html` name rewrite (`docs.rs:1545-1553`).
+   * The original's stated reason was that the body is HTML; here the body is
+   * the source, so the name is now the only thing `.html` about it. The
+   * rewrite is kept because it is the original's wire contract and a client
+   * matching on the filename is downstream of it — but it is a rename, not a
+   * claim that the attachment is rendered. */
   const char *base = strrchr(art.path, '/');
   base = base != NULL ? base + 1 : art.path;
   char name[256];

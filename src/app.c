@@ -58,6 +58,7 @@
 #include "kbc/app.h"
 #include "kbc/chunk.h"
 #include "kbc/json.h"
+#include "kbc/links.h"
 #include "kbc/log.h"
 #include "kbc/mem.h"
 #include "kbc/parse.h"
@@ -99,19 +100,12 @@ size_t kbc_app_query_cache_capacity(const kbc_app *app);
  * config key for it — kbc_config is frozen, and this file is not config.c —
  * so 1024 is a constant rather than a setting. */
 #define APP_QUERY_CACHE_CAPACITY 1024u
-/* The link graph's write, and the per-source view it takes. Defined next to
- * store_forget_path; declared here because reindex_locked is the caller that
- * owns the whole document set. */
-typedef struct {
-  const char *corpus;
-  const char *src;
-  char **dst; /* owned targets; the array is ours to free */
-  size_t n;
-} app_edge_src;
-
-static void app_edge_srcs_free(app_edge_src *v, size_t n);
-static kbc_status store_write_links(kbc_app *app, app_edge_src *v, size_t nsrc,
-                                    kbc_err *err);
+/* The link graph's batch, and the one place that frees it. The element type
+ * is app.h's kbc_enrich_source — a hook reads it, so it is the header's
+ * shape, and a private twin of it here is the two-definitions drift this
+ * project keeps paying for. Defined next to store_forget_path; declared here
+ * because reindex_pass is the caller that owns the whole document set. */
+static void app_edge_srcs_free(kbc_enrich_source *v, size_t n);
 /* "A document went away": the ONE removal. Declared here because the reconcile
  * sweep is defined above its definition and must reach the same implementation
  * the watcher does — a second copy of this cascade is how the two drift. */
@@ -149,6 +143,21 @@ typedef struct {
   size_t n_unchanged;
   size_t n_skipped;
 } kbc_app_manifest;
+
+/* Where the enrichment registry's candidate set comes from; see
+ * ladder_candidates, which is its only reader. The full pass has the walk's
+ * manifest, and the single-file path has the live index plus the one
+ * document it has just ingested. */
+typedef struct {
+  const kbc_app_manifest *manifest; /* NULL takes the index instead */
+  const char *self_id;              /* the document just ingested, or NULL */
+  const char *self_path;
+  const char *self_title;
+} app_ladder;
+
+static kbc_status store_write_links(kbc_app *app, kbc_enrich_source *v,
+                                    size_t nsrc, const app_ladder *lad,
+                                    kbc_err *err);
 
 struct kbc_app {
   kbc_config *cfg;   /* KBC_OWN, a private copy */
@@ -791,6 +800,37 @@ static kbc_status ingest_file(kbc_app *app, const char *corpus_name,
     goto fail;
   }
 
+  /* WHEN THIS DOCUMENT FIRST BECAME KNOWN, recorded once and never again.
+   * The write is INSERT OR IGNORE inside the store and that is the whole
+   * point: a "created" sort needs an anchor that survives a reindex and a
+   * file copy, and every other candidate timestamp fails one of the two —
+   * mtime drifts on every edit, and the store row's own updated_at refreshes
+   * on every pass. So the call is idempotent BY DESIGN, and the second pass
+   * over an unchanged corpus must leave this value exactly where the first
+   * pass put it; tests/test_app.c::a_reindex_does_not_move_the_first_seen_
+   * anchor is the assertion of that.
+   *
+   * It rides on the ingest of the document rather than on the reindex pass
+   * because that is where a document becomes known: the single-file update
+   * path (reindex_one_locked) reaches this same function, so a document
+   * added by the watcher gets its anchor on the same transaction as its row
+   * instead of waiting for the next full pass.
+   *
+   * A failure here is LOGGED, not propagated. The document is indexed and
+   * searchable either way; the anchor is a sort order, and a store that
+   * cannot accept one more row has already failed the upsert above, so
+   * failing the pass too would turn one lost sort key into a lost index. */
+  {
+    kbc_err local;
+    kbc_err_reset(&local);
+    if (kbc_failed(kbc_store_first_seen(app->store, id,
+                                        kbc_now_ns() / 1000000000LL,
+                                        &local))) {
+      KBC_LOGW("first-indexed anchor for %s/%s not recorded: %s", corpus_name,
+               rel, local.msg);
+    }
+  }
+
   /* Chunks are what a comment anchors to; a doc without them is uncommentable,
    * so they are part of the same transaction, not a later backfill.
    *
@@ -1271,6 +1311,36 @@ static bool embed_gated(kbc_app *app, const char *corpus, const char *rel_path,
   return true;
 }
 
+/* The row-id mint for the store tables this file writes BY HAND, i.e. the two
+ * whose contract says the CALLER names the row: an error row (store.h:
+ * "e-" + 6 base32) and an index run ("r-" + 6 base32). ONE function, because
+ * two id schemes in one file is how a reader ends up unable to tell which
+ * rows are comparable and which are not, and because the alphabet below has
+ * to be the same in both or a "r-" id is not the shape the store documents.
+ *
+ * The name is (what the row is about) x (what makes this attempt different)
+ * x salt, hashed: the salt separates the per-corpus runs of one pass, and
+ * kbc_now_ns() separates two passes. Both are folded into the SAME 32 bits
+ * the way the error id already was — a collision is not a correctness
+ * problem, because the row that loses is a run row that reports KBC_ERR_*
+ * and is logged, never a document row. */
+static void app_row_id(char *out, char prefix, const char *about_a,
+                       const char *about_b, uint32_t salt) {
+  uint32_t h = kbc_fnv1a32(about_a, strlen(about_a));
+  h ^= kbc_fnv1a32(about_b, strlen(about_b));
+  h ^= salt;
+  h ^= (uint32_t)(kbc_now_ns() & 0xFFFFFFFFu);
+  static const char hex[] = "0123456789abcdefghjkmnpqrstvwxyz";
+  out[0] = prefix;
+  out[1] = '-';
+  for (unsigned i = 0; i < 6u; i++) {
+    out[2u + i] = hex[h & 31u];
+    h >>= 5;
+  }
+  out[8] = '\0';
+}
+
+
 /* Records one embed failure for a path, durably.
  *
  * The id is minted here, not in the store, because the store's contract says
@@ -1294,17 +1364,9 @@ static void record_embed_failure(kbc_app *app, const char *corpus,
                                  const char *rel_path, const char *content_hash,
                                  const char *msg) {
   char id[KBC_MAX_ID_LEN + 1];
-  uint32_t h = kbc_fnv1a32(corpus, strlen(corpus));
-  h ^= kbc_fnv1a32(rel_path, strlen(rel_path));
-  h ^= (uint32_t)(kbc_now_ns() & 0xFFFFFFFFu);
-  static const char hex[] = "0123456789abcdefghjkmnpqrstvwxyz";
-  id[0] = 'e';
-  id[1] = '-';
-  for (unsigned i = 0; i < 6u; i++) {
-    id[2u + i] = hex[h & 31u];
-    h >>= 5;
-  }
-  id[8] = '\0';
+  /* What makes this failure a different ROW is the attempt, so the clock is
+   * part of the name; see app_row_id for the one scheme. */
+  app_row_id(id, 'e', corpus, rel_path, 0u);
 
   kbc_error_row row;
   memset(&row, 0, sizeof row);
@@ -2063,14 +2125,174 @@ static kbc_status sweep_orphans(kbc_app *app, const kbc_app_manifest *m,
   return s;
 }
 
+/* ------------------------------------------------- the index_runs ledger --
+ *
+ * A reindex PASS is an index run, and this is where that fact is recorded.
+ * The store's row is per SOURCE — `index_runs.corpus` is NOT NULL and
+ * REFERENCES sources(slug) — so a pass over N configured corpora opens N runs,
+ * one per corpus, all with the same started_at, and closes them all together.
+ * One row for the whole pass was the other option and it is wrong: a pass that
+ * covered four corpora would be listed under whichever one the code happened
+ * to name first, and `list_index_runs(corpus)` — the query the table exists to
+ * answer — would answer "no runs" for the other three.
+ *
+ * THE COUNTS, defined here because the columns are two int64s and a reader
+ * deserves to know which question they answer:
+ *
+ *   ok_count  documents of this corpus the pass covered without error: the
+ *             changed ones it re-ingested, plus the unchanged ones it left
+ *             alone, plus one that vanished mid-pass and is carried as a
+ *             tombstone. It is "how much of this corpus this pass is sure
+ *             about", not "how many bytes it wrote".
+ *   err_count documents of this corpus the pass could NOT account for, plus,
+ *             if the pass as a whole aborted, ONE — see runs_end.
+ *
+ * LOCKING, and the reason this is inside reindex_pass rather than in either
+ * wrapper: reindex_pass is only ever reached with reindex_mu already held
+ * (reindex_locked takes it for kbc_app_reindex, and reindex_one_locked holds
+ * it across both of the places it calls the pass). So the run row is written
+ * under the same outer lock as the store rows and the index of the pass it
+ * describes. A run row written OUTSIDE reindex_mu could be written twice for
+ * one pass, or interleaved with the single-file update that reindex_one runs
+ * concurrently — and the store would then hold a run whose counts describe a
+ * mix of two passes. There is no lock to take here, and none may be taken.
+ *
+ * index_touch_one writes NO run row: one file changing is not a pass, and a
+ * ledger whose every watcher event is a "run" is a ledger nobody can read. The
+ * single-file path's one call into reindex_pass — the full-scan fallback when
+ * there is no index yet, or after a store write the single-file path could not
+ * complete — IS a pass, and does open and close its runs like any other. */
+typedef struct {
+  char id[KBC_MAX_ID_LEN + 1];
+  const char *corpus; /* BORROWED from the config */
+  int64_t ok;
+  int64_t err;
+  bool open; /* the row is in the store and has not been finished */
+} app_run;
+
+typedef struct {
+  app_run *v; /* KBC_OWN, one per configured corpus */
+  size_t n;
+} app_runs;
+
+/* Opens one in-flight run per configured corpus. NEVER fails the pass: a run
+ * row is a ledger entry, and refusing to index a corpus because its ledger
+ * entry did not fit would trade a missing status row for a missing index. A
+ * corpus whose row could not be written is marked closed and simply has no
+ * run, which is the same shape as the row that was never opened. */
+static void runs_begin(kbc_app *app, app_runs *runs) {
+  runs->v = calloc(app->cfg->ncorpora, sizeof(*runs->v));
+  runs->n = 0;
+  if (runs->v == NULL) {
+    KBC_LOGW("index runs for %zu corpora not recorded: out of memory",
+             app->cfg->ncorpora);
+    return;
+  }
+  runs->n = app->cfg->ncorpora;
+  const int64_t now = kbc_now_ns() / 1000000000LL;
+  for (size_t i = 0; i < runs->n; i++) {
+    app_run *r = &runs->v[i];
+    r->corpus = app->cfg->corpora[i].name;
+    /* The corpus index is the salt, so the runs of ONE pass cannot mint the
+     * same id twice; the clock inside app_row_id separates two passes. */
+    app_row_id(r->id, 'r', r->corpus, "", (uint32_t)i);
+
+    kbc_index_run row;
+    memset(&row, 0, sizeof row);
+    row.id = r->id;
+    row.corpus = r->corpus;
+    row.started_at = now;
+    /* Negative is the store's "still in flight" (store.h: a NULL finished_at
+     * expressed in a column that cannot be NULL), so the row reads as open
+     * from the moment it is written until runs_end closes it. */
+    row.finished_at = -1;
+    row.ok_count = 0;
+    row.err_count = 0;
+
+    kbc_err local;
+    kbc_err_reset(&local);
+    if (kbc_failed(kbc_store_put_index_run(app->store, &row, &local))) {
+      /* KBC_ERR_CONFLICT here is the foreign key: this corpus has no
+       * `sources` row, which kbc_app_open writes and which a caller that
+       * deleted the row out from under a running daemon can remove. The pass
+       * is unaffected either way; the corpus simply has no run row. */
+      KBC_LOGW("index run for corpus %s not opened: %s", r->corpus, local.msg);
+      r->open = false;
+      continue;
+    }
+    r->open = true;
+  }
+}
+
+static app_run *run_of(app_runs *runs, size_t corpus_index) {
+  if (runs->v == NULL || corpus_index >= runs->n) {
+    return NULL;
+  }
+  return &runs->v[corpus_index];
+}
+
+static void runs_count_ok(app_runs *runs, size_t corpus_index) {
+  app_run *r = run_of(runs, corpus_index);
+  if (r != NULL) r->ok++;
+}
+
+/* Closes every open run, and is called on EVERY exit from the pass — the
+ * success path and all seven failures. A run left open forever is worse than
+ * no run row at all: `finished_at` negative is the ONLY thing that
+ * distinguishes "this pass is still going" from "this pass died and nobody
+ * noticed", and a crash that skips the close leaves a row that claims to be
+ * in flight for the rest of the database's life.
+ *
+ * `aborted` is the pass's own status. A pass that did not complete carries
+ * that fact into every run it had not finished, even one whose documents were
+ * all individually fine: the index this run describes was never promoted, so
+ * the run is not a statement about a corpus that is now correctly indexed. A
+ * run that already counted a document-level error keeps that count. */
+static void runs_end(kbc_app *app, app_runs *runs, bool aborted) {
+  const int64_t now = kbc_now_ns() / 1000000000LL;
+  for (size_t i = 0; i < runs->n; i++) {
+    app_run *r = &runs->v[i];
+    if (!r->open) continue;
+    int64_t err = r->err;
+    if (aborted && err == 0) {
+      err = 1;
+    }
+    kbc_err local;
+    kbc_err_reset(&local);
+    if (kbc_failed(
+            kbc_store_finish_index_run(app->store, r->id, now, r->ok, err,
+                                       &local))) {
+      KBC_LOGW("index run %s for corpus %s not finished: %s", r->id, r->corpus,
+               local.msg);
+    } else {
+      r->open = false;
+    }
+  }
+  free(runs->v);
+  runs->v = NULL;
+  runs->n = 0;
+}
+
 /* Walk -> ingest -> build -> save -> promote -> swap. On any failure before
  * the swap the old index keeps serving: the daemon never publishes a
  * half-built index, and the store keeps the rows it already committed.
  *
  * `_pass`, not `_locked`: it takes no lock of its own. The lock that makes
  * this safe against the other writer is reindex_mu, and it is taken by the
- * wrapper below for the WHOLE pass. */
-static kbc_status reindex_pass(kbc_app *app, kbc_err *err) {
+ * wrapper below for the WHOLE pass.
+ *
+ * SPLIT IN TWO, and the split is about the run ledger rather than about the
+ * work: reindex_pass owns opening and closing the index_runs rows, and this
+ * body does the pass. The body has seven early returns, each with a different
+ * set of things to free, so a close on the way out of each of them is seven
+ * chances to forget — and the failure that forgets is exactly the one that
+ * leaves a run open forever. One wrapper, one close, every exit covered
+ * including the ones nobody exercises.
+ *
+ * `runs` is the pass's ledger: already open, non-NULL, and every document the
+ * pass covers is counted into it as the pass covers it. */
+static kbc_status reindex_pass_body(kbc_app *app, app_runs *runs,
+                                    kbc_err *err) {
   const int64_t t0 = kbc_now_ns();
 
   kbc_app_manifest m;
@@ -2094,7 +2316,7 @@ static kbc_status reindex_pass(kbc_app *app, kbc_err *err) {
   /* The link graph is written after the loop, not inside it: a link target
    * that has not been ingested yet is not a document, and a document that
    * links to a sibling further down the walk must still produce an edge. */
-  app_edge_src *edge_srcs = calloc(m.len > 0 ? m.len : 1, sizeof(*edge_srcs));
+  kbc_enrich_source *edge_srcs = calloc(m.len > 0 ? m.len : 1, sizeof(*edge_srcs));
   size_t n_edge_srcs = 0;
   if (edge_srcs == NULL) {
     manifest_free(&m);
@@ -2103,7 +2325,15 @@ static kbc_status reindex_pass(kbc_app *app, kbc_err *err) {
 
   for (size_t i = 0; i < m.len; i++) {
     kbc_app_row *row = &m.items[i];
+    /* Counted HERE and not derived from the manifest at the end, because the
+     * manifest counts files the walk SAW and this counts documents the pass
+     * ACCOUNTED FOR — a row whose ingest failed is an error for this run, and
+     * counting it as covered would make a failed pass read as a complete one.
+     * The unchanged rows never reach the body, so they are counted where they
+     * are skipped: the pass covered those by deciding not to touch them,
+     * which is the only thing it could have done. */
     if (!row->changed) {
+      runs_count_ok(runs, row->corpus_index);
       continue;
     }
     const kbc_corpus_cfg *cc = &app->cfg->corpora[row->corpus_index];
@@ -2121,6 +2351,9 @@ static kbc_status reindex_pass(kbc_app *app, kbc_err *err) {
       KBC_LOGW("%s/%s vanished mid-reindex, keeping the row as a tombstone",
                cc->name, row->path);
       kbc_err_reset(err);
+      /* Carried as a tombstone: the pass accounted for the document even
+       * though it is gone, so it is covered and not an error. */
+      runs_count_ok(runs, row->corpus_index);
       continue;
     }
     if (g.title && g.title[0] != '\0') {
@@ -2149,16 +2382,24 @@ static kbc_status reindex_pass(kbc_app *app, kbc_err *err) {
      * which is what deletes the edges it used to have. */
     edge_srcs[n_edge_srcs].corpus = cc->name;
     edge_srcs[n_edge_srcs].src = row->path;
-    edge_srcs[n_edge_srcs].dst = g.link_paths;
-    edge_srcs[n_edge_srcs].n = g.n_links;
+    edge_srcs[n_edge_srcs].targets = g.link_paths;
+    edge_srcs[n_edge_srcs].n_targets = g.n_links;
     n_edge_srcs++;
     g.link_paths = NULL;
     g.n_links = 0;
     ingested_free(&g);
+    /* The document is stored, faceted and about to have its links written:
+     * this run covered it. Counted after the facet write, not after the
+     * ingest, so a document whose facets the store rejected is not counted —
+     * it exits the pass a few lines up with the error still set. */
+    runs_count_ok(runs, row->corpus_index);
   }
 
-  if (!kbc_failed(s = store_write_links(app, edge_srcs, n_edge_srcs, err))) {
-    /* nothing */
+  {
+    /* The walk's manifest is the candidate set, and it is the one that costs
+     * nothing: every document the corpus contains, already named. */
+    const app_ladder lad = {&m, NULL, NULL, NULL};
+    s = store_write_links(app, edge_srcs, n_edge_srcs, &lad, err);
   }
   app_edge_srcs_free(edge_srcs, n_edge_srcs);
   if (kbc_failed(s)) {
@@ -2260,6 +2501,29 @@ static kbc_status reindex_pass(kbc_app *app, kbc_err *err) {
            docs, terms, n_changed, n_unchanged, n_skipped, n_removed, embedded,
            (t1 - t0) / 1000);
   return KBC_OK;
+}
+
+/* One reindex pass, and the index_runs rows that describe it.
+ *
+ * The ledger is opened HERE, above the body, and closed HERE, below it, on
+ * every path out — success, and each of the body's seven failures. That is the
+ * whole reason this wrapper exists: an in-flight run row that is never closed
+ * is indistinguishable, forever, from a pass that is still running, and the
+ * one time that matters most is the time the pass died.
+ *
+ * LOCKING: none is taken and none may be. Both callers of the pass reach it
+ * holding reindex_mu (reindex_locked, and reindex_one_locked across both of
+ * its calls), so the run row is already inside the outer lock that serialises
+ * this pass against a single-file update. Taking reindex_mu here would
+ * self-deadlock on a plain non-recursive mutex. */
+static kbc_status reindex_pass(kbc_app *app, kbc_err *err) {
+  app_runs runs;
+  runs.v = NULL;
+  runs.n = 0;
+  runs_begin(app, &runs);
+  kbc_status s = reindex_pass_body(app, &runs, err);
+  runs_end(app, &runs, kbc_failed(s));
+  return s;
 }
 
 /* The full rebuild, serialised against the single-file path.
@@ -2436,6 +2700,47 @@ kbc_app *kbc_app_open(const kbc_config *cfg, kbc_err *err) {
   app->store = kbc_store_open(app->cfg, err);
   if (!app->store) {
     goto fail;
+  }
+
+  /* The config DECLARES corpora; this is where they become LIVE, indexed
+   * roots, and it is the only writer of the `sources` table. Two facts make
+   * this the natural home rather than the first reindex:
+   *
+   *   - `index_runs.corpus` REFERENCES sources(slug) with foreign_keys = ON,
+   *     so a pass cannot open a run row for a corpus the registry does not
+   *     know. Registering at open is what makes the run ledger possible at
+   *     all, and registering at reindex would make the first pass of a fresh
+   *     database fail its own bookkeeping.
+   *   - a corpus is live from the moment the daemon answers, not from the
+   *     moment someone reindexes. A daemon that has opened a corpus and been
+   *     asked to list its sources must be able to.
+   *
+   * ONCE per open, and put_source is an upsert that keeps `added_at` (the
+   * first time the source was seen) and does NOT touch `paused` — so a corpus
+   * an operator paused stays paused across every restart. That is the whole
+   * reason the column is on this row and not in the config file: pausing is
+   * runtime operator intent, durable in the database, and re-declaring the
+   * corpus must not silently un-pause it.
+   *
+   * A corpus that cannot be registered is a WARNING, not a failed open: the
+   * two ways it happens are a store that cannot be written at all (which the
+   * first reindex reports far better than this can) and a config that aliases
+   * two corpora onto one directory, which `sources.path` being UNIQUE refuses
+   * and which is a real, supported configuration — refusing to start would
+   * take down a daemon that indexes both corpora perfectly well. */
+  for (size_t i = 0; i < app->cfg->ncorpora; i++) {
+    kbc_source src;
+    memset(&src, 0, sizeof src);
+    src.corpus = app->cfg->corpora[i].name;
+    src.path = app->cfg->corpora[i].path;
+    src.added_at = kbc_now_ns() / 1000000000LL;
+    src.paused = false;
+    kbc_err local;
+    kbc_err_reset(&local);
+    if (kbc_failed(kbc_store_put_source(app->store, &src, &local))) {
+      KBC_LOGW("corpus %s not registered as a source: %s", src.corpus,
+               local.msg);
+    }
   }
 
   /* A missing index is normal — first start, or before the first reindex. A
@@ -2681,40 +2986,129 @@ static kbc_status store_forget_path(kbc_app *app, const char *corpus,
   return s;
 }
 
-/* The one place that frees a link batch. `dst` and its entries are KBC_OWN,
- * transferred here from the parse, and BOTH callers abort part-way through a
- * pass — reindex_pass on an unreadable document or a rejected facet,
- * reindex_one on a store write. A free loop at the call site is a loop some
- * abort path skips, and both of these did: a full rebuild that died on its
- * Nth document leaked every link array the first N-1 had handed over. */
-static void app_edge_srcs_free(app_edge_src *v, size_t n) {
+/* The one place that frees a link batch. `targets` and its entries are
+ * KBC_OWN, transferred here from the parse, and BOTH callers abort part-way
+ * through a pass — reindex_pass on an unreadable document or a rejected
+ * facet, reindex_one on a store write. A free loop at the call site is a
+ * loop some abort path skips, and both of these did: a full rebuild that
+ * died on its Nth document leaked every link array the first N-1 had handed
+ * over.
+ *
+ * The array is read back as the `char **` its allocator produced, which is
+ * what free() takes. app.h types it `char *const *` so a HOOK cannot replace a
+ * target, and freeing is the one place that has to be the owner instead: a
+ * cast says it and -Wcast-qual forbids exactly that, so the two views sit in a
+ * union rather than in a cast. */
+static void app_edge_srcs_free(kbc_enrich_source *v, size_t n) {
   for (size_t i = 0; i < n; i++) {
-    for (size_t j = 0; j < v[i].n; j++) {
-      free(v[i].dst[j]);
+    for (size_t j = 0; j < v[i].n_targets; j++) {
+      free(v[i].targets[j]);
     }
-    free(v[i].dst);
-    v[i].dst = NULL;
-    v[i].n = 0;
+    union {
+      char *const *as_a_hook_sees_it;
+      char **as_it_was_allocated;
+    } owner;
+    owner.as_a_hook_sees_it = v[i].targets;
+    free(owner.as_it_was_allocated);
+    v[i].targets = NULL;
+    v[i].n_targets = 0;
   }
   free(v);
 }
 
-/* The link graph, kept in step with the documents.
+/* --------------------------------------------------------- enrich hooks --- */
+
+/* The contract is app.h's, and it is stated there once: best-effort, cheap
+ * pre-filter, registration order IS run order, a batch rather than a
+ * document, `candidates` is everything the ladder may name. What belongs
+ * HERE is the implementation and the one thing app.h cannot say — which of
+ * the original's eight are registered, and which are absent.
  *
- * Every re-ingest REPLACES the edges leaving that path, and a removal drops
- * them, so a file whose links changed cannot leave the previous edges behind.
- * A target that is not an indexed document is not an edge at all (store.h:
- * the table is a subset of what the parser found, never a superset), which is
- * why this runs after the whole pass has stored its documents: whether a
- * target is a document is not knowable while the pass is still half done, and
- * an order-dependent graph is a graph that flips on the next reindex.
+ * ONE OF THE EIGHT IS HERE. The other seven are absent because the FEATURE
+ * each one serves is not in kb-c's scope (INVENTORY.md), not because they
+ * were hard — and a registration whose feature does not exist is a hook that
+ * cannot fire, which is worse than no table at all: it reads like coverage.
  *
- * The targets of every source are resolved against the store in ONE batch;
- * each source's own replace is then a single transaction. */
-static kbc_status store_write_links(kbc_app *app, app_edge_src *v, size_t nsrc,
-                                    kbc_err *err) {
+ *   session-capture       no sessions corpus, no transcript parsing.
+ *   memory-recall-ledger  no memory-recall ledger: no table, no writer.
+ *   memory-commit-ledger  no memory-commit ledger: no table, no writer.
+ *   memory-link-seed      no memory-link seed metas, no cross-kb linking.
+ *   code-refs             no code-reference extraction in the parser.
+ *   snapshot-capture      no artifact snapshots: no versions table, no
+ *                         content-hash snapshot store.
+ *   list-anchor           no list entries, no reading lists.
+ *
+ * Adding one is a row in enrich_registry and an enrich fn; the seven lines
+ * above are what tells the next porter which rows are missing ON PURPOSE. */
+
+/* One row of the registry. `name` is the failure log's only use of a hook —
+ * the original's stable identifier (enrich.rs:103-105) — and `user` is the
+ * hook's own state, NULL for a hook that has none. The table is private
+ * because the hook LAYOUT is not part of the contract: kbc_enrich_run takes
+ * parallel arrays so a caller never has to mirror this struct. */
+typedef struct {
+  const char *name;
+  kbc_enrich_prefilter_fn interested;
+  kbc_enrich_fn enrich;
+  void *user;
+} kbc_enrich_hook;
+
+
+/* The ladder answers with ids; the edges table is keyed by PATH. This is the
+ * one lookup that turns an answer into a row, built once per batch over the
+ * same candidate array the ladder was built from, and sorted so that it is a
+ * bsearch: a hub document with four thousand links in a corpus of twenty
+ * thousand documents is eighty million comparisons otherwise. */
+typedef struct {
+  const char *id; /* BORROWED, from the candidate array */
+  size_t cand;    /* index into that array */
+} app_id_ref;
+
+/* Orders by the id ALONE, and that is not a simplification: this is also the
+ * comparator the lookup runs under, and a tiebreak on `cand` would make a
+ * probe (whose cand is 0) compare unequal to the very element it names, so
+ * the search would walk past it and report a miss. Ids are unique per
+ * candidate — they are minted from (corpus, path) — so the order is total
+ * anyway. */
+static int app_id_ref_cmp(const void *a, const void *b) {
+  const app_id_ref *x = (const app_id_ref *)a;
+  const app_id_ref *y = (const app_id_ref *)b;
+  return strcmp(x->id, y->id);
+}
+
+/* NULL when the id names no candidate, which a resolution out of THIS index
+ * cannot produce and is checked anyway: an edge row pointing at a document
+ * nobody can name is a dangling edge. */
+static const char *edge_path_of_id(const kbc_resolve_doc *cand,
+                                   const app_id_ref *order, size_t n,
+                                   const char *id) {
+  app_id_ref probe = {id, 0};
+  const app_id_ref *hit =
+      bsearch(&probe, order, n, sizeof(*order), app_id_ref_cmp);
+  return hit != NULL ? cand[hit->cand].rel_path : NULL;
+}
+
+/* edge-record — the one hook kb-c registers, and the index-time consumer of
+ * the resolution ladder. */
+static bool edge_record_interested(const kbc_enrich_ctx *ctx, void *user) {
+  (void)user;
+  /* A batch of no documents has nothing to enrich, which is the only thing
+   * this hook can be unready for. It is NOT "a document with no links": that
+   * document still has to reach the write that deletes the edges it used to
+   * have, so a prefilter that skipped it would leave them behind forever. */
+  return ctx->n_sources > 0;
+}
+
+static kbc_status edge_record_enrich(const kbc_enrich_ctx *ctx, void *user,
+                                     kbc_err *err) {
+  (void)user;
+  const kbc_enrich_source *v = ctx->sources;
+  const size_t nsrc = ctx->n_sources;
   size_t total = 0;
-  for (size_t i = 0; i < nsrc; i++) total += v[i].n;
+  for (size_t i = 0; i < nsrc; i++) {
+    total += v[i].n_targets;
+  }
+
   /* total == 0 is NOT a no-op: every source in this batch has lost its last
    * link, and the write that deletes those edges is exactly the point. Only
    * the batch RESOLVE needs targets, so that is what is skipped. The pending
@@ -2722,101 +3116,402 @@ static kbc_status store_write_links(kbc_app *app, app_edge_src *v, size_t nsrc,
    * target must stop being the reason to look for it. */
   if (total == 0) {
     for (size_t i = 0; i < nsrc; i++) {
-      kbc_status s = kbc_store_replace_edges(app->store, v[i].corpus, v[i].src,
+      kbc_status s = kbc_store_replace_edges(ctx->store, v[i].corpus, v[i].src,
                                              NULL, 0, err);
       if (kbc_failed(s)) return s;
-      s = kbc_store_delete_pending(app->store, v[i].corpus, v[i].src, err);
+      s = kbc_store_delete_pending(ctx->store, v[i].corpus, v[i].src, err);
       if (kbc_failed(s)) return s;
     }
     KBC_LOGI("graph: %zu documents, 0 of 0 link targets recorded", nsrc);
     return KBC_OK;
   }
 
-  kbc_arena *ea = kbc_arena_new(64u * 1024u);
-  if (ea == NULL)
-    return kbc_err_set(err, KBC_ERR_NOMEM, "link arena for %zu targets", total);
-  const char **corpora = kbc_arena_calloc(ea, total, sizeof(*corpora));
-  const char **paths = kbc_arena_calloc(ea, total, sizeof(*paths));
-  if (corpora == NULL || paths == NULL) {
-    kbc_arena_free(ea);
-    return kbc_err_set(err, KBC_ERR_NOMEM, "link batch of %zu targets", total);
-  }
-  size_t at = 0;
-  for (size_t i = 0; i < nsrc; i++) {
-    for (size_t j = 0; j < v[i].n; j++) {
-      corpora[at] = v[i].corpus;
-      paths[at] = v[i].dst[j];
-      at++;
-    }
-  }
-
-  kbc_artifact **arts = NULL;
   kbc_err local;
   kbc_err_reset(&local);
-  kbc_status s = kbc_store_get_artifacts_by_path(app->store, ea, corpora, paths,
-                                                 total, &arts, &local);
-  if (kbc_failed(s)) {
-    kbc_arena_free(ea);
-    return kbc_err_set(err, s, "resolve %zu link targets: %s", total,
-                       local.msg[0] ? local.msg : "store failed");
+  kbc_resolve_index *ix =
+      kbc_resolve_index_new(ctx->candidates, ctx->n_candidates, &local);
+  if (ix == NULL) {
+    return kbc_err_set(err, KBC_ERR_NOMEM,
+                       "resolution ladder over %zu documents of %s: %s",
+                       ctx->n_candidates, ctx->corpus,
+                       local.msg[0] ? local.msg : "out of memory");
   }
+  app_id_ref *order = malloc((ctx->n_candidates + 1u) * sizeof(*order));
+  if (order == NULL) {
+    kbc_resolve_index_free(ix);
+    return kbc_err_set(err, KBC_ERR_NOMEM, "id order for %zu documents",
+                       ctx->n_candidates);
+  }
+  for (size_t i = 0; i < ctx->n_candidates; i++) {
+    order[i].id = ctx->candidates[i].id;
+    order[i].cand = i;
+  }
+  qsort(order, ctx->n_candidates, sizeof(*order), app_id_ref_cmp);
 
+  /* `sa` is the ladder's SCRATCH: the normalised target and its lowercased
+   * form are dead by the next call (links.h), so one arena serves the whole
+   * batch and each resolution's ids are freed where they were read. */
+  kbc_arena *sa = kbc_arena_new(8192u);
   const char **kept = calloc(total, sizeof(*kept));
   /* One pending slot per raw target, filled in the same pass: a target that
-   * did not resolve is not an edge, but it IS a link the corpus states, and
-   * dropping it is what made the graph depend on visit order. */
+   * resolved to nothing is not an edge, but it IS a link the corpus states,
+   * and dropping it is what made the graph depend on visit order. */
   const char **pending = calloc(total, sizeof(*pending));
-  if (kept == NULL || pending == NULL) {
-    free(kept);
-    free(pending);
-    free(arts);
-    kbc_arena_free(ea);
-    return kbc_err_set(err, KBC_ERR_NOMEM, "%zu resolved links", total);
+  kbc_status st = KBC_OK;
+  if (sa == NULL || kept == NULL || pending == NULL) {
+    st = kbc_err_set(err, KBC_ERR_NOMEM, "ladder scratch for %zu links of %s",
+                     total, ctx->corpus);
   }
-  at = 0;
   size_t recorded = 0;
   size_t n_pending = 0;
-  s = KBC_OK;
-  for (size_t i = 0; i < nsrc && s == KBC_OK; i++) {
+  size_t ambiguous = 0;
+  size_t self_links = 0;
+  for (size_t i = 0; st == KBC_OK && i < nsrc; i++) {
     size_t nk = 0;
     size_t np = 0;
-    for (size_t j = 0; j < v[i].n; j++) {
-      /* The resolved path is the artifact's own, not the link's spelling:
-       * `../x/y.md` and `x/y.md` are one edge, and the primary key says so. */
-      if (arts[at + j] != NULL) {
-        kept[nk++] = arts[at + j]->path;
-      } else {
-        pending[np++] = v[i].dst[j];
+    for (size_t j = 0; st == KBC_OK && j < v[i].n_targets; j++) {
+      kbc_resolution r;
+      kbc_err rl;
+      kbc_err_reset(&rl);
+      kbc_status rs =
+          kbc_resolve_index_resolve(ix, sa, v[i].targets[j], &r, &rl);
+      if (kbc_failed(rs)) {
+        st = kbc_err_set(err, rs, "%s/%s: resolve link \"%s\": %s",
+                         ctx->corpus, v[i].src, v[i].targets[j],
+                         rl.msg[0] ? rl.msg : "ladder failed");
+        break;
       }
+      /* ONLY a unique answer is an edge (enrich.rs:1095). A bare basename
+       * shared by ops/deploy.md and infra/deploy.md is AMBIGUOUS, and taking
+       * one of them would be an edge that flips on the next reindex; what a
+       * route offers for an ambiguous target is the candidates, not a
+       * winner. A None is a link the corpus states that no document answers
+       * to, which is a pending link rather than a silent loss. */
+      if (r.kind == KBC_RESOLVE_ONE) {
+        /* The resolved path is the document's own, not the link's spelling:
+         * `../x/y.md` and `x/y.md` are one edge, and the primary key says
+         * so. So is a target named twice by one source, which is where the
+         * original's `seen` set has no counterpart here. */
+        const char *path =
+            edge_path_of_id(ctx->candidates, order, ctx->n_candidates,
+                            r.ids.items[0]);
+        if (path == NULL) {
+          ambiguous++; /* unreachable from this index; counted, not written */
+        } else if (strcmp(path, v[i].src) == 0) {
+          self_links++; /* a document naming itself is not a backlink */
+        } else {
+          kept[nk++] = path;
+        }
+      } else if (r.kind == KBC_RESOLVE_AMBIGUOUS) {
+        ambiguous++;
+      } else {
+        pending[np++] = v[i].targets[j];
+      }
+      kbc_strlist_free(&r.ids);
     }
-    s = kbc_store_replace_edges(app->store, v[i].corpus, v[i].src, kept, nk,
-                                err);
-    if (s == KBC_OK)
-      s = kbc_store_delete_pending(app->store, v[i].corpus, v[i].src, err);
-    if (s == KBC_OK && np > 0)
-      s = kbc_store_add_pending_links(app->store, v[i].corpus, v[i].src,
-                                      pending, np, err);
-    recorded += nk;
-    n_pending += np;
-    at += v[i].n;
+    if (st == KBC_OK) {
+      st = kbc_store_replace_edges(ctx->store, v[i].corpus, v[i].src, kept, nk,
+                                   err);
+      if (st == KBC_OK)
+        st = kbc_store_delete_pending(ctx->store, v[i].corpus, v[i].src, err);
+      if (st == KBC_OK && np > 0)
+        st = kbc_store_add_pending_links(ctx->store, v[i].corpus, v[i].src,
+                                         pending, np, err);
+      recorded += nk;
+      n_pending += np;
+    }
+  }
+  if (sa != NULL) {
+    kbc_arena_free(sa);
   }
   free(kept);
   free(pending);
-  free(arts);
-  kbc_arena_free(ea);
-  if (s == KBC_OK) {
-    /* Four numbers, and they are not the same number: the parser found
-     * `total` link targets, `recorded` of them resolved to an indexed
-     * document, `n_pending` name a target that is not one yet and wait for
-     * it, and the graph holds `edges` rows — fewer than `recorded`
-     * because a source linking one document twice has one edge. Only the last
-     * is the table itself. */
-    const int64_t edges = kbc_store_edge_count(app->store, v[0].corpus, NULL);
+  free(order);
+  kbc_resolve_index_free(ix);
+  if (st == KBC_OK) {
+    /* Five numbers, and they are not the same number: the parser found
+     * `total` link targets, `recorded` of them resolved to exactly one
+     * indexed document, `n_pending` name a target that is not one yet and
+     * wait for it, `ambiguous` were answered by more than one document and
+     * are deliberately not edges, `self_links` are this document's own name
+     * — and the graph holds `edges` rows, fewer than `recorded` because a
+     * source naming one document twice has one edge. Only the last is the
+     * table itself. */
+    const int64_t edges = kbc_store_edge_count(ctx->store, v[0].corpus, NULL);
     KBC_LOGI("graph: %zu documents, %zu of %zu link targets resolved, %zu "
-             "awaiting their target, %lld edges in the graph",
-             nsrc, recorded, total, n_pending, (long long)edges);
+             "awaiting their target, %zu ambiguous, %zu self, %lld edges in "
+             "the graph",
+             nsrc, recorded, total, n_pending, ambiguous, self_links,
+             (long long)edges);
   }
-  return s;
+  return st;
+}
+
+/* The default registry, in RUN ORDER. Registration order IS run order
+ * (enrich.rs:118-133), so a row's position is a decision and not an accident.
+ * edge-record is the original's fifth hook, the only one whose feature is in
+ * kb-c's scope, and it keeps that slot. */
+static const kbc_enrich_hook *enrich_registry(size_t *n_out) {
+  static const kbc_enrich_hook hooks[] = {
+      {"edge-record", edge_record_interested, edge_record_enrich, NULL},
+  };
+  *n_out = sizeof(hooks) / sizeof(hooks[0]);
+  return hooks;
+}
+
+/* The run. It has no failure to return, and that IS the contract rather than
+ * an omission: a hook that fails is logged by name and stepped over, and the
+ * hooks after it still run (enrich.rs:14-24, indexer.rs:2300-2308). */
+static void enrich_run(const kbc_enrich_hook *hooks, size_t n,
+                       const kbc_enrich_ctx *ctx) {
+  for (size_t i = 0; i < n; i++) {
+    if (!hooks[i].interested(ctx, hooks[i].user)) {
+      continue;
+    }
+    kbc_err local;
+    kbc_err_reset(&local);
+    kbc_status s = hooks[i].enrich(ctx, hooks[i].user, &local);
+    if (kbc_failed(s)) {
+      KBC_LOGW("enrich: hook %s failed and was skipped: %s", hooks[i].name,
+               local.msg[0] ? local.msg : "no message");
+    }
+  }
+}
+
+/* The registry's other entry point, and the seam a caller drives its OWN hooks
+ * through. It is the same loop over the same table as the daemon's own run —
+ * app.h says why the arguments are parallel arrays, and the reason it is here
+ * at all is the pre-filter and the failure: neither is observable from a
+ * registry of one hook that never says no. */
+kbc_status kbc_enrich_run(size_t n, const char *const *names,
+                          kbc_enrich_prefilter_fn pre[], kbc_enrich_fn fns[],
+                          void *const *users, const kbc_enrich_ctx *ctx,
+                          kbc_err *err) {
+  if (ctx == NULL || (n > 0 && (names == NULL || pre == NULL ||
+                                 fns == NULL))) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "enrich_run: %zu hooks with a NULL table or context",
+                       n);
+  }
+  if (n > KBC_ENRICH_MAX_HOOKS) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "enrich_run: %zu hooks is over the %u cap", n,
+                       KBC_ENRICH_MAX_HOOKS);
+  }
+  kbc_enrich_hook table[KBC_ENRICH_MAX_HOOKS];
+  for (size_t i = 0; i < n; i++) {
+    if (pre[i] == NULL || fns[i] == NULL) {
+      return kbc_err_set(err, KBC_ERR_INVALID, "enrich_run: hook %zu has no "
+                                               "function",
+                         i);
+    }
+    table[i].name = names[i] != NULL ? names[i] : "?";
+    table[i].interested = pre[i];
+    table[i].enrich = fns[i];
+    table[i].user = users != NULL ? users[i] : NULL;
+  }
+  enrich_run(table, n, ctx);
+  return KBC_OK;
+}
+
+/* Appends one candidate, or hands back the slot it took so that a caller
+ * REPLACING an entry can copy into the position the old one held: the
+ * ladder's first-wins rule (links.h) makes a document's place in the array
+ * part of what it resolves to. */
+static kbc_resolve_doc *ladder_push(kbc_resolve_doc **v, size_t *n, size_t *cap,
+                                    kbc_arena *a, const char *id,
+                                    const char *path, const char *title,
+                                    kbc_err *err) {
+  if (*n == *cap) {
+    size_t want = *cap != 0 ? *cap * 2u : 64u;
+    if (want < *cap || want > SIZE_MAX / sizeof(**v)) {
+      (void)kbc_err_set(err, KBC_ERR_NOMEM, "candidate set would exceed %zu",
+                        SIZE_MAX / sizeof(**v));
+      return NULL;
+    }
+    kbc_resolve_doc *grown =
+        (kbc_resolve_doc *)realloc(*v, want * sizeof(*grown));
+    if (grown == NULL) {
+      (void)kbc_err_set(err, KBC_ERR_NOMEM, "realloc for %zu candidates",
+                        want);
+      return NULL;
+    }
+    *v = grown;
+    *cap = want;
+  }
+  char *cid = kbc_arena_strdup(a, id);
+  char *cpath = kbc_arena_strdup(a, path);
+  char *ctitle = kbc_arena_strdup(a, title);
+  if (cid == NULL || cpath == NULL || ctitle == NULL) {
+    (void)kbc_err_set(err, KBC_ERR_NOMEM, "candidate copy for %s", path);
+    return NULL;
+  }
+  (*v)[*n].id = cid;
+  (*v)[*n].rel_path = cpath;
+  (*v)[*n].title = ctitle;
+  return &(*v)[(*n)++];
+}
+
+/* Every document in the corpus, as the ladder's three fields. Which array it
+ * is read from depends on who is asking, and both name the same set of
+ * documents by app.h's invariant:
+ *
+ *   - The full pass has the WALK's manifest: every file the corpus contains,
+ *     in walk order, under the id and title it is being stored with. It
+ *     costs no store read at all, which is why a rebuild does not pay a
+ *     corpus-sized query to keep the graph honest.
+ *   - The single-file path has only the live INDEX, which app.h keeps
+ *     replaced together with the store, plus the document it has just
+ *     ingested — the index has not been told about that one yet, and its
+ *     title is the fresh one. A target the index cannot see resolves to
+ *     nothing and is recorded as a PENDING link, so an edge missed because
+ *     the index was a generation behind heals on the next full pass instead
+ *     of never existing.
+ */
+static kbc_status ladder_candidates(kbc_app *app, const char *corpus,
+                                    const app_ladder *lad, kbc_arena *a,
+                                    kbc_resolve_doc **out, size_t *n_out,
+                                    kbc_err *err) {
+  kbc_resolve_doc *v = NULL;
+  size_t n = 0;
+  size_t cap = 0;
+  kbc_status s = KBC_OK;
+
+  if (lad->manifest != NULL) {
+    const kbc_app_manifest *m = lad->manifest;
+    for (size_t ci = 0; s == KBC_OK && ci < app->cfg->ncorpora; ci++) {
+      if (strcmp(app->cfg->corpora[ci].name, corpus) != 0) {
+        continue;
+      }
+      for (size_t i = 0; s == KBC_OK && i < m->len; i++) {
+        const kbc_app_row *row = &m->items[i];
+        if (row->corpus_index != ci) {
+          continue;
+        }
+        s = ladder_push(&v, &n, &cap, a, row->id, row->path, row->title, err)
+                == NULL
+                ? KBC_ERR_NOMEM
+                : KBC_OK;
+      }
+    }
+  } else {
+    /* The index is read under the lock and copied into `a` before the lock is
+     * dropped, which is the whole reason this is cheap: no store read, and no
+     * per-document query to fetch a path and a title the index already
+     * holds. app->lock is taken under reindex_mu and only there (the locking
+     * note at the top of this file), and nothing else is held here, so this
+     * cannot invert that order. */
+    pthread_rwlock_rdlock(&app->lock);
+    const kbc_index *ix = app->index;
+    const uint32_t count = ix != NULL ? kbc_index_doc_count(ix) : 0u;
+    for (uint32_t d = 0; s == KBC_OK && d < count; d++) {
+      const kbc_doc_meta *meta = kbc_index_doc(ix, d);
+      if (meta == NULL || meta->corpus == NULL || meta->path == NULL ||
+          strcmp(meta->corpus, corpus) != 0 ||
+          (kbc_kind)meta->kind != KBC_KIND_ARTIFACT) {
+        continue;
+      }
+      char id[KBC_MAX_ID_LEN + 1];
+      /* The index's own doc id is a dense handle, not the artifact id its
+       * first tier keys on; types.h mints the artifact id from (corpus,
+       * path), which is the same value for the same document. */
+      kbc_id_for_artifact(id, corpus, meta->path);
+      s = ladder_push(&v, &n, &cap, a, id, meta->path,
+                      meta->title != NULL ? meta->title : "", err) == NULL
+              ? KBC_ERR_NOMEM
+              : KBC_OK;
+    }
+    pthread_rwlock_unlock(&app->lock);
+
+    /* The document this call ingested, refreshed where the index already
+     * knows it: the previous generation's title would answer a link that the
+     * new title answers differently. The position is kept, because the
+     * ladder's first-wins rule is positional. */
+    if (s == KBC_OK && lad->self_path != NULL) {
+      size_t at = 0;
+      bool seen = false;
+      for (size_t i = 0; i < n; i++) {
+        if (strcmp(v[i].rel_path, lad->self_path) == 0) {
+          at = i;
+          seen = true;
+          break;
+        }
+      }
+      kbc_resolve_doc *slot =
+          ladder_push(&v, &n, &cap, a, lad->self_id, lad->self_path,
+                      lad->self_title != NULL ? lad->self_title : "", err);
+      if (slot == NULL) {
+        s = KBC_ERR_NOMEM;
+      } else if (seen) {
+        v[at] = *slot;
+        n--;
+      }
+    }
+  }
+  if (kbc_failed(s)) {
+    free(v);
+    return s;
+  }
+  *out = v;
+  *n_out = n;
+  return KBC_OK;
+}
+
+/* The link graph, kept in step with the documents.
+ *
+ * Every re-ingest REPLACES the edges leaving that path, and a removal drops
+ * them, so a file whose links changed cannot leave the previous edges behind.
+ * A target that is not an indexed document is not an edge at all (store.h:
+ * the table is a subset of what the parser found, never a superset), which
+ * is why this runs after the whole pass has stored its documents: whether a
+ * target is a document is not knowable while the pass is still half done, and
+ * an order-dependent graph is a graph that flips on the next reindex.
+ *
+ * It is a DRIVER and not a second edge path: it groups the batch by corpus,
+ * builds the candidate set, and hands both to the registry. The write is the
+ * edge-record hook's and lives in it, so there is exactly one place in this
+ * file that turns a link into an edge.
+ *
+ * The grouping is by corpus because a corpus is the ladder's whole world —
+ * the original builds one ResolveIndex per kb over that kb's documents — so
+ * a link must not resolve into another corpus that happens to share a
+ * basename. reindex_pass appends its sources in corpus order already; this
+ * does not rely on that, and a corpus split across two runs simply has its
+ * index built twice. */
+static kbc_status store_write_links(kbc_app *app, kbc_enrich_source *v,
+                                    size_t nsrc, const app_ladder *lad,
+                                    kbc_err *err) {
+  size_t start = 0;
+  while (start < nsrc) {
+    const char *corpus = v[start].corpus;
+    size_t end = start + 1u;
+    while (end < nsrc && strcmp(v[end].corpus, corpus) == 0) {
+      end++;
+    }
+    kbc_arena *a = kbc_arena_new(64u * 1024u);
+    if (a == NULL) {
+      return kbc_err_set(err, KBC_ERR_NOMEM, "ladder arena for %s", corpus);
+    }
+    kbc_resolve_doc *docs = NULL;
+    size_t n_docs = 0;
+    kbc_status s = ladder_candidates(app, corpus, lad, a, &docs, &n_docs, err);
+    if (!kbc_failed(s)) {
+      kbc_enrich_ctx ctx = {app->store, corpus, &v[start], end - start, docs,
+                            n_docs};
+      size_t n_hooks = 0;
+      const kbc_enrich_hook *hooks = enrich_registry(&n_hooks);
+      enrich_run(hooks, n_hooks, &ctx);
+    }
+    /* The array is the caller's; the strings in it are the arena's, and the
+     * hook is finished with both. */
+    free(docs);
+    kbc_arena_free(a);
+    if (kbc_failed(s)) {
+      return s;
+    }
+    start = end;
+  }
+  return KBC_OK;
 }
 
 /* One document, in place: read it, tokenize it, rewrite only its postings.
@@ -3096,18 +3791,22 @@ static kbc_status reindex_one_locked(kbc_app *app, const char *corpus,
     ingested_free(&g);
     return s;
   }
-  /* The single-document path writes its own edges here: the rest of the
-   * corpus is already in the store, so a target that is a document resolves
-   * now. A target that is not yet indexed records no edge but DOES record a
-   * pending link, and the drain below is what picks it up when the target
-   * arrives — the watcher's single-file event, not a full scan. */
+  /* The single-document path writes its own edges here, through the same
+   * registry: the rest of the corpus is already in the index, so a target
+   * that is a document resolves now. A target that is not yet indexed records
+   * no edge but DOES record a pending link, and the drain below is what picks
+   * it up when the target arrives — the watcher's single-file event, not a
+   * full scan. */
   if (g.n_links > 0) {
-    app_edge_src one;
+    kbc_enrich_source one;
     one.corpus = corpus;
     one.src = rel_path;
-    one.dst = g.link_paths;
-    one.n = g.n_links;
-    s = store_write_links(app, &one, 1, err);
+    one.targets = g.link_paths;
+    one.n_targets = g.n_links;
+    char self_id[KBC_MAX_ID_LEN + 1];
+    kbc_id_for_artifact(self_id, corpus, rel_path);
+    const app_ladder lad = {NULL, self_id, rel_path, g.title};
+    s = store_write_links(app, &one, 1, &lad, err);
   } else {
     s = kbc_store_delete_edges(app->store, corpus, rel_path, err);
     if (s == KBC_OK)

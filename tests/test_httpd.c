@@ -2215,6 +2215,62 @@ static void ofx_setup(origin_fixture *o) {
 
 static void ofx_teardown(origin_fixture *o) { fx_teardown(&o->f); }
 
+/* The rendered page carries the full 7.4 KB stylesheet, so a buffer sized for
+ * a raw `.md` source truncates the answer mid-body and a test asserting on the
+ * document's prose would fail for the wrong reason. Every reply buffer that
+ * can receive a rendered page is this size. */
+#define PAGE_REPLY 32768
+
+/* The id the store minted for a corpus-relative path, found through the public
+ * listing rather than by recomputing it: the test must not re-implement the id
+ * minting to find its own fixture.
+ *
+ * The scan pairs each `"id"` with the `"path"` that FOLLOWS it in the same
+ * object, so the id returned is the one that goes WITH the path — taking the
+ * first id in the list would silently return a different document's. */
+static void ofx_id_for(origin_fixture *o, const char *rel, char *out,
+                       size_t cap) {
+  kbc_response r;
+  out[0] = '\0';
+  KBC_CHECK_EQ_INT(call(&o->f, "GET", "/api/artifacts", AT0, NULL, &r), 200);
+  char pat[256];
+  int n = snprintf(pat, sizeof pat, "\"path\":\"%s\"", rel);
+  KBC_CHECK_MSG(n > 0 && (size_t)n < sizeof pat, "bad path pattern for %s", rel);
+  const char *cur = NULL;
+  for (const char *q = r.body.ptr; q != NULL && *q != '\0'; q++) {
+    if (strncmp(q, "\"id\":\"", 6) == 0) cur = q + 6;
+    if (cur != NULL && strncmp(q, pat, (size_t)n) == 0) {
+      size_t i = 0;
+      while (cur[i] != '\0' && cur[i] != '"' && i < KBC_MAX_ID_LEN &&
+             i + 1 < cap) {
+        out[i] = cur[i];
+        i++;
+      }
+      out[i] = '\0';
+      break;
+    }
+  }
+  kbc_response_free(&r);
+  KBC_CHECK_MSG(out[0] != '\0', "no id found for %s", rel);
+}
+
+/* Writes one more document into the origin corpus and re-indexes, so the
+ * store knows it. The id comes back through the listing, never from a second
+ * implementation of the minting rule. */
+static void ofx_add_md(origin_fixture *o, const char *name,
+                       const char *body, char *id, size_t cap) {
+  char p[KBC_TEST_PATH_MAX];
+  path_under(p, sizeof p, o->sub, name);
+  kbc_test_write_file(p, body);
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(o->f.app, &err));
+  char rel[256];
+  int n = snprintf(rel, sizeof rel, "sub/%s", name);
+  KBC_CHECK_MSG(n > 0 && (size_t)n < sizeof rel, "bad rel for %s", name);
+  ofx_id_for(o, rel, id, cap);
+}
+
 /* One request on the artifact subdomain, spelled out raw so the Host is
  * exactly what the test means it to be. */
 static int origin_get(server *s, const char *host, const char *path,
@@ -2340,7 +2396,7 @@ KBC_TEST(the_artifact_subdomain_is_chosen_by_host) {
   }
   char host[KBC_TEST_PATH_MAX];
   snprintf(host, sizeof host, "%s.artifacts.localhost", o.id);
-  char reply[8192];
+  char reply[PAGE_REPLY]; /* `/` is a rendered page; see PAGE_REPLY. */
 
   /* `/` on the artifact host is the artifact itself. */
   int status = origin_get(&s, host, "/", NULL, reply, sizeof reply);
@@ -2440,7 +2496,9 @@ KBC_TEST(artifact_bytes_on_the_parent_origin) {
     return;
   }
   char path[256];
-  char reply[8192];
+  /* PAGE_REPLY, not 8 KiB: one.md is now served as a rendered page and the
+   * stylesheet alone is 7.4 KiB, so the old buffer truncated the body. */
+  char reply[PAGE_REPLY];
   int status = 0;
 
   snprintf(path, sizeof path, "/api/kb/kb/artifact/%s", o.id);
@@ -2511,6 +2569,499 @@ KBC_TEST(artifact_bytes_on_the_parent_origin) {
   }
 
   srv_stop(&s);
+  ofx_teardown(&o);
+}
+
+/* A `.md` is served as a RENDERED PAGE on the parent origin, and the answer
+ * over a real socket is a page and not the source it was made from.
+ *
+ * Every assertion here is one that fails if the render is reverted to a raw
+ * serve, and each names a different thing: the doctype and the `kb-md-doc`
+ * container are markup the source never contained, and the source's own `# `
+ * heading marker is markup the renderer consumed. A body-length check would
+ * pass either way — the page is only a couple of hundred bytes more than the
+ * 7.4 KiB stylesheet it wraps — so nothing here counts bytes. */
+KBC_TEST(a_markdown_artifact_is_served_as_a_rendered_page) {
+  origin_fixture o;
+  ofx_setup(&o);
+  server s;
+  srv_start(&s, &o.f);
+  if (s.h == NULL || o.id[0] == '\0') {
+    srv_stop(&s);
+    ofx_teardown(&o);
+    return;
+  }
+  char path[256];
+  snprintf(path, sizeof path, "/api/kb/kb/artifact/%s", o.id);
+  kbc_str req;
+  kbc_str_init(&req);
+  (void)kbc_str_printf(&req, "GET %s HTTP/1.1\r\nHost: x\r\n\r\n", path);
+  char reply[PAGE_REPLY];
+  int status = 0;
+  KBC_CHECK(raw_exchange(&s, req.ptr, req.len, &status, reply, sizeof reply));
+  kbc_str_free(&req);
+  KBC_CHECK_EQ_INT(status, 200);
+
+  /* The wrapper the renderer emits and the source does not contain. */
+  KBC_CHECK_MSG(strstr(reply, "<!doctype html>") != NULL,
+                "a .md was not served as a rendered page: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "<main class=\"kb-md-doc\">") != NULL,
+                "the rendered page has no kb-md-doc container: %s", reply);
+  /* The heading became markup: `<h1>One</h1>`, and no ATX marker anywhere. */
+  KBC_CHECK_MSG(strstr(reply, "<h1>One</h1>") != NULL,
+                "the heading was not rendered: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "# One") == NULL,
+                "the raw markdown source was served instead of the page: %s",
+                reply);
+  /* The body prose survives rendering, so this is not an empty shell. */
+  KBC_CHECK_MSG(strstr(reply, "sub artifact") != NULL,
+                "the rendered page lost the document body: %s", reply);
+
+  /* The header set is unchanged by rendering. */
+  KBC_CHECK_MSG(strstr(reply, "Content-Type: text/html; charset=utf-8") != NULL,
+                "a rendered page is not text/html: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "X-Content-Type-Options: nosniff") != NULL,
+                "a rendered page carries no nosniff: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "Content-Security-Policy: sandbox\r\n") != NULL,
+                "a rendered page lost the bare `sandbox` CSP: %s", reply);
+  {
+    char want[128];
+    snprintf(want, sizeof want, "X-Kb-Artifact-Id: %s", o.id);
+    KBC_CHECK_MSG(strstr(reply, want) != NULL,
+                  "a rendered page carries no X-Kb-Artifact-Id: %s", reply);
+  }
+
+  srv_stop(&s);
+  ofx_teardown(&o);
+}
+
+/* The SAME document is a rendered page on the artifact subdomain. That is a
+ * different handler with a different header set and a different status for a
+ * bad body, so "the parent route renders it" is no evidence that this one
+ * does. */
+KBC_TEST(a_markdown_artifact_is_rendered_on_the_subdomain_too) {
+  origin_fixture o;
+  ofx_setup(&o);
+  server s;
+  srv_start(&s, &o.f);
+  if (s.h == NULL || o.id[0] == '\0') {
+    srv_stop(&s);
+    ofx_teardown(&o);
+    return;
+  }
+  char host[KBC_TEST_PATH_MAX];
+  snprintf(host, sizeof host, "%s.artifacts.localhost", o.id);
+  char reply[PAGE_REPLY];
+
+  int status = origin_get(&s, host, "/", NULL, reply, sizeof reply);
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK_MSG(strstr(reply, "<!doctype html>") != NULL,
+                "the subdomain served a .md as raw source: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "<main class=\"kb-md-doc\">") != NULL,
+                "the subdomain's page has no kb-md-doc container: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "# One") == NULL,
+                "the subdomain served the raw markdown source: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "sub artifact") != NULL,
+                "the subdomain's rendered page lost the body: %s", reply);
+  /* The label is now the truth about the body: it is HTML, and saying
+   * otherwise under `nosniff` is how a rendered page becomes a download. */
+  KBC_CHECK_MSG(strstr(reply, "Content-Type: text/html; charset=utf-8") != NULL,
+                "a rendered page on the subdomain is not text/html: %s", reply);
+  /* The subdomain's own header set, unchanged by rendering. */
+  {
+    char want[128];
+    snprintf(want, sizeof want, "X-Kb-Artifact-Id: %s", o.id);
+    KBC_CHECK_MSG(strstr(reply, want) != NULL,
+                  "the subdomain page carries no artifact id: %s", reply);
+  }
+
+  srv_stop(&s);
+  ofx_teardown(&o);
+}
+
+/* A `.md` that is not valid UTF-8 is refused, and the refusal carries no bytes
+ * of the document. This is the case the render exists to make decidable: the
+ * renderer returns KBC_ERR_PARSE and renders nothing, and the route had
+ * already decided such a document is a 400 rather than something to serve
+ * under a text/html label.
+ *
+ * "Serves no bytes" is the assertion that matters, and the one a plausible fix
+ * fails: a route that renders, fails, and then falls back to the raw source
+ * would still be a 200 with the whole document in it, and a test that checked
+ * only the status would call that correct. */
+KBC_TEST(a_non_utf8_markdown_artifact_is_refused_and_serves_no_bytes) {
+  origin_fixture o;
+  ofx_setup(&o);
+  /* 0xff 0xfe is never valid UTF-8, and these bytes cannot appear in the
+   * rendered output of a document that was refused. */
+  static const char kBad[] = "# Bad\n\nMARKER-BYTES \xff\xfe not utf8\n";
+  char bad_id[KBC_MAX_ID_LEN + 1];
+  ofx_add_md(&o, "bad.md", kBad, bad_id, sizeof bad_id);
+  server s;
+  srv_start(&s, &o.f);
+  if (s.h == NULL || bad_id[0] == '\0') {
+    srv_stop(&s);
+    ofx_teardown(&o);
+    return;
+  }
+  char path[256];
+  snprintf(path, sizeof path, "/api/kb/kb/artifact/%s", bad_id);
+  kbc_str req;
+  kbc_str_init(&req);
+  (void)kbc_str_printf(&req, "GET %s HTTP/1.1\r\nHost: x\r\n\r\n", path);
+  char reply[PAGE_REPLY];
+  int status = 0;
+  KBC_CHECK(raw_exchange(&s, req.ptr, req.len, &status, reply, sizeof reply));
+  kbc_str_free(&req);
+  KBC_CHECK_EQ_INT(status, 400);
+  /* Not one byte of the document, and certainly not a half-rendered page. */
+  KBC_CHECK_MSG(strstr(reply, "MARKER-BYTES") == NULL,
+                "a refused .md leaked its source: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "<!doctype html>") == NULL,
+                "a refused .md was served as a page anyway: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "problem+json") != NULL,
+                "the refusal is not a problem+json 400: %s", reply);
+  /* The artifact headers must not ride along on a refusal: a sandbox CSP on an
+   * error body is a header set for a document that was not served. */
+  KBC_CHECK_MSG(strstr(reply, "X-Kb-Artifact-Id") == NULL,
+                "a refused .md published artifact headers: %s", reply);
+
+  /* The subdomain refuses the same document too, and with the status IT uses:
+   * 500, not the parent origin's 400. The two handlers disagree about this in
+   * the original (`artifact.rs:715` vs `docs.rs:1489`) and the disagreement is
+   * deliberately preserved, so the assertion pins 500 rather than "some 4xx".
+   * What matters on both surfaces is the same: a refusal, carrying no bytes. */
+  char host[KBC_TEST_PATH_MAX];
+  snprintf(host, sizeof host, "%s.artifacts.localhost", bad_id);
+  status = origin_get(&s, host, "/", NULL, reply, sizeof reply);
+  KBC_CHECK_EQ_INT(status, 500);
+  KBC_CHECK_MSG(strstr(reply, "MARKER-BYTES") == NULL,
+                "the subdomain leaked a refused document's bytes: %s", reply);
+
+  srv_stop(&s);
+  ofx_teardown(&o);
+}
+
+/* A render that fails for a reason OTHER than bad UTF-8 is reported as the
+ * error it is, and the raw source is NOT served in its place.
+ *
+ * This is the test that makes the no-fallback rule observable, and it is the
+ * one the UTF-8 case above cannot be. The UTF-8 refusal is decided by the
+ * ROUTE, before the renderer is ever called, so a route that rendered, got a
+ * failure and then fell back to raw bytes would still pass it. Here the
+ * renderer itself refuses — the document is larger than
+ * KBC_MAX_ARTIFACT_BYTES — and the only way to pass is to surface that.
+ *
+ * The file is grown on disk AFTER indexing, which is how this state is
+ * reached in practice: the indexer caps what it will ingest, so an artifact
+ * over the limit never gets an id, but a document that was a kilobyte at index
+ * time and is twenty megabytes now does. The renderer re-checks the limit on
+ * the bytes it is actually handed, so it refuses.
+ *
+ * Without the render, this route would serve those twenty megabytes as a 200.
+ * That is the specific outcome this asserts against. */
+KBC_TEST(a_failed_markdown_render_is_an_error_not_a_raw_serve) {
+  origin_fixture o;
+  ofx_setup(&o);
+  /* `one.md` is already indexed and has an id; it is about to stop being
+   * renderable. */
+  char p[KBC_TEST_PATH_MAX];
+  path_under(p, sizeof p, o.sub, "one.md");
+  FILE *f = fopen(p, "wb");
+  KBC_CHECK_NOT_NULL(f);
+  if (f == NULL) {
+    ofx_teardown(&o);
+    return;
+  }
+  /* Just over the 16 MiB limit, so the renderer's size check fires. The
+   * marker rides along so a raw fallback would be unmistakable. */
+  static const char kChunk[65536] = {'A'};
+  for (unsigned i = 0; i < 257u; i++) { /* 257 * 64 KiB = 16.06 MiB */
+    if (fwrite(kChunk, 1, sizeof kChunk, f) != sizeof kChunk) break;
+  }
+  (void)fputs("MARKER-OVERSIZE", f);
+  (void)fclose(f);
+  {
+    struct stat sb;
+    KBC_CHECK_EQ_INT(stat(p, &sb), 0);
+    KBC_CHECK_MSG((size_t)sb.st_size > (size_t)KBC_MAX_ARTIFACT_BYTES,
+                  "the fixture did not exceed the limit: %lld bytes",
+                  (long long)sb.st_size);
+  }
+
+  server s;
+  srv_start(&s, &o.f);
+  if (s.h == NULL || o.id[0] == '\0') {
+    srv_stop(&s);
+    ofx_teardown(&o);
+    return;
+  }
+  char path[256];
+  snprintf(path, sizeof path, "/api/kb/kb/artifact/%s", o.id);
+  kbc_str req;
+  kbc_str_init(&req);
+  (void)kbc_str_printf(&req, "GET %s HTTP/1.1\r\nHost: x\r\n\r\n", path);
+  /* The fallback would put sixteen megabytes in the body, so the buffer has to
+   * be big enough that a fallback is detected as "far too much" rather than
+   * as a truncated success. It only has to hold the ERROR body in the correct
+   * case. */
+  static char reply[1 << 20];
+  int status = 0;
+  KBC_CHECK(raw_exchange(&s, req.ptr, req.len, &status, reply, sizeof reply));
+  kbc_str_free(&req);
+  /* An error, not a 200 carrying the source. */
+  KBC_CHECK_MSG(status >= 400,
+                "a failed render served status %d instead of an error", status);
+  KBC_CHECK_MSG(strstr(reply, "MARKER-OVERSIZE") == NULL,
+                "a failed render fell back to serving the raw source: %s",
+                reply);
+  KBC_CHECK_MSG(strstr(reply, "<!doctype html>") == NULL,
+                "a failed render served a page anyway: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "Content-Security-Policy") == NULL,
+                "a failed render published artifact headers: %s", reply);
+  /* And the reason is in the answer, so an operator can act on it. */
+  KBC_CHECK_MSG(strstr(reply, "markdown") != NULL,
+                "the render failure does not name the renderer: %s", reply);
+
+  srv_stop(&s);
+  ofx_teardown(&o);
+}
+
+/* A zero-byte `.md` is served as an empty PAGE, not refused.
+ *
+ * This is a real corpus state — a `touch`, a writer that created the file and
+ * never filled it, a truncation — and the route has one specific way to get it
+ * wrong. `read_whole_file` appends to a `kbc_str` and appends nothing for a
+ * zero-byte file, so it hands back `ptr == NULL, len == 0`. That is a correct
+ * description of "no bytes" and a NULL `const char *` is not how the render
+ * API spells a document: `kbc_markdown_render` rejects a NULL `src` as
+ * KBC_ERR_INVALID, which the route's status mapping turns into a 400 — a
+ * "bad request" blaming the caller for a file the caller never wrote. The
+ * render helper therefore passes "" explicitly, and this is the test that
+ * holds that line in place.
+ *
+ * The file is TRUNCATED after indexing, and that is forced rather than
+ * convenient: the indexer skips zero-byte files outright (app.c:1050, "1..N
+ * bytes is out of range"), so a file that was empty all along never gets an id
+ * and the route is unreachable. The route reads the bytes off DISK rather than
+ * out of the store, so a document that HAD content and no longer does reaches
+ * exactly the state under test — the same way the oversize case does, and for
+ * the same reason: the store's row and the file behind it can disagree.
+ *
+ * The assertions are the shape of a rendered page plus the ABSENCE of a
+ * failure. A body-length check alone would not do — "rendered an empty page"
+ * and "served no body" are the same size — so the wrapper is what separates
+ * them. */
+KBC_TEST(an_empty_markdown_artifact_is_an_empty_page_not_an_error) {
+  origin_fixture o;
+  ofx_setup(&o);
+  /* `one.md` is indexed with content and has an id; it is about to be
+   * emptied underneath that id. */
+  char p[KBC_TEST_PATH_MAX];
+  path_under(p, sizeof p, o.sub, "one.md");
+  FILE *f = fopen(p, "wb");
+  KBC_CHECK_NOT_NULL(f);
+  /* A real zero-byte file, not one holding "": kbc_test_write_file writes
+   * strlen(content) bytes, and the bug is specifically about a file with none.
+   * fopen("wb") alone truncates to zero, which is the honest way to make one. */
+  if (f != NULL) (void)fclose(f);
+  {
+    struct stat sb;
+    KBC_CHECK_EQ_INT(stat(p, &sb), 0);
+    KBC_CHECK_MSG(sb.st_size == 0, "the fixture is not zero bytes: %lld",
+                  (long long)sb.st_size);
+  }
+
+  server s;
+  srv_start(&s, &o.f);
+  if (s.h == NULL || o.id[0] == '\0') {
+    srv_stop(&s);
+    ofx_teardown(&o);
+    return;
+  }
+  char path[256];
+  snprintf(path, sizeof path, "/api/kb/kb/artifact/%s", o.id);
+  kbc_str req;
+  kbc_str_init(&req);
+  (void)kbc_str_printf(&req, "GET %s HTTP/1.1\r\nHost: x\r\n\r\n", path);
+  char reply[PAGE_REPLY];
+  int status = 0;
+  KBC_CHECK(raw_exchange(&s, req.ptr, req.len, &status, reply, sizeof reply));
+  kbc_str_free(&req);
+  /* Not a 500. This is the assertion the NULL-source bug would break. */
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK_MSG(strstr(reply, "<!doctype html>") != NULL,
+                "an empty .md did not render the page shell: %s", reply);
+  /* The body container is present and EMPTY — that is what "rendered, with
+   * nothing in it" looks like, and it is not the same as serving no body. */
+  KBC_CHECK_MSG(strstr(reply, "<main class=\"kb-md-doc\"></main>") != NULL,
+                "an empty .md did not render an empty kb-md-doc: %s", reply);
+  /* The document has no title of its own, so it takes the renderer's literal. */
+  KBC_CHECK_MSG(strstr(reply, "<title>Untitled</title>") != NULL,
+                "an empty .md is not titled Untitled: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "</main></body></html>") != NULL,
+                "the empty page is truncated: %s", reply);
+  /* Nothing of the old document survived: it is empty, not stale. */
+  KBC_CHECK_MSG(strstr(reply, "sub artifact") == NULL,
+                "an emptied .md still serves its old body: %s", reply);
+  /* The header set is still the artifact set, not an error's. */
+  KBC_CHECK_MSG(strstr(reply, "Content-Security-Policy: sandbox\r\n") != NULL,
+                "an empty page lost the bare `sandbox` CSP: %s", reply);
+
+  srv_stop(&s);
+  ofx_teardown(&o);
+}
+
+/* Raw HTML in a `.md` is passed through by the renderer — the original's
+ * `render.unsafe = true` — and what contains it is the
+ * `Content-Security-Policy: sandbox` this route sets, which forces the
+ * response into an opaque origin with scripts disabled. The two are read
+ * together, so this asserts BOTH: the passthrough happened, and the policy
+ * that makes it safe is still the bare word `sandbox`.
+ *
+ * A test that only checked the passthrough would pass on a route that had
+ * dropped or widened the CSP, which is the dangerous direction. */
+KBC_TEST(raw_html_in_markdown_passes_through_under_the_sandbox) {
+  origin_fixture o;
+  ofx_setup(&o);
+  static const char kHtml[] = "# Raw\n\nMARKER-HTML <b class=\"x\">bold</b> "
+                              "<script>MARKER-SCRIPT</script>\n";
+  char html_id[KBC_MAX_ID_LEN + 1];
+  ofx_add_md(&o, "raw.md", kHtml, html_id, sizeof html_id);
+  server s;
+  srv_start(&s, &o.f);
+  if (s.h == NULL || html_id[0] == '\0') {
+    srv_stop(&s);
+    ofx_teardown(&o);
+    return;
+  }
+  char path[256];
+  snprintf(path, sizeof path, "/api/kb/kb/artifact/%s", html_id);
+  kbc_str req;
+  kbc_str_init(&req);
+  (void)kbc_str_printf(&req, "GET %s HTTP/1.1\r\nHost: x\r\n\r\n", path);
+  char reply[PAGE_REPLY];
+  int status = 0;
+  KBC_CHECK(raw_exchange(&s, req.ptr, req.len, &status, reply, sizeof reply));
+  kbc_str_free(&req);
+  KBC_CHECK_EQ_INT(status, 200);
+  /* The source's own markup reached the page unescaped. */
+  KBC_CHECK_MSG(strstr(reply, "<b class=\"x\">bold</b>") != NULL,
+                "raw HTML in a .md was escaped instead of passed through: %s",
+                reply);
+  KBC_CHECK_MSG(strstr(reply, "<script>MARKER-SCRIPT</script>") != NULL,
+                "a <script> in a .md was not passed through: %s", reply);
+  /* And the policy that contains it is the whole value: `sandbox`, literally,
+   * with no directive appended that would weaken it into a partial sandbox. */
+  KBC_CHECK_MSG(strstr(reply, "Content-Security-Policy: sandbox\r\n") != NULL,
+                "the passthrough is not contained by a bare `sandbox` CSP: %s",
+                reply);
+  KBC_CHECK_MSG(strstr(reply, "Content-Security-Policy: sandbox allow-") == NULL,
+                "the sandbox CSP was widened: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "X-Content-Type-Options: nosniff") != NULL,
+                "a page carrying raw HTML has no nosniff: %s", reply);
+
+  srv_stop(&s);
+  ofx_teardown(&o);
+}
+
+/* `?download=1` is a download: the SOURCE, not the page. Rendering it would be
+ * wrong — the caller asked for the file, and a file that silently became a
+ * styled HTML document is not the file.
+ *
+ * The `.md` -> `.html` filename rewrite is kept, because it is the original's
+ * wire contract and this route has always sent it; what is asserted here is
+ * the BODY, which is the part that is a behaviour rather than a name. */
+KBC_TEST(a_markdown_download_is_the_source_not_the_page) {
+  origin_fixture o;
+  ofx_setup(&o);
+  server s;
+  srv_start(&s, &o.f);
+  if (s.h == NULL || o.id[0] == '\0') {
+    srv_stop(&s);
+    ofx_teardown(&o);
+    return;
+  }
+  char path[256];
+  snprintf(path, sizeof path, "/api/kb/kb/artifact/%s?download=1", o.id);
+  kbc_str req;
+  kbc_str_init(&req);
+  (void)kbc_str_printf(&req, "GET %s HTTP/1.1\r\nHost: x\r\n\r\n", path);
+  char reply[PAGE_REPLY];
+  int status = 0;
+  KBC_CHECK(raw_exchange(&s, req.ptr, req.len, &status, reply, sizeof reply));
+  kbc_str_free(&req);
+  KBC_CHECK_EQ_INT(status, 200);
+  /* The source's own bytes, ATX marker and all. */
+  KBC_CHECK_MSG(strstr(reply, "# One") != NULL,
+                "?download=1 did not serve the markdown source: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "sub artifact") != NULL,
+                "?download=1 lost the document body: %s", reply);
+  /* And emphatically not a rendered page. */
+  KBC_CHECK_MSG(strstr(reply, "<!doctype html>") == NULL,
+                "?download=1 rendered the document instead of serving it: %s",
+                reply);
+  KBC_CHECK_MSG(strstr(reply, "kb-md-doc") == NULL,
+                "?download=1 served a rendered page: %s", reply);
+  /* The disposition and the name rewrite are unchanged. */
+  KBC_CHECK_MSG(strstr(reply, "Content-Disposition: attachment;") != NULL,
+                "?download=1 does not attach: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "filename=\"one.html\"") != NULL,
+                "a markdown download is not offered as .html: %s", reply);
+
+  srv_stop(&s);
+  ofx_teardown(&o);
+}
+
+/* The title a `.md` is REPORTED under is the renderer's, not the store's, and
+ * for this document the two are provably different — which is the only way
+ * this test can fail.
+ *
+ * `title: Frontmatter Name` above an `# Ignored Heading` is titled
+ * "Ignored Heading" by `kbc_parsed_title` (first h1 wins there) and
+ * "Frontmatter Name" by the renderer's precedence, which is the one the served
+ * page's <title> uses. A document where both functions agree would pass
+ * whether or not the renderer is consulted, so the fixture is chosen to make
+ * them disagree.
+ *
+ * Both JSON surfaces are checked because they are separate code paths, and a
+ * fix that wired only one of them would leave a list row and the artifact it
+ * links to named differently. */
+KBC_TEST(a_markdown_artifact_is_reported_under_the_renderers_title) {
+  origin_fixture o;
+  ofx_setup(&o);
+  static const char kDoc[] = "---\ntitle: Frontmatter Name\n---\n\n"
+                             "# Ignored Heading\n\nbody\n";
+  char fm_id[KBC_MAX_ID_LEN + 1];
+  ofx_add_md(&o, "fm.md", kDoc, fm_id, sizeof fm_id);
+
+  kbc_response r;
+  /* The single-artifact route. */
+  char p[256];
+  snprintf(p, sizeof p, "/api/artifacts/%s", fm_id);
+  KBC_CHECK_EQ_INT(call(&o.f, "GET", p, NULL, NULL, &r), 200);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"title\":\"Frontmatter Name\"") != NULL,
+                "the artifact route does not report the renderer's title: %s",
+                r.body.ptr);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "Ignored Heading") == NULL,
+                "the store's title leaked onto the artifact route: %s",
+                r.body.ptr);
+  kbc_response_free(&r);
+
+  /* The list, which has no source loaded and must fetch one to answer. */
+  KBC_CHECK_EQ_INT(call(&o.f, "GET", "/api/artifacts", AT0, NULL, &r), 200);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"title\":\"Frontmatter Name\"") != NULL,
+                "the list does not report the renderer's title: %s", r.body.ptr);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "Ignored Heading") == NULL,
+                "the list shows the store's title for a .md: %s", r.body.ptr);
+  /* A `.md` with an h1 and no frontmatter is one the two AGREE on, so it
+   * must still be titled normally — a title resolver that answered
+   * "Untitled" for everything would pass the case above and fail this. */
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"title\":\"One\"") != NULL,
+                "a plain h1 .md is no longer titled from its heading: %s",
+                r.body.ptr);
+  kbc_response_free(&r);
+
   ofx_teardown(&o);
 }
 
@@ -2844,6 +3395,22 @@ int main(void) {
        the_artifact_subdomain_is_chosen_by_host},
       {"artifact_bytes_on_the_parent_origin",
        artifact_bytes_on_the_parent_origin},
+      {"a_markdown_artifact_is_served_as_a_rendered_page",
+       a_markdown_artifact_is_served_as_a_rendered_page},
+      {"a_markdown_artifact_is_rendered_on_the_subdomain_too",
+       a_markdown_artifact_is_rendered_on_the_subdomain_too},
+      {"a_non_utf8_markdown_artifact_is_refused_and_serves_no_bytes",
+       a_non_utf8_markdown_artifact_is_refused_and_serves_no_bytes},
+      {"a_failed_markdown_render_is_an_error_not_a_raw_serve",
+       a_failed_markdown_render_is_an_error_not_a_raw_serve},
+      {"an_empty_markdown_artifact_is_an_empty_page_not_an_error",
+       an_empty_markdown_artifact_is_an_empty_page_not_an_error},
+      {"raw_html_in_markdown_passes_through_under_the_sandbox",
+       raw_html_in_markdown_passes_through_under_the_sandbox},
+      {"a_markdown_download_is_the_source_not_the_page",
+       a_markdown_download_is_the_source_not_the_page},
+      {"a_markdown_artifact_is_reported_under_the_renderers_title",
+       a_markdown_artifact_is_reported_under_the_renderers_title},
       {"metrics_is_prometheus_text_exposition",
        metrics_is_prometheus_text_exposition},
       {"metrics_counts_served_api_requests", metrics_counts_served_api_requests},

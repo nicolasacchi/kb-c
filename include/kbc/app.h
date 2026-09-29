@@ -11,6 +11,7 @@
 #include "kbc/config.h"
 #include "kbc/embed.h"
 #include "kbc/index.h"
+#include "kbc/links.h"
 #include "kbc/kbc.h"
 #include "kbc/search.h"
 #include "kbc/store.h"
@@ -94,6 +95,81 @@ typedef struct {
 } kbc_app_stats;
 
 kbc_status kbc_app_stats_get(kbc_app *app, kbc_app_stats *out, kbc_err *err);
+
+/* ------------------------------------------------- the enrichment registry */
+
+/* PORT_PLAN stage 1 unit 5, and SMALLER than the plan's wording. The original
+ * registers eight hooks (kb-core/src/enrich.rs:118-133) and six of them serve
+ * features kb-c does not have — a sessions corpus, two memory ledgers,
+ * memory-link seeding, code-reference extraction, artifact snapshots and
+ * reading-list anchors. Porting them would be a table of empty registrations,
+ * so they are named-and-absent with a reason each, not present-and-dead.
+ *
+ * What IS kb-c's is the DISCIPLINE, and it is the part with teeth
+ * (enrich.rs:14-24): a hook is BEST-EFFORT. Its failure is logged and stepped
+ * over, it must NEVER fail the index, and it must never leave the store half
+ * written. A pre-filter runs first and cheaply, so a hook that cannot apply
+ * costs nothing. Run order IS registration order — the plan says so, and a
+ * batch whose hooks ran in an arbitrary order would be a batch whose result
+ * depended on a sort.
+ *
+ * A BATCH, not a document, and this is the one place kb-c cannot follow the
+ * original. The original enriches per document; kb-c writes the link graph
+ * after the whole walk, because a document linking to a sibling further down
+ * must still produce an edge, and an edge written per document would make the
+ * graph depend on walk order. The convergence property in store.h is what
+ * makes that safe, and this unit is shaped to match it. */
+typedef struct kbc_enrich_ctx kbc_enrich_ctx;
+
+/* One document to enrich: its corpus, its path, and the link targets the
+ * parser found, still unresolved. The original dedups on a normalised target
+ * (enrich.rs:1088-1094) and that has no counterpart here, because the edges
+ * table's own primary key collapses duplicates. */
+typedef struct {
+  const char *corpus;   /* BORROWED; every source in a batch names one corpus,
+                         * because a corpus is the ladder's whole world */
+  const char *src;      /* BORROWED, corpus-relative, '/' separated */
+  char *const *targets; /* BORROWED, owned by the caller */
+  size_t n_targets;
+} kbc_enrich_source;
+
+/* Cheap pre-filter. False means the hook is not run at all. */
+typedef bool (*kbc_enrich_prefilter_fn)(const kbc_enrich_ctx *ctx, void *user);
+typedef kbc_status (*kbc_enrich_fn)(const kbc_enrich_ctx *ctx, void *user,
+                                    kbc_err *err);
+
+/* The registry's size, not a policy: the original's is a fixed eight. */
+#define KBC_ENRICH_MAX_HOOKS 16u
+
+/* What a hook may write through. The store is the ONLY writer — the original
+ * says hooks write through the storage handle and never SQL directly
+ * (enrich.rs:20-24) — and every other field is BORROWED and dies with the
+ * batch, so a hook that keeps one past kbc_enrich_run holds a dangling
+ * pointer. `candidates` is what the resolution ladder may name, and an edge
+ * written to anything outside it is an edge the graph cannot later verify. */
+struct kbc_enrich_ctx {
+  kbc_store *store;
+  const char *corpus;
+  const kbc_enrich_source *sources; /* walk order */
+  size_t n_sources;
+  const kbc_resolve_doc *candidates;
+  size_t n_candidates;
+};
+
+/* Runs `n` hooks over `ctx` in the order given. The arrays are parallel
+ * rather than a struct table so a caller never has to redeclare the hook
+ * layout to use it — mirroring a struct asserts its layout, not its
+ * behaviour. They are packed into the daemon's own table and run by the same
+ * loop, so this entry point and the daemon's path are ONE implementation.
+ *
+ * Returns KBC_OK even when a hook fails: that failure is logged under the
+ * hook's name and the run continues. `err` is filled only for a failure of
+ * the RUN itself, never on a hook's behalf — a caller seeing a failure here
+ * would reasonably conclude the index failed, and it did not. */
+kbc_status kbc_enrich_run(size_t n, const char *const *names,
+                          kbc_enrich_prefilter_fn pre[], kbc_enrich_fn fns[],
+                          void *const *users, const kbc_enrich_ctx *ctx,
+                          kbc_err *err);
 
 /* Test seam: replace the index with one the caller built (used by the
  * integration tests to assert ranking without an on-disk corpus). */
