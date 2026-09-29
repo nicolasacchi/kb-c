@@ -52,6 +52,22 @@ disjoint namespaces publishing different shapes, and the note row carries
 no category, no created, no severity and no summary at all. Reading them
 off the list row made a document that publishes all six front-matter
 fields look like one that publishes none.
+WHY THE DOCUMENT COUNT IS ENUMERATED, NOT READ OFF THE TWO STATUTES. Each
+daemon publishes a "how many documents do I hold" counter and the obvious
+comparison is those two numbers against each other. They are not the same
+quantity, and the rust's is not a document count at all: the
+`/api/kb/{kb}/stats` `doc_count` is `storage.count_rows()` — every physical
+row of that kb's Lance `artifacts` table (routes/stats.rs:182,
+storage/lance.rs:974). Two walks that merge the same documents into the
+same table at once leave duplicate rows behind, so 21 documents can be
+stored as 32 rows; a row whose file has since been deleted is counted too,
+until a reconcile pass reaps it. kb-c's `/api/health` `docs` is the other
+thing entirely: `kbc_index_doc_count()` over the live inverted index
+(httpd.c:847, app.c:6934, index.c:2299) — a count of DISTINCT documents.
+So the count this harness compares is the number of documents each daemon
+actually LISTS, read off the same routes the rest of the suite reads, and
+the two store counters are printed under their own names as what they are:
+settle signals, never compared with each other.
 
 EXIT CODES
   0   every comparison either matched or matched an allowlist entry, and
@@ -520,7 +536,7 @@ def wait_ready(side, kb, timeout, what):
 
 
 def doc_count(side, kb):
-    """How many documents this daemon holds RIGHT NOW.
+    """This daemon's own "documents held" counter, polled.
 
     Per side, not one path for both: the Rust daemon answers
     /api/kb/{kb}/stats and has no /api/health, kb-c answers /api/health and
@@ -528,6 +544,12 @@ def doc_count(side, kb):
     which the settle loop reads as "still counting" until it times out and
     reports zero — a ten-minute run that ends in a fabricated divergence
     nobody can reproduce.
+
+    A SETTLE SIGNAL, never a parity claim. The two counters are not the same
+    quantity — the rust's is a physical Lance row count and kb-c's is a
+    distinct-document count (see the module docstring) — so nothing compares
+    them, and this run's document count is enumerated from the list routes
+    instead.
     """
     path = ("/api/kb/%s/stats" % kb) if side.name == "rust" else "/api/health"
     key = "doc_count" if side.name == "rust" else "docs"
@@ -539,13 +561,14 @@ def doc_count(side, kb):
 
 
 def wait_ingest(side, kb, expected, timeout, log):
-    """Wait for BOTH daemons to hold the whole corpus, then to hold still.
+    """Wait for this daemon to hold the whole corpus, then to hold still.
 
-    The Rust daemon's first ingest lands on a reconcile pass, which is a
-    minute away on a fresh sandbox, so a fixed sleep is a race and "the
-    doc_count stopped moving" is the only settle condition that means
-    anything. Two consecutive equal readings, or a timeout that is reported
-    as a FAILURE rather than as agreement over a half-indexed corpus.
+    A fixed sleep is a race: the rust daemon's first ingest finishes when its
+    embedder is up and its first walk finishes, which is seconds to tens of
+    seconds on a cold sandbox, so "the count stopped moving" is the only
+    settle condition that means anything. Three consecutive equal readings,
+    or a timeout that is reported as a FAILURE rather than as agreement over
+    a half-indexed corpus.
     """
     deadline = time.time() + timeout
     last, stable = -2, 0
@@ -558,26 +581,22 @@ def wait_ingest(side, kb, expected, timeout, log):
             raise Blocked("%s daemon exited during ingest (rc=%d)"
                           % (side.name, side.proc.returncode))
         n = doc_count(side, kb)
-        # Settle on "the count STOPPED MOVING", never on "the count equals
-        # the number of files". Those are different questions and the daemon
-        # does not promise the second: a run observed the Rust side reporting
-        # 32 documents for a 21-file corpus while every reconcile pass it
-        # logged said files=21, so a harness that waits for equality there
-        # waits forever on a daemon that has already finished. The count is
-        # REPORTED and compared as a divergence in its own right; it is not a
-        # precondition for looking at the documents.
-        # Two conditions, because one of them alone is wrong in a different
-        # direction each time:
-        #   n >= expected  the daemon has at least everything the corpus
-        #                  holds. Below that it is still working, and settling
-        #                  on "stopped moving" alone compares 18 of 21
-        #                  documents and calls the missing three agreement.
-        #   stable         and it has stopped moving, so a daemon that
-        #                  OVER-counts (a run observed 32 for a 21-file
-        #                  corpus while every reconcile pass it logged said
-        #                  files=21) is not waited on forever. The over-count
-        #                  is reported as its own divergence; it is not a
-        #                  reason to hang.
+        # Settle on "the count STOPPED MOVING" and "the count is at least the
+        # number of files in the corpus", never on "the count equals it" and
+        # never on "both daemons report the same count". Those are three
+        # different questions, and the counter answers the first two:
+        #   n >= expected  the daemon holds at least everything the corpus
+        #                  walk found. Below that it is still working, and
+        #                  settling on "stopped moving" alone would compare
+        #                  18 of 21 documents and call the missing three
+        #                  agreement.
+        #   stable         and it has stopped moving, so a daemon that stalls
+        #                  below the corpus size is reported as stalled
+        #                  rather than waited on to the timeout.
+        # The value itself is a settle signal and nothing more. It is not
+        # compared with the other daemon's counter — the two are not the same
+        # quantity (module docstring) — and it is not this run's document
+        # count either; that is enumerated from the list routes in main().
         if n == last and n >= 0:
             stable += 1
             if stable >= 3 and n >= expected:
@@ -616,7 +635,14 @@ def pages(side, first, kb):
 
 
 def rust_docs(side, kb):
-    """Every document the Rust daemon holds, notes included.
+    """Every document the Rust daemon holds, notes included, and how many
+    ROWS it took to say so.
+
+    Returns `(by_path, rows)`. The second number is not decoration: this
+    daemon can list the same document twice — two walks that merge the same
+    documents into the same Lance table concurrently append duplicate rows
+    instead of merging them — and keying by path would collapse that into
+    agreement. The caller reports it (main()).
 
     `kb-category: note` documents live in /notes, not /docs, on the Rust
     side and in /artifacts on the kb-c side. Unioning both is the only way
@@ -628,24 +654,29 @@ def rust_docs(side, kb):
     # shapes for the same concept is one more thing every consumer has to
     # unpack correctly, and the one consumer that got it wrong took the run
     # down with a ValueError instead of a report.
-    docs = {}
+    docs, rows = {}, 0
     for d in pages(side, "/api/kb/%s/docs" % kb, kb):
         d["_kind"] = "doc"
+        rows += 1
         docs[d["source_relative"]] = d
     for n in pages(side, "/api/kb/%s/notes" % kb, kb):
         n["_kind"] = "note"
+        rows += 1
         docs[n["source_relative"]] = n
-    return docs
+    return docs, rows
 
 
 def c_docs(side, kb):
-    out = {}
+    """kb-c's documents, and the row count behind them — the same pair
+    `rust_docs` returns, so the two are compared like with like."""
+    out, rows = {}, 0
     for a in pages(side, "/api/artifacts", kb):
         if a.get("corpus") != kb:
             continue
         a["_kind"] = "artifact"
+        rows += 1
         out[a["path"]] = a
-    return out
+    return out, rows
 
 
 # ------------------------------------------------------------------ capture --
@@ -870,8 +901,12 @@ def c_source(side, ident):
     return body.get("source")
 
 
-def run_capture(rep, c, r, kb, fm_override):
-    cdocs, rdocs = c_docs(c, kb), rust_docs(r, kb)
+def run_capture(rep, c, r, kb, fm_override, cdocs, rdocs):
+    # The document sets are enumerated ONCE, in main(), and handed to every
+    # suite: the ingest count, the per-path document_set comparison and the
+    # per-field columns are all statements about the same two enumerations,
+    # and enumerating them per suite would let the count and the comparison
+    # be taken at different moments.
     subjects = sorted(set(cdocs) | set(rdocs))
     print("    capture: %d documents in the union of both daemons" % len(subjects))
 
@@ -1035,6 +1070,19 @@ def backlinked(side, kb, docs):
         for src in srcs:
             edges.add((src, dst))
     return inb, edges
+
+
+def graph_state(c, r, kb, cdocs, rdocs):
+    """Both sides' edge sets, as one value a settle loop can compare.
+
+    Read through `backlinked`, i.e. the same transposed /backlinks route the
+    links suite reads, so what settles is what is compared — a fingerprint
+    taken from some cheaper surface could report "settled" while the thing
+    under test still moves. Both sides are in the tuple: a settle loop that
+    watched only one daemon would stop on whichever finished first.
+    """
+    return (frozenset(backlinked(c, kb, cdocs)[1]),
+            frozenset(backlinked(r, kb, rdocs)[1]))
 
 
 def run_links(rep, c, r, kb, cdocs, rdocs):
@@ -1225,6 +1273,15 @@ def main(argv):
         help="the cmake build directory, named in the stale-binary error")
     ap.add_argument("--ready-timeout", type=int, default=180)
     ap.add_argument("--ingest-timeout", type=int, default=420)
+    ap.add_argument("--startup-timeout", type=int, default=240,
+                    help="how long the rust daemon's OWN startup ingest is "
+                         "given to settle before the harness asks for a "
+                         "further pass; asking while that ingest is still "
+                         "running races it and leaves duplicate rows behind")
+    ap.add_argument("--graph-passes", type=int, default=4,
+                    help="how many settle passes the harness will ask BOTH "
+                         "daemons for while the edge set keeps changing; the "
+                         "graph is compared as it stands when this runs out")
     args = ap.parse_args(argv)
 
     if args.verb == "verify":
@@ -1444,31 +1501,110 @@ def do_run(args):
 
         print("\n[2] ingest, and wait for the graph to settle")
         side_c.post("/api/reindex")
-        side_r.post("/api/kb/%s/reindex" % args.kb_name)
         nc = wait_ingest(side_c, args.kb_name, len(expected),
                          args.ingest_timeout, print)
+        # The rust daemon is NOT asked to reindex while it is still ingesting.
+        # It ingests its whole source at startup — it is started on a fresh
+        # sandbox, so there is nothing a reindex could add — and a reindex
+        # POSTed into that startup ingest starts a second walk merging the
+        # same documents into the same Lance table while the first is still
+        # committing. The two merge_inserts race, the loser appends its rows
+        # beside the winner's instead of merging them, and 11 of the corpus's
+        # 21 documents end up stored twice: measured, the daemon then holds
+        # 32 rows for 21 documents, reports doc_count=32 and serves 32 list
+        # rows over 21 paths, while every reconcile pass it logs says
+        # files=21. Whether the race is lost is a coin flip, so a harness
+        # that provokes it and then reports the number it provoked is
+        # measuring its own footprint — and a gate that is green some of the
+        # time is worse than one that is reliably red.
+        #
+        # The pass that follows is asked for AFTER the startup ingest has
+        # settled, never during it, and it is repeated until the GRAPH stops
+        # changing — see the settle loop below for why the graph needs it.
         nr = wait_ingest(side_r, args.kb_name, len(expected),
-                         args.ingest_timeout, print)
-        print("    kb-c holds %d documents, rust holds %d, corpus has %d"
-              % (nc, nr, len(expected)))
+                         min(args.ingest_timeout, args.startup_timeout),
+                         print)
 
         rep = Report()
-        cdocs, rdocs = {}, {}
+        # The document count is ENUMERATED, not read off either counter: the
+        # counters are a distinct-document count on one side and a physical
+        # row count on the other (module docstring), and only the list routes
+        # answer the question this gate actually asks — how many documents
+        # does each daemon hold. Enumerating once here also means the count,
+        # the per-path document_set comparison and the per-field columns are
+        # all statements about the same two snapshots.
+        cdocs, c_rows = c_docs(side_c, args.kb_name)
+        rdocs, r_rows = rust_docs(side_r, args.kb_name)
+        print("    kb-c lists %d rows over %d documents, rust lists %d rows "
+              "over %d documents, corpus has %d files"
+              % (c_rows, len(cdocs), r_rows, len(rdocs), len(expected)))
+
+        # SETTLING THE GRAPH, WHICH THE DOCUMENT COUNT IS NOT EVIDENCE OF.
+        # The rust records a document's outbound edges by resolving their
+        # targets against the rows that exist AT THAT MOMENT
+        # (`get_by_source_paths`, enrich.rs:996), so on a cold store an edge
+        # whose target is indexed after its source is dropped, or recorded
+        # against the wrong target, and no amount of WAITING fixes it: a
+        # later pass over a fully-written store is what settles it. Measured
+        # on this corpus, `ladder.md -> only-here.md` is the edge that goes
+        # wrong — missing (6 rust edges where kb-c has 8) or pointed at
+        # `ops/Runbook.md` instead, depending on how the ingest batches
+        # interleave — and one further pass puts it right every time.
+        #
+        # So the settle condition is the one this harness already uses for
+        # the document count, applied to the thing the links suite actually
+        # reads: keep asking for a pass until the edge set stops CHANGING.
+        # Both daemons are asked, so neither is measured in a state the
+        # other was not offered the same chance to reach. And the trigger is
+        # "the graph moved", never "the two sides disagree" — a difference
+        # that a further pass would close is a difference this harness must
+        # report, not one it is allowed to retry into agreement.
+        prev = None
+        for attempt in range(args.graph_passes):
+            state = graph_state(side_c, side_r, args.kb_name, cdocs, rdocs)
+            if state == prev:
+                print("    graph settled after %d pass(es)" % attempt)
+                break
+            prev = state
+            print("    graph still moving — asking both daemons for pass %d"
+                  % (attempt + 1))
+            side_c.post("/api/reindex")
+            nc = wait_ingest(side_c, args.kb_name, len(expected),
+                             args.ingest_timeout, print)
+            side_r.post("/api/kb/%s/reindex" % args.kb_name)
+            nr = wait_ingest(side_r, args.kb_name, len(expected),
+                             args.ingest_timeout, print)
+        else:
+            print("    graph had not stopped moving after %d passes; it is "
+                  "compared as it stands" % args.graph_passes)
+        print("    store counters (settle signals — the two are not the same "
+              "quantity and are not compared): kb-c /api/health docs=%d, rust "
+              "/api/kb/%s/stats doc_count=%d" % (nc, args.kb_name, nr))
+
         if args.suite in ("all", "capture"):
             print("\n[3] capture suite — stored artefact and front matter")
-            cdocs, rdocs = run_capture(rep, side_c, side_r, args.kb_name, fm)
+            run_capture(rep, side_c, side_r, args.kb_name, fm, cdocs, rdocs)
         if args.suite in ("all", "links"):
-            if not cdocs:
-                cdocs, rdocs = c_docs(side_c, args.kb_name), \
-                    rust_docs(side_r, args.kb_name)
             print("\n[4] links suite — edges, ladder, backlinks")
             run_links(rep, side_c, side_r, args.kb_name, cdocs, rdocs)
 
-        if nc != nr:
-            classify(rep, Div("ingest", "document_count", "<corpus>", nc, nr,
-                              "the two daemons did not index the same number "
-                              "of documents"), ENTRIES)
-        return finish(rep, args, nc, nr, len(expected))
+        if len(cdocs) != len(rdocs):
+            classify(rep, Div("ingest", "document_count", "<corpus>",
+                              len(cdocs), len(rdocs),
+                              "the two daemons hold a different number of "
+                              "documents; which ones is reported one path at "
+                              "a time as capture/document_set"), ENTRIES)
+        if c_rows != r_rows:
+            classify(rep, Div("ingest", "listed_rows", "<corpus>", c_rows,
+                              r_rows,
+                              "the two daemons returned a different number of "
+                              "list rows for the same corpus; with equal "
+                              "document counts that means one side lists a "
+                              "document it has already listed"), ENTRIES)
+        return finish(rep, args, {"kbc": len(cdocs), "kbc_rows": c_rows,
+                                  "rust": len(rdocs), "rust_rows": r_rows,
+                                  "corpus": len(expected),
+                                  "kbc_counter": nc, "rust_counter": nr})
     finally:
         side_c.stop()
         side_r.stop()
@@ -1478,7 +1614,7 @@ def do_run(args):
             shutil.rmtree(sandbox, ignore_errors=True)
 
 
-def finish(rep, args, nc, nr, expected):
+def finish(rep, args, docs):
     # A GAP — a comparison this run could have made and did not — fails the
     # run, and says which ones, because an unchecked comparison is not an
     # agreeing one. The remedy is the gap's own, so it can never advise
@@ -1609,8 +1745,14 @@ def finish(rep, args, nc, nr, expected):
               "appears only by an explicit edit to %s."
               % (len(ENTRIES), growth, len(ENTRIES) - growth, args.allowlist))
     print("=" * 72)
-    print("kb-c indexed %d, rust indexed %d, corpus has %d files"
-          % (nc, nr, expected))
+    print("kb-c lists %d documents (%d rows), rust lists %d documents "
+          "(%d rows), corpus has %d files"
+          % (docs["kbc"], docs["kbc_rows"], docs["rust"], docs["rust_rows"],
+             docs["corpus"]))
+    print("store counters, reported not compared: kb-c /api/health docs=%d, "
+          "rust /api/kb/%s/stats doc_count=%d — a distinct-document count and "
+          "a physical Lance row count are not the same quantity"
+          % (docs["kbc_counter"], args.kb_name, docs["rust_counter"]))
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
@@ -1629,7 +1771,7 @@ def finish(rep, args, nc, nr, expected):
                                  for u in rep.not_measured],
                 "coverage": {"%s/%s" % k: {"compared": v[0], "documents": v[1]}
                              for k, v in rep.coverage.items()},
-                "documents": {"kbc": nc, "rust": nr, "corpus": expected},
+                "documents": docs,
             }, fh, indent=1, sort_keys=True)
         print("full result: %s" % args.json)
 
