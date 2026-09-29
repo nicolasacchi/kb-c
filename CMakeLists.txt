@@ -78,6 +78,9 @@ if(KBC_BUILD_TESTS)
   target_link_libraries(kbc_testing PUBLIC kbc)
   target_include_directories(kbc_testing PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 
+  # src/rstore.c (the review-store mirror manager) and tests/test_rstore.c
+  # are picked up by the two globs above; there is nothing to add here and
+  # nothing to add for them beyond the skip below.
   file(GLOB KBC_TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_*.c")
   foreach(test_src ${KBC_TEST_SOURCES})
     get_filename_component(test_name "${test_src}" NAME_WE)
@@ -86,6 +89,11 @@ if(KBC_BUILD_TESTS)
     add_test(NAME ${test_name} COMMAND ${test_name})
     set_tests_properties(${test_name} PROPERTIES TIMEOUT 300)
   endforeach()
+  # test_rstore drives REAL git: a bare remote built with real git plumbing, a
+  # real credential-helper shell snippet, and a real flock under a real
+  # fork(2). With no `git` on PATH it exits 77 and there is nothing to
+  # report, which must read as "did not run", never as "passed".
+  set_tests_properties(test_rstore PROPERTIES SKIP_RETURN_CODE 77)
   # kbc_parity.c is deliberately NOT named test_*.c, so the glob above does
   # not take it. It is not a unit test of kb-c; it is the gate that runs the
   # cross-implementation diff against the Rust daemon, and it takes minutes
