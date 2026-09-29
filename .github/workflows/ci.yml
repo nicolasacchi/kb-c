@@ -12,7 +12,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: |
-          sudo apt-get update
+          # Only the default Ubuntu sources. The runner image pre-configures
+          # extra repos (packages.microsoft.com among them) in sources.list.d,
+          # and plain `apt-get update` fetches ALL of them — so an unrelated
+          # 403 from a repo this workflow never asked for turned the gate red
+          # on a commit whose code was fine. Restricting the sourcelist makes
+          # the install depend on packages this job actually uses.
+          sudo apt-get update \
+            -o Dir::Etc::sourcelist="sources.list" \
+            -o Dir::Etc::sourceparts="-" \
+            -o APT::Get::List-Cleanup="0"
           sudo apt-get install -y libsqlite3-dev
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DKBC_WERROR=ON
@@ -27,7 +36,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: |
-          sudo apt-get update
+          # Only the default Ubuntu sources. The runner image pre-configures
+          # extra repos (packages.microsoft.com among them) in sources.list.d,
+          # and plain `apt-get update` fetches ALL of them — so an unrelated
+          # 403 from a repo this workflow never asked for turned the gate red
+          # on a commit whose code was fine. Restricting the sourcelist makes
+          # the install depend on packages this job actually uses.
+          sudo apt-get update \
+            -o Dir::Etc::sourcelist="sources.list" \
+            -o Dir::Etc::sourceparts="-" \
+            -o APT::Get::List-Cleanup="0"
           sudo apt-get install -y libsqlite3-dev
       - name: Configure
         run: cmake -B build -DKBC_SANITIZE=ON
@@ -48,7 +66,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: |
-          sudo apt-get update
+          # Only the default Ubuntu sources. The runner image pre-configures
+          # extra repos (packages.microsoft.com among them) in sources.list.d,
+          # and plain `apt-get update` fetches ALL of them — so an unrelated
+          # 403 from a repo this workflow never asked for turned the gate red
+          # on a commit whose code was fine. Restricting the sourcelist makes
+          # the install depend on packages this job actually uses.
+          sudo apt-get update \
+            -o Dir::Etc::sourcelist="sources.list" \
+            -o Dir::Etc::sourceparts="-" \
+            -o APT::Get::List-Cleanup="0"
           sudo apt-get install -y libsqlite3-dev
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DKBC_WERROR=ON
