@@ -753,9 +753,28 @@ grant loopback.
 loopback → registry token → configured token (no fallback on mismatch) →
 `KB_ALLOW_NO_AUTH=1`. Identity is attribution only, resolved
 `header|token|legacy|loopback`, and it never changes what a caller may do.
-Test: a valid token from a non-loopback peer is admitted and attributed; an
-invalid token from a non-loopback peer is 401 even with a valid
-`X-Kb-Token` registry entry for a different user.
+Test: a valid token from a non-loopback peer is admitted and attributed.
+
+The `X-Kb-Token` clause this paragraph used to carry — "an invalid token from a
+non-loopback peer is 401 even with a valid `X-Kb-Token` registry entry for a
+different user" — is **false against the original**, and the port follows the
+original instead. `registry_match` (kb-server/src/middleware.rs:379-391) takes
+candidates in the fixed order `[bearer, x_kb_token]` and returns the FIRST that
+matches; there is no comparison between the two anywhere, and a bearer that
+fails followed by an `X-Kb-Token` that matches **admits the request**
+(middleware.rs:290-293). So the two carriers are not required to agree,
+disagreement is not an error, and `Authorization` silently outranks
+`X-Kb-Token`.
+
+That is inherited rather than endorsed, and the consequence is written down
+where the ladder is implemented: in the proxy deployment the second carrier
+exists for, the proxy overwrites `Authorization` with the shared daemon token,
+so a request carrying both is attributed to the operator and the per-user secret
+on `X-Kb-Token` is discarded without a word. `/api/identity` now reports which
+carrier decided, because a silent preference is otherwise invisible, and that
+response declares `Vary: Authorization, X-Kb-Token` so a shared cache cannot hand
+one caller's attribution to another. If kb-c ever gains per-user tokens, this is
+the line to revisit.
 
 **P9 — No path reaches the filesystem without the guard.** Every id that
 becomes a path is checked (`..` rejected, `[A-Za-z0-9._-]` only, no leading or

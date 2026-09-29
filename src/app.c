@@ -86,6 +86,19 @@ kbc_status kbc_searcher_set_vecstore(kbc_searcher *s, const kbc_vecstore *vs,
  * applied here; see the note there for the header line the
  * orchestrator should add. */
 kbc_status kbc_since_value_ns(const char *value, int64_t *ns, kbc_err *err);
+/* The query cache's ceiling, and only that: hits, misses, invalidations and
+ * the live entry count are fields on the frozen kbc_app_stats, filled in
+ * kbc_app_stats_get. A capacity is not a counter — it is what tells an
+ * operator whether the eviction ceiling is doing any work at all. */
+size_t kbc_app_query_cache_capacity(const kbc_app *app);
+
+
+/* The eviction ceiling: the original's DEFAULT_CAPACITY (embed_cache.rs:52).
+ * It is also the capacity the linear-scan measurement in embed.h was taken
+ * at, so raising it would make that number untrue. The daemon exposes no
+ * config key for it — kbc_config is frozen, and this file is not config.c —
+ * so 1024 is a constant rather than a setting. */
+#define APP_QUERY_CACHE_CAPACITY 1024u
 /* The link graph's write, and the per-source view it takes. Defined next to
  * store_forget_path; declared here because reindex_locked is the caller that
  * owns the whole document set. */
@@ -145,6 +158,18 @@ struct kbc_app {
   kbc_embedder *embed;
   kbc_watcher *watch;
   char *vec_path; /* KBC_OWN */
+  /* The query-embedding LRU, KBC_OWN: created in kbc_app_open, freed in
+   * kbc_app_close, never touched by a reindex, and never REPLACED — the
+   * pointer is written once, before any worker can see the app, so every
+   * reader needs no lock of its own and the cache's own mutex in embed.c is
+   * the only synchronisation in this path. That is what makes the stale-vector
+   * question unnecessary here rather than merely unaddressed: the model name
+   * is in the key and is read off the live wire on every call, a sidecar that
+   * fails to handshake has no model to key under, and a replacement announcing
+   * a different model is a different key. An owned object rather than a global
+   * is what lets it hang off the app at all (AGENTS.md rule 5), and one
+   * instance shared by the daemon is the original's process-wide behaviour. */
+  kbc_query_cache *qcache;
 
   /* NOT the rwlock, and not a second view of it. The two indexers — the full
    * rebuild and the single-file path — run on different threads (an httpd
@@ -177,6 +202,20 @@ struct kbc_app {
   _Atomic int64_t st_terms;
   _Atomic int64_t st_docs;
   _Atomic int64_t st_bytes;
+  /* Query-cache observability. hits/misses/drops are per CALL, not per byte,
+   * and together they account for every search that entered the query lane: a
+   * hit came from the LRU, a miss embedded and wrote back, a drop embedded and
+   * FAILED so nothing was written. The ratio of hits to misses is the only
+   * number that says whether the ~100 ms is being saved; drops is the one that
+   * says the sidecar is refusing or dying.
+   *
+   * The header describes query_cache_drops as counting whole-cache
+   * invalidations. There are none: the app never throws the cache away (see
+   * the qcache field), so the field counts failed query embeds instead and its
+   * comment in app.h should say so. */
+  _Atomic int64_t st_qc_hits;
+  _Atomic int64_t st_qc_misses;
+  _Atomic int64_t st_qc_drops;
 };
 
 
@@ -1089,6 +1128,69 @@ static float *embed_one(kbc_app *app, kbc_arena *a, const char *text,
   }
   *dim_out = kbc_embedder_dim(app->embed);
   return *dim_out ? out : NULL;
+}
+
+/* ------------------------------------------------------ query cache ---- */
+
+/* Embeds a QUERY, through the LRU.
+ *
+ * Same sidecar and same wire as embed_one; the difference is that the second
+ * identical query costs a ~19 us linear scan instead of a 50-100 ms round
+ * trip, and that a hit never opens the pipe at all — kbc_embed_query consults
+ * the cache before the embedder, and reports embed_ms == 0 because on a hit
+ * there is no embedding step to time. The query text is the only part of the
+ * key: corpus, mode, limit and top-k are not in it and cannot be, since they
+ * do not change what a query embeds to.
+ *
+ * WHY OUTSIDE app->lock. The search takes the read lock for {index, vec} a few
+ * lines on, and the cache has a mutex of its own in embed.c; reaching the
+ * cache under the rwlock would put a scan on the critical path of a lock a
+ * reindex swap also wants. Nothing here runs with app->lock or reindex_mu
+ * held, and nothing here needs a lock of the app's own: app->qcache is written
+ * once in kbc_app_open and freed once in kbc_app_close, so the cache's own
+ * mutex is the only synchronisation this path has.
+ *
+ * A NULL cache is not a second-class mode: it is embed_one, the call this file
+ * made before the cache existed. That covers an app with no sidecar and an app
+ * whose cache could not be allocated. */
+static float *embed_query(kbc_app *app, kbc_arena *a, const char *text,
+                          size_t *dim_out, kbc_err *why) {
+  *dim_out = 0;
+  if (app->qcache == NULL) {
+    return embed_one(app, a, text, dim_out, why);
+  }
+  kbc_query_outcome oc;
+  kbc_err local;
+  kbc_err_reset(&local);
+  const kbc_status st =
+      kbc_embed_query(app->embed, app->qcache, a, text, &oc, &local);
+
+  if (oc.cache_hit) {
+    atomic_fetch_add_explicit(&app->st_qc_hits, 1, memory_order_relaxed);
+  } else if (st == KBC_OK) {
+    atomic_fetch_add_explicit(&app->st_qc_misses, 1, memory_order_relaxed);
+  }
+  if (kbc_failed(st) || oc.vec == NULL || oc.dim == 0) {
+    if (st == KBC_OK) {
+      /* A success carrying no vector is still a failed query, and saying
+       * "success" in the log would send an operator looking at the sidecar
+       * for a refusal that never happened. */
+      (void)kbc_err_set(&local, KBC_ERR_INTERNAL,
+                        "query embed returned no vector");
+    }
+    KBC_LOGW("embedder: %s, query lane degraded", local.msg);
+    atomic_fetch_add_explicit(&app->st_qc_drops, 1, memory_order_relaxed);
+    if (why != NULL) {
+      *why = local;
+    }
+    return NULL;
+  }
+  /* No query text in the log: it is caller-supplied and rule 9 says an
+   * unescaped query fragment does not go into a log line. */
+  KBC_LOGD("query cache: %s, %llu ms of embedding",
+           oc.cache_hit ? "hit" : "miss", (unsigned long long)oc.embed_ms);
+  *dim_out = oc.dim;
+  return oc.vec;
 }
 
 /* --------------------------------------------------------- quarantine --- */
@@ -2368,6 +2470,22 @@ kbc_app *kbc_app_open(const kbc_config *cfg, kbc_err *err) {
     }
   }
 
+  /* The query cache, created BEFORE the sidecar on purpose: a sidecar that
+   * fails to start then unwinds through kbc_app_close with a live cache to
+   * free, so the error path is the same code the normal path is.
+   *
+   * A NULL cache is survivable, not fatal, because kbc_embed_query defines it
+   * as "embed unconditionally" and the query lane then runs embed_one — this
+   * file's behaviour before the cache existed. Losing the cache costs the
+   * 50-100 ms a repeat query used to pay; failing the open would cost the
+   * daemon. */
+  app->qcache = kbc_query_cache_new(APP_QUERY_CACHE_CAPACITY, NULL);
+  if (app->qcache == NULL) {
+    KBC_LOGW("query cache of %u entries could not be allocated, query "
+             "embeddings will not be cached",
+             (unsigned)APP_QUERY_CACHE_CAPACITY);
+  }
+
   if (app->cfg->embedder_cmd && app->cfg->embedder_cmd[0] != '\0') {
     const size_t clen = strlen(app->cfg->embedder_cmd);
     char *cbuf = malloc(clen + 1);
@@ -2409,6 +2527,13 @@ void kbc_app_close(kbc_app *app) {
   if (app->embed) {
     kbc_embedder_stop(app->embed);
     app->embed = NULL;
+  }
+  if (app->qcache) {
+    /* Freeed after the last search has returned, never during one: the httpd
+     * joins its workers before the app closes, and an entry is malloc'd per
+     * key, so this is the only place any of them is released. */
+    kbc_query_cache_free(app->qcache);
+    app->qcache = NULL;
   }
   if (app->vec) {
     kbc_vecstore_free(app->vec);
@@ -2875,9 +3000,20 @@ out:
  * writes are the reason it is taken at all: the full pass writes the same rows
  * for the same documents — upsert_artifact, replace_chunks, replace_metas, the
  * edges — and `chunks` is UNIQUE(doc_id, ord), so a rebuild ingesting a
- * document while the single-file path ingests the same one produced
- * "chunk <id>/0: duplicate ord" and a FAILED reindex. Serialising only the
- * index, as this did, left the half that actually collides unprotected.
+ * document while the single-file path ingests the same one collided. Serialising
+ * only the index, as this did, left the half that actually collides unprotected.
+ *
+ * A CORRECTION, since this comment named the wrong constraint. Measurement
+ * later showed the ord collision is UNREACHABLE even between two apps over one
+ * data dir: `replace_chunks` holds BEGIN IMMEDIATE across its DELETE and its
+ * INSERT, so SQLite serialises the connections itself. What actually fired was
+ * a FOREIGN KEY violation — `chunks.doc_id REFERENCES artifacts(id)` — because
+ * ingest is two transactions and another app's removal lands between the
+ * artifact upsert and the chunk write. That is why the lock spans several store
+ * calls rather than one: the window is between them, not inside either. The
+ * message was "duplicate ord" because kb-c leaves sqlite's extended result
+ * codes off, so every constraint returns the primary code 19; the store now
+ * reads the extended code and names the constraint that actually fired.
  *
  * The lock covers the whole body rather than the store phase and the index
  * phase separately, because the two must not be separable: split, the store
@@ -3808,20 +3944,28 @@ kbc_status kbc_app_search(kbc_app *app, kbc_arena *a, const kbc_query *q,
   kbc_status pre = query_since_ns(q->q, &since_ns, err);
   if (kbc_failed(pre)) return pre;
   if (q->since_ns > since_ns) since_ns = q->since_ns;
-  pthread_rwlock_rdlock(&app->lock);
-
+  /* The query vector is computed BEFORE the read lock, and the reason is the
+   * lock, not the ordering. Everything this needs — the embedder, the cache,
+   * both immutable after open — is stable without it, and the only thing the
+   * lock guards is {index, vec}, which the query vector does not depend on.
+   * So the 50-100 ms sidecar round trip (or the 19 us cache scan that avoids
+   * it) is no longer held against a reindex that is waiting to swap the index
+   * under the WRITE lock: the old comment here said the read lock kept a slow
+   * sidecar from stalling that swap, and holding nothing keeps that promise
+   * strictly better. The health test moved with the call: with a cache a dead
+   * sidecar must not block a HIT, and kbc_embed_query already fails a miss
+   * against a reaped child in one exchange_raw call. */
   kbc_arena *ea = NULL;
   float *vec = NULL;
   size_t vec_len = 0;
-  if (app->embed && kbc_embedder_healthy(app->embed)) {
-    /* Embedding is a subprocess round trip. It runs under the READ lock: a
-     * slow sidecar must not stall the swap a concurrent reindex is waiting to
-     * make, and the embedder serializes its own pipe internally. */
+  if (app->embed) {
     ea = kbc_arena_new(16u * 1024u);
     if (ea) {
-      vec = embed_one(app, ea, q->q, &vec_len, NULL);
+      vec = embed_query(app, ea, q->q, &vec_len, NULL);
     }
   }
+
+  pthread_rwlock_rdlock(&app->lock);
 
   /* The searcher is handed no resolver: the rows come back with their corpus
    * and path already copied into the caller's arena, which is everything the
@@ -4157,7 +4301,24 @@ kbc_status kbc_app_stats_get(kbc_app *app, kbc_app_stats *out, kbc_err *err) {
     atomic_store_explicit(&app->st_bytes, bytes, memory_order_relaxed);
   }
   out->db_bytes = atomic_load_explicit(&app->st_bytes, memory_order_relaxed);
+  /* The query cache. app->qcache is immutable after kbc_app_open, so reading
+   * the pointer needs nothing; the entry count is a sampled number taken under
+   * the cache's own lock, which is a lock this file does not hold anywhere
+   * else. */
+  out->query_cache_entries = (int64_t)kbc_query_cache_len(app->qcache);
+  out->query_cache_hits =
+      atomic_load_explicit(&app->st_qc_hits, memory_order_relaxed);
+  out->query_cache_misses =
+      atomic_load_explicit(&app->st_qc_misses, memory_order_relaxed);
+  out->query_cache_drops =
+      atomic_load_explicit(&app->st_qc_drops, memory_order_relaxed);
   return KBC_OK;
+}
+
+/* The one query-cache number that is not a counter. Safe on NULL, so a caller
+ * holding no app reads 0 rather than crashing. */
+size_t kbc_app_query_cache_capacity(const kbc_app *app) {
+  return app == NULL ? 0 : kbc_query_cache_capacity(app->qcache);
 }
 
 void kbc_app_set_index(kbc_app *app, kbc_index *ix) {

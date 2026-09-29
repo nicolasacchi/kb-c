@@ -312,6 +312,43 @@ static kbc_status sql_fail(kbc_err *err, const kbc_store *s, const char *what,
   return st;
 }
 
+/* What a bare SQLITE_CONSTRAINT actually was.
+ *
+ * The connection leaves extended result codes OFF, so a failed step hands back
+ * the primary code 19 whatever broke: the unique index, the foreign key, a
+ * NOT NULL, a CHECK. Guessing one of those is how "chunk <id>/0: duplicate
+ * ord" came to be reported for a write that had nothing to do with ords — the
+ * one constraint chunks can hit besides the primary key is the foreign key
+ * onto artifacts, and it fires whenever another writer removes the document
+ * between the artifact upsert and this call. The extended code is still
+ * available on demand, so the diagnosis is read rather than assumed.
+ *
+ * `fkey` names the table the foreign key points at, and is NULL where the
+ * table has no foreign key to blame. Anything this does not recognise falls
+ * through to sql_fail, which reports sqlite's own words.
+ *
+ * The status is left KBC_ERR_CONFLICT on every branch: a caller decides what a
+ * lost race means, and this layer only knows what broke. */
+static kbc_status constraint_fail(kbc_err *err, const kbc_store *s,
+                                  const char *what, const char *fkey) {
+  switch (sqlite3_extended_errcode(s->db)) {
+    case SQLITE_CONSTRAINT_PRIMARYKEY:
+      return kbc_err_set(err, KBC_ERR_CONFLICT, "%s: a row with this key is "
+                                                "already there",
+                         what);
+    case SQLITE_CONSTRAINT_UNIQUE:
+      return kbc_err_set(err, KBC_ERR_CONFLICT,
+                         "%s: a row with this value is already there", what);
+    case SQLITE_CONSTRAINT_FOREIGNKEY:
+      return kbc_err_set(err, KBC_ERR_CONFLICT,
+                         "%s: no such row in %s — the row it references is "
+                         "gone",
+                         what, fkey ? fkey : "the referenced table");
+    default:
+      return sql_fail(err, s, what, sqlite3_errcode(s->db));
+  }
+}
+
 static kbc_status bind_text(kbc_err *err, const kbc_store *s, sqlite3_stmt *st,
                             int i, const char *v) {
   /* SQLITE_TRANSIENT: sqlite copies, so a caller buffer that dies before
@@ -755,10 +792,16 @@ kbc_status kbc_store_upsert_artifact(kbc_store *s, const kbc_artifact *a,
   }
   if (st == KBC_OK) {
     int step = sqlite3_step(ins);
-    if (step == SQLITE_CONSTRAINT)
-      st = kbc_err_set(err, KBC_ERR_CONFLICT, "artifact %s: constraint", a->id);
-    else if (step != SQLITE_DONE)
+    if (step == SQLITE_CONSTRAINT) {
+      /* "constraint" on its own told an operator nothing. The only constraint
+       * left after the (corpus, path) probe above is the one another writer
+       * can win between that probe and this statement. */
+      char what[KBC_MAX_ID_LEN + 16];
+      (void)snprintf(what, sizeof what, "artifact %s", a->id);
+      st = constraint_fail(err, s, what, NULL);
+    } else if (step != SQLITE_DONE) {
       st = sql_fail(err, s, "upsert artifact", step);
+    }
   }
   kbc_status fin2 = finalize(err, s, ins, st);
   if (st == KBC_OK) st = fin2;
@@ -1870,11 +1913,18 @@ kbc_status kbc_store_replace_chunks(kbc_store *s, const kbc_chunk_in *chunks,
     }
     if (rc == KBC_OK) {
       int step = sqlite3_step(ins);
-      if (step == SQLITE_CONSTRAINT)
-        rc = kbc_err_set(err, KBC_ERR_CONFLICT, "chunk %s/%u: duplicate ord",
-                         chunks[i].doc_id, chunks[i].ord);
-      else if (step != SQLITE_DONE)
+      if (step == SQLITE_CONSTRAINT) {
+        /* Read BEFORE the reset: reset re-reports the step's error as its own,
+         * and the extended code is only the last failed call's. The context
+         * names the document because chunks.doc_id IS the artifact id, and
+         * "artifacts" is the only table this key can point at. */
+        char what[KBC_MAX_ID_LEN + 32];
+        (void)snprintf(what, sizeof what, "chunk %s/%u", chunks[i].doc_id,
+                       chunks[i].ord);
+        rc = constraint_fail(err, s, what, "artifacts");
+      } else if (step != SQLITE_DONE) {
         rc = sql_fail(err, s, "insert chunk", step);
+      }
       (void)sqlite3_reset(ins);
     }
   }

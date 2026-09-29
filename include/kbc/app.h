@@ -59,8 +59,7 @@ uint64_t kbc_app_subscribe(kbc_app *app, kbc_event_fn fn, void *user);
 void kbc_app_unsubscribe(kbc_app *app, uint64_t id);
 void kbc_app_publish(kbc_app *app, const char *type, const char *json_payload);
 
-/* Counters for /api/metrics and `kbc status`. */
-/* Counters for GET /api/stats and `kbc status`. */
+/* Counters for GET /api/stats, /api/metrics and `kbc status`. */
 typedef struct {
   int64_t artifacts_indexed;
   int64_t reindex_runs;
@@ -72,6 +71,16 @@ typedef struct {
   int64_t index_terms;
   int64_t index_docs;
   int64_t db_bytes;
+  /* The query-embedding cache. A cache nobody can read is a cache nobody can
+   * tell is working, and the hit ratio is the only evidence the thing does
+   * anything at all. `query_cache_drops` counts whole-cache invalidations —
+   * a sidecar that failed a query and is no longer healthy — which is the
+   * number that distinguishes "the cache is cold" from "the cache is being
+   * thrown away". */
+  int64_t query_cache_hits;
+  int64_t query_cache_misses;
+  int64_t query_cache_drops;
+  int64_t query_cache_entries;
 } kbc_app_stats;
 
 kbc_status kbc_app_stats_get(kbc_app *app, kbc_app_stats *out, kbc_err *err);

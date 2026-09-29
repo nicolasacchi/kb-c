@@ -94,6 +94,84 @@ kbc_status kbc_vecstore_gather(const kbc_vecstore *v, const uint32_t *ids,
                                size_t n, kbc_arena *a, float *out,
                                kbc_err *err);
 
+/* --------------------------------------------------------- query cache -- */
+
+/* Caches one embedding per (model, query). The key is those two fields and
+ * NOTHING else — no corpus, no mode, no limit, no top-k, no dim and no
+ * embedder identity. The original is emphatic about it (embed_cache.rs:320-322)
+ * and the reason is the failure it prevents: two distinct models can share a
+ * dim, and serving one's vector under the other's key returns silently wrong
+ * results with no dim error left to catch it.
+ *
+ * The key is the RAW query — no trim, no case fold, no whitespace collapse and
+ * no hash — so two queries differing only past the embedder's 32 KiB input cap
+ * share an entry and the first to populate wins. That is the original's
+ * behaviour and it is reproduced rather than quietly "fixed".
+ *
+ * A caller-owned object, not a global: AGENTS.md rule 5 forbids mutable
+ * file-scope state, and one instance shared by the daemon IS the original's
+ * process-wide behaviour without the global. Sharing it across embedders
+ * running different models is safe precisely because the model is in the key;
+ * a caller wanting isolation passes a separate cache.
+ *
+ * Look-up is a LINEAR SCAN with tuple equality, not a hash, and the reason is
+ * measured rather than assumed: at capacity 1024 a random hit costs about
+ * 19 us, and contention is flat from 1 to 8 threads, against the 50-100 ms
+ * sidecar round trip this cache exists to avoid — 0.02-0.04% of the work it
+ * replaces. If embedding ever gets a hundred times faster the trade flips and
+ * a hash wins; that is recorded here so the decision gets revisited rather
+ * than inherited. */
+typedef struct kbc_query_cache kbc_query_cache;
+
+typedef struct {
+  float *vec;  /* KBC_ARENA, `dim` floats; NULL on a failed embed */
+  size_t dim;
+  uint64_t embed_ms; /* wall time of the EMBEDDING STEP, and exactly 0 on a
+                      * hit, because on a hit there is no embedding step to
+                      * time. Timing the whole call would make this field say
+                      * nothing about whether inference happened. */
+  bool cache_hit;
+} kbc_query_outcome;
+
+/* `capacity` is the eviction ceiling and is never exceeded, not even
+ * transiently. 0 is KBC_ERR_INVALID: a cache with no room is not a cache. */
+kbc_query_cache *kbc_query_cache_new(size_t capacity, kbc_err *err);
+void kbc_query_cache_free(kbc_query_cache *c);
+size_t kbc_query_cache_len(const kbc_query_cache *c);
+size_t kbc_query_cache_capacity(const kbc_query_cache *c);
+
+/* `get` MUTATES the LRU order — a hit moves the entry to most-recently-used,
+ * so eviction is least-recently-*used*. That is not obvious from the signature
+ * and it is load-bearing.
+ *
+ * `*vec` is a KBC_ARENA copy in `a`, valid as long as `a`, and NOT a pointer
+ * into the cache: a later `put` of the same key may replace the entry, and a
+ * caller still holding the vector would otherwise be reading freed memory. */
+bool kbc_query_cache_get(kbc_query_cache *c, const char *model,
+                         const char *query, size_t query_len, kbc_arena *a,
+                         const float **vec, size_t *dim);
+
+/* Replacing an existing key does not grow the cache. */
+kbc_status kbc_query_cache_put(kbc_query_cache *c, const char *model,
+                               const char *query, size_t query_len,
+                               const float *vec, size_t dim, kbc_err *err);
+
+/* The model the sidecar ACTUALLY loaded, captured off the wire at handshake
+ * time and never reconstructed from argv — argv is the operator's request,
+ * the wire is what the model is. An over-long name is KBC_ERR_PARSE rather
+ * than a truncation, because a clipped name collides with every other clipped
+ * name, which is the failure the name is in the key to prevent. */
+kbc_status kbc_embedder_model(kbc_embedder *e, char *out, size_t cap,
+                              kbc_err *err);
+
+/* The cached path: a hit answers without touching the sidecar, a miss embeds,
+ * puts, and reports the `embed_ms` it took. `c` may be NULL, which embeds
+ * unconditionally — so a caller with no cache is not a special case. */
+kbc_status kbc_embed_query(kbc_embedder *e, kbc_query_cache *c, kbc_arena *a,
+                           const char *query, kbc_query_outcome *out,
+                           kbc_err *err);
+
+
 #ifdef __cplusplus
 }
 #endif

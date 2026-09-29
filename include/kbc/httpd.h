@@ -32,6 +32,13 @@ typedef struct {
   const char *body;    /* BORROWED, NUL-terminated by the server */
   size_t body_len;
   const char *auth;    /* borrowed Authorization header value, "" if absent */
+  const char *x_kb_token; /* borrowed X-Kb-Token value, "" when absent; the
+                           * second auth carrier beside Authorization. The
+                           * ladder gives Authorization PRECEDENCE and does
+                           * not require the two to agree, matching the
+                           * original; `/api/identity` reports which one was
+                           * used, because a silent preference is invisible
+                           * on the wire. */
   const char *client_addr;
 } kbc_request;
 

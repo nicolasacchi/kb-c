@@ -53,6 +53,25 @@
 #define KBC_EMBED_DRAIN_TIMEOUT_MS 2000
 #define KBC_EMBED_READ_CHUNK 8192u
 #define KBC_EMBED_MAX_DIM 65536u
+/* The model name the sidecar announces, and the ceiling on it. The name is
+ * half the query cache key (embed_cache.rs:66-70), so it is captured from the
+ * handshake rather than reconstructed from argv. Over-long is a protocol
+ * error, not a truncation: a key built from a clipped name would collide
+ * with every other clipped name, which is the silent-wrong-vector failure the
+ * model is in the key to prevent. */
+#define KBC_EMBED_MODEL_MAX 128u
+
+/* In-memory query-cache capacity. kb's DEFAULT_CAPACITY is 1024 for the same
+ * reason it is here: a 1024-dim vector is ~4 KB, so a full cache is ~4 MB
+ * resident, and the linear scan it replaces is noise next to the ~50-100 ms
+ * sidecar round trip the cache exists to avoid. */
+#define KBC_QUERY_CACHE_DEFAULT_CAPACITY 1024u
+
+/* Backstop on one key's query bytes. Nothing inside kb-c can reach it: the
+ * search layer clamps a query to KBC_MAX_QUERY_LEN (4096) before it gets
+ * here. It exists because the cache copies the key into a slot, and an
+ * unbounded copy is what rule 7 forbids. */
+#define KBC_QUERY_CACHE_KEY_MAX (64u * 1024u)
 
 /* --------------------------------------------------------------- sidecar - */
 
@@ -67,6 +86,16 @@ struct kbc_embedder {
   _Atomic int64_t requests;
   _Atomic int64_t failures;
   _Atomic uint64_t req_id; /* next request id; the sidecar echoes it back */
+  /* The sidecar's announced model, "" when it announced none. Guarded by its
+   * own mutex, NOT by `mu`: a cache hit must not queue behind an in-flight
+   * document embed to learn which model it is keyed on. */
+  pthread_mutex_t mmu;
+  char model[KBC_EMBED_MODEL_MAX + 1];
+  /* Set once a handshake has completed, whatever it announced. It separates
+   * "the sidecar named no model" (a legitimate key, the empty string) from
+   * "we have not asked yet" (KBC_ERR_NOTFOUND) — a caller must be able to
+   * tell those apart, or it will cache vectors under a key it never chose. */
+  _Atomic bool handshaked;
 };
 
 typedef enum {
@@ -358,6 +387,8 @@ static kbc_status exchange_raw(kbc_embedder *e, const kbc_str *req,
 static const char *reply_kind(const kbc_json *j);
 static kbc_status sidecar_error(const char *msg, kbc_err *err);
 static size_t reply_dim(const kbc_json *j, bool *bad);
+static kbc_status note_model(kbc_embedder *e, const kbc_json *j, kbc_err *err);
+
 
 /* Request ids are ours to allocate; the sidecar only echoes them, so all this
  * has to guarantee is that two in-flight requests never share one. */
@@ -400,7 +431,14 @@ static kbc_status exchange(kbc_embedder *e, const kbc_str *req, kbc_str *line,
     /* The ready line is the handshake; take its dimension and keep reading. */
     bool bad = false;
     size_t d = ready ? reply_dim(j, &bad) : 0;
+    /* The model arrives on the same ready line. Taken before the arena dies;
+     * a name we cannot hold is a protocol error, and the stream is already
+     * untrustworthy at that point. */
+    st = ready ? note_model(e, j, err) : KBC_OK;
     kbc_arena_free(a);
+    if (kbc_failed(st)) {
+      return st;
+    }
     if (stale) {
       return kbc_err_set(err, KBC_ERR_PARSE,
                          "sidecar %s: reply to request %llu, expected %llu",
@@ -413,6 +451,10 @@ static kbc_status exchange(kbc_embedder *e, const kbc_str *req, kbc_str *line,
     if (!bad && d > 0) {
       atomic_store(&e->dim, d);
     }
+    /* A ready absorbed mid-request IS a handshake: the sidecar told us what
+     * it loaded, so the model is now a known fact even though no explicit
+     * health exchange ran. */
+    atomic_store(&e->handshaked, true);
     /* Read the line that actually answers the request. */
     kbc_str tmp;
     kbc_str_init(&tmp);
@@ -483,6 +525,17 @@ kbc_embedder *kbc_embedder_start(const char *const *argv, kbc_err *err) {
     (void)kbc_err_set(err, KBC_ERR_INTERNAL, "pthread_mutex_init for sidecar");
     return NULL;
   }
+  if (pthread_mutex_init(&e->mmu, NULL) != 0) {
+    for (size_t i = 0; i < argc; i++) {
+      free(e->args[i]);
+    }
+    free(e->args);
+    (void)pthread_mutex_destroy(&e->mu);
+    free(e);
+    (void)kbc_err_set(err, KBC_ERR_INTERNAL,
+                      "pthread_mutex_init for the model name");
+    return NULL;
+  }
   kbc_status st = spawn(e, err);
   if (kbc_failed(st)) {
     for (size_t i = 0; i < argc; i++) {
@@ -490,6 +543,7 @@ kbc_embedder *kbc_embedder_start(const char *const *argv, kbc_err *err) {
     }
     free(e->args);
     (void)pthread_mutex_destroy(&e->mu);
+    (void)pthread_mutex_destroy(&e->mmu);
     free(e);
     return NULL;
   }
@@ -509,6 +563,7 @@ void kbc_embedder_stop(kbc_embedder *e) {
   }
   free(e->args);
   (void)pthread_mutex_destroy(&e->mu);
+  (void)pthread_mutex_destroy(&e->mmu);
   free(e);
 }
 
@@ -518,6 +573,56 @@ bool kbc_embedder_healthy(const kbc_embedder *e) {
 
 size_t kbc_embedder_dim(const kbc_embedder *e) {
   return e == NULL ? 0 : atomic_load(&e->dim);
+}
+
+/* The model the sidecar ACTUALLY loaded, copied into the caller's buffer.
+ *
+ * Copying rather than returning a pointer into `e` is what lets the caller
+ * hold the name across a concurrent handshake without re-reading a buffer
+ * that handshake is rewriting.
+ *
+ * Every failure leaves `out` EMPTY rather than partially filled. A half
+ * copied name is the worst possible result here: it is a valid C string that
+ * is not the model's name, and it would key a cache entry under it. */
+kbc_status kbc_embedder_model(kbc_embedder *e, char *out, size_t cap,
+                              kbc_err *err) {
+  if (out == NULL || cap == 0) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "out buffer and capacity must be non-zero");
+  }
+  out[0] = '\0';
+  if (e == NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "embedder must not be NULL");
+  }
+  if (!atomic_load(&e->handshaked)) {
+    /* Distinct from a sidecar that handshook and named nothing: that one
+     * hands back "" and is cacheable, this one we simply have not asked. */
+    return kbc_err_set(err, KBC_ERR_NOTFOUND,
+                       "sidecar has not completed a handshake, so its model "
+                       "is not known yet");
+  }
+  (void)pthread_mutex_lock(&e->mmu);
+  size_t n = strlen(e->model);
+  if (n > KBC_EMBED_MODEL_MAX) {
+    /* Unreachable while note_model refuses an over-long name at the wire, but
+     * a truncation here would still be a silent key collision, so it is
+     * reported rather than clipped. */
+    (void)pthread_mutex_unlock(&e->mmu);
+    out[0] = '\0';
+    return kbc_err_set(err, KBC_ERR_PARSE,
+                       "recorded model name is %zu bytes, over the %u limit",
+                       n, KBC_EMBED_MODEL_MAX);
+  }
+  if (n >= cap) {
+    (void)pthread_mutex_unlock(&e->mmu);
+    out[0] = '\0';
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "model name needs %zu bytes, buffer holds %zu", n + 1,
+                       cap);
+  }
+  memcpy(out, e->model, n + 1);
+  (void)pthread_mutex_unlock(&e->mmu);
+  return KBC_OK;
 }
 
 void kbc_embedder_counts(const kbc_embedder *e, int64_t *requests,
@@ -549,6 +654,37 @@ static size_t reply_dim(const kbc_json *j, bool *bad) {
     return 0;
   }
   return (size_t)v;
+}
+
+/* Records the model the sidecar says it is serving. This is the `model`
+ * half of the query cache key, taken from the wire rather than from argv
+ * because argv is the operator's REQUEST and the wire is what the model
+ * actually loaded — the case where they disagree is exactly the case where a
+ * wrong cache key is silently wrong.
+ *
+ * A missing model is not an error: a sidecar that names nothing still gets a
+ * cache, keyed on the empty name. Refusing to cache would trade a slow query
+ * for a search lane that stops working.
+ *
+ * An over-long name IS an error. Truncating it would make two different
+ * models share a key prefix, which is the collision the model name in the key
+ * exists to prevent. */
+static kbc_status note_model(kbc_embedder *e, const kbc_json *j,
+                             kbc_err *err) {
+  const char *m = kbc_json_str(j, "model", NULL);
+  if (m == NULL) {
+    return KBC_OK;
+  }
+  size_t n = strlen(m);
+  if (n > KBC_EMBED_MODEL_MAX) {
+    return kbc_err_set(err, KBC_ERR_PARSE,
+                       "sidecar model name is %zu bytes, over the %u limit", n,
+                       KBC_EMBED_MODEL_MAX);
+  }
+  (void)pthread_mutex_lock(&e->mmu);
+  memcpy(e->model, m, n + 1);
+  (void)pthread_mutex_unlock(&e->mmu);
+  return KBC_OK;
 }
 
 /* The production sidecar tags every envelope with "kind" (serde's internally
@@ -652,6 +788,12 @@ static kbc_status handshake(kbc_embedder *e, kbc_err *err) {
       atomic_store(&e->dim, (size_t)d);
     }
   }
+  if (st == KBC_OK) {
+    /* Both handshake shapes carry the model: {"kind":"ready",...} from the
+     * production sidecar and the older {"ok":true,...}. It is read here
+     * rather than in either branch so a future shape cannot forget it. */
+    st = note_model(e, j, err);
+  }
   kbc_arena_free(a);
   kbc_str_free(&req);
 
@@ -670,6 +812,11 @@ static kbc_status handshake(kbc_embedder *e, kbc_err *err) {
     kbc_str_free(&drain);
   }
   kbc_str_free(&line);
+  /* Set only on success. A restart that leaves the embedder without a
+   * handshake must report NOTFOUND for the model rather than serving the
+   * PREVIOUS sidecar's name: the child is gone, and its name is not a fact
+   * about whatever loads next. */
+  atomic_store(&e->handshaked, st == KBC_OK);
   return st;
 }
 
@@ -949,6 +1096,424 @@ done:
   }
   kbc_str_free(&line);
   return st;
+}
+
+/* ----------------------------------------------------- query cache ------- */
+
+/* The query-embedding LRU, ported from kb-server/src/embed_cache.rs.
+ *
+ * The whole cache exists because `kbc_embedder_embed` is a ~50-100 ms
+ * round trip through the sidecar's stdio, paid again on every keystroke and
+ * again in every corpus that shares a model.
+ *
+ * Four decisions are load-bearing and all four come from the original. They
+ * are collected here because each one looks like an improvement waiting to
+ * happen, and each improvement is a bug:
+ *
+ *  1. The key is (model, query) and NOTHING ELSE. No corpus, no mode, no
+ *     limit, no top-k, no dim, no embedder identity. The original says so
+ *     twice and means it (embed_cache.rs:9-12, :320-322 — "the cache key is
+ *     (model, query) — not a corpus"). A query's embedding does not depend on
+ *     which corpus asked for it, so a corpus in the key is pure duplication.
+ *  2. The key is the RAW query string. No trim, no lowercase, no whitespace
+ *     collapse, no hash of a normalised form. The embedder's own 32 KiB
+ *     input cap (kb-core/src/embed.rs:59, applied at :395) lives INSIDE the
+ *     embedder, downstream of this key, so two queries differing only past
+ *     byte 32768 do land on the same vector by the first-to-populate. We
+ *     reproduce that: the cap is not applied here, so we do not accidentally
+ *     give those two queries different entries.
+ *  3. The model NAME, never the dim. Two distinct models can share a dim
+ *     (bge-base-en-v1.5 and jina-embeddings-v2-base-code are both 768), and
+ *     serving one's vector under the other's key is silently wrong with no
+ *     dim error to catch it (embed_cache.rs:154-158).
+ *  4. There is NO TTL. No timestamp on the key, no expiry, no sweeper. An
+ *     entry lives until eviction or process exit. A model's output for a
+ *     fixed input is deterministic, so an expiry would buy nothing and cost
+ *     a timestamp in every comparison.
+ *
+ * Lookup is a LINEAR SCAN with tuple equality, not a hash, and that is
+ * deliberate: capacity is 1024, so a 1024-entry scan is noise next to the
+ * ~100 ms embed it replaces, and a hash table would be more code for no
+ * measurable win (embed_cache.rs:9-12, :105). The scan is why the model is
+ * compared first — it is a short string and it discriminates immediately.
+ *
+ * SCOPE. In the original this is process-wide, held in an Arc and shared by
+ * every kb. kb-c has no global mutable state (rule 5), so the store is an
+ * ordinary owned object the caller creates once and passes to every query.
+ * One instance shared by the daemon is the same thing without the global;
+ * the key carrying the model is what makes that safe for two embedders
+ * running different models in one process, which is also why it is in the
+ * key. A caller who wants per-embedder isolation passes a separate cache.
+ *
+ * PERSISTENCE. The original saves the top PERSIST_CAP=256 entries to
+ * <state>/query-embed-cache.json and reloads them, so hot queries survive a
+ * restart. kb-c does NOT persist, and the reason is that a cold start is
+ * cheap here in a way it was not there: the file is a state-directory
+ * contract (kb-core/src/paths.rs:221) that kb-c has not frozen a path for,
+ * and the win is only "hot queries stay warm across a restart", which is
+ * strictly less than the ~100 ms it costs to re-embed. Persistence is
+ * deferred until kb-c has a state directory to name, not forgotten.
+ *
+ * CONCURRENCY. One mutex covers the whole scan-and-mutate, as in the
+ * original's `Mutex<VecDeque<..>>`. The lock is held across the whole
+ * scan-and-touch, so it is the only contention point in the query path; its
+ * cost is measured in the port report rather than assumed negligible. The
+ * sidecar exchange is NOT under it: a hit must never queue behind a document
+ * embed, and a miss must not hold this lock across a ~100 ms round trip. */
+
+typedef struct qc_entry {
+  struct qc_entry *prev, *next; /* LRU order; head = most recently used */
+  char *model;                   /* KBC_OWN, interned per entry */
+  char *query;                   /* KBC_OWN, the raw query bytes */
+  size_t query_len;
+  float *vec;                    /* KBC_OWN, dim floats */
+  size_t dim;
+  size_t model_len;
+} qc_entry;
+
+struct kbc_query_cache {
+  qc_entry *head, *tail; /* head = MRU, tail = next to evict */
+  size_t len, capacity;
+  pthread_mutex_t mu;
+};
+
+/* Tuple equality: model name AND raw query bytes. Nothing else compares. */
+static bool qc_key_eq(const qc_entry *e, const char *model, size_t model_len,
+                      const char *query, size_t query_len) {
+  return e->model_len == model_len && e->query_len == query_len &&
+         memcmp(e->model, model, model_len) == 0 &&
+         memcmp(e->query, query, query_len) == 0;
+}
+
+static void qc_unlink(kbc_query_cache *c, qc_entry *e) {
+  if (e->prev != NULL) {
+    e->prev->next = e->next;
+  } else {
+    c->head = e->next;
+  }
+  if (e->next != NULL) {
+    e->next->prev = e->prev;
+  } else {
+    c->tail = e->prev;
+  }
+  e->prev = e->next = NULL;
+  c->len--;
+}
+
+static void qc_push_front(kbc_query_cache *c, qc_entry *e) {
+  e->prev = NULL;
+  e->next = c->head;
+  if (c->head != NULL) {
+    c->head->prev = e;
+  } else {
+    c->tail = e;
+  }
+  c->head = e;
+  c->len++;
+}
+
+static void qc_entry_free(qc_entry *e) {
+  if (e == NULL) {
+    return;
+  }
+  free(e->model);
+  free(e->query);
+  free(e->vec);
+  free(e);
+}
+
+/* Evicts from the tail until there is room for one more. The original is
+ * `while g.len() > self.capacity { g.pop_back() }` AFTER the push, so it
+ * transiently holds capacity+1 entries; evicting BEFORE the push keeps the
+ * invariant true at every observable instant, which is strictly stronger at
+ * no cost — the same number of pops for the same sequence of puts. */
+static void qc_make_room(kbc_query_cache *c) {
+  while (c->len >= c->capacity && c->tail != NULL) {
+    qc_entry *victim = c->tail;
+    qc_unlink(c, victim);
+    qc_entry_free(victim);
+  }
+}
+
+kbc_query_cache *kbc_query_cache_new(size_t capacity, kbc_err *err) {
+  if (capacity == 0) {
+    (void)kbc_err_set(err, KBC_ERR_INVALID,
+                       "query cache capacity must be at least 1");
+    return NULL;
+  }
+  if (capacity > SIZE_MAX / sizeof(qc_entry)) {
+    (void)kbc_err_set(err, KBC_ERR_NOMEM, "query cache capacity %zu overflows",
+                      capacity);
+    return NULL;
+  }
+  kbc_query_cache *c = calloc(1, sizeof *c);
+  if (c == NULL) {
+    (void)kbc_err_set(err, KBC_ERR_NOMEM, "calloc kbc_query_cache");
+    return NULL;
+  }
+  c->capacity = capacity;
+  if (pthread_mutex_init(&c->mu, NULL) != 0) {
+    free(c);
+    (void)kbc_err_set(err, KBC_ERR_INTERNAL,
+                      "pthread_mutex_init for the query cache");
+    return NULL;
+  }
+  return c;
+}
+
+void kbc_query_cache_free(kbc_query_cache *c) {
+  if (c == NULL) {
+    return;
+  }
+  (void)pthread_mutex_lock(&c->mu);
+  qc_entry *e = c->head;
+  while (e != NULL) {
+    qc_entry *next = e->next;
+    qc_entry_free(e);
+    e = next;
+  }
+  c->head = c->tail = NULL;
+  c->len = 0;
+  (void)pthread_mutex_unlock(&c->mu);
+  (void)pthread_mutex_destroy(&c->mu);
+  free(c);
+}
+
+size_t kbc_query_cache_len(const kbc_query_cache *c) {
+  if (c == NULL) {
+    return 0;
+  }
+  kbc_query_cache *w = (kbc_query_cache *)(uintptr_t)(const void *)c;
+  (void)pthread_mutex_lock(&w->mu);
+  size_t n = c->len;
+  (void)pthread_mutex_unlock(&w->mu);
+  return n;
+}
+
+/* On a hit, copies the vector into `a` and MOVES the entry to the front.
+ * The move is the point: `get` is a mutating touch in the original
+ * (embed_cache.rs:103-107 — remove(pos) then push_front), which is what
+ * makes the eviction order least-recently-USED rather than
+ * least-recently-inserted. A read that does not touch degrades the cache
+ * into a FIFO and a hot query still gets evicted.
+ *
+ * The copy is not an optimisation artefact: the caller gets a KBC_ARENA
+ * vector that outlives the lock, and the entry's own buffer is freed or
+ * overwritten on the next eviction of that key. */
+bool kbc_query_cache_get(kbc_query_cache *c, const char *model,
+                          const char *query, size_t query_len, kbc_arena *a,
+                          const float **vec, size_t *dim) {
+  if (c == NULL || model == NULL || query == NULL || a == NULL || vec == NULL ||
+      dim == NULL) {
+    return false;
+  }
+  *vec = NULL;
+  *dim = 0;
+  size_t model_len = strlen(model);
+  (void)pthread_mutex_lock(&c->mu);
+  qc_entry *hit = NULL;
+  for (qc_entry *e = c->head; e != NULL; e = e->next) {
+    if (qc_key_eq(e, model, model_len, query, query_len)) {
+      hit = e;
+      break;
+    }
+  }
+  if (hit == NULL) {
+    (void)pthread_mutex_unlock(&c->mu);
+    return false;
+  }
+  size_t d = hit->dim;
+  if (d > SIZE_MAX / sizeof(float)) {
+    (void)pthread_mutex_unlock(&c->mu);
+    return false;
+  }
+  float *copy = kbc_arena_alloc(a, d * sizeof(float));
+  if (copy == NULL) {
+    /* A failed copy is a miss, not a wrong answer: the caller falls through
+     * to the sidecar and re-caches. Returning false keeps the arena OOM from
+     * turning into a silently truncated vector. */
+    (void)pthread_mutex_unlock(&c->mu);
+    return false;
+  }
+  memcpy(copy, hit->vec, d * sizeof(float));
+  qc_unlink(c, hit);
+  qc_push_front(c, hit);
+  (void)pthread_mutex_unlock(&c->mu);
+  *vec = copy;
+  *dim = d;
+  return true;
+}
+
+/* Inserts or replaces (model, query). Replacing does NOT grow the cache: the
+ * original removes the old entry before pushing (embed_cache.rs:113-116),
+ * and a put that appended instead would let a repeatedly-queried key grow
+ * the cache without bound while evicting everything else. */
+kbc_status kbc_query_cache_put(kbc_query_cache *c, const char *model,
+                               const char *query, size_t query_len,
+                               const float *vec, size_t dim, kbc_err *err) {
+  if (c == NULL || model == NULL || query == NULL || vec == NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "cache, model, query and vec must not be NULL");
+  }
+  if (dim == 0 || dim > KBC_EMBED_MAX_DIM) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "cache vector dim %zu is out of "
+                                            "range",
+                       dim);
+  }
+  size_t model_len = strlen(model);
+  if (model_len > KBC_EMBED_MODEL_MAX) {
+    return kbc_err_set(err, KBC_ERR_INVALID, "model name %zu is over the %u "
+                                            "limit",
+                       model_len, KBC_EMBED_MODEL_MAX);
+  }
+  if (query_len > KBC_QUERY_CACHE_KEY_MAX) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "query is %zu bytes, over the %u cache key limit",
+                       query_len, KBC_QUERY_CACHE_KEY_MAX);
+  }
+  if (dim > SIZE_MAX / sizeof(float)) {
+    return kbc_err_set(err, KBC_ERR_NOMEM, "dim %zu overflows", dim);
+  }
+
+  /* Build the replacement before touching the list, so an allocation failure
+   * leaves the cache exactly as it was (rule 10: no half-applied put). */
+  qc_entry *fresh = calloc(1, sizeof *fresh);
+  if (fresh == NULL) {
+    return kbc_err_set(err, KBC_ERR_NOMEM, "calloc query cache entry");
+  }
+  fresh->model = malloc(model_len + 1);
+  fresh->query = malloc(query_len + 1);
+  fresh->vec = malloc(dim * sizeof(float));
+  if (fresh->model == NULL || fresh->query == NULL || fresh->vec == NULL) {
+    qc_entry_free(fresh);
+    return kbc_err_set(err, KBC_ERR_NOMEM,
+                       "query cache entry for model \"%s\" (%zu x %zu floats)",
+                       model, query_len, dim);
+  }
+  memcpy(fresh->model, model, model_len + 1);
+  memcpy(fresh->query, query, query_len);
+  fresh->query[query_len] = '\0';
+  memcpy(fresh->vec, vec, dim * sizeof(float));
+  fresh->model_len = model_len;
+  fresh->query_len = query_len;
+  fresh->dim = dim;
+
+  (void)pthread_mutex_lock(&c->mu);
+  qc_entry *old = NULL;
+  for (qc_entry *e = c->head; e != NULL; e = e->next) {
+    if (qc_key_eq(e, model, model_len, query, query_len)) {
+      old = e;
+      break;
+    }
+  }
+  if (old != NULL) {
+    qc_unlink(c, old);
+  }
+  qc_make_room(c);
+  qc_push_front(c, fresh);
+  (void)pthread_mutex_unlock(&c->mu);
+  qc_entry_free(old);
+  return KBC_OK;
+}
+
+
+/* Embeds one query, consulting and then populating `c`.
+ *
+ * The two out-fields are NOT counters, they are per-call facts about THIS
+ * call, and the pairing is what makes them readable:
+ *
+ *   embed_ms   wall time of the EMBEDDING step, in ms. ZERO on a cache hit,
+ *              because on a hit there is no embedding step to time
+ *              (embed_cache.rs:224-229, :284-290). It does not time the
+ *              lookup, so it is not "how long the query took".
+ *   cache_hit  whether the vector came from the cache rather than the
+ *              sidecar.
+ *
+ * A caller reading embed_ms==0 therefore knows it did no inference, without
+ * having to correlate two fields. If embed_ms timed the whole call it would
+ * be non-zero on a hit and the field would say nothing.
+ *
+ * The cache is consulted BEFORE the embedder is locked, so a hit never waits
+ * behind an in-flight document embed. On a miss the vector is put back into
+ * the cache before returning, so a burst of identical queries costs one
+ * round trip rather than one per caller. */
+kbc_status kbc_embed_query(kbc_embedder *e, kbc_query_cache *c, kbc_arena *a,
+                           const char *query, kbc_query_outcome *out,
+                           kbc_err *err) {
+  if (e == NULL || a == NULL || out == NULL || query == NULL) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "embedder, arena, query and out must not be NULL");
+  }
+  memset(out, 0, sizeof *out);
+  if (query[0] == '\0') {
+    return kbc_err_set(err, KBC_ERR_INVALID, "query must not be empty");
+  }
+  size_t query_len = strlen(query);
+  if (query_len > KBC_QUERY_CACHE_KEY_MAX) {
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "query is %zu bytes, over the %u cache key limit",
+                       query_len, KBC_QUERY_CACHE_KEY_MAX);
+  }
+
+  /* `c == NULL` embeds unconditionally, so a caller with no cache is not a
+   * special case. No key is built and none is needed, so an embedder that
+   * has not handshook is not in the way here. */
+  char model[KBC_EMBED_MODEL_MAX + 1];
+  if (c != NULL) {
+    /* A failure here is reported, not swallowed. Embedding anyway and then
+     * skipping the write-back would return a correct vector now and make
+     * every later identical query a miss, with nothing saying why. */
+    kbc_status mst = kbc_embedder_model(e, model, sizeof model, err);
+    if (kbc_failed(mst)) {
+      return mst;
+    }
+
+    const float *hit_vec = NULL;
+    size_t hit_dim = 0;
+    if (kbc_query_cache_get(c, model, query, query_len, a, &hit_vec, &hit_dim)) {
+      /* The arena owns this copy; the const on hit_vec only records that the
+       * cache never handed out its own buffer. */
+      out->vec = (float *)(uintptr_t)(const void *)hit_vec;
+      out->dim = hit_dim;
+      out->embed_ms = 0; /* no embedding ran, so there is nothing to time */
+      out->cache_hit = true;
+      return KBC_OK;
+    }
+  }
+
+  const char *texts[1];
+  texts[0] = query;
+  float *vec = NULL;
+  int64_t started = now_ms();
+  kbc_status st = kbc_embedder_embed(e, a, texts, 1u, 0, &vec, err);
+  int64_t elapsed = now_ms() - started;
+  if (kbc_failed(st)) {
+    return st;
+  }
+  size_t dim = kbc_embedder_dim(e);
+  if (vec == NULL || dim == 0) {
+    return kbc_err_set(err, KBC_ERR_INTERNAL,
+                      "sidecar returned no vector for a query");
+  }
+  out->vec = vec;
+  out->dim = dim;
+  out->embed_ms = (uint64_t)(elapsed > 0 ? elapsed : 0);
+  out->cache_hit = false;
+  /* A failed write-back is not a failed query: the vector is already in hand
+   * and the caller must have it. The next identical query just misses again.
+   * `model` is only initialised when `c != NULL`, so the put is guarded by
+   * the same condition rather than reading an uninitialised key. */
+  if (c != NULL) {
+    kbc_err scratch;
+    kbc_err_reset(&scratch);
+    (void)kbc_query_cache_put(c, model, query, query_len, vec, dim, &scratch);
+  }
+  return KBC_OK;
+}
+
+
+size_t kbc_query_cache_capacity(const kbc_query_cache *c) {
+  return c == NULL ? 0 : c->capacity;
 }
 
 /* ---------------------------------------------------------- vector store - */

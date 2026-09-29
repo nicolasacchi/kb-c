@@ -11,6 +11,7 @@
  * runs -Werror=format-truncation, and a 4096-byte root plus a leaf is a
  * warning no matter how carefully the sizes are written.
  */
+#include <pthread.h>
 #include <sys/wait.h>
 
 #include "kbc/embed.h"
@@ -726,6 +727,956 @@ KBC_TEST(embedder_start_rejects_bad_argv) {
   kbc_embedder_stop(NULL); /* must be safe */
 }
 
+/* --------------------------------------------------------- query cache -- */
+
+/* A fake sidecar that names its model and returns a dim-3 vector, so a test
+ * can tell WHICH sidecar answered rather than only that something did. The
+ * announced model is what the cache key is built from. */
+static void make_model_fake(const char *path, const char *model) {
+  static char script[8192];
+  sbuf b = {script, sizeof script, 0};
+  sb_add(&b, "#!/bin/sh\n");
+  sb_add(&b, "while IFS= read -r line; do\n");
+  sb_add(&b, "  case \"$line\" in\n");
+  sb_add(&b, "  *health*) printf '%s\\n' '{\"ok\":true,\"dim\":3,\"model\":\"");
+  sb_add(&b, model);
+  sb_add(&b, "\"}' ;;\n");
+  sb_add(&b, "  *embed*) printf '%s\\n' '{\"ok\":true,\"dim\":3,\"vectors\":"
+             "[[1.5,-2.25,3]]}' ;;\n");
+  sb_add(&b, "  esac\n");
+  sb_add(&b, "done\n");
+  kbc_test_write_file(path, script);
+  KBC_CHECK_MSG(chmod(path, 0755) == 0, "chmod %s: %s", path, strerror(errno));
+}
+
+/* Starts a fake and completes its handshake, which is where the model name
+ * is learned. */
+static kbc_embedder *start_model_fake(const char *dir, const char *leaf,
+                                      const char *model) {
+  static char script[KBC_TEST_PATH_MAX];
+  KBC_CHECK_NOT_NULL(join_path(script, sizeof script, dir, leaf));
+  make_model_fake(script, model);
+  const char *argv[2] = {script, NULL};
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_embedder *e = kbc_embedder_start(argv, &err);
+  KBC_CHECK_MSG(e != NULL, "start %s: %s", leaf, err.msg);
+  if (e == NULL) {
+    return NULL;
+  }
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embedder_restart(e, &err));
+  return e;
+}
+
+/* THE key test. Two models of the SAME dim must not share an entry: a
+ * dim-keyed cache serves one model's vector for the other's query, and
+ * nothing anywhere reports an error. */
+KBC_TEST(query_cache_two_models_same_dim_do_not_share) {
+  char *dir = case_dir("qc-two-models");
+  if (dir == NULL) {
+    return;
+  }
+  kbc_embedder *a = start_model_fake(dir, "a.sh", "bge-base-en-v1.5");
+  kbc_embedder *b =
+      start_model_fake(dir, "b.sh", "jina-embeddings-v2-base-code");
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_query_cache *c = kbc_query_cache_new(8, &err);
+  kbc_arena *ar = kbc_arena_new(1024);
+  KBC_CHECK_NOT_NULL(c);
+  KBC_CHECK_NOT_NULL(ar);
+  if (a == NULL || b == NULL || c == NULL || ar == NULL) {
+    kbc_embedder_stop(a);
+    kbc_embedder_stop(b);
+    kbc_query_cache_free(c);
+    kbc_arena_free(ar);
+    kbc_test_rmrf(dir);
+    return;
+  }
+  KBC_CHECK_EQ_INT(kbc_embedder_dim(a), 3);
+  KBC_CHECK_EQ_INT(kbc_embedder_dim(b), 3);
+  char ma[160];
+  char mb[160];
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embedder_model(a, ma, sizeof ma, &err));
+  KBC_CHECK_OK(kbc_embedder_model(b, mb, sizeof mb, &err));
+  KBC_CHECK_EQ_STR(ma, "bge-base-en-v1.5");
+  KBC_CHECK_EQ_STR(mb, "jina-embeddings-v2-base-code");
+
+  kbc_query_outcome oa;
+  kbc_query_outcome ob;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embed_query(a, c, ar, "shared query", &oa, &err));
+  KBC_CHECK_MSG(!oa.cache_hit, "the first query cannot be a cache hit");
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embed_query(b, c, ar, "shared query", &ob, &err));
+  /* Same text, same dim, different model: a MISS. A hit here means the key
+   * carries the dim rather than the model name. */
+  KBC_CHECK_MSG(!ob.cache_hit,
+                "a same-dim different-model query was served from the cache");
+
+  /* And both entries coexist, so replaying A is a hit on A's own entry. */
+  kbc_query_outcome again;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embed_query(a, c, ar, "shared query", &again, &err));
+  KBC_CHECK_MSG(again.cache_hit, "model A's own replay missed its entry");
+  KBC_CHECK_EQ_INT(kbc_query_cache_len(c), 2);
+
+  /* A model nobody announced shares nothing, at the same dim. */
+  kbc_arena *peek = kbc_arena_new(256);
+  KBC_CHECK_NOT_NULL(peek);
+  const float *va = NULL;
+  const float *vb = NULL;
+  const float *vn = NULL;
+  size_t dim = 0;
+  KBC_CHECK(kbc_query_cache_get(c, "bge-base-en-v1.5", "shared query", 12, peek,
+                                &va, &dim));
+  KBC_CHECK(kbc_query_cache_get(c, "jina-embeddings-v2-base-code",
+                                "shared query", 12, peek, &vb, &dim));
+  KBC_CHECK(!kbc_query_cache_get(c, "some-other-model", "shared query", 12,
+                                 peek, &vn, &dim));
+  KBC_CHECK_NULL(vn);
+
+  kbc_arena_free(peek);
+  kbc_arena_free(ar);
+  kbc_query_cache_free(c);
+  kbc_embedder_stop(a);
+  kbc_embedder_stop(b);
+  check_no_zombie("query_cache_two_models_same_dim_do_not_share");
+  kbc_test_rmrf(dir);
+}
+
+/* A hit does not call the sidecar and reports embed_ms 0, which is what makes
+ * the field readable: 0 means no embedding step ran. */
+KBC_TEST(query_cache_hit_skips_sidecar_and_reports_zero_ms) {
+  char *dir = case_dir("qc-hit");
+  if (dir == NULL) {
+    return;
+  }
+  kbc_embedder *e = start_model_fake(dir, "one.sh", "fake-model");
+  if (e == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_query_cache *c = kbc_query_cache_new(8, &err);
+  kbc_arena *ar = kbc_arena_new(1024);
+  KBC_CHECK_NOT_NULL(c);
+  KBC_CHECK_NOT_NULL(ar);
+  if (c == NULL || ar == NULL) {
+    kbc_query_cache_free(c);
+    kbc_arena_free(ar);
+    kbc_embedder_stop(e);
+    kbc_test_rmrf(dir);
+    return;
+  }
+
+  kbc_query_outcome miss;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embed_query(e, c, ar, "how do I reindex?", &miss, &err));
+  KBC_CHECK_MSG(!miss.cache_hit, "the first query reported a cache hit");
+  KBC_CHECK_NOT_NULL(miss.vec);
+  if (miss.vec != NULL) {
+    KBC_CHECK_EQ_DBL(miss.vec[0], 1.5, 0.0);
+    KBC_CHECK_EQ_DBL(miss.vec[1], -2.25, 0.0);
+    KBC_CHECK_EQ_DBL(miss.vec[2], 3.0, 0.0);
+  }
+  KBC_CHECK_EQ_INT(miss.dim, 3);
+  int64_t after_miss = -1;
+  kbc_embedder_counts(e, &after_miss, NULL);
+  KBC_CHECK_MSG(after_miss > 0, "the miss never reached the sidecar");
+
+  kbc_query_outcome hit;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embed_query(e, c, ar, "how do I reindex?", &hit, &err));
+  KBC_CHECK_MSG(hit.cache_hit, "the replayed query missed the cache");
+  KBC_CHECK_MSG(hit.embed_ms == 0,
+                "a cache hit reported embed_ms %llu; it is 0 because no "
+                "embedding step ran",
+                (unsigned long long)hit.embed_ms);
+  KBC_CHECK_EQ_INT(hit.dim, 3);
+  KBC_CHECK_NOT_NULL(hit.vec);
+  if (hit.vec != NULL) {
+    KBC_CHECK_EQ_DBL(hit.vec[0], 1.5, 0.0);
+    KBC_CHECK_EQ_DBL(hit.vec[1], -2.25, 0.0);
+  }
+  /* The proof the sidecar was not called: the request counter is unchanged.
+   * A hit that quietly re-embedded would move it. */
+  int64_t after_hit = -1;
+  kbc_embedder_counts(e, &after_hit, NULL);
+  KBC_CHECK_MSG(after_hit == after_miss,
+                "a cache hit spent %lld extra sidecar request(s)",
+                (long long)(after_hit - after_miss));
+
+  /* A different query under the same model is a separate entry and does
+   * reach the sidecar. */
+  kbc_query_outcome other;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(
+      kbc_embed_query(e, c, ar, "how do I rebuild the index?", &other, &err));
+  KBC_CHECK_MSG(!other.cache_hit, "a different query hit the first entry");
+  int64_t after_other = -1;
+  kbc_embedder_counts(e, &after_other, NULL);
+  KBC_CHECK_EQ_INT(after_other, after_miss + 1);
+  KBC_CHECK_EQ_INT(kbc_query_cache_len(c), 2);
+
+  kbc_arena_free(ar);
+  kbc_query_cache_free(c);
+  kbc_embedder_stop(e);
+  check_no_zombie("query_cache_hit_skips_sidecar_and_reports_zero_ms");
+  kbc_test_rmrf(dir);
+}
+
+/* A get TOUCHES: it moves the entry to the front, so the next put evicts a
+ * DIFFERENT entry than it would have without the touch. Without the move the
+ * cache is a FIFO and "aaa survived" below fails. */
+KBC_TEST(query_cache_get_touches_lru_order) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_query_cache *c = kbc_query_cache_new(3, &err);
+  KBC_CHECK_NOT_NULL(c);
+  if (c == NULL) {
+    return;
+  }
+  const float v[3] = {1.0f, 2.0f, 3.0f};
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_query_cache_put(c, "m", "aaa", 3, v, 3, &err));
+  KBC_CHECK_OK(kbc_query_cache_put(c, "m", "bbb", 3, v, 3, &err));
+  KBC_CHECK_OK(kbc_query_cache_put(c, "m", "ccc", 3, v, 3, &err));
+  KBC_CHECK_EQ_INT(kbc_query_cache_len(c), 3);
+
+  /* Touch the oldest. LRU order becomes ccc, aaa, bbb — bbb is the victim.
+   * Without the touch it would be aaa. */
+  kbc_arena *a1 = kbc_arena_new(256);
+  KBC_CHECK_NOT_NULL(a1);
+  const float *got = NULL;
+  size_t dim = 0;
+  KBC_CHECK(kbc_query_cache_get(c, "m", "aaa", 3, a1, &got, &dim));
+  KBC_CHECK_NOT_NULL(got);
+  KBC_CHECK_EQ_INT(dim, 3);
+
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_query_cache_put(c, "m", "ddd", 3, v, 3, &err));
+  KBC_CHECK_EQ_INT(kbc_query_cache_len(c), 3);
+
+  kbc_arena *a2 = kbc_arena_new(256);
+  KBC_CHECK_NOT_NULL(a2);
+  const float *out = NULL;
+  size_t d2 = 0;
+  KBC_CHECK_MSG(kbc_query_cache_get(c, "m", "aaa", 3, a2, &out, &d2),
+                "the touched entry was evicted; get is not touching");
+  KBC_CHECK_MSG(!kbc_query_cache_get(c, "m", "bbb", 3, a2, &out, &d2),
+                "the least-recently-used entry survived an overflowing put");
+  KBC_CHECK(kbc_query_cache_get(c, "m", "ccc", 3, a2, &out, &d2));
+  KBC_CHECK(kbc_query_cache_get(c, "m", "ddd", 3, a2, &out, &d2));
+
+  kbc_arena_free(a1);
+  kbc_arena_free(a2);
+  kbc_query_cache_free(c);
+}
+
+/* Capacity is a ceiling that is never exceeded, and re-putting a live key
+ * REPLACES rather than appends. The ceiling is asserted after EVERY put: an
+ * implementation that appends and trims on the next call passes a check made
+ * only at the end. */
+KBC_TEST(query_cache_capacity_ceiling_and_reput) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_query_cache *c = kbc_query_cache_new(4, &err);
+  KBC_CHECK_NOT_NULL(c);
+  if (c == NULL) {
+    return;
+  }
+  KBC_CHECK_EQ_INT(kbc_query_cache_capacity(c), 4);
+  const float v[3] = {1.0f, 2.0f, 3.0f};
+  char key[32];
+
+  for (int i = 0; i < 40; i++) {
+    KBC_CHECK_EQ_INT(snprintf(key, sizeof key, "q%02d", i), 3);
+    kbc_err_reset(&err);
+    KBC_CHECK_OK(kbc_query_cache_put(c, "m", key, strlen(key), v, 3, &err));
+    KBC_CHECK_MSG(kbc_query_cache_len(c) <= 4,
+                  "after %d puts into a capacity of 4 the cache holds %zu", i,
+                  kbc_query_cache_len(c));
+  }
+  KBC_CHECK_EQ_INT(kbc_query_cache_len(c), 4);
+
+  kbc_arena *a = kbc_arena_new(256);
+  KBC_CHECK_NOT_NULL(a);
+  const float *got = NULL;
+  size_t dim = 0;
+  for (int i = 36; i < 40; i++) {
+    KBC_CHECK_EQ_INT(snprintf(key, sizeof key, "q%02d", i), 3);
+    KBC_CHECK_MSG(kbc_query_cache_get(c, "m", key, strlen(key), a, &got, &dim),
+                  "recently inserted key %s was evicted", key);
+  }
+  KBC_CHECK(!kbc_query_cache_get(c, "m", "q00", 3, a, &got, &dim));
+  KBC_CHECK(!kbc_query_cache_get(c, "m", "q35", 3, a, &got, &dim));
+
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_query_cache_put(c, "m", "q39", 3, v, 3, &err));
+  KBC_CHECK_EQ_INT(kbc_query_cache_len(c), 4);
+  const float replacement[3] = {9.0f, 8.0f, 7.0f};
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_query_cache_put(c, "m", "q39", 3, replacement, 3, &err));
+  KBC_CHECK_MSG(kbc_query_cache_len(c) == 4,
+                "re-putting a live key grew the cache to %zu",
+                kbc_query_cache_len(c));
+  KBC_CHECK(kbc_query_cache_get(c, "m", "q39", 3, a, &got, &dim));
+  if (got != NULL) {
+    KBC_CHECK_EQ_DBL(got[0], 9.0, 0.0);
+    KBC_CHECK_EQ_DBL(got[2], 7.0, 0.0);
+  }
+
+  for (int i = 0; i < 200; i++) {
+    kbc_err_reset(&err);
+    KBC_CHECK_OK(kbc_query_cache_put(c, "m", "q38", 3, v, 3, &err));
+  }
+  KBC_CHECK_EQ_INT(kbc_query_cache_len(c), 4);
+
+  kbc_arena_free(a);
+  kbc_query_cache_free(c);
+}
+
+/* The key is the RAW query: no trim, no case folding, no whitespace
+ * collapse, and length travels with the bytes so an embedded NUL is data
+ * rather than a terminator. */
+KBC_TEST(query_cache_key_is_the_raw_query) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_query_cache *c = kbc_query_cache_new(16, &err);
+  KBC_CHECK_NOT_NULL(c);
+  if (c == NULL) {
+    return;
+  }
+  const float v[3] = {1.0f, 2.0f, 3.0f};
+  const char *variants[] = {"query", " query", "query ", "QUERY", "Query",
+                            "qu ery"};
+  const size_t nvariants = sizeof variants / sizeof variants[0];
+  for (size_t i = 0; i < nvariants; i++) {
+    kbc_err_reset(&err);
+    KBC_CHECK_OK(kbc_query_cache_put(c, "m", variants[i], strlen(variants[i]),
+                                      v, 3, &err));
+  }
+  KBC_CHECK_MSG(kbc_query_cache_len(c) == nvariants,
+                "the cache holds %zu of %zu raw-query variants; the key is "
+                "being normalised",
+                kbc_query_cache_len(c), nvariants);
+  kbc_arena *a = kbc_arena_new(256);
+  KBC_CHECK_NOT_NULL(a);
+  const float *got = NULL;
+  size_t dim = 0;
+  for (size_t i = 0; i < nvariants; i++) {
+    KBC_CHECK_MSG(kbc_query_cache_get(c, "m", variants[i], strlen(variants[i]),
+                                      a, &got, &dim),
+                  "variant \"%s\" did not get its own entry", variants[i]);
+  }
+  /* The key is (len, bytes): a query whose tail follows a NUL is a DIFFERENT
+   * entry from its own prefix. Truncating at the NUL would let the two
+   * collide and serve one vector for two different queries. */
+  const char embedded[8] = {'a', 'b', '\0', 'c', 'd', 'e', 'f', '\0'};
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_query_cache_put(c, "m", embedded, 8, v, 3, &err));
+  KBC_CHECK(kbc_query_cache_get(c, "m", embedded, 8, a, &got, &dim));
+  KBC_CHECK_MSG(!kbc_query_cache_get(c, "m", embedded, 2, a, &got, &dim),
+                "a NUL-truncated key collided with the full-length key");
+  KBC_CHECK_MSG(kbc_query_cache_len(c) == nvariants + 1,
+                "the cache holds %zu entries, expected the %zu variants plus "
+                "the embedded-NUL key",
+                kbc_query_cache_len(c), nvariants);
+
+  kbc_arena_free(a);
+  kbc_query_cache_free(c);
+}
+
+/* Re-putting a live key REPLACES it. With room to spare, a put that appended
+ * instead of removing the old entry would grow the cache by one per call, and
+ * the capacity ceiling would not hide it. */
+KBC_TEST(query_cache_reput_does_not_grow) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_query_cache *c = kbc_query_cache_new(64, &err);
+  KBC_CHECK_NOT_NULL(c);
+  if (c == NULL) {
+    return;
+  }
+  const float v[3] = {1.0f, 2.0f, 3.0f};
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_query_cache_put(c, "m", "same", 4, v, 3, &err));
+  KBC_CHECK_EQ_INT(kbc_query_cache_len(c), 1);
+  for (int i = 0; i < 20; i++) {
+    kbc_err_reset(&err);
+    KBC_CHECK_OK(kbc_query_cache_put(c, "m", "same", 4, v, 3, &err));
+    KBC_CHECK_MSG(kbc_query_cache_len(c) == 1,
+                  "re-putting one key %d times left %zu entries; a put must "
+                  "replace, not append",
+                  i + 1, kbc_query_cache_len(c));
+  }
+  kbc_query_cache_free(c);
+}
+
+/* A miss's embed_ms is a real duration and a hit's is 0. The fake sleeps on
+ * the embed branch, so the miss is tens of milliseconds: without that a miss
+ * could round to 0 ms and the hit's 0 would prove nothing. */
+KBC_TEST(query_cache_embed_ms_is_zero_only_on_a_hit) {
+  char *dir = case_dir("qc-ms");
+  if (dir == NULL) {
+    return;
+  }
+  char script[KBC_TEST_PATH_MAX];
+  KBC_CHECK_NOT_NULL(join_path(script, sizeof script, dir, "slow.sh"));
+  make_fake(script, "while IFS= read -r line; do\n"
+                    "  case \"$line\" in\n"
+                    "  *health*) printf '%s\\n' '{\"ok\":true,\"dim\":3,"
+                    "\"model\":\"slow-model\"}' ;;\n"
+                    "  *embed*) sleep 0.05; printf '%s\\n' '{\"ok\":true,"
+                    "\"dim\":3,\"vectors\":[[1.5,-2.25,3]]}' ;;\n"
+                    "  esac\n"
+                    "done\n");
+  const char *argv[2] = {script, NULL};
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_embedder *e = kbc_embedder_start(argv, &err);
+  KBC_CHECK_NOT_NULL(e);
+  if (e == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embedder_restart(e, &err));
+  kbc_err_reset(&err);
+  kbc_query_cache *c = kbc_query_cache_new(8, &err);
+  kbc_arena *a = kbc_arena_new(256);
+  KBC_CHECK_NOT_NULL(c);
+  KBC_CHECK_NOT_NULL(a);
+  if (c == NULL || a == NULL) {
+    kbc_query_cache_free(c);
+    kbc_arena_free(a);
+    kbc_embedder_stop(e);
+    kbc_test_rmrf(dir);
+    return;
+  }
+
+  kbc_query_outcome miss;
+  kbc_query_outcome hit;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embed_query(e, c, a, "a slow query", &miss, &err));
+  KBC_CHECK_MSG(!miss.cache_hit, "the first query was a hit");
+  KBC_CHECK_MSG(miss.embed_ms > 0,
+                "a miss that spent ~50 ms in the sidecar reported embed_ms 0");
+
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embed_query(e, c, a, "a slow query", &hit, &err));
+  KBC_CHECK_MSG(hit.cache_hit, "the replayed query missed the cache");
+  /* The sharp form: same query, same model, 0 ms because the embedding step
+   * did not run. Timing the whole call here would make the field say nothing
+   * about whether inference happened. */
+  KBC_CHECK_MSG(hit.embed_ms == 0,
+                "a cache hit reported embed_ms %llu; it must be 0",
+                (unsigned long long)hit.embed_ms);
+
+  /* A different query is a fresh miss and pays the sleep again, so the 0 on
+   * the hit is the cache and not a stuck counter. */
+  kbc_query_outcome other;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embed_query(e, c, a, "another slow query", &other, &err));
+  KBC_CHECK_MSG(!other.cache_hit, "a different query hit the cache");
+  KBC_CHECK_MSG(other.embed_ms > 0, "the second miss reported embed_ms 0");
+
+  kbc_arena_free(a);
+  kbc_query_cache_free(c);
+  kbc_embedder_stop(e);
+  check_no_zombie("query_cache_embed_ms_is_zero_only_on_a_hit");
+  kbc_test_rmrf(dir);
+}
+
+/* The vector handed to a caller is the CALLER's: it is an arena copy, so it
+ * survives a later put that replaces the same key. A cache that returned its
+ * own buffer would show the second put's floats here. */
+KBC_TEST(query_cache_hit_vector_is_an_independent_copy) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_query_cache *c = kbc_query_cache_new(4, &err);
+  KBC_CHECK_NOT_NULL(c);
+  if (c == NULL) {
+    return;
+  }
+  const float first[3] = {1.0f, 2.0f, 3.0f};
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_query_cache_put(c, "m", "q", 1, first, 3, &err));
+
+  kbc_arena *a = kbc_arena_new(256);
+  KBC_CHECK_NOT_NULL(a);
+  const float *held = NULL;
+  size_t dim = 0;
+  KBC_CHECK(kbc_query_cache_get(c, "m", "q", 1, a, &held, &dim));
+  KBC_CHECK_NOT_NULL(held);
+  if (held == NULL) {
+    kbc_arena_free(a);
+    kbc_query_cache_free(c);
+    return;
+  }
+  KBC_CHECK_EQ_DBL(held[0], 1.0, 0.0);
+
+  const float second[3] = {42.0f, 43.0f, 44.0f};
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_query_cache_put(c, "m", "q", 1, second, 3, &err));
+  KBC_CHECK_EQ_INT(kbc_query_cache_len(c), 1);
+  KBC_CHECK_MSG(held[0] == 1.0f && held[2] == 3.0f,
+                "the previously returned vector changed under the caller: it "
+                "aliased the cache's buffer (%g, %g)",
+                (double)held[0], (double)held[2]);
+
+  const float *fresh = NULL;
+  size_t fdim = 0;
+  KBC_CHECK(kbc_query_cache_get(c, "m", "q", 1, a, &fresh, &fdim));
+  if (fresh != NULL) {
+    KBC_CHECK_EQ_DBL(fresh[0], 42.0, 0.0);
+  }
+
+  kbc_arena_free(a);
+  kbc_query_cache_free(c);
+}
+
+/* Hostile input is refused, not absorbed: a zero capacity, a zero-width
+ * vector, a NULL vector, and a query past the key ceiling. A truncated key
+ * would collide with every other query sharing the prefix, which is the
+ * failure the model name in the key exists to prevent. */
+KBC_TEST(query_cache_rejects_bad_arguments) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_NULL(kbc_query_cache_new(0, &err));
+  KBC_CHECK_ERR_MSG(err);
+  KBC_CHECK_EQ_INT(kbc_query_cache_len(NULL), 0);
+  KBC_CHECK_EQ_INT(kbc_query_cache_capacity(NULL), 0);
+  kbc_query_cache_free(NULL); /* must be safe */
+
+  kbc_err_reset(&err);
+  kbc_query_cache *c = kbc_query_cache_new(2, &err);
+  KBC_CHECK_NOT_NULL(c);
+  if (c == NULL) {
+    return;
+  }
+  const float v[3] = {1.0f, 2.0f, 3.0f};
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_query_cache_put(c, "m", "q", 1, v, 0, &err),
+                KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(err);
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_query_cache_put(c, "m", "q", 1, NULL, 3, &err),
+                KBC_ERR_INVALID);
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_query_cache_put(NULL, "m", "q", 1, v, 3, &err),
+                KBC_ERR_INVALID);
+  /* A rejected put leaves nothing behind. */
+  KBC_CHECK_EQ_INT(kbc_query_cache_len(c), 0);
+
+  kbc_arena *a = kbc_arena_new(256);
+  KBC_CHECK_NOT_NULL(a);
+  kbc_query_outcome o;
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_embed_query(NULL, c, a, "q", &o, &err), KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(err);
+
+  kbc_arena_free(a);
+  kbc_query_cache_free(c);
+}
+
+/* An empty query is refused at the query seam and never reaches the
+ * sidecar: a zero-length text is not a search, and caching it would let it
+ * evict a real query. */
+KBC_TEST(query_cache_rejects_empty_query) {
+  char *dir = case_dir("qc-empty");
+  if (dir == NULL) {
+    return;
+  }
+  kbc_embedder *e = start_model_fake(dir, "one.sh", "fake-model");
+  if (e == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_query_cache *c = kbc_query_cache_new(4, &err);
+  kbc_arena *a = kbc_arena_new(256);
+  KBC_CHECK_NOT_NULL(c);
+  KBC_CHECK_NOT_NULL(a);
+  kbc_query_outcome o;
+  memset(&o, 0xff, sizeof o);
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_embed_query(e, c, a, "", &o, &err), KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(err);
+  KBC_CHECK_EQ_INT(kbc_query_cache_len(c), 0);
+  int64_t requests = -1;
+  kbc_embedder_counts(e, &requests, NULL);
+  KBC_CHECK_MSG(requests == 0, "an empty query spent %lld sidecar request(s)",
+                (long long)requests);
+
+  kbc_arena_free(a);
+  kbc_query_cache_free(c);
+  kbc_embedder_stop(e);
+  check_no_zombie("query_cache_rejects_empty_query");
+  kbc_test_rmrf(dir);
+}
+
+/* A sidecar that names no model still gets a cache, keyed on the empty name.
+ * Refusing to cache would trade a slow query for a lane that re-embeds
+ * forever, which is the wrong trade. */
+KBC_TEST(query_cache_works_without_an_announced_model) {
+  char *dir = case_dir("qc-nomodel");
+  if (dir == NULL) {
+    return;
+  }
+  char script[KBC_TEST_PATH_MAX];
+  KBC_CHECK_NOT_NULL(join_path(script, sizeof script, dir, "anon.sh"));
+  make_fake(script, "while IFS= read -r line; do\n"
+                    "  case \"$line\" in\n"
+                    "  *health*) printf '%s\\n' '{\"ok\":true,\"dim\":3}' ;;\n"
+                    "  *embed*) printf '%s\\n' '{\"ok\":true,\"dim\":3,"
+                    "\"vectors\":[[1.5,-2.25,3]]}' ;;\n"
+                    "  esac\n"
+                    "done\n");
+  const char *argv[2] = {script, NULL};
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_embedder *e = kbc_embedder_start(argv, &err);
+  KBC_CHECK_NOT_NULL(e);
+  if (e == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embedder_restart(e, &err));
+  /* A sidecar that HANDSHOOK and named no model is not an error: the empty
+   * name is a legitimate key component. This is the case that is distinct
+   * from never having handshook at all, which the next test pins. */
+  char model[160];
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embedder_model(e, model, sizeof model, &err));
+  KBC_CHECK_EQ_STR(model, "");
+
+  kbc_err_reset(&err);
+  kbc_query_cache *c = kbc_query_cache_new(4, &err);
+  kbc_arena *a = kbc_arena_new(256);
+  KBC_CHECK_NOT_NULL(c);
+  KBC_CHECK_NOT_NULL(a);
+  kbc_query_outcome miss;
+  kbc_query_outcome hit;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embed_query(e, c, a, "who goes there", &miss, &err));
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embed_query(e, c, a, "who goes there", &hit, &err));
+  KBC_CHECK_MSG(!miss.cache_hit, "the first query was a hit");
+  KBC_CHECK_MSG(hit.cache_hit,
+                "an unnamed model is not cached, so every query re-embeds");
+  KBC_CHECK_MSG(hit.embed_ms == 0, "the hit reported a non-zero embed_ms");
+  int64_t requests = -1;
+  kbc_embedder_counts(e, &requests, NULL);
+  KBC_CHECK_EQ_INT(requests, 1);
+
+  kbc_arena_free(a);
+  kbc_query_cache_free(c);
+  kbc_embedder_stop(e);
+  check_no_zombie("query_cache_works_without_an_announced_model");
+  kbc_test_rmrf(dir);
+}
+
+/* An embedder that has NOT handshook has no model, and saying so is a status
+ * rather than a silent empty string: a caller that cannot tell "unknown yet"
+ * from "the sidecar named nothing" will cache vectors under a key it never
+ * chose, which is the failure the model name in the key exists to prevent.
+ * Every failure also leaves `out` empty rather than partially filled, since a
+ * half-copied name is a valid C string that is not the model's name. */
+KBC_TEST(embedder_model_is_notfound_before_a_handshake) {
+  char *dir = case_dir("qc-model-unknown");
+  if (dir == NULL) {
+    return;
+  }
+  /* One fake that answers a good handshake until a marker appears, so the
+   * SAME embedder can be walked from "handshook, model known" to
+   * "restart failed, model unknown" without swapping children underneath. */
+  char script[KBC_TEST_PATH_MAX];
+  char marker[KBC_TEST_PATH_MAX];
+  KBC_CHECK_NOT_NULL(join_path(script, sizeof script, dir, "flaky.sh"));
+  KBC_CHECK_NOT_NULL(join_path(marker, sizeof marker, dir, "broken"));
+  static char body[8192];
+  sbuf b = {body, sizeof body, 0};
+  sb_add(&b, "M='");
+  sb_add(&b, marker);
+  sb_add(&b, "'\n");
+  sb_add(&b,
+         "while IFS= read -r line; do\n"
+         "  case \"$line\" in\n"
+         "  *health*)\n"
+         "    if [ -f \"$M\" ]; then printf '%s\\n' 'not json at all';\n"
+         "    else printf '%s\\n' '{\"ok\":true,\"dim\":3,"
+         "\"model\":\"some-model\"}'; fi ;;\n"
+         "  *embed*) printf '%s\\n' '{\"ok\":true,\"dim\":3,\"vectors\":"
+         "[[1.5,-2.25,3]]}' ;;\n"
+         "  esac\n"
+         "done\n");
+  make_fake(script, body);
+  const char *argv[2] = {script, NULL};
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_embedder *e = kbc_embedder_start(argv, &err);
+  KBC_CHECK_NOT_NULL(e);
+  if (e == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+
+  /* Before any handshake: NOTFOUND, and the buffer is EMPTIED rather than
+   * left holding whatever the caller had. A half-filled name is a valid C
+   * string that is not the model's name. */
+  char out[64];
+  memset(out, 'x', sizeof out);
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_embedder_model(e, out, sizeof out, &err), KBC_ERR_NOTFOUND);
+  KBC_CHECK_ERR_MSG(err);
+  KBC_CHECK_MSG(out[0] == '\0',
+                "a failed model read left \"%s\" in the caller's buffer; a "
+                "half-filled name would key a cache entry under it",
+                out);
+
+  /* After a good handshake the name is readable. */
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embedder_restart(e, &err));
+  memset(out, 'x', sizeof out);
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embedder_model(e, out, sizeof out, &err));
+  KBC_CHECK_EQ_STR(out, "some-model");
+
+  /* Now break it and restart: the model must NOT still be the old child's.
+   * That child is gone, and its name is not a fact about whatever loads
+   * next — serving it would key the new sidecar's vectors under the old
+   * model's name, which is precisely the collision the key prevents. */
+  kbc_test_write_file(marker, "broken now\n");
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_embedder_restart(e, &err), KBC_ERR_PARSE);
+  memset(out, 'x', sizeof out);
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_embedder_model(e, out, sizeof out, &err), KBC_ERR_NOTFOUND);
+  KBC_CHECK_MSG(out[0] == '\0',
+                "a failed restart left the old model readable as \"%s\"", out);
+
+  /* Bad arguments are refused rather than dereferenced, and a NULL embedder
+   * is safe to ask. */
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_embedder_model(NULL, out, sizeof out, &err),
+                KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(err);
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_embedder_model(e, NULL, 8, &err), KBC_ERR_INVALID);
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_embedder_model(e, out, 0, &err), KBC_ERR_INVALID);
+  /* err == NULL must be safe on every one of those paths. */
+  (void)kbc_embedder_model(NULL, out, sizeof out, NULL);
+  (void)kbc_embedder_model(e, out, 0, NULL);
+
+  kbc_embedder_stop(e);
+  check_no_zombie("embedder_model_is_notfound_before_a_handshake");
+  kbc_test_rmrf(dir);
+}
+
+/* A buffer too small for the model is refused. Clipping it instead would hand
+ * back a valid C string that is not the model's name — the same silent key
+ * collision the name in the key prevents, reached from the other direction. */
+KBC_TEST(embedder_model_refuses_a_short_buffer) {
+  char *dir = case_dir("qc-model-short");
+  if (dir == NULL) {
+    return;
+  }
+  kbc_embedder *e = start_model_fake(dir, "one.sh", "jina-embeddings-v2-base");
+  if (e == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+  char small[8];
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_embedder_model(e, small, sizeof small, &err),
+                KBC_ERR_INVALID);
+  KBC_CHECK_ERR_MSG(err);
+  KBC_CHECK_MSG(small[0] == '\0',
+                "a refused short read left \"%s\" behind", small);
+  /* A buffer that fits exactly still works: n+1 bytes, no off-by-one. */
+  char exact[28];
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embedder_model(e, exact, sizeof exact, &err));
+  KBC_CHECK_EQ_STR(exact, "jina-embeddings-v2-base");
+
+  kbc_embedder_stop(e);
+  check_no_zombie("embedder_model_refuses_a_short_buffer");
+  kbc_test_rmrf(dir);
+}
+
+/* `c == NULL` embeds unconditionally — the header's promise that a caller
+ * with no cache is not a special case. Every call misses, every call reaches
+ * the sidecar, and the floats are still right. */
+KBC_TEST(query_cache_null_cache_embeds_every_time) {
+  char *dir = case_dir("qc-nocache");
+  if (dir == NULL) {
+    return;
+  }
+  kbc_embedder *e = start_model_fake(dir, "one.sh", "fake-model");
+  if (e == NULL) {
+    kbc_test_rmrf(dir);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(512);
+  KBC_CHECK_NOT_NULL(a);
+  kbc_err err;
+  kbc_query_outcome first;
+  kbc_query_outcome second;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embed_query(e, NULL, a, "same text", &first, &err));
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embed_query(e, NULL, a, "same text", &second, &err));
+  KBC_CHECK_MSG(!first.cache_hit && !second.cache_hit,
+                "a NULL cache reported a hit");
+  if (first.vec != NULL && second.vec != NULL) {
+    KBC_CHECK_EQ_DBL(first.vec[0], 1.5, 0.0);
+    KBC_CHECK_EQ_DBL(second.vec[0], 1.5, 0.0);
+  }
+  int64_t requests = -1;
+  kbc_embedder_counts(e, &requests, NULL);
+  KBC_CHECK_EQ_INT(requests, 2);
+
+  kbc_arena_free(a);
+  kbc_embedder_stop(e);
+  check_no_zombie("query_cache_null_cache_embeds_every_time");
+  kbc_test_rmrf(dir);
+}
+
+/* An embedder that has not handshook cannot key a cache entry, and asking for
+ * one is an error rather than a query silently stored under an empty model. */
+KBC_TEST(query_cache_refuses_to_cache_before_a_handshake) {
+  char *dir = case_dir("qc-query-unknown");
+  if (dir == NULL) {
+    return;
+  }
+  char script[KBC_TEST_PATH_MAX];
+  KBC_CHECK_NOT_NULL(join_path(script, sizeof script, dir, "junk.sh"));
+  /* A sidecar that answers EMBED but whose health we never ran: it has not
+   * handshook, so no model is known, yet an uncached embed still works. */
+  make_fake(script, "while IFS= read -r line; do\n"
+                    "  case \"$line\" in\n"
+                    "  *embed*) printf '%s\\n' '{\"ok\":true,\"dim\":3,"
+                    "\"vectors\":[[1.5,-2.25,3]]}' ;;\n"
+                    "  esac\n"
+                    "done\n");
+  const char *argv[2] = {script, NULL};
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_embedder *e = kbc_embedder_start(argv, &err);
+  KBC_CHECK_NOT_NULL(e);
+  kbc_err_reset(&err);
+  kbc_query_cache *c = kbc_query_cache_new(4, &err);
+  kbc_arena *a = kbc_arena_new(256);
+  KBC_CHECK_NOT_NULL(c);
+  KBC_CHECK_NOT_NULL(a);
+  if (e == NULL || c == NULL || a == NULL) {
+    kbc_embedder_stop(e);
+    kbc_query_cache_free(c);
+    kbc_arena_free(a);
+    kbc_test_rmrf(dir);
+    return;
+  }
+  kbc_query_outcome o;
+  memset(&o, 0xff, sizeof o);
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_embed_query(e, c, a, "a query", &o, &err), KBC_ERR_NOTFOUND);
+  KBC_CHECK_ERR_MSG(err);
+  KBC_CHECK_NULL(o.vec);
+  KBC_CHECK_MSG(kbc_query_cache_len(c) == 0,
+                "a query on an unhandshaked embedder cached %zu entries",
+                kbc_query_cache_len(c));
+  /* A NULL cache is not a special case, so the same query embeds anyway. */
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_embed_query(e, NULL, a, "a query", &o, &err));
+
+  kbc_arena_free(a);
+  kbc_query_cache_free(c);
+  kbc_embedder_stop(e);
+  check_no_zombie("query_cache_refuses_to_cache_before_a_handshake");
+  kbc_test_rmrf(dir);
+}
+
+/* Four threads hammering the same eight keys: every get must see a whole
+ * vector, never a mix of two keys' patterns, and the ceiling must hold
+ * throughout. Under TSan this is also the race detector for the
+ * scan-and-mutate lock. */
+static void *cache_worker(void *arg) {
+  kbc_query_cache *c = arg;
+  kbc_arena *a = kbc_arena_new(4096);
+  if (a == NULL) {
+    return NULL;
+  }
+  for (int i = 0; i < 400; i++) {
+    for (int k = 0; k < 8; k++) {
+      char key[8];
+      (void)snprintf(key, sizeof key, "k%d", k);
+      const float *got = NULL;
+      size_t dim = 0;
+      if (!kbc_query_cache_get(c, "m", key, strlen(key), a, &got, &dim)) {
+        float v[3] = {(float)(k + 1), (float)(k + 1), (float)(k + 1)};
+        kbc_err scratch;
+        kbc_err_reset(&scratch);
+        (void)kbc_query_cache_put(c, "m", key, strlen(key), v, 3, &scratch);
+      }
+    }
+    if (kbc_query_cache_len(c) > 64) {
+      break; /* the ceiling was breached; the assertion below reports it */
+    }
+  }
+  kbc_arena_free(a);
+  return NULL;
+}
+
+KBC_TEST(query_cache_is_thread_safe) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_query_cache *c = kbc_query_cache_new(64, &err);
+  KBC_CHECK_NOT_NULL(c);
+  if (c == NULL) {
+    return;
+  }
+  pthread_t th[4];
+  for (int t = 0; t < 4; t++) {
+    KBC_CHECK_EQ_INT(pthread_create(&th[t], NULL, cache_worker, c), 0);
+  }
+  for (int t = 0; t < 4; t++) {
+    KBC_CHECK_EQ_INT(pthread_join(th[t], NULL), 0);
+  }
+  KBC_CHECK_MSG(kbc_query_cache_len(c) == 8,
+                "after concurrent access the cache holds %zu entries, want 8",
+                kbc_query_cache_len(c));
+  kbc_arena *a = kbc_arena_new(1024);
+  KBC_CHECK_NOT_NULL(a);
+  const float *got = NULL;
+  size_t dim = 0;
+  for (int k = 0; k < 8; k++) {
+    char key[8];
+    KBC_CHECK_EQ_INT(snprintf(key, sizeof key, "k%d", k), 2);
+    KBC_CHECK_MSG(kbc_query_cache_get(c, "m", key, strlen(key), a, &got, &dim),
+                  "key %s is missing after concurrent access", key);
+    if (got != NULL) {
+      /* A torn read shows up as a mix of two keys' patterns. */
+      float want = (float)(k + 1);
+      KBC_CHECK_MSG(got[0] == want && got[1] == want && got[2] == want,
+                    "key %s came back torn: %g %g %g", key, (double)got[0],
+                    (double)got[1], (double)got[2]);
+    }
+  }
+  KBC_CHECK_MSG(kbc_query_cache_len(c) <= 64, "the ceiling was exceeded");
+
+  kbc_arena_free(a);
+  kbc_query_cache_free(c);
+}
+
 int main(void) {
   kbc_test_tmpdir(g_tmp, sizeof g_tmp);
   int rc = kbc_test_run(
@@ -744,6 +1695,38 @@ int main(void) {
                        {"embedder_silent_on_embed", embedder_silent_on_embed},
                        {"embedder_start_rejects_bad_argv",
                         embedder_start_rejects_bad_argv},
+                       {"query_cache_two_models_same_dim_do_not_share",
+                        query_cache_two_models_same_dim_do_not_share},
+                       {"query_cache_hit_skips_sidecar_and_reports_zero_ms",
+                        query_cache_hit_skips_sidecar_and_reports_zero_ms},
+                       {"query_cache_get_touches_lru_order",
+                        query_cache_get_touches_lru_order},
+                       {"query_cache_capacity_ceiling_and_reput",
+                        query_cache_capacity_ceiling_and_reput},
+                       {"query_cache_key_is_the_raw_query",
+                        query_cache_key_is_the_raw_query},
+                       {"query_cache_hit_vector_is_an_independent_copy",
+                        query_cache_hit_vector_is_an_independent_copy},
+                       {"query_cache_rejects_bad_arguments",
+                        query_cache_rejects_bad_arguments},
+                       {"query_cache_rejects_empty_query",
+                        query_cache_rejects_empty_query},
+                       {"query_cache_works_without_an_announced_model",
+                        query_cache_works_without_an_announced_model},
+                       {"query_cache_is_thread_safe",
+                        query_cache_is_thread_safe},
+                       {"embedder_model_is_notfound_before_a_handshake",
+                        embedder_model_is_notfound_before_a_handshake},
+                       {"embedder_model_refuses_a_short_buffer",
+                        embedder_model_refuses_a_short_buffer},
+                       {"query_cache_null_cache_embeds_every_time",
+                        query_cache_null_cache_embeds_every_time},
+                       {"query_cache_refuses_to_cache_before_a_handshake",
+                        query_cache_refuses_to_cache_before_a_handshake},
+                       {"query_cache_reput_does_not_grow",
+                        query_cache_reput_does_not_grow},
+                       {"query_cache_embed_ms_is_zero_only_on_a_hit",
+                        query_cache_embed_ms_is_zero_only_on_a_hit},
                        {NULL, NULL}});
   kbc_test_rmrf(g_tmp);
   return rc;

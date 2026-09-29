@@ -3,6 +3,7 @@
 
 #include "kbc_test.h"
 
+#include <pthread.h>
 #include <sqlite3.h>
 
 #include "kbc/store.h"
@@ -615,6 +616,156 @@ KBC_TEST(replace_chunks_is_per_document) {
   kbc_arena_free(ar);
 
   kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* The failure two apps over one data dir actually produce.
+ *
+ * `chunks.doc_id` is a foreign key onto `artifacts`, and the two writes that
+ * keep a document indexed — the artifact upsert and the chunk replace — are
+ * two transactions, because the app layer makes two calls. So a second writer
+ * that removes the document in between leaves the first one inserting chunks
+ * for a document that is no longer there. That is a FOREIGN KEY failure, and
+ * reporting it as "duplicate ord" sends whoever reads the log looking for a
+ * race on the ordinal that cannot exist: the delete and the insert are one
+ * BEGIN IMMEDIATE, so no other connection can be inside them. */
+KBC_TEST(a_chunk_write_for_a_removed_document_names_the_missing_artifact) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_store *a = open_at(root, "kb.db", &err);
+  KBC_CHECK_MSG(a != NULL, "open a: %s", err.msg);
+  kbc_store *b = a ? open_at(root, "kb.db", &err) : NULL;
+  KBC_CHECK_MSG(b != NULL, "open b: %s", err.msg);
+  if (a == NULL || b == NULL) {
+    kbc_store_close(a);
+    kbc_store_close(b);
+    kbc_test_rmrf(root);
+    return;
+  }
+
+  kbc_artifact art;
+  fill(&art, "c0000000001", "kb", "gone.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(a, &art, &err));
+  kbc_chunk_in in[1] = {{"c0000000001", 0, "body", 4}};
+  KBC_CHECK_OK(kbc_store_replace_chunks(a, in, 1, &err));
+
+  /* The other store takes the document away — what a delete event, a reconcile
+   * sweep or a second daemon over the same directory all end up doing. */
+  KBC_CHECK_OK(kbc_store_delete_artifact(b, "c0000000001", &err));
+
+  kbc_err_reset(&err);
+  KBC_CHECK_ERR(kbc_store_replace_chunks(a, in, 1, &err), KBC_ERR_CONFLICT);
+  KBC_CHECK_ERR_MSG(err);
+  KBC_CHECK_MSG(strstr(err.msg, "c0000000001") != NULL,
+                "msg does not name the document: %s", err.msg);
+  KBC_CHECK_MSG(strstr(err.msg, "artifacts") != NULL,
+                "msg does not name the table the foreign key points at: %s",
+                err.msg);
+  KBC_CHECK_MSG(strstr(err.msg, "duplicate ord") == NULL,
+                "a missing artifact is reported as a duplicate ord: %s",
+                err.msg);
+
+  /* And it failed whole: no chunk row survives a write that could not commit. */
+  kbc_block blocks[4];
+  size_t n = 0;
+  kbc_arena *ar = kbc_arena_new(0);
+  KBC_CHECK_OK(kbc_store_list_chunks(a, ar, "c0000000001", blocks, &n, &err));
+  KBC_CHECK_EQ_INT(n, 0);
+  kbc_arena_free(ar);
+
+  kbc_store_close(a);
+  kbc_store_close(b);
+  kbc_test_rmrf(root);
+}
+
+/* The same two stores, writing the SAME document at the same time — the shape
+ * that was reported as a possible duplicate ord. It is not one, and the reason
+ * is worth pinning: replace_chunks holds BEGIN IMMEDIATE across its delete and
+ * its insert, so two connections are serialised by sqlite itself and the store
+ * mutex never has to cross a connection boundary to keep them apart. A weaker
+ * transaction here is the only thing that could produce the collision, and the
+ * final row set below is what says whether it happened. */
+typedef struct {
+  kbc_store *s;
+  const char *doc_id;
+  int iters;
+  int conflicts;
+  int other_errors;
+} chunk_racer;
+
+static void *race_replace_chunks(void *p) {
+  chunk_racer *r = p;
+  kbc_chunk_in in[2] = {
+      {r->doc_id, 0, "first", 5},
+      {r->doc_id, 1, "second", 6},
+  };
+  for (int i = 0; i < r->iters; i++) {
+    kbc_err err;
+    kbc_err_reset(&err);
+    kbc_status st = kbc_store_replace_chunks(r->s, in, 2, &err);
+    if (st == KBC_OK) continue;
+    if (st == KBC_ERR_CONFLICT) {
+      r->conflicts++;
+    } else {
+      r->other_errors++;
+    }
+  }
+  return NULL;
+}
+
+KBC_TEST(two_stores_sharing_one_db_never_collide_on_a_chunk_ord) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_store *a = open_at(root, "kb.db", &err);
+  KBC_CHECK_MSG(a != NULL, "open a: %s", err.msg);
+  kbc_store *b = a ? open_at(root, "kb.db", &err) : NULL;
+  KBC_CHECK_MSG(b != NULL, "open b: %s", err.msg);
+  if (a == NULL || b == NULL) {
+    kbc_store_close(a);
+    kbc_store_close(b);
+    kbc_test_rmrf(root);
+    return;
+  }
+
+  kbc_artifact art;
+  fill(&art, "c0000000002", "kb", "shared.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(a, &art, &err));
+
+  chunk_racer racers[2] = {
+      {a, "c0000000002", 1000, 0, 0},
+      {b, "c0000000002", 1000, 0, 0},
+  };
+  pthread_t t[2];
+  for (int i = 0; i < 2; i++) {
+    KBC_CHECK_EQ_INT(pthread_create(&t[i], NULL, race_replace_chunks,
+                                    &racers[i]),
+                     0);
+  }
+  for (int i = 0; i < 2; i++) (void)pthread_join(t[i], NULL);
+  KBC_CHECK_MSG(racers[0].conflicts == 0 && racers[1].conflicts == 0,
+                "two connections collided on a chunk ord (%d, %d)", racers[0].conflicts,
+                racers[1].conflicts);
+  KBC_CHECK_MSG(racers[0].other_errors == 0 && racers[1].other_errors == 0,
+                "a concurrent chunk replace failed (%d, %d)",
+                racers[0].other_errors, racers[1].other_errors);
+
+  /* One coherent document, not two stores' rows interleaved: every replace
+ * deleted what the previous one wrote, so the ord set is a whole document. */
+  kbc_block blocks[4];
+  size_t n = 0;
+  kbc_arena *ar = kbc_arena_new(0);
+  KBC_CHECK_OK(kbc_store_list_chunks(b, ar, "c0000000002", blocks, &n, &err));
+  KBC_CHECK_EQ_INT(n, 2);
+  if (n == 2) {
+    KBC_CHECK_EQ_STR(blocks[0].text, "first");
+    KBC_CHECK_EQ_STR(blocks[1].text, "second");
+  }
+  kbc_arena_free(ar);
+
+  kbc_store_close(a);
+  kbc_store_close(b);
   kbc_test_rmrf(root);
 }
 
@@ -2649,6 +2800,10 @@ static const kbc_test_case cases[] = {
       {"replace_chunks_replaces_and_never_leaves_a_ghost_ord",
        replace_chunks_replaces_and_never_leaves_a_ghost_ord},
       {"replace_chunks_is_per_document", replace_chunks_is_per_document},
+      {"a_chunk_write_for_a_removed_document_names_the_missing_artifact",
+       a_chunk_write_for_a_removed_document_names_the_missing_artifact},
+      {"two_stores_sharing_one_db_never_collide_on_a_chunk_ord",
+       two_stores_sharing_one_db_never_collide_on_a_chunk_ord},
       {"comments_list_resolve_and_foreign_key",
        comments_list_resolve_and_foreign_key},
       {"delete_cascades_to_chunks_and_comments",

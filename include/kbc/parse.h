@@ -97,7 +97,30 @@ kbc_status kbc_tokenize(kbc_arena *a, const char *text, size_t len,
 /* The stopword set, exposed for tests: 60+ common English words plus the
  * markdown/HTML scaffolding words that carry no retrieval signal. */
 extern const char *const KBC_STOPWORDS[];
-extern const size_t KBC_STOPWORDS_LEN;
+
+/* THE front-matter fence, as ONE predicate, because two callers disagreed and
+ * the disagreement was a correctness bug rather than a style difference.
+ *
+ * `parse.c` and `markdown.c` each grew their own scan. `parse.c`'s skipped the
+ * first line unconditionally and looked for a closing fence anywhere after it,
+ * so a document that opened with prose, mentioned `kb-tags:` anywhere, and
+ * contained a `---` line later had that facet INDEXED while the renderer
+ * treated the whole document as body. `tag:x` then matched a document that
+ * never declared the tag, which is the exact inverse of what
+ * `include/kbc/meta.h` requires. It also accepted a `...` closing fence, which
+ * the original does not, and did not strip a leading BOM.
+ *
+ * The rule, matching the original's `parse_frontmatter`: a leading UTF-8 BOM
+ * is skipped, the opener must be exactly `---` at byte 0 after it, and the
+ * block closes only on a line whose trimmed content is `---`. An unclosed
+ * opener is NOT front matter.
+ *
+ * On true, `*start` and `*end` bound the fenced block and `*body` is the first
+ * byte after the closing fence line. On false, only `*bom` and `*body` are
+ * meaningful and `*body` is the BOM-stripped document — the whole thing, so a
+ * caller that finds no front matter knows where the body begins. */
+bool kbc_fm_fence(const char *s, size_t n, size_t *bom, size_t *start,
+                  size_t *end, size_t *body);
 
 /* "how to fix the parser" -> "how-to-fix-the-parser" */
 kbc_status kbc_slugify(kbc_arena *a, const char *text, size_t len,

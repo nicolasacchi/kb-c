@@ -1309,55 +1309,121 @@ static void fm_scalar(const char *s, size_t n, size_t *i, const char **out,
   *i = end;
 }
 
-/* Markdown front matter: a `---` fence on the FIRST line, closed by a `---`
- * or `...` line. Only `kb-*` keys are read, exactly as for the HTML form, so
- * a `title:` or a `date:` in a document's front matter stays a document and
- * does not become a filterable facet. */
+/* ------------------------------------------------- the frontmatter fence --
+ *
+ * ONE fence predicate for the whole library, because the two parsers that
+ * read a leading `---` block used to disagree on what one is — and the
+ * disagreement was invisible: the renderer treated a document as body while
+ * the indexer read a facet out of the same bytes, so `tag:x` returned a
+ * document that never declared `x`. The rule, from the Rust at
+ * markdown.rs:230-231 and confirmed against the renderer:
+ *
+ *   - a leading UTF-8 BOM is skipped (an editor artefact, not content);
+ *   - the OPENING fence is `---` and nothing else at byte 0 after the BOM,
+ *     followed by a line ending — `strip_prefix("---\n")`;
+ *   - the CLOSING fence is a line whose trimmed content is `---`. `...` is
+ *     NOT a closing fence, even though it is a YAML document end;
+ *   - no closing fence means no front matter at all: a `---` that never
+ *     closes is a thematic break, and guessing would read the whole document
+ *     as metadata.
+ *
+ * On a false return only `*bom` and `*body` are meaningful: `*body` is the
+ * document with the BOM removed, which is what a caller renders.
+ *
+ * NOTE: src/markdown.c must call THIS function rather than keep its own
+ * copy of the scan. It declares the prototype below locally (include/kbc/
+ * parse.h is frozen); the definition lives here, in the library. */
+bool kbc_fm_fence(const char *s, size_t n, size_t *bom, size_t *start,
+                  size_t *end, size_t *body);
+
+/* The whitespace set a fence is trimmed with. `\v` is included because the
+ * Rust trims it, so `---` followed by a vertical tab still closes. */
+static bool fm_space(unsigned char c) {
+  return is_space(c) || c == '\v';
+}
+
+/* One line as the REFERENCE reads one: it ends at `\n` and nowhere else.
+ * `split_inclusive('\n')` at markdown.rs:250 does not treat a lone `\r` as
+ * a break, so in `---\ntitle: T\r---\rbody\n` the second line is the whole
+ * rest of the document, its trim is not `---`, and the block never closes.
+ * markdown.c's `line_at` DOES break on `\r`, which is why both parsers used
+ * to accept a mixed-ending document the reference renders as a thematic
+ * break plus a heading. `\r` is ordinary text here; it is trimmed as
+ * whitespace below, which is how a genuine CRLF fence still closes. */
+static size_t fm_line_end(const char *s, size_t n, size_t i) {
+  while (i < n && s[i] != '\n') i++;
+  return i;
+}
+
+static size_t fm_line_next(size_t n, size_t e) { return e < n ? e + 1u : n; }
+
+bool kbc_fm_fence(const char *s, size_t n, size_t *bom, size_t *start,
+                  size_t *end, size_t *body) {
+  const size_t b = (n >= 3 && (unsigned char)s[0] == 0xEFu &&
+                    (unsigned char)s[1] == 0xBBu &&
+                    (unsigned char)s[2] == 0xBFu)
+                       ? 3u
+                       : 0u;
+  *bom = b;
+  *start = 0;
+  *end = 0;
+  *body = b;
+  if (n - b < 4 || s[b] != '-' || s[b + 1] != '-' || s[b + 2] != '-') {
+    return false;
+  }
+  size_t after;
+  if (s[b + 3] == '\n') {
+    after = b + 4;
+  } else if (s[b + 3] == '\r' && n - b >= 5 && s[b + 4] == '\n') {
+    after = b + 5;
+  } else {
+    return false;
+  }
+
+  for (size_t pos = after; pos < n;) {
+    const size_t le = fm_line_end(s, n, pos);
+    size_t t = pos;
+    while (t < le && fm_space((unsigned char)s[t])) t++;
+    size_t u = le;
+    while (u > t && fm_space((unsigned char)s[u - 1])) u--;
+    if (u - t == 3 && s[t] == '-' && s[t + 1] == '-' && s[t + 2] == '-') {
+      *start = after;
+      *end = pos;
+      *body = fm_line_next(n, le);
+      return true;
+    }
+    pos = fm_line_next(n, le);
+  }
+  return false; /* a thematic break, not metadata */
+}
+
+/* Reads the `kb-*` facets out of the leading `---` block. Only `kb-*` keys
+ * are read, exactly as for the HTML form, so a `title:` or a `date:` in a
+ * document's front matter stays a document and does not become a filterable
+ * facet. */
 static kbc_status front_matter(kbc_arena *a, const char *s, size_t n,
                                kbc_metas *out) {
-  size_t i = 0;
-  while (i < n && s[i] != '\n') i++; /* the opening line */
-  size_t body = i < n ? i + 1 : n;
-  /* A file that opens with `---` and never closes it is not front matter; a
- * horizontal rule at the top of a document is more common than a truncated
- * fence, and guessing would read the whole document as metadata. */
-  size_t p = body;
-  size_t end = 0;
-  bool closed = false;
-  while (p <= n) {
-    const size_t ls = p;
-    size_t le = ls;
-    while (le < n && s[le] != '\n') le++;
-    size_t t = ls;
-    while (t < le && is_space((unsigned char)s[t])) t++;
-    size_t u = le;
-    while (u > t && is_space((unsigned char)s[u - 1])) u--;
-    if (u - t == 3 && s[t] == '-' && s[t + 1] == '-' && s[t + 2] == '-') {
-      end = ls;
-      closed = true;
-      break;
-    }
-    if (u - t == 3 && s[t] == '.' && s[t + 1] == '.' && s[t + 2] == '.') {
-      end = ls;
-      closed = true;
-      break;
-    }
-    if (le >= n) break;
-    p = le + 1;
-  }
-  if (!closed) return KBC_OK;
+  /* THE INVARIANT (include/kbc/meta.h): "a filter on an absent facet returns
+   * zero rows rather than everything." A document that does not OPEN with a
+   * frontmatter fence has declared nothing, so it contributes NO facets at
+   * all — whatever it goes on to contain. A `---` thematic break halfway
+   * down a document is body text, and a prose line that merely mentions
+   * `kb-tags:` is a mention, not a declaration; scanning the whole file for
+   * a closing fence would make `tag:` return documents that never declared
+   * the tag, which is the failure this guard exists to prevent. */
+  size_t bom = 0, start = 0, end = 0, body = 0;
+  if (!kbc_fm_fence(s, n, &bom, &start, &end, &body)) return KBC_OK;
 
   /* The key the previous `- item` lines belong to; a block list is how
- * `kb-tags:\n  - rust\n  - c` is written, and dropping it would silently
- * lose every tag in that form. */
+   * `kb-tags:\n  - rust\n  - c` is written, and dropping it would silently
+   * lose every tag in that form. */
   char *list_key = NULL;
-  i = body;
+  size_t i = start;
   kbc_status st = KBC_OK;
   while (st == KBC_OK && i < end) {
     const size_t ls = i;
-    size_t le = ls;
-    while (le < end && s[le] != '\n') le++;
-    i = le + 1;
+    size_t le = fm_line_end(s, end, ls);
+    i = fm_line_next(end, le);
     size_t t = ls;
     while (t < le && is_space((unsigned char)s[t])) t++;
     if (t >= le || s[t] == '#') continue;

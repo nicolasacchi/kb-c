@@ -1175,6 +1175,165 @@ KBC_TEST(metas_an_unclosed_front_matter_fence_is_not_front_matter) {
   kbc_arena_free(a);
 }
 
+/* A document that does not OPEN with the fence has declared nothing, whatever
+ * it contains later. The renderer treats all four lines as body text, so
+ * indexing a facet from them made `tag:sneaky` return a document that never
+ * declared it — the exact inverse of the rule in include/kbc/meta.h. */
+KBC_TEST(metas_prose_before_a_fence_declares_nothing) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a,
+                            "Notes.\n"
+                            "kb-tags: sneaky\n"
+                            "---\n"
+                            "body\n");
+  KBC_CHECK_EQ_INT(metas_of(p)->len, 0);
+  kbc_arena_free(a);
+}
+
+/* A `---` a few lines into a document is a thematic break in the body, and a
+ * `kb-*` line above it is prose. Same invariant, longer distance. */
+KBC_TEST(metas_a_late_fence_does_not_harvest_the_lines_above_it) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a,
+                            "kb-tags: sneaky\n"
+                            "kb-index: true\n"
+                            "kb-caps: search\n"
+                            "\n"
+                            "Some prose.\n"
+                            "\n"
+                            "---\n"
+                            "\n"
+                            "More prose.\n");
+  KBC_CHECK_EQ_INT(metas_of(p)->len, 0);
+  kbc_arena_free(a);
+}
+
+/* The fence must be at byte 0, not merely somewhere near the top: a single
+ * leading space is a code block or a list, not front matter. */
+KBC_TEST(metas_an_indented_fence_is_not_front_matter) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a, " ---\nkb-tags: rust\n---\nBody.\n");
+  KBC_CHECK_EQ_INT(metas_of(p)->len, 0);
+  kbc_arena_free(a);
+}
+
+/* `...` is a YAML document end, but the reference closes a block only on a
+ * `---` line. With `...` the block is unterminated, so it is a thematic
+ * break and nothing is declared. */
+KBC_TEST(metas_a_dot_fence_does_not_close_front_matter) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a,
+                            "---\n"
+                            "kb-tags: rust\n"
+                            "...\n"
+                            "Body.\n");
+  KBC_CHECK_EQ_INT(metas_of(p)->len, 0);
+  kbc_arena_free(a);
+}
+
+/* A BOM is an editor artefact, not content: a BOM'd document with a real
+ * block still declares its facets. */
+KBC_TEST(metas_a_bom_does_not_hide_front_matter) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a,
+                            "\xEF\xBB\xBF"
+                            "---\n"
+                            "kb-tags: rust\n"
+                            "---\n"
+                            "Body.\n");
+  const kbc_metas *m = metas_of(p);
+  KBC_CHECK_EQ_INT(m->len, 1);
+  KBC_CHECK_EQ_STR(m->items[0].key, "tags");
+  KBC_CHECK_EQ_STR(m->items[0].value, "rust");
+  kbc_arena_free(a);
+}
+
+/* A BOM with no block still declares nothing — stripping it must not make a
+ * document that merely mentions a facet into one that declares it. */
+KBC_TEST(metas_a_bom_without_a_block_declares_nothing) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a,
+                            "\xEF\xBB\xBF"
+                            "Notes.\n"
+                            "kb-tags: sneaky\n"
+                            "---\n"
+                            "body\n");
+  KBC_CHECK_EQ_INT(metas_of(p)->len, 0);
+  kbc_arena_free(a);
+}
+
+/* An opening fence that never closes declares nothing, even when the block
+ * ends in a `---` that belongs to a later thematic break. */
+KBC_TEST(metas_an_unclosed_fence_beats_a_later_thematic_break) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a,
+                            "---\n"
+                            "kb-tags: rust\n"
+                            "\n"
+                            "Prose.\n"
+                            "---\n"
+                            "kb-index: true\n");
+  /* The FIRST `---` after the opener closes, so this block IS front matter
+   * and the later `kb-index:` is body. */
+  const kbc_metas *m = metas_of(p);
+  KBC_CHECK_EQ_INT(m->len, 1);
+  KBC_CHECK_EQ_STR(m->items[0].key, "tags");
+  kbc_arena_free(a);
+}
+
+/* A document whose only `---` is a closing fence it never opened must
+ * contribute no facets at all — the guard is the opener, not the closer. */
+KBC_TEST(metas_a_trailing_fence_alone_declares_nothing) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a, "Prose.\n\n---\n\nMore prose.\n");
+  KBC_CHECK_EQ_INT(metas_of(p)->len, 0);
+  kbc_arena_free(a);
+}
+
+/* A closing fence may carry trailing whitespace (markdown.rs:230 trims the
+ * line), so a block that closes on `---   ` is still front matter. */
+KBC_TEST(metas_a_padded_closing_fence_still_closes) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a,
+                            "---\n"
+                            "kb-tags: rust\n"
+                            "---   \n"
+                            "Body.\n");
+  const kbc_metas *m = metas_of(p);
+  KBC_CHECK_EQ_INT(m->len, 1);
+  KBC_CHECK_EQ_STR(m->items[0].value, "rust");
+  kbc_arena_free(a);
+}
+
+/* A CRLF document is a CRLF document: the reference accepts a `---\r\n`
+ * opener, and a `---\r` closer trims to `---`. Fence handling must not be
+ * the thing that breaks on Windows line endings. */
+KBC_TEST(metas_crlf_front_matter_is_still_front_matter) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a,
+                            "---\r\n"
+                            "kb-tags: rust\r\n"
+                            "---\r\n"
+                            "Body.\r\n");
+  const kbc_metas *m = metas_of(p);
+  KBC_CHECK_EQ_INT(m->len, 1);
+  KBC_CHECK_EQ_STR(m->items[0].key, "tags");
+  KBC_CHECK_EQ_STR(m->items[0].value, "rust");
+  kbc_arena_free(a);
+}
+
+/* The reference splits frontmatter lines on `\n` ONLY (markdown.rs:250,
+ * `split_inclusive('\n')`), so a lone `\r` is ordinary text and the block
+ * never closes. Treating `\r` as a break made this document front matter —
+ * the indexer would return a `tag:t` facet for a document the renderer
+ * shows as a thematic break and a heading. */
+KBC_TEST(metas_a_mixed_ending_fence_does_not_close) {
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_parsed *p = parse_doc(a, "---\nkb-tags: sneaky\r---\rbody\n");
+  KBC_CHECK_EQ_INT(metas_of(p)->len, 0);
+  kbc_arena_free(a);
+}
+
 /* THE INVARIANT: reading metadata must not move a byte of what the index
  * tokenizes. A `<meta>` element between two paragraphs is the case that
  * would break it — a scanner that fed the tag through the block builder
@@ -1301,6 +1460,27 @@ static const kbc_test_case cases[] = {
     {"metas_front_matter_block_list", metas_front_matter_block_list},
     {"metas_an_unclosed_front_matter_fence_is_not_front_matter",
      metas_an_unclosed_front_matter_fence_is_not_front_matter},
+    {"metas_prose_before_a_fence_declares_nothing",
+     metas_prose_before_a_fence_declares_nothing},
+    {"metas_a_late_fence_does_not_harvest_the_lines_above_it",
+     metas_a_late_fence_does_not_harvest_the_lines_above_it},
+    {"metas_an_indented_fence_is_not_front_matter",
+     metas_an_indented_fence_is_not_front_matter},
+    {"metas_a_dot_fence_does_not_close_front_matter",
+     metas_a_dot_fence_does_not_close_front_matter},
+    {"metas_a_bom_does_not_hide_front_matter",
+     metas_a_bom_does_not_hide_front_matter},
+    {"metas_a_bom_without_a_block_declares_nothing",
+     metas_a_bom_without_a_block_declares_nothing},
+    {"metas_an_unclosed_fence_beats_a_later_thematic_break",
+     metas_an_unclosed_fence_beats_a_later_thematic_break},
+    {"metas_a_trailing_fence_alone_declares_nothing",
+     metas_a_trailing_fence_alone_declares_nothing},
+    {"metas_a_padded_closing_fence_still_closes",
+     metas_a_padded_closing_fence_still_closes},
+    {"metas_crlf_front_matter_is_still_front_matter",
+     metas_crlf_front_matter_is_still_front_matter},
+    {"metas_a_mixed_ending_fence_does_not_close", metas_a_mixed_ending_fence_does_not_close},
     {"metas_do_not_change_the_block_text", metas_do_not_change_the_block_text},
     {"metas_a_document_without_any_yields_an_empty_list",
      metas_a_document_without_any_yields_an_empty_list},

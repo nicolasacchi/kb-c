@@ -320,12 +320,31 @@ KBC_TEST(token_gate_is_exhaustive) {
   KBC_CHECK_EQ_INT(call(&f, "GET", "/api/search", "q=alpha", "", &r), 401);
   kbc_response_free(&r);
 
-  /* Well-formed, wrong: 403, so a client can tell "who are you" from "no". An
-   * EMPTY token is well-formed and wrong too, not a missing header. */
+  /* Well-formed, wrong: 403, so a client can tell "who are you" from "no". A
+   * carrier that presents NOTHING is 401, whatever it looked like.
+   *
+   * The 401/403 split is a DELIBERATE kb-c narrowing, not parity: the original
+   * has only `unauthorized` on this path and answers 401 for a wrong secret
+   * too (`middleware.rs:302-304`). kb-c keeps the second status because the
+   * CLI keys on 401 for its "run `kbc token generate`" hint and because the
+   * distinction is what lets a client tell a missing credential from a stale
+   * one. What the original establishes, and what is pinned here, is that a
+   * MISSING carrier is 401 and a PRESENTED-AND-WRONG one is 403 — including
+   * for the second carrier, in token_carriers_admit_and_refuse. */
   KBC_CHECK_EQ_INT(
       call(&f, "GET", "/api/search", "q=alpha", "Bearer wrong", &r), 403);
   kbc_response_free(&r);
-  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/search", "q=alpha", "Bearer ", &r), 403);
+  /* An EMPTY token is 401, not 403, and used to be asserted as 403 here.
+   * Over a socket the parser strips the optional whitespace around a field
+   * value (RFC 7230 §3.2.4), so `Authorization: Bearer ` reaches the ladder as
+   * the six bytes "Bearer": the prefix does not match and no credential was
+   * presented. The 403 this asserted was reachable only through this socketless
+   * seam, which hands kbc_httpd_handle a `kbc_request.auth` that never went
+   * through a parser — a fiction no HTTP client could produce. A secret of
+   * length zero is now treated as no secret at all, so the seam and the wire
+   * agree; the padded-but-present cases the trim exists for are in
+   * token_carriers_admit_and_refuse. */
+  KBC_CHECK_EQ_INT(call(&f, "GET", "/api/search", "q=alpha", "Bearer ", &r), 401);
   kbc_response_free(&r);
   KBC_CHECK_EQ_INT(
       call(&f, "GET", "/api/search", "q=alpha", "Bearer s3cr3t-toke", &r), 403);
@@ -1056,6 +1075,233 @@ KBC_TEST(identity_names_the_admission_that_happened) {
   fx_teardown(&f);
 }
 
+/* --------------------------------------------- the two token carriers ----
+ *
+ * X-Kb-Token exists only ON THE WIRE — it is a header, and the frozen
+ * `kbc_request` (httpd.h:28-36) carries just the Authorization value, so the
+ * socketless seam cannot even express it. Every carrier case therefore goes
+ * over a real loopback socket, which is also the path a caller actually uses.
+ */
+
+/* Sends `raw` and reports the status plus the whole reply. */
+static bool carrier_exchange(server *s, const char *raw, int *status,
+                             char *reply, size_t cap) {
+  return raw_exchange(s, raw, strlen(raw), status, reply, cap);
+}
+
+KBC_TEST(token_carriers_admit_and_refuse) {
+  fixture f;
+  fx_setup(&f, TOKEN);
+  server s;
+  srv_start(&s, &f);
+  if (s.h == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char reply[8192];
+  int status = 0;
+  char good[64];
+  snprintf(good, sizeof good, "Bearer %s", TOKEN);
+
+  struct {
+    const char *hdrs;   /* the whole header block, Host included */
+    int want;
+    const char *what;
+  } cases[] = {
+      {"Authorization: Bearer s3cr3t-token\r\n", 200, "bearer alone"},
+      {"X-Kb-Token: s3cr3t-token\r\n", 200, "x-kb-token alone"},
+      /* Both, agreeing: admitted once, on the first carrier. */
+      {"Authorization: Bearer s3cr3t-token\r\nX-Kb-Token: s3cr3t-token\r\n",
+       200, "both carriers agreeing"},
+      /* Both, DISAGREEING. The original does not compare them: the first
+       * match wins and the loser is never examined (middleware.rs:379-391),
+       * so a valid bearer beside a bogus header is still admitted. */
+      {"Authorization: Bearer s3cr3t-token\r\nX-Kb-Token: not-a-secret\r\n",
+       200, "both carriers, bearer right and x-kb wrong"},
+      /* The mirror: a bogus bearer does not veto a valid X-Kb-Token, which is
+       * what makes the second carrier usable when a proxy has already
+       * overwritten Authorization. */
+      {"Authorization: Bearer not-a-secret\r\nX-Kb-Token: s3cr3t-token\r\n",
+       200, "both carriers, bearer wrong and x-kb right"},
+      {"", 401, "neither carrier"},
+      {"Authorization: Bearer wrong\r\n", 403, "wrong bearer"},
+      {"X-Kb-Token: wrong\r\n", 403, "wrong x-kb-token"},
+      /* A blank Authorization is 401, NOT the 403 a wrong secret gets, and
+       * the reason is upstream of the ladder: RFC 7230 §3.2.4 requires a
+       * parser to strip the optional whitespace around a field value, so this
+       * arrives as the six bytes "Bearer" with no trailing space and the
+       * "Bearer " prefix does not match. No credential was presented.
+       *
+       * The socketless seam disagrees, and deliberately so: it hands
+       * kbc_httpd_handle a `kbc_request` whose `auth` never went through a
+       * parser, so "Bearer " there really does carry a prefix and an empty
+       * secret, and is a 403 (token_gate_is_exhaustive). The wire is the
+       * contract a caller meets; the seam is a test convenience. */
+      {"Authorization: Bearer \r\n", 401, "blank bearer"},
+      /* Whitespace the parser CANNOT remove stays in the secret, so this is
+       * the well-formed-but-wrong case: the leading space is part of " x". */
+      {"Authorization: Bearer  x\r\n", 403, "bearer with an inner space"},
+      /* A BLANK X-Kb-Token is likewise absent (middleware.rs:421-427 filters
+       * it on `!s.is_empty()`), so it is 401 for the same reason. */
+      {"X-Kb-Token: \r\n", 401, "blank x-kb-token"},
+      {"X-Kb-Token:    \r\n", 401, "whitespace-only x-kb-token"},
+      /* The X-Kb-Token trim is load-bearing, not cosmetic: a padded value
+       * carries the SAME secret and must be admitted. This is the case that
+       * needs the trimmed LENGTH rather than a NUL — a compare that took
+       * strlen of the untrimmed value would see the trailing spaces, miss, and
+       * 403 a caller that presented the right secret. */
+      {"X-Kb-Token:   s3cr3t-token  \r\n", 200, "padded x-kb-token"},
+      {"X-Kb-Token:\ts3cr3t-token\t\r\n", 200, "tab-padded x-kb-token"},
+      /* A blank Authorization is 401, NOT the 403 a wrong secret gets, and
+       * the reason is upstream of the ladder: RFC 7230 §3.2.4 requires a
+       * parser to strip the optional whitespace around a field value, so this
+       * arrives as the six bytes "Bearer" with no trailing space and the
+       * "Bearer " prefix does not match. No credential was presented.
+       *
+       * The socketless seam disagrees, and deliberately so: it hands
+       * kbc_httpd_handle a `kbc_request` whose `auth` never went through a
+       * parser, so "Bearer " there really does carry a prefix and an empty
+       * secret, and is a 403 (token_gate_is_exhaustive). The wire is the
+       * contract a caller meets; the seam is a test convenience. */
+      {"Authorization: Bearer \r\n", 401, "blank bearer"},
+      /* Whitespace the parser CANNOT remove stays in the secret, so this is
+       * the well-formed-but-wrong case: the leading space is part of " x". */
+      {"Authorization: Bearer  x\r\n", 403, "bearer with an inner space"},
+      /* Case-sensitive on the scheme, like strip_prefix("Bearer ") — a
+       * lower-case scheme is not a credential at all. */
+      {"Authorization: bearer s3cr3t-token\r\n", 401, "lower-case scheme"},
+      {"Authorization: Basic s3cr3t-token\r\n", 401, "wrong scheme"},
+  };
+  for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+    char req[512];
+    int n = snprintf(req, sizeof req,
+                     "GET /api/identity HTTP/1.1\r\nHost: x\r\n%s\r\n",
+                     cases[i].hdrs);
+    KBC_CHECK_MSG(n > 0 && (size_t)n < sizeof req, "bad fixture for %s",
+                  cases[i].what);
+    KBC_CHECK_MSG(carrier_exchange(&s, req, &status, reply, sizeof reply),
+                  "%s: no HTTP reply", cases[i].what);
+    KBC_CHECK_MSG(status == cases[i].want,
+                  "%s: got %d, want %d (%s)", cases[i].what, status,
+                  cases[i].want, reply);
+    if (cases[i].want >= 400) {
+      KBC_CHECK_MSG(strstr(reply, "application/problem+json") != NULL,
+                    "%s: refusal is not problem+json: %s", cases[i].what,
+                    reply);
+      if (cases[i].want == 401) {
+        KBC_CHECK_MSG(strstr(reply, "WWW-Authenticate: Bearer realm=\"kb\"") !=
+                          NULL,
+                      "%s: a 401 must challenge: %s", cases[i].what, reply);
+      }
+    }
+  }
+
+  srv_stop(&s);
+  fx_teardown(&f);
+}
+
+KBC_TEST(both_carriers_authorization_decides_and_says_so) {
+  /* The rule is a silent PREFERENCE, so the only way an operator can see it
+   * is if the daemon reports which carrier decided. Without the `carrier`
+   * field these three requests are indistinguishable on the wire, and a
+   * per-user secret silently discarded behind a proxy's shared token is
+   * invisible. */
+  fixture f;
+  fx_setup(&f, TOKEN);
+  server s;
+  srv_start(&s, &f);
+  if (s.h == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char reply[8192];
+  int status = 0;
+
+  /* Agreeing: Authorization is the carrier that decided, by position. */
+  {
+    const char *req = "GET /api/identity HTTP/1.1\r\nHost: x\r\n"
+                      "Authorization: Bearer s3cr3t-token\r\n"
+                      "X-Kb-Token: s3cr3t-token\r\n\r\n";
+    KBC_CHECK(carrier_exchange(&s, req, &status, reply, sizeof reply));
+    KBC_CHECK_EQ_INT(status, 200);
+    KBC_CHECK_MSG(strstr(reply, "\"carrier\":\"authorization\"") != NULL,
+                  "agreeing carriers did not report the first: %s", reply);
+  }
+
+  /* Disagreeing, bearer valid: still Authorization, and the bogus
+   * X-Kb-Token neither refuses the request nor changes the attribution. */
+  {
+    const char *req = "GET /api/identity HTTP/1.1\r\nHost: x\r\n"
+                      "Authorization: Bearer s3cr3t-token\r\n"
+                      "X-Kb-Token: someone-elses-secret\r\n\r\n";
+    KBC_CHECK(carrier_exchange(&s, req, &status, reply, sizeof reply));
+    KBC_CHECK_EQ_INT(status, 200);
+    KBC_CHECK_MSG(strstr(reply, "\"carrier\":\"authorization\"") != NULL,
+                  "a disagreeing X-Kb-Token overrode the bearer: %s", reply);
+    KBC_CHECK_MSG(strstr(reply, "\"identity\":\"operator\"") != NULL,
+                  "identity changed: %s", reply);
+  }
+
+  /* Disagreeing the other way: the bearer does NOT veto a valid X-Kb-Token,
+   * which is the case the second carrier exists for. */
+  {
+    const char *req = "GET /api/identity HTTP/1.1\r\nHost: x\r\n"
+                      "Authorization: Bearer not-a-secret\r\n"
+                      "X-Kb-Token: s3cr3t-token\r\n\r\n";
+    KBC_CHECK(carrier_exchange(&s, req, &status, reply, sizeof reply));
+    KBC_CHECK_EQ_INT(status, 200);
+    KBC_CHECK_MSG(strstr(reply, "\"carrier\":\"x-kb-token\"") != NULL,
+                  "the fallback carrier was not reported: %s", reply);
+  }
+
+  /* A loopback caller with no credential was admitted by neither, and saying
+   * "none" is what distinguishes it from a token admission. */
+  {
+    kbc_response r;
+    KBC_CHECK_EQ_INT(
+        call_from(&f, "GET", "/api/identity", NULL, NULL, "127.0.0.1", &r),
+        401);
+    kbc_response_free(&r);
+  }
+
+  /* The identity body answers "which credential did you present", so the
+   * response must declare the headers it varies on — otherwise a shared cache
+   * is free to hand one caller's attribution to another. Vary is a set, so
+   * this also has to survive alongside the Origin the write path always
+   * adds; a second Vary line replacing the first would silently re-open the
+   * cross-origin hole the first one closed. */
+  {
+    const char *req = "GET /api/identity HTTP/1.1\r\nHost: x\r\n"
+                      "Authorization: Bearer s3cr3t-token\r\n\r\n";
+    KBC_CHECK(carrier_exchange(&s, req, &status, reply, sizeof reply));
+    KBC_CHECK_EQ_INT(status, 200);
+    KBC_CHECK_MSG(strstr(reply, "Authorization") != NULL &&
+                      strstr(reply, "X-Kb-Token") != NULL,
+                  "the identity response does not declare what it varies on: "
+                  "%s",
+                  reply);
+    KBC_CHECK_MSG(strstr(reply, "Origin") != NULL,
+                  "the Origin variance was dropped: %s", reply);
+  }
+
+  srv_stop(&s);
+  fx_teardown(&f);
+}
+
+KBC_TEST(identity_reports_the_carrier_for_a_socketless_token) {
+  fixture f;
+  fx_setup(&f, TOKEN);
+  kbc_response r;
+  char good[64];
+  snprintf(good, sizeof good, "Bearer %s", TOKEN);
+  KBC_CHECK_EQ_INT(
+      call_from(&f, "GET", "/api/identity", NULL, good, "10.1.2.3", &r), 200);
+  KBC_CHECK_MSG(strstr(r.body.ptr, "\"carrier\":\"authorization\"") != NULL,
+                "a bearer admission did not name its carrier: %s", r.body.ptr);
+  kbc_response_free(&r);
+  fx_teardown(&f);
+}
+
 KBC_TEST(new_routes_are_in_the_route_table) {
   /* The export is what the docs and the CLI are generated from, so a route
    * that exists but is not listed is a route nobody can discover — and, worse,
@@ -1436,6 +1682,58 @@ typedef struct {
   size_t len;
 } sse_client;
 
+/* Opens a stream with an arbitrary request head, so a test can supply a
+ * Last-Event-ID. `rcvbuf` shrinks the kernel receive buffer before the
+ * connect, which is what makes a stall observable at all: with the default
+ * buffer the kernel absorbs the whole burst and the daemon's own queue never
+ * fills, so the lag path is never taken and the test would pass on a build
+ * with the probe removed. */
+static bool sse_open_head(int port, const char *last_event_id, int rcvbuf,
+                          sse_client *c) {
+  memset(c, 0, sizeof *c);
+  c->fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (c->fd < 0) return false;
+  if (rcvbuf > 0) {
+    (void)setsockopt(c->fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+  }
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof a);
+  a.sin_family = AF_INET;
+  a.sin_port = htons((uint16_t)port);
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (connect(c->fd, (struct sockaddr *)&a, sizeof a) != 0) {
+    close(c->fd);
+    c->fd = -1;
+    return false;
+  }
+  char req[256];
+  int n = snprintf(req, sizeof req,
+                   "GET /api/events HTTP/1.1\r\nHost: x\r\n%s%s%s\r\n",
+                   last_event_id != NULL ? "Last-Event-ID: " : "",
+                   last_event_id != NULL ? last_event_id : "",
+                   last_event_id != NULL ? "\r\n" : "");
+  if (n <= 0 || (size_t)n >= sizeof req) {
+    close(c->fd);
+    c->fd = -1;
+    return false;
+  }
+  size_t off = 0;
+  while (off < (size_t)n) {
+    ssize_t w = send(c->fd, req + off, (size_t)n - off, MSG_NOSIGNAL);
+    if (w <= 0) {
+      close(c->fd);
+      c->fd = -1;
+      return false;
+    }
+    off += (size_t)w;
+  }
+  struct timeval tv;
+  tv.tv_sec = 5;
+  tv.tv_usec = 0;
+  (void)setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  return true;
+}
+
 static bool sse_open(int port, sse_client *c) {
   memset(c, 0, sizeof *c);
   c->fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1660,6 +1958,165 @@ KBC_TEST(sse_attach_racing_the_event_fan_out_keeps_the_daemon) {
                 status);
   KBC_CHECK_MSG(published > 0, "the storm published nothing, so it proved "
                 "nothing");
+
+  kbc_httpd_stop(h);
+  fx_teardown(&f);
+}
+
+/* ------------------------------------------------- the SSE gap/lag probe --
+ *
+ * This is not an invention: the original emits two synthetic frames from
+ * `events_stream` (`kb-core/src/events.rs:190-204, 214-277`), rendered by
+ * `routes/events.rs:139-153`. `gap` fires when the client's Last-Event-ID is
+ * a position the ring cannot serve; `lag` fires when a consumer fell behind
+ * and the broadcast dropped events for it. Both carry NO `id:` line. */
+
+/* Starts a daemon on a loopback port the kernel picked. */
+static int probe_server(fixture *f, kbc_httpd **out) {
+  free(f->cfg->bind_addr);
+  f->cfg->bind_addr = strdup("127.0.0.1");
+  f->cfg->port = 0;
+  f->cfg->http_workers = 1;
+  kbc_err err;
+  kbc_err_reset(&err);
+  *out = kbc_httpd_start(f->app, f->cfg, &err);
+  if (*out == NULL) {
+    fprintf(stderr, "  httpd_start: %s\n", err.msg);
+    return 0;
+  }
+  return kbc_httpd_port(*out);
+}
+
+KBC_TEST(sse_gap_probe_replaces_the_replay_it_cannot_honour) {
+  fixture f;
+  fx_setup(&f, NULL);
+  kbc_httpd *h = NULL;
+  int port = probe_server(&f, &h);
+  if (h == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  /* Three events, so the ring holds ids 1..3 and nothing has been evicted. */
+  for (int i = 0; i < 3; i++) {
+    kbc_app_publish(f.app, "probe.event", "{\"n\":1}");
+  }
+
+  /* A cursor the ring CAN serve replays. This is the control: without it the
+   * assertions below would also pass on a daemon that never replays at all. */
+  {
+    sse_client c;
+    KBC_CHECK(sse_open_head(port, "1", 0, &c));
+    KBC_CHECK(sse_wait(&c, "id: 3", 16));
+    KBC_CHECK_MSG(sse_saw(&c, "id: 2") && sse_saw(&c, "id: 3"),
+                  "a serviceable cursor did not replay: %s", c.buf);
+    KBC_CHECK_MSG(!sse_saw(&c, "event: gap"),
+                  "a serviceable cursor was probed as gapped: %s", c.buf);
+    sse_hangup(&c);
+  }
+
+  /* A cursor AHEAD of everything this process ever assigned — the shape a
+   * client holds after the daemon restarts, since ids restart at 1. */
+  {
+    sse_client c;
+    KBC_CHECK(sse_open_head(port, "99999", 0, &c));
+    KBC_CHECK(sse_wait(&c, "event: gap", 16));
+    KBC_CHECK_MSG(sse_saw(&c, "\"requested_id\":99999"),
+                  "the gap did not name the cursor: %s", c.buf);
+    /* oldest_available_id is 0: three events fit in the ring, so nothing has
+     * been evicted and the ahead-of-daemon case is the only one in play. */
+    KBC_CHECK_MSG(sse_saw(&c, "\"oldest_available_id\":0"),
+                  "the gap did not name the ring's oldest id: %s", c.buf);
+    /* The probe describes the stream, it is not IN it. An `id:` between the
+     * event line and the data line would make a reconnecting client treat the
+     * probe as the newest event and skip everything after it. */
+    KBC_CHECK_MSG(sse_saw(&c, "event: gap\ndata: "),
+                  "the gap probe carried an id: line: %s", c.buf);
+    /* And the replay it cannot honour is SUPPRESSED, not sent alongside. */
+    KBC_CHECK_MSG(!sse_saw(&c, "id: 2") && !sse_saw(&c, "id: 3"),
+                  "a gapped client was replayed the ring anyway: %s", c.buf);
+    sse_hangup(&c);
+  }
+
+  /* A COLD client has no cursor to have fallen behind from, so it is not
+   * probed. The original checks `last_id > 0` before anything else
+   * (`events.rs:232-233`), and probing cold clients would hand every
+   * EventSource a spurious gap. */
+  {
+    sse_client c;
+    KBC_CHECK(sse_open_head(port, NULL, 0, &c));
+    KBC_CHECK(sse_wait(&c, ":ok", 16));
+    KBC_CHECK_MSG(!sse_saw(&c, "event: gap"),
+                  "a cursorless client was probed: %s", c.buf);
+    sse_hangup(&c);
+  }
+
+  kbc_httpd_stop(h);
+  fx_teardown(&f);
+}
+
+KBC_TEST(sse_lag_probe_tells_a_stalled_client_how_far_behind_it_is) {
+  fixture f;
+  fx_setup(&f, NULL);
+  kbc_httpd *h = NULL;
+  int port = probe_server(&f, &h);
+  if (h == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  sse_client c;
+  KBC_CHECK(sse_open_head(port, NULL, 128, &c));
+  KBC_CHECK(sse_wait(&c, ":ok", 16));
+  /* A short per-recv deadline, unlike the five seconds the other streams use:
+   * the check below polls often, and a long deadline would turn each empty
+   * poll into a second of dead time. */
+  {
+    struct timeval quick;
+    quick.tv_sec = 1;
+    quick.tv_usec = 0;
+    (void)setsockopt(c.fd, SOL_SOCKET, SO_RCVTIMEO, &quick, sizeof quick);
+  }
+  /* Publish in chunks, checking for the probe between them, rather than
+   * firing one fixed burst and hoping.
+   *
+   * The earlier version published 400 events and then waited. That races the
+   * worker: EPOLLOUT is level-triggered, so once the socket is writable the
+   * worker spins, drains the whole queue in one sse_pump and goes back to
+   * sleep — and on a many-core box it sometimes kept up with the publisher
+   * well enough that the 64-slot queue never filled. Two runs in ten failed
+   * with no bug present. Chunking removes the race instead of tuning around
+   * it: if the worker kept up this round, another round follows, and the only
+   * way out of the loop without a probe is a daemon that never emits one.
+   *
+   * The 128-byte receive buffer keeps the stall real between checks — the
+   * kernel cannot absorb the burst, so the worker's flush blocks and the queue
+   * starts shedding its oldest entries. */
+  bool saw_lag = false;
+  for (int chunk = 0; chunk < 60 && !saw_lag; chunk++) {
+    for (int i = 0; i < 200; i++) {
+      kbc_app_publish(f.app, "probe.lag", "{\"n\":1}");
+    }
+    for (int p = 0; p < 4 && !saw_lag; p++) {
+      (void)sse_poll(&c);
+      if (sse_saw(&c, "event: lag")) saw_lag = true;
+    }
+  }
+  KBC_CHECK_MSG(saw_lag, "a client that fell behind was never told: %s", c.buf);
+  /* The count is the point: a probe with no number is a shrug, and the client
+   * still cannot tell a one-event slip from a four-hundred-event one. */
+  {
+    const char *sk = strstr(c.buf, "\"skipped\":");
+    KBC_CHECK_MSG(sk != NULL, "the lag carried no count: %s", c.buf);
+    if (sk != NULL) {
+      long skipped = strtol(sk + 10, NULL, 10);
+      KBC_CHECK_MSG(skipped > 0, "the lag reported nothing dropped: %s", c.buf);
+    }
+  }
+  /* Same reason as the gap probe: no id, so it cannot be mistaken for an
+   * event and cannot advance a reconnecting cursor past the frames it
+   * describes. */
+  KBC_CHECK_MSG(sse_saw(&c, "event: lag\ndata: "),
+                "the lag probe carried an id: line: %s", c.buf);
+  sse_hangup(&c);
 
   kbc_httpd_stop(h);
   fx_teardown(&f);
@@ -2418,6 +2875,11 @@ int main(void) {
       {"identity_reports_attribution_only", identity_reports_attribution_only},
       {"identity_names_the_admission_that_happened",
        identity_names_the_admission_that_happened},
+      {"token_carriers_admit_and_refuse", token_carriers_admit_and_refuse},
+      {"both_carriers_authorization_decides_and_says_so",
+       both_carriers_authorization_decides_and_says_so},
+      {"identity_reports_the_carrier_for_a_socketless_token",
+       identity_reports_the_carrier_for_a_socketless_token},
       {"new_routes_are_in_the_route_table", new_routes_are_in_the_route_table},
       {"cors_is_same_origin_only_unless_configured",
        cors_is_same_origin_only_unless_configured},
@@ -2428,6 +2890,10 @@ int main(void) {
        concurrent_connects_do_not_corrupt_the_conn_table},
       {"sse_attach_racing_the_event_fan_out_keeps_the_daemon",
        sse_attach_racing_the_event_fan_out_keeps_the_daemon},
+      {"sse_gap_probe_replaces_the_replay_it_cannot_honour",
+       sse_gap_probe_replaces_the_replay_it_cannot_honour},
+      {"sse_lag_probe_tells_a_stalled_client_how_far_behind_it_is",
+       sse_lag_probe_tells_a_stalled_client_how_far_behind_it_is},
       {"a_refused_start_leaves_the_callers_descriptors_open",
        a_refused_start_leaves_the_callers_descriptors_open},
       {"no_path_outside_the_source_root_is_ever_served",

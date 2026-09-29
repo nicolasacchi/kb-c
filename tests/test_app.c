@@ -39,6 +39,11 @@ int64_t kbc_store_pending_count(kbc_store *s, kbc_err *err);
  * by-path case can be driven from the public boundary. */
 kbc_status kbc_app_delete_path(kbc_app *app, const char *corpus,
                                const char *rel_path, kbc_err *err);
+/* The query-embedding LRU's ceiling. Its hits, misses, invalidations and
+ * entry count are fields on the frozen kbc_app_stats and are read through
+ * kbc_app_stats_get like every other counter; only the capacity is app.c's
+ * own function, declared here on the same terms as kbc_app_delete_path. */
+size_t kbc_app_query_cache_capacity(const kbc_app *app);
 
 #define CORPUS_A "alpha"
 #define CORPUS_B "beta"
@@ -3496,17 +3501,32 @@ KBC_TEST(a_long_document_is_stored_as_overlapping_windows_and_stays_findable) {
  * a fixed vector, so "was this document re-embedded?" is observable from
  * outside the process. The log is the whole point: the alternative — reading
  * the vector store back — cannot tell a document that was re-embedded with
- * the same value from one that was not touched. */
+ * the same value from one that was not touched.
+ *
+ * `announce` is the difference between a fake and a sidecar. A production
+ * one pushes {"kind":"ready","model":...,"dim":N} unprompted the moment the
+ * model is loaded, and the query cache is keyed on the model name read off
+ * THAT line — so a fake that stays silent leaves the query lane with no key to
+ * build, and every query embed fails with "its model is not known yet" before
+ * the sidecar is ever asked. The quarantine cases below drive the DOCUMENT
+ * lane, which never builds a key, so they leave it off and keep the fake as
+ * silent as it was; the query-cache cases turn it on. The health case stays
+ * for the older handshake shape. */
 static void make_counting_sidecar(const char *path, const char *log_path,
-                                  bool fail) {
+                                  bool fail, bool announce) {
   kbc_str s;
   kbc_str_init(&s);
   (void)kbc_str_printf(&s, "#!/bin/sh\nLOG=%s\n", log_path);
+  if (announce) {
+    (void)kbc_str_puts(&s,
+                       "printf '%s\\n' '{\"kind\":\"ready\",\"model\":\"fake\","
+                       "\"dim\":3}'\n");
+  }
   (void)kbc_str_puts(&s,
                      "while IFS= read -r line; do\n"
-       "  printf '%s\\n' \"$line\" >> \"$LOG\"\n"
-       "  case \"$line\" in\n"
-    "  *health*) printf '%s\\n' '{\"ok\":true,\"dim\":3,\"model\":\"fake\"}' ;;\n");
+      "  printf '%s\\n' \"$line\" >> \"$LOG\"\n"
+      "  case \"$line\" in\n"
+   "  *health*) printf '%s\\n' '{\"ok\":true,\"dim\":3,\"model\":\"fake\"}' ;;\n");
   if (fail) {
     /* A sidecar-reported error is a failed REQUEST, not a dead pipe. */
     (void)kbc_str_puts(&s,
@@ -3595,8 +3615,10 @@ static kbc_status seed_failure(const kbc_config *cfg, const char *path,
 }
 
 /* A corpus of ONE document with a fake sidecar wired in, so what the sidecar
- * was asked to embed names exactly one file. */
-static void fx_setup_quarantine(fixture *f, bool sidecar_fails) {
+ * was asked to embed names exactly one file. `announce` is the query-cache
+ * cases' flag: the document lane never needs the model, the query lane keys
+ * on it. */
+static void fx_setup_quarantine(fixture *f, bool sidecar_fails, bool announce) {
   memset(f, 0, sizeof(*f));
   kbc_test_tmpdir(f->root, sizeof f->root);
   join(f->data, sizeof f->data, f->root, "data");
@@ -3607,7 +3629,7 @@ static void fx_setup_quarantine(fixture *f, bool sidecar_fails) {
   kbc_test_write_file(p, DOC_A);
   join(f->sidecar, sizeof f->sidecar, f->root, "sidecar.sh");
   join(f->log, sizeof f->log, f->root, "sidecar.log");
-  make_counting_sidecar(f->sidecar, f->log, sidecar_fails);
+  make_counting_sidecar(f->sidecar, f->log, sidecar_fails, announce);
 
   f->cfg = make_cfg(f->data, f->corpus_a, NULL);
   KBC_CHECK_NOT_NULL(f->cfg);
@@ -3626,7 +3648,7 @@ static void fx_setup_quarantine(fixture *f, bool sidecar_fails) {
  * forever — which is the failure the gate exists to stop. */
 KBC_TEST(a_failed_embed_is_recorded_against_the_document) {
   fixture f;
-  fx_setup_quarantine(&f, true);
+  fx_setup_quarantine(&f, true, false);
   if (f.app == NULL) {
     fx_teardown(&f);
     return;
@@ -3707,7 +3729,7 @@ KBC_TEST(a_failed_embed_is_recorded_against_the_document) {
  * stop. So the count must still read at the threshold after a gated pass. */
 KBC_TEST(a_quarantined_document_stays_indexed_and_keeps_its_error_row) {
   fixture f;
-  fx_setup_quarantine(&f, false);
+  fx_setup_quarantine(&f, false, false);
   if (f.app == NULL) {
     fx_teardown(&f);
     return;
@@ -3817,7 +3839,7 @@ static bool log_mentions(const char *log_path, const char *word) {
  * reads the recorded hash back off the row. */
 KBC_TEST(an_edited_document_leaves_quarantine_and_an_unchanged_one_does_not) {
   fixture f;
-  fx_setup_quarantine(&f, false);
+  fx_setup_quarantine(&f, false, false);
   if (f.app == NULL) {
     fx_teardown(&f);
     return;
@@ -3893,6 +3915,423 @@ KBC_TEST(an_edited_document_leaves_quarantine_and_an_unchanged_one_does_not) {
 
   fx_teardown(&f);
 }
+
+/* --------------------------------------------------------- query cache --- */
+
+/* How many EMBED requests the sidecar was actually asked for. The log holds
+ * every line the sidecar read, handshake included, so a raw line count would
+ * let a protocol change masquerade as a cache miss. */
+static size_t count_embed_requests(const char *log_path) {
+  char *text = kbc_test_read_file(log_path);
+  if (text == NULL) {
+    return 0;
+  }
+  size_t n = 0;
+  for (const char *p = text; (p = strstr(p, "\"kind\":\"embed\"")) != NULL;
+       p++) {
+    n++;
+  }
+  free(text);
+  return n;
+}
+
+/* The query cache's half of the stats, read the way the daemon reports it —
+ * kbc_app_stats_get, not a private peek. */
+static kbc_app_stats qc_stats(kbc_app *app) {
+  kbc_app_stats st;
+  memset(&st, 0, sizeof st);
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_stats_get(app, &st, &err));
+  return st;
+}
+
+/* THE cache test: the second identical query must not reach the sidecar.
+ *
+ * The sidecar's log is the only witness that can tell the two apart. A hit and
+ * a miss both return the right vector and both answer the query, so asserting
+ * on the RESULT proves nothing — the vector a cache returns is the vector the
+ * sidecar returned. What a cache changes is the number of round trips, and
+ * that is what the log counts.
+ *
+ * The key is the model name and the RAW query text and nothing else, and the
+ * second half of the case is what makes that claim falsifiable: a search that
+ * differs only in mode, limit or corpus filter is the SAME query and must
+ * still hit. A key that carried any of those would silently re-embed and cost
+ * the 50-100 ms the cache exists to avoid. */
+KBC_TEST(a_second_identical_query_never_reaches_the_sidecar) {
+  fixture f;
+  fx_setup_quarantine(&f, false, true);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  /* The app owns the cache: it exists before the first query, it is empty, and
+   * its ceiling is the original's DEFAULT_CAPACITY (embed_cache.rs:52) — the
+   * capacity the 19 us linear-scan measurement in embed.h was taken at. */
+  KBC_CHECK_EQ_INT(qc_stats(f.app).query_cache_entries, 0);
+  KBC_CHECK_EQ_INT(kbc_app_query_cache_capacity(f.app), 1024);
+
+  /* From here the log belongs to the QUERY lane alone. The reindex above
+   * embedded the document, and that request must not be read as a query. */
+  kbc_test_write_file(f.log, "");
+
+  char path[64], title[64], id[32];
+  search_flags flags;
+  memset(&flags, 0, sizeof flags);
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "accruals", NULL, path, sizeof path,
+                                  title, sizeof title, id, sizeof id, &flags),
+                   1);
+  KBC_CHECK_MSG(flags.vector_ran,
+                "the vector lane did not run on a cache miss");
+  KBC_CHECK_MSG(count_embed_requests(f.log) == 1,
+                "a cold query asked the sidecar %zu times, want 1",
+                count_embed_requests(f.log));
+  {
+    const kbc_app_stats st = qc_stats(f.app);
+    KBC_CHECK_EQ_INT(st.query_cache_hits, 0);
+    KBC_CHECK_EQ_INT(st.query_cache_misses, 1);
+    KBC_CHECK_EQ_INT(st.query_cache_drops, 0);
+    KBC_CHECK_EQ_INT(st.query_cache_entries, 1);
+  }
+
+  /* The same query, asked a different way: semantic instead of hybrid, limit
+   * 3 instead of 10, and scoped to a corpus. None of that is in the key and
+   * none of it changes what the query embeds to. */
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a != NULL) {
+    kbc_query q;
+    memset(&q, 0, sizeof q);
+    q.q = "accruals";
+    q.corpus = CORPUS_A;
+    q.kind = KBC_KIND__COUNT;
+    q.mode = KBC_MODE_SEMANTIC;
+    q.limit = 3;
+    kbc_search_result r;
+    memset(&r, 0, sizeof r);
+    kbc_err le;
+    kbc_err_reset(&le);
+    KBC_CHECK_OK(kbc_app_search(f.app, a, &q, &r, &le));
+    /* A hit must still be an ANSWER: an empty, degraded result would also have
+     * cost no round trip, and would pass a request count alone. */
+    KBC_CHECK_MSG(r.vector_ran, "a cache hit left the vector lane off");
+    KBC_CHECK_MSG(!r.degraded, "a cached query reported itself degraded");
+    KBC_CHECK_EQ_INT(r.len, 1);
+    if (r.len == 1) {
+      KBC_CHECK_EQ_STR(r.rows[0].path, "a.md");
+    }
+    KBC_CHECK_MSG(count_embed_requests(f.log) == 1,
+                  "a repeated query asked the sidecar %zu times, want 1: the "
+                  "cache is not on the query lane",
+                  count_embed_requests(f.log));
+    {
+      const kbc_app_stats st = qc_stats(f.app);
+      KBC_CHECK_EQ_INT(st.query_cache_hits, 1);
+      KBC_CHECK_EQ_INT(st.query_cache_misses, 1);
+      KBC_CHECK_EQ_INT(st.query_cache_entries, 1);
+    }
+    kbc_arena_free(a);
+  }
+
+  /* A DIFFERENT query is a different key, however similar: it misses, and it
+   * reaches the sidecar. A cache keyed on anything coarser than the query text
+   * would answer this one from the entry above. */
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "ledger", NULL, path, sizeof path,
+                                  title, sizeof title, id, sizeof id, NULL),
+                   1);
+  KBC_CHECK_MSG(count_embed_requests(f.log) == 2,
+                "a different query asked the sidecar %zu times, want 2",
+                count_embed_requests(f.log));
+  {
+    const kbc_app_stats st = qc_stats(f.app);
+    KBC_CHECK_EQ_INT(st.query_cache_hits, 1);
+    KBC_CHECK_EQ_INT(st.query_cache_misses, 2);
+    KBC_CHECK_EQ_INT(st.query_cache_entries, 2);
+  }
+
+  fx_teardown(&f);
+}
+
+/* A sidecar that answers honestly until `marker` exists and lies after it. The
+ * lie is a line that is not a reply: embed.c treats a malformed one as fatal
+ * and reaps the child, which is the "the sidecar died" case exactly, without
+ * the test having to kill anything. */
+static void make_flipping_sidecar(const char *path, const char *log_path,
+                                  const char *marker) {
+  kbc_str s;
+  kbc_str_init(&s);
+  (void)kbc_str_printf(&s, "#!/bin/sh\nLOG=%s\nMARKER=%s\n", log_path, marker);
+  (void)kbc_str_puts(&s,
+                     "printf '%s\\n' '{\"kind\":\"ready\",\"model\":\"fake\","
+                     "\"dim\":3}'\n"
+                     "while IFS= read -r line; do\n"
+                     "  printf '%s\\n' \"$line\" >> \"$LOG\"\n"
+                     "  case \"$line\" in\n"
+                     "  *health*) printf '%s\\n' '{\"ok\":true,\"dim\":3,"
+                     "\"model\":\"fake\"}' ;;\n"
+                     "  *embed*)\n"
+                     "    if [ -f \"$MARKER\" ]; then\n"
+                     "      printf '%s\\n' 'not a reply at all'\n"
+                     "    else\n"
+                     "      printf '%s\\n' '{\"ok\":true,\"dim\":3,"
+                     "\"vectors\":[[1,0,0]]}'\n"
+                     "    fi ;;\n"
+                     "  esac\n"
+                     "done\n");
+  kbc_test_write_file(path, s.ptr);
+  kbc_str_free(&s);
+  KBC_CHECK_MSG(chmod(path, 0755) == 0, "chmod %s: %s", path, strerror(errno));
+}
+
+static void fx_setup_flipping(fixture *f) {
+  memset(f, 0, sizeof(*f));
+  kbc_test_tmpdir(f->root, sizeof f->root);
+  join(f->data, sizeof f->data, f->root, "data");
+  join(f->corpus_a, sizeof f->data, f->root, CORPUS_A);
+  kbc_test_mkdir_p(f->corpus_a);
+  char p[KBC_TEST_PATH_MAX];
+  join(p, sizeof p, f->corpus_a, "a.md");
+  kbc_test_write_file(p, DOC_A);
+  join(f->sidecar, sizeof f->sidecar, f->root, "sidecar.sh");
+  join(f->log, sizeof f->log, f->root, "sidecar.log");
+  char marker[KBC_TEST_PATH_MAX];
+  join(marker, sizeof marker, f->root, "flip");
+  make_flipping_sidecar(f->sidecar, f->log, marker);
+
+  f->cfg = make_cfg(f->data, f->corpus_a, NULL);
+  KBC_CHECK_NOT_NULL(f->cfg);
+  if (f->cfg == NULL) return;
+  free(f->cfg->embedder_cmd);
+  f->cfg->embedder_cmd = strdup(f->sidecar);
+  kbc_err err;
+  kbc_err_reset(&err);
+  f->app = kbc_app_open(f->cfg, &err);
+  if (f->app == NULL) fprintf(stderr, "  app_open: %s\n", err.msg);
+  KBC_CHECK_NOT_NULL(f->app);
+}
+
+/* What a sidecar that dies actually does to the cache: nothing.
+ *
+ * The vectors in the LRU are keyed on the model name the sidecar announced,
+ * so a replacement announcing a different model is a different key and a
+ * sidecar that fails to handshake has no model to key under at all —
+ * kbc_embed_query refuses rather than caching under a name it cannot vouch
+ * for. What is left is the exposure this project accepted on purpose: the
+ * entries a live sidecar produced stay answerable after it dies, because they
+ * are a pure function of (model, query) and a dead sidecar is exactly when an
+ * operator least wants a 30 s timeout per keystroke.
+ *
+ * So the two halves that matter are pinned here rather than asserted in a
+ * comment: a HIT survives the death without touching the pipe, and a query
+ * the dead sidecar refuses writes NOTHING back — a failed embed must not
+ * leave a hole, a zero vector, or an entry the next identical query would be
+ * served. */
+KBC_TEST(a_dead_sidecar_keeps_the_cache_and_stores_nothing_new) {
+  fixture f;
+  fx_setup_flipping(&f);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  char path[64], title[64], id[32];
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "accruals", NULL, path, sizeof path,
+                                  title, sizeof title, id, sizeof id, NULL),
+                   1);
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "accruals", NULL, path, sizeof path,
+                                  title, sizeof title, id, sizeof id, NULL),
+                   1);
+  {
+    const kbc_app_stats st = qc_stats(f.app);
+    KBC_CHECK_EQ_INT(st.query_cache_hits, 1);
+    KBC_CHECK_EQ_INT(st.query_cache_misses, 1);
+    KBC_CHECK_EQ_INT(st.query_cache_entries, 1);
+    KBC_CHECK_EQ_INT(st.query_cache_drops, 0);
+  }
+
+  /* The sidecar starts lying: every reply from here is a line that is not a
+   * reply, which embed.c treats as fatal and answers by reaping the child. */
+  char marker[KBC_TEST_PATH_MAX];
+  join(marker, sizeof marker, f.root, "flip");
+  kbc_test_write_file(marker, "x");
+
+  /* A HIT is answered entirely from the cache: no sidecar, no request, and
+   * still a real answer. */
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "accruals", NULL, path, sizeof path,
+                                  title, sizeof title, id, sizeof id, NULL),
+                   1);
+  {
+    const kbc_app_stats st = qc_stats(f.app);
+    KBC_CHECK_MSG(st.query_cache_hits == 2,
+                  "a cached query was not served after the sidecar died: %lld "
+                  "hits",
+                  (long long)st.query_cache_hits);
+    KBC_CHECK_EQ_INT(st.query_cache_drops, 0);
+  }
+
+  /* A MISS reaches the sidecar, is refused, and writes nothing back. */
+  KBC_CHECK_EQ_INT(first_hit_path(f.app, "ledger", NULL, path, sizeof path,
+                                  title, sizeof title, id, sizeof id, NULL),
+                   1);
+  {
+    const kbc_app_stats st = qc_stats(f.app);
+    KBC_CHECK_EQ_INT(st.query_cache_drops, 1);
+    KBC_CHECK_MSG(st.query_cache_entries == 1,
+                  "a refused query left %lld entries behind; a failed embed "
+                  "must cache nothing",
+                  (long long)st.query_cache_entries);
+    /* And it is not a miss that will be re-attempted for ever either: the
+     * entry it failed to write is simply absent, which is the honest state. */
+    KBC_CHECK_EQ_INT(st.query_cache_misses, 1);
+  }
+  KBC_CHECK_EQ_INT(kbc_app_query_cache_capacity(f.app), 1024);
+
+  fx_teardown(&f);
+}
+
+/* The cache is freed with the app.
+ *
+ * The reopen is the observable half: a second kbc_app over the same data
+ * directory starts from an empty cache at the full ceiling, so nothing from
+ * the first outlived the close. The free ITSELF is what ASan proves — a
+ * leaked LRU and its per-entry vectors are invisible to any in-process
+ * assertion, which is why this case is worth running in that lane. */
+KBC_TEST(a_populated_query_cache_is_released_when_the_app_closes) {
+  fixture f;
+  fx_setup_quarantine(&f, false, true);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  char path[64], title[64], id[32];
+  for (int i = 0; i < 3; i++) {
+    static const char *three[3] = {"accruals", "ledger", "alpha"};
+    (void)first_hit_path(f.app, three[i], NULL, path, sizeof path, title,
+                         sizeof title, id, sizeof id, NULL);
+  }
+  KBC_CHECK_EQ_INT(qc_stats(f.app).query_cache_entries, 3);
+
+  kbc_app_close(f.app);
+  f.app = NULL;
+  kbc_err_reset(&err);
+  f.app = kbc_app_open(f.cfg, &err);
+  if (f.app == NULL) fprintf(stderr, "  app_open: %s\n", err.msg);
+  KBC_CHECK_NOT_NULL(f.app);
+  if (f.app != NULL) {
+    KBC_CHECK_EQ_INT(qc_stats(f.app).query_cache_entries, 0);
+    KBC_CHECK_EQ_INT(kbc_app_query_cache_capacity(f.app), 1024);
+  }
+
+  fx_teardown(&f);
+}
+
+/* One cache, four workers, and the counters have to add up.
+ *
+ * The cache's own mutex in embed.c is the only synchronisation between
+ * concurrent queries — app->qcache is immutable after kbc_app_open, so the app
+ * adds no lock of its own and this is the path where a race in the LRU would
+ * live. The invariant is an accounting one, which is the only kind that can be
+ * asserted after the fact: every search that entered the query lane is exactly
+ * one hit, one miss or one drop, and the cache holds exactly one entry per
+ * DISTINCT query. A lost counter update, a double-counted put or an entry
+ * evicted by a racing touch all break that arithmetic, and none of them shows
+ * up in a single-threaded run. The threads deliberately share terms, so they
+ * collide on keys and the LRU order is mutated from several directions at once
+ * rather than merely read.
+ *
+ * This is the case that wants the TSan lane as much as the ASan one. */
+typedef struct {
+  kbc_app *app;
+  int rounds;
+} qc_racer;
+
+static void *qc_race(void *user) {
+  qc_racer *r = (qc_racer *)user;
+  static const char *terms[4] = {"accruals", "ledger", "alpha", "accruals"};
+  for (int i = 0; i < r->rounds; i++) {
+    kbc_arena *a = kbc_arena_new(64u * 1024u);
+    if (a == NULL) {
+      return NULL;
+    }
+    kbc_query q;
+    memset(&q, 0, sizeof q);
+    q.q = terms[(size_t)i % 4u];
+    q.kind = KBC_KIND__COUNT;
+    q.mode = KBC_MODE_HYBRID;
+    q.limit = 10;
+    kbc_search_result res;
+    memset(&res, 0, sizeof res);
+    kbc_err err;
+    kbc_err_reset(&err);
+    /* A degraded lane is never a reason to fail the search, so a status other
+     * than KBC_OK here would be the bug. */
+    if (kbc_app_search(r->app, a, &q, &res, &err) != KBC_OK) {
+      KBC_CHECK_MSG(false, "concurrent search failed: %s", err.msg);
+    }
+    kbc_arena_free(a);
+  }
+  return NULL;
+}
+
+KBC_TEST(concurrent_queries_share_one_cache_and_the_counters_add_up) {
+  fixture f;
+  fx_setup_quarantine(&f, false, true);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+
+  enum { N_THREADS = 4, N_ROUNDS = 40, N_TERMS = 3 };
+  pthread_t th[N_THREADS];
+  qc_racer racers[N_THREADS];
+  for (int i = 0; i < N_THREADS; i++) {
+    racers[i].app = f.app;
+    racers[i].rounds = N_ROUNDS;
+    KBC_CHECK_MSG(pthread_create(&th[i], NULL, qc_race, &racers[i]) == 0,
+                  "pthread_create %d", i);
+  }
+  for (int i = 0; i < N_THREADS; i++) {
+    (void)pthread_join(th[i], NULL);
+  }
+
+  const int64_t searches = (int64_t)N_THREADS * N_ROUNDS;
+  const kbc_app_stats st = qc_stats(f.app);
+  KBC_CHECK_EQ_INT(st.searches_served, searches);
+  /* A live sidecar and a cache with room: nothing can fail, and the three
+   * counters between them must account for every single search. */
+  KBC_CHECK_MSG(st.query_cache_drops == 0,
+                "%lld query embeds failed against a sidecar that was up",
+                (long long)st.query_cache_drops);
+  KBC_CHECK_MSG(st.query_cache_hits + st.query_cache_misses == searches,
+                "the query lane accounted for %lld of %lld searches",
+                (long long)(st.query_cache_hits + st.query_cache_misses),
+                (long long)searches);
+  KBC_CHECK_MSG(st.query_cache_hits > 0,
+                "%d queries over %d terms produced no hit at all", searches,
+                N_TERMS);
+  /* One entry per distinct term — the fourth array slot repeats the first. A
+   * racing eviction or a duplicate put would show up here. */
+  KBC_CHECK_EQ_INT(st.query_cache_entries, N_TERMS);
+
+  fx_teardown(&f);
+}
+
+
 
 
 int main(void) {
@@ -3992,6 +4431,14 @@ int main(void) {
        a_quarantined_document_stays_indexed_and_keeps_its_error_row},
       {"an_edited_document_leaves_quarantine_and_an_unchanged_one_does_not",
        an_edited_document_leaves_quarantine_and_an_unchanged_one_does_not},
+      {"a_second_identical_query_never_reaches_the_sidecar",
+       a_second_identical_query_never_reaches_the_sidecar},
+      {"a_dead_sidecar_keeps_the_cache_and_stores_nothing_new",
+       a_dead_sidecar_keeps_the_cache_and_stores_nothing_new},
+      {"a_populated_query_cache_is_released_when_the_app_closes",
+       a_populated_query_cache_is_released_when_the_app_closes},
+      {"concurrent_queries_share_one_cache_and_the_counters_add_up",
+       concurrent_queries_share_one_cache_and_the_counters_add_up},
       {NULL, NULL},
   };
   return kbc_test_run("app", cases);
