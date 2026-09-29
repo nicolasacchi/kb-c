@@ -6,8 +6,8 @@ the port exists, what is being built in what order, how the performance claim
 is measured, and what would have to be true for kb-c to be a drop-in.
 
 Scope in one line: 231,507 LOC of Rust across six crates, of which kb-c today
-claims 97,546 (42.1%) and a further 19,020 (8.2%) is scheduled below. The
-remaining 49.6% is out of scope and stays in Rust. Those three figures are the
+claims 102,964 (44.5%) and a further 15,920 (6.9%) is scheduled below. The
+remaining 48.6% is out of scope and stays in Rust. Those three figures are the
 PORTED+PARTIAL, PLANNED and OUT-OF-SCOPE row sums in `INVENTORY.md`,
 recomputed from the rows on 2026-09-29.
 
@@ -200,8 +200,8 @@ originally stated:
    sequential scan.
 3. **Query scratch is thread-local**, not mutex-guarded — see §2.3.
 4. **The JSON writer and the daemon's own test suite found defects a design
-   document would not have.** The test suite is 14 ctest binaries with 531
-   case functions, and it found 24 defects during the build, among them two
+   document would not have.** The test suite is 14 ctest binaries with 624
+   case functions; it found 24 defects during the build, among them two
    use-after-frees, a data race across query threads, and the CLI's offline
    path. Treat a stage's acceptance gate as unproven until a test exists that
    fails when the behaviour is wrong.
@@ -340,8 +340,11 @@ one-flag version of it that needs no second toolchain.
 ## 3. Staged migration
 
 Stage 0 is built. Stage 1 is **MOSTLY BUILT**: of its six units, five are in
-and the enrich hooks are not. Stage 2 is **mostly** built: the query grammar and
-prefix expansion landed, in the shape the index can answer, the `docs_query.rs`
+and unit 5 — the enrichment hooks — is in as ONE of the original's eight hooks
+plus the registry and the discipline the hooks hang off, so it is PARTIAL
+rather than absent.
+Stage 2 is **mostly** built: the query grammar and prefix expansion landed, in
+the shape the index can answer, the `docs_query.rs`
 filter overlay is in (`tag:`, `cap:`/`caps:`, `index:`; `scope:` and `since:`
 stay refused), and link extraction — including wikilinks — is in. Stage 3 is
 **mostly** built: `problem+json`, `/api/identity`, `/api/kbs`, CORS, rate
@@ -384,13 +387,13 @@ SSE — stages 3 and 5 added more, and the exported `KBC_ROUTES` table is the
 authority), `watcher.c` (inotify), `json.c`, `mem.c`, `log.c`, `kbc.c`,
 `cli/main.c`, the frozen headers.
 
-The tree today, which is more than stage 0: 31,392 lines of C in `src/`, 2,261
-of frozen header (18 headers), 3,648 in the CLI.
+The tree today, which is more than stage 0: 36,605 lines of C in `src/` (16
+files), 2,701 of frozen header (18 headers), 4,953 in the CLI.
 
 Acceptance gate (met): Release, `-DKBC_SANITIZE=ON` and TSan builds clean under
 `-Wall -Wextra -Wpedantic -Wshadow -Wcast-qual -Wstrict-prototypes
 -Wmissing-prototypes -Wwrite-strings -Wvla -Wformat=2 -Werror`; `ctest` green in
-all three — 14 suites, 531 case functions, last recorded at `8fc54e3` with
+all three — 14 suites, 624 case functions, last recorded at `8fc54e3` with
 14/14 in each lane from clean trees.
 
 Behaviour it matches, per the contracts extracted from the Rust source: BM25
@@ -445,9 +448,11 @@ floor: the journal appends ~1.9 KB after ten appends and still costs 36.3 ms,
 and fsync on this device costs 33.9 ms for 90 bytes. The cost no longer scales
 with the corpus. `BENCHMARKS.md` has the breakdown and the before/after.
 
-**Units 1–4 and 6 are in; unit 5, the enrich hooks, is not.** They landed
-together in `5b17573` (storage, the resolution ladder, the root guard) and
-`8dc36bb` (quarantine, chunking, backup, the renderer).
+**Units 1–4 and 6 are in; unit 5 is PARTIAL, not absent.** Units 1–4 and 6
+landed together in `5b17573` (storage, the resolution ladder, the root guard)
+and `8dc36bb` (quarantine, chunking, backup, the renderer). Unit 5 landed in
+`cab1f2a`, which brought the registry, the discipline and the one hook kb-c's
+scope has a feature for.
 
 Units:
 1. `store.c`: **BUILT.** The flat CREATE-TABLE array is now a versioned
@@ -492,8 +497,36 @@ Units:
    `history`, `corkboard`, `pinned_memories` and `reading_sections` untouched
    (invariant 8). Inbound edges are demoted to `pending_links` rather than
    dropped, so a document that comes back finds its backlinks.
-5. `app.c`: the eight `enrich.rs` hooks, in Rust's registration order. **NOT
-   BUILT** — the only unit of this stage with nothing in the tree.
+5. `app.c`: the `enrich.rs` hooks, in Rust's registration order — **PARTIAL,
+   not BUILT and not absent.** What landed in `cab1f2a` is the REGISTRY and the
+   DISCIPLINE, plus one hook: `enrich_registry` (`app.c:3285`) holds exactly one
+   row, `edge-record`, which keeps the original's fifth slot
+   (`enrich.rs:118-133`). The discipline is the part with teeth
+   (`enrich.rs:14-24`): a hook is BEST-EFFORT — its failure is logged by name
+   and stepped over, and it must never fail the index or leave the store half
+   written — a cheap pre-filter runs before it, run order IS registration
+   order, and the store is the only writer. That contract is frozen in
+   `include/kbc/app.h:243-266`, and the seam `kbc_enrich_run` takes parallel
+   arrays so a caller never mirrors the private hook struct. Tested at the app
+   layer (`tests/test_app.c:1620` onward): the discipline — order, pre-filter,
+   best-effort, a hook that writes — and the edge-record hook's own resolution
+   rule.
+
+   **The seven hooks that are NOT ported are named and absent with a reason
+   each** (`app.c:3050-3072`), and that is the whole of what is missing:
+   `session-capture` (no sessions corpus), `memory-recall-ledger` and
+   `memory-commit-ledger` (no ledger table, no writer), `memory-link-seed` (no
+   seed metas, no cross-kb linking), `code-refs` (no code-reference extraction
+   in the parser), `snapshot-capture` (no versions table, no content-hash
+   snapshot store) and `list-anchor` (no list entries, no reading lists) — each
+   serving a feature `INVENTORY.md` marks OUT-OF-SCOPE. A registration whose
+   feature does not exist is a hook that cannot fire, which reads like coverage
+   and is worse than no row at all, so they are absent **on purpose**, and
+   those seven lines are what tells the next porter which rows are missing. One
+   further divergence, stated because it changes what a hook may see: kb-c
+   enriches a **BATCH**, not a document, because it writes the link graph after
+   the whole walk and an edge written per document would make the graph depend
+   on walk order.
 6. `app.c` + `include/kbc/chunk.h`: **BUILT.** The 280-word window with 60-word
    overlap and chunk 0 as the title passage, replacing one-chunk-per-parsed-
    block. The contract is frozen because the constants are a contract; the
@@ -516,6 +549,23 @@ indexed and BM25-searchable. The gate is the `errors` row keyed by
 `(path, content hash)`, **not** a `<state>/quarantine/<kb>/` directory — which
 is what this section used to promise, and what a reader checking the tree
 will not find.
+
+**The gate for unit 5 is per-hook, and it is this: each of the original's
+eight hooks is either registered in `enrich_registry` or named-and-absent with
+a reason. — met, and it is met asymmetrically: one is registered
+(`edge-record`), seven are named-and-absent.** A gate phrased as "do the eight
+hooks exist?" is a gate this unit could fail while shipping everything kb-c's
+scope has a feature for, so the gate asks the question the tree can answer. The
+discipline's own gates are met too and are tested: run order IS registration
+order; a hook that says it is uninterested is not run at all; a hook that
+returns an error is logged by name and stepped over, the hooks after it still
+run, and the batch is unaffected; and `edge_record` writes an edge only for a
+unique resolution (`enrich.rs:1095`). **What this unit does NOT have, and what
+no gate here can substitute for, is the seven features the absent hooks serve**
+— no sessions corpus, no memory ledgers, no memory-link seeds, no
+code-reference extraction, no artifact snapshots, no list entries. Each is a
+stage that is out of scope, and porting the hook without the feature would
+register a callback that can never fire.
 
 Behaviour it must match: the four ingest constants
 (`INGEST_QUEUE_CAPACITY = 1024`, `INGEST_BATCH_MAX_DOCS = 32`,
@@ -1163,8 +1213,11 @@ narrowing recorded in `INVENTORY.md`:
   (`AND`/`OR`/`NOT`, groups, implicit AND, `folder:`, `text:`/`q:`, and the
   `tag:`/`cap:`/`index:` facet atoms), which tantivy never had; the narrowing
   is the other way round. `since:` and `scope:` are refused with a 400.
-- No `corkboard`/lists/notes/slate/session/memory/atlas/share surface. Those
-  are 49.6% of the in-scope LOC and they stay in Rust. (The `corkboard`,
+- No `corkboard`/lists/notes/slate/session/memory/atlas/share surface, with one
+  exception: the note-links READ surface (`GET /api/kb/{kb}/notes/{id}/links`)
+  is served, because it is a pure function of the `edges` table kb-c already
+  keeps; nothing writes, edits or deletes a note. The named families are 48.6%
+  of the in-scope LOC and they stay in Rust. (The `corkboard`,
   `pinned_memories` and `excluded_files` TABLES exist, because a removal must
   leave the user's rows alone and the port has to be able to say so; no surface
   writes or reads them yet.)
@@ -1295,11 +1348,11 @@ softened, Zig is the first alternative to re-evaluate.
 | R3 | Memory safety under ASan is not the same as memory safety in a long-running daemon (the sanitizer only sees what the tests run). | Corruption after days of uptime. | ASan lane is mandatory before any commit. Bounds are checked before arithmetic, not after (§`AGENTS.md` rule 7). The index's mmap'd structures are the sharp edge: they are parsed from a file, so a truncated or corrupt index must be detected and rejected, never trusted. |
 | R4 | Hand-rolling 226 routes and 7 middleware layers reproduces the behaviour but not the ergonomics; a subtle layer-order bug changes who can read what. | An auth or CORS regression. | P6 and P7 are testable invariants, tested directly. The route table is generated from kb-c's own dispatch and checked against the exported `KBC_ROUTES` in both directions, so no route is undiscoverable and no listed route lacks one — a table check, not a behaviour check. |
 | R5 | The vector lane's loss of IVF-PQ makes large corpora slower. | kb-c loses to Rust above ~20k rows. | Stated in §4 M5 as a non-claim. The crossover point is a measurement, and the honest answer may be "kb-c is a keyword-first tool". |
-| R6 | Scope creep: 49.6% of the in-scope LOC is untaken, and the pressure to "just add slate" or "just add sessions" is real. | The port never finishes and the delivered thing is neither a drop-in nor fast. | `INVENTORY.md` is the scope contract, with the reason on every OUT-OF-SCOPE row. Adding a subsystem means changing this document first, with a cost, not slipping into a stage. **And the cost is not the LOC column**: `doctor.rs` read as 2,930 lines of stage-5 work and turned out to be a check of the Claude Code provenance chain, which kb-c has no concept of; `markdown.rs` read as 800 lines of a renderer and hid an entire engine. A row's size is not its scope, which is the same reason R13 is a risk. |
+| R6 | Scope creep: 48.6% of the in-scope LOC is untaken, and the pressure to "just add slate" or "just add sessions" is real. | The port never finishes and the delivered thing is neither a drop-in nor fast. | `INVENTORY.md` is the scope contract, with the reason on every OUT-OF-SCOPE row. Adding a subsystem means changing this document first, with a cost, not slipping into a stage. **And the cost is not the LOC column**: `doctor.rs` read as 2,930 lines of stage-5 work and turned out to be a check of the Claude Code provenance chain, which kb-c has no concept of; `markdown.rs` read as 800 lines of a renderer and hid an entire engine. A row's size is not its scope, which is the same reason R13 is a risk. |
 | R7 | The two daemons (`kb`, `kb-code`) drift further apart as kb-c diverges from kb. | A workspace with two incompatible `kb`s. | Out of scope by decision and stated as such, in both documents. When kb-c becomes production-replacement, the migration story is "run the new daemon, keep the old one for the code lane" — they never shared a store. |
 | R8 | The `kb-code-*` subtree is 240,255 LOC of Rust that nobody maintains after the port lands. | Silent bit-rot in a subsystem kb-c does not replace. | Explicitly not this project's problem, and said so rather than left implicit. |
 | R9 | Performance work is done before correctness work, because the performance claim is the reason the port exists. | A fast, wrong index ships. | The stage order in §3 puts storage completeness, grammar and HTTP parity ahead of measurement (stage 6), and the measurement stage found two severe correctness defects in the ingest path (§2.4.5) — which is the argument for the order, made by the order itself. |
 | R10 | The debounce and batching constants are tuned for the Rust daemon's latency. | kb-c either re-indexes too eagerly or too slowly. | P3-style treatment: `watcher_debounce_ms` (250 ms today, configurable) and the batch constants are in one place and listed in stage 1's gate, and are revisited once kb-c has a corpus to tune against. The reconcile pass has landed — a full reindex sweeps and removes what vanished — but it runs **on a reindex**, not on a 60-second timer, so an unobserved removal is still only noticed when something asks for a reindex. |
 | R11 | A watcher event re-indexes **that one file** in place (`reindex_one`), because the frozen index has no add-to-open operation. | Ingestion cost is a function of change size rather than corpus size, which is the point, but there is still no batch drain: N files touched in a debounce window means N single-file updates rather than one transaction. | Deliberate and measured, and the measurement corrected the design twice: the in-place update alone did NOT make the cost proportional to the file, because the save rewrote and fsynced the whole index (251 ms / 500 ms / 1.19 s at 1,000 / 5,000 / 20,000 documents). A delta journal fixed that, and the matched A/B puts a save at 30.6 / 33.3 / 36.3 ms at 1,000 / 5,000 / 20,000 documents — flat across a 20× range, because all three are the storage's fsync floor (`BENCHMARKS.md`). The remaining work is stage 1's batch drain (≤32 docs / ≤8 MiB), which is now a throughput improvement rather than a correctness one. Until it lands, many small changes in one window cost more than they should — a known weakness, not a surprise. |
 | R12 | The artifact id is a pure function of `(corpus, path)`, so a **rename** is a delete plus an insert, not an update. | A renamed file loses its id, its comment threads and its chunk history unless the move is observed. | **Mitigated in the store, and not yet reachable by an operator.** `kbc_store_rekey_artifact` rewrites every id-keyed row in ONE transaction, so a rename carries the id, the comments with their ids and timestamps, the corkboard entry, the pin, the first-indexed anchor and the reading history across rather than dropping them; `moves` records the intent before the rename and stamps it after, a stale id resolves through a chain-walked lookup, and a bring-up pass converges an interrupted one by warning and ABANDONING (a rekey it cannot complete would report having carried state it did not carry). The alternative the row used to weigh — minting a new id on every save — remains worse. What is missing is the last step: there is no `mv` verb and no relocate route, so the seam is reachable from the tests only. A rename the daemon does NOT observe still disappears through stage 1's reconcile pass, which keeps the user's rows and demotes inbound edges to `pending_links` |
-| R13 | A design document can describe a behaviour convincingly enough that nobody tests it. | Stage 0 shipped claiming a `sha256(rel_path)` id, 280-word chunk windows and plain JSON errors — and later drafts of this plan described an embedder wire protocol the real sidecar does not speak, and quoted a 10.3 ms incremental update that was never measured clean. | The test suite is the arbiter, and it earns that position: 14 suites, 624 cases, 24 defects found during the build, including two use-after-frees and a cross-thread data race (§2.4.4). A number that no run on the current code produced does not belong in this document, even as a placeholder. Any behaviour added to §3 without a test that fails when it is wrong is not done. **The corollary, learned the hard way in §2.5: a green lane is not the same as a correct one.** An uninitialised struct flag passed a green release lane AND a green ASan lane, because no sanitizer reports uninitialised reads; it was caught only because the TSan build rendered differently from the release build. A test that fails intermittently is worse than no test — it trains everyone who reads CI to ignore red — so the one such case was deleted rather than tuned, with the declined alternative recorded in DECISIONS.md ADR-007. |
+| R13 | A design document can describe a behaviour convincingly enough that nobody tests it. | Stage 0 shipped claiming a `sha256(rel_path)` id, 280-word chunk windows and plain JSON errors — and later drafts of this plan described an embedder wire protocol the real sidecar does not speak, and quoted a 10.3 ms incremental update that was never measured clean. | The test suite is the arbiter, and it earns that position: 14 suites, 624 cases, and **36 defects** found and fixed across the build — the 24 the suite itself found at stage 0 (§2.4.4), three more found by measuring the running daemon (§2.4.5), five more by a review pass over the three largest files (§2.4.6), and four more by the 2026-09-28/29 work (§2.5) — among them two use-after-frees and a cross-thread data race. A number that no run on the current code produced does not belong in this document, even as a placeholder. Any behaviour added to §3 without a test that fails when it is wrong is not done. **A corollary this document learned the expensive way: a unit that ships NAMED GAPS is a different fact from a unit that ships nothing.** Stage 1 unit 5 (the enrichment hooks) read here as NOT BUILT because it delivered one of eight hooks, when what the tree actually held was a registry, a discipline, one registered hook and seven documented absences — a PARTIAL unit with an acceptance gate a reader can actually run. A gate phrased as "do the eight hooks exist?" cannot distinguish that from an empty table, which is why this one is now written per hook. **The other corollary, learned the hard way in §2.5: a green lane is not the same as a correct one.** An uninitialised struct flag passed a green release lane AND a green ASan lane, because no sanitizer reports uninitialised reads; it was caught only because the TSan build rendered differently from the release build. A test that fails intermittently is worse than no test — it trains everyone who reads CI to ignore red — so the one such case was deleted rather than tuned, with the declined alternative recorded in DECISIONS.md ADR-007. |

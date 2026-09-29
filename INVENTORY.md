@@ -1,7 +1,7 @@
 # INVENTORY.md — module-by-module map of the Rust `kb` → C `kb-c`
 
 Source of truth for LOC: `find /home/nik/project/kb/crates -name '*.rs' -not -path '*/tests/*' -not -path '*/benches/*' | xargs wc -l`.
-Total: **471,634 LOC across 540 files in 8 crates.**
+Total: **510,455 LOC across 575 files in 8 crates.**
 
 kb-c's side is the frozen contract in `include/kbc/*.h` (18 headers) and its
 implementation, one file per subsystem (`src/<name>.c`, `cli/main.c`).
@@ -30,9 +30,9 @@ recomputed from the rows on 2026-09-29.
 | Status | Files | LOC | % |
 |---|---:|---:|---:|
 | PORTED | 33 | 11,357 | 4.91% |
-| PARTIAL | 44 | 86,189 | 37.23% |
-| PLANNED | 51 | 19,020 | 8.22% |
-| OUT-OF-SCOPE | 124 | 114,941 | 49.65% |
+| PARTIAL | 47 | 91,607 | 39.57% |
+| PLANNED | 50 | 15,920 | 6.88% |
+| OUT-OF-SCOPE | 122 | 112,623 | 48.65% |
 | **total** | **252** | **231,507** | **100%** |
 
 Plus, in the two `kb-code-*` crates: 34 module rows, 240,255 LOC, every one
@@ -40,8 +40,8 @@ OUT-OF-SCOPE (table below).
 
 > These counts are the row statuses in this document, not a claim about what
 > is finished. The port's live surface today is the PORTED + PARTIAL set:
-> 97,546 LOC of Rust that kb-c claims, of which 11,357 is a row-for-row port
-> and 86,189 is a deliberately narrower replacement. The bulk of the
+> 102,964 LOC of Rust that kb-c claims, of which 11,357 is a row-for-row port
+> and 91,607 is a deliberately narrower replacement. The bulk of the
 > difference is `storage/sqlite.rs` and `storage/lance.rs`, whose C
 > counterparts are `store.c` and `index.c` — a fifteen-data-table SQLite schema
 > at v12 (plus the `schema_version` bookkeeping table) and a hand-rolled
@@ -124,13 +124,13 @@ of roughly the same size as this one, not a stage of it. It stays in Rust.
 | `kb-core/src/memory.rs` | 3,678 | Memory types, decay, salience, recall scoring | OUT-OF-SCOPE | — |
 | `kb-core/src/share/mod.rs` | 3,268 | Share/deploy orchestration | OUT-OF-SCOPE | — |
 | `kb-core/src/review.rs` | 3,169 | Review anchors, comments, verdicts, attachments | PARTIAL | `src/store.c` — comments and anchors; no verdicts, no attachments |
-| `kb-core/src/enrich.rs` | 3,100 | 8 ordered post-index enrichment hooks | PLANNED | `src/app.c` (stage 4) |
+| `kb-core/src/enrich.rs` | 3,100 | 8 ordered post-index enrichment hooks | PARTIAL | `src/app.c` — `enrich_registry` (app.c:3285) registers **one** of the original's eight, `edge-record`, in the original's fifth slot; the other seven are named-and-absent with a reason each at app.c:3050-3072. What kb-c took whole is the DISCIPLINE, not the count: a hook is best-effort (`enrich.rs:14-24`) — its failure is logged by name and stepped over and must never fail the index — a cheap pre-filter runs first, run order IS registration order, and the store is the only writer (`include/kbc/app.h:243-266`). The seam `kbc_enrich_run` is in the frozen `app.h` and takes parallel arrays, so a caller never mirrors the private hook struct. NOT ported, and this is a narrowing rather than a gap: the seven absent hooks each serve a feature this document marks OUT-OF-SCOPE — `session-capture` (no sessions corpus), `memory-recall-ledger` and `memory-commit-ledger` (`memory.rs` is OUT-OF-SCOPE and no ledger table exists), `memory-link-seed` (`memory_links.rs`), `code-refs` (`coderefs.rs`), `snapshot-capture` (`versions.rs`), `list-anchor` (`lists.rs`). kb-c also enriches a BATCH, not a document, because it writes the link graph after the whole walk and an edge written per document would make the graph depend on walk order |
 | `kb-core/src/atlas.rs` | 2,530 | UMAP/PCA embedding layout, clustering, snapshots | OUT-OF-SCOPE | — |
 | `kb-core/src/parser.rs` | 2,029 | HTML/Markdown field extraction, frontmatter, capability flags | PARTIAL | `src/parse.c` — Markdown and HTML block extraction with stable element anchors, heading levels and a title fallback, and **frontmatter is read**: the `kb-*` keys of a LEADING `---` block become facets, in both the scalar (`kb-tags: a, b`) and block-list (`kb-tags:\n  - a`) forms. The fence predicate is `kbc_fm_fence` in the frozen `parse.h`, called by BOTH the facet extractor and the renderer — the second copy of that scan is what produced a facet-injection defect (a document opening with prose, mentioning `kb-tags:` anywhere and containing a later `---` had that facet **indexed** while the renderer treated the whole file as body, so `tag:x` matched a document that never declared the tag). No capability flags |
 | `kb-core/src/lists.rs` | 1,927 | Lists and entries with dense positions | OUT-OF-SCOPE | — |
 | `kb-core/src/coderefs.rs` | 1,791 | Code-reference extraction from doc prose | OUT-OF-SCOPE | — |
 | `kb-core/src/capture.rs` | 1,585 | Capture pipeline: slug, stamp, atomic write, id | PARTIAL | `src/app.c` — write/stamp/id, no HTML sanitizer |
-| `kb-core/src/relocate.rs` | 1,505 | Move log and path relocation | OUT-OF-SCOPE | — |
+| `kb-core/src/relocate.rs` | 1,505 | Move log and path relocation | PARTIAL | `src/store.c` + `src/app.c` + the frozen `include/kbc/store.h`'s moves section — **the rekey half is ported, the file is not**. The `moves` table is migration 11 and `abandoned_at` is migration 12 (`ALTER`, not a fold into 11); `kbc_store_record_move` writes the intent BEFORE the rename and `kbc_store_complete_move` stamps it after, so an interrupted move is a listable row rather than a lost document. `kbc_store_rekey_artifact` re-keys every artifact-referencing row in ONE transaction, and `kbc_store_moves_lookup` is CHAIN-WALKED (bounded, cycle-guarded) so a stale id resolves to where the document is now; `kbc_store_list_incomplete_moves` feeds a bring-up pass in `kbc_app_open`, which warns and ABANDONS rather than re-running the rekey. `kbc_app_move_path` drives all of it. **Deliberately NOT ported: the delete-suppression guard.** The original holds an in-memory `PendingMoves` set plus a durable `moves_suppresses_delete` check so a rename cannot be read as a delete inside the watcher's debounce window; kb-c has no such table and does not need one, because the watcher's delete resolves against the STORE ROW for the path and the move holds `reindex_mu` across the rename and the rekey, so the window never opens — the argument is stated in `include/kbc/app.h`'s move contract. Its absence is a narrowing, not a missing capability, and it is why this row is PARTIAL rather than a whole-file port. Also not ported and not claimed: `relocate_folder` (a whole-folder rename) and `list_indexed_under_folder`, which have no counterpart in `src/` or `cli/`. The move has no verb and no route — see `PORT_PLAN.md` stage 4 |
 | `kb-core/src/watcher.rs` | 1,390 | Filesystem watch, debounce, reconcile walk | PARTIAL | `src/watcher.c` (inotify) — per-path debounce/coalescing into one publish and a prompt, null-safe stop; no periodic reconcile walk |
 | `kb-core/src/docs_query.rs` | 1,300 | In-memory filter evaluation over candidate rows | PARTIAL | `src/search.c` + `src/app.c` + `src/store.c` — the filter overlay is built. Facets come from the document's own markup (`<meta name="kb-tags" content="a, b">` and Markdown front matter), extracted into `doc_metas` (schema v4) and evaluated **once per query** as a membership set of index doc ids. `tag:`, `cap:`/`caps:` and `index:` are no longer HTTP 400s. A filter that matches nothing returns **zero** rows, never everything — that invariant is tested at the store, search and app layers. Value comparison is CASE-SENSITIVE, as in the original (`docs_query.rs:258` compares `String`s with `==`). `cap:` matches declared `kb-caps` metadata rather than the original's capability ANALYSIS (`svg_count`, `has_canvas`, `code_block_count`), which kb-c does not perform — a deliberate deviation |
 | `kb-core/src/sessions/live.rs` | 1,256 | Live-transcript tailing | OUT-OF-SCOPE | — |
@@ -225,7 +225,7 @@ of roughly the same size as this one, not a stage of it. It stays in Rust.
 | `kb-server/src/routes/lookup.rs` | 937 | Lookup by id/path/title | PLANNED | `src/httpd.c` (stage 3) |
 | `kb-server/src/routes/artifacts.rs` | 935 | Artifact list/paging | PARTIAL | `src/httpd.c` — `GET /api/artifacts` with `kb`, `kind`, `limit`, `offset`; no filter grammar |
 | `kb-server/src/routes/history.rs` | 820 | History write/read | PLANNED | `src/httpd.c` (stage 3) |
-| `kb-server/src/routes/notes.rs` | 813 | Notes routes | OUT-OF-SCOPE | — |
+| `kb-server/src/routes/notes.rs` | 813 | Notes routes | PARTIAL | `src/httpd.c` — **one handler**, and it is the same handler the `routes/links.rs` row below credits: `GET /api/kb/{kb}/notes/{id}/links`, registered in the exported `KBC_ROUTES` table (httpd.c:6547) and implemented at httpd.c:2021 — one note's outgoing wikilinks carrying state `resolved`/`ambiguous`/`dangling`, plus its backlinks. **One deliberate divergence**: `note_row` asserts `notes::is_note` before it will answer (`notes.rs:305-317`), so an artifact id is a 404 there; kb-c cannot make that assertion, because its ingest assigns `KBC_KIND_ARTIFACT` to every document unconditionally (`app.c:789`) and asserting the stored kind would 404 the whole corpus. The row's `is_note` still reports the stored kind, so the assertion is a single `if` away the day ingest starts minting notes. Not ported: every other notes route — create, edit, delete, today, daycard — and none of them is in `KBC_ROUTES`. `kb-core/src/notes.rs` (the note model itself: `slugify`, `compose_note_source`, `split_note_source`, `checklist_counts`) is a separate row and is still OUT-OF-SCOPE; this row is the serving surface, not the model |
 | `kb-server/src/routes/proposals.rs` | 747 | Proposals | OUT-OF-SCOPE | — |
 | `kb-server/src/routes/links.rs` | 747 | Link routes | PARTIAL | `src/httpd.c` — three of the five handlers, wire shapes field for field: `GET /api/kb/{kb}/backlinks/{id}` (nothing linking here is an **empty array, not a 404**), `GET /api/kb/{kb}/wikilinks/suggest` (`?q=` required, a title prefix outranks a substring outranks a basename, `?limit=` clamped to 50) and the note-links surface at `GET /api/kb/{kb}/notes/{id}/links`, whose outgoing rows carry `state` `resolved`/`ambiguous`/`dangling`. **The ladder's AMBIGUOUS answer discards its candidate ids on the wire**, because the original does, and the test asserts the whole row so a build that smuggles them through any member fails. NOT ported: `links suggest` and `links apply` — both are thin handlers over `kb_core::mentions` (`suggest_unlinked` calls `find_mentions` and reads `MIN_MENTION_LEN` directly), and that module is OUT-OF-SCOPE below, so there is nothing to port them *from* |
 | `kb-server/src/routes/metrics.rs` | 736 | Prometheus text endpoint | PORTED | `src/httpd.c` — `GET /metrics`, text exposition 0.0.4, always 200, always `no-store`. It sits outside the `/api` tree, so it is neither counted nor rate-limited as an API request, which is the placement the original has. Tested: the exposition shape, that served `/api` requests are counted, and that the detailed layer appears when enabled. **A client of it is in the tree now too** — see the `kb-cli/src/commands/metrics.rs` row |
