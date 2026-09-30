@@ -270,16 +270,6 @@ struct kbc_worker {
   size_t zomb_len, zomb_cap;
 };
 
-/* One entry of the STALE set: the (artifact_id, comment_id) pair the original
- * keys its `anchor_state` map on (indexer.rs:3036). Fixed-width, because the
- * store mints both ids through `mint_id` at KBC_MAX_ID_LEN hex characters and
- * a comment id that did not fit would be a row this pass cannot key — the
- * pass refuses it loudly rather than tracking half of it. */
-typedef struct {
-  char doc_id[KBC_MAX_ID_LEN + 1];
-  char comment_id[KBC_MAX_ID_LEN + 1];
-} anchor_key;
-
 struct kbc_httpd {
   kbc_app *app;
   const kbc_config *cfg; /* BORROWED; the daemon outlives its httpd anyway */
@@ -327,16 +317,25 @@ struct kbc_httpd {
    * kb-c serves no web UI, so there is no legitimate cross-origin caller. */
   kbc_strlist cors;
   size_t rate_limit; /* requests per connection per second, 0 disables */
-  /* Anchor re-evaluation, the state behind `comment.anchor_stale` and
+  /* Anchor re-evaluation, the trigger behind `comment.anchor_stale` and
    * `comment.anchor_resolved`. Guarded by `anchors_mu`, which is ALSO the
    * single-owner lock for the pass: the workers' tick takes it with trylock,
    * so N workers tick and exactly one of them scans. That is the same
    * discipline as `all_conns`/`conns_mu` — shared state, mutated from more
    * than one thread, one lock, initialised in start and destroyed in stop
-   * alongside the other two. Nothing here is read without it. */
+   * alongside the other two. Nothing here is read without it.
+   *
+   * There is NO in-memory set beside this flag, and that is the change worth
+   * naming. The httpd used to keep its own (doc_id, comment_id) keys so it
+   * could tell a first stale from a steady one, and that set died with the
+   * process — which is exactly the bug `kb-core/src/anchors.rs` documents
+   * introducing its sidecar to fix ("v0.5 P4 introduced an in-process HashSet
+   * of stale comment ids; it died on restart, so the first reindex after a
+   * restart could never fire comment.anchor_resolved"). The set now lives in
+   * `comment_anchors`, written in the same transaction as the verdict it
+   * describes, and `kbc_anchor_judgement.transitioned` is the edge this flag
+   * does not have to track. */
   pthread_mutex_t anchors_mu;
-  anchor_key *anchors; /* KBC_OWN; the STALE set */
-  size_t anchors_len, anchors_cap;
   atomic_bool anchors_dirty; /* set by `index.updated`, consumed by the pass */
 
 };
@@ -353,6 +352,52 @@ static const char *const CT_PROBLEM =
 static const char *const KBC_PROM_CONTENT_TYPE =
     "text/plain; version=0.0.4; charset=utf-8";
 
+/* Case-insensitive, because HTTP requires it and two spellings of one header
+ * is a client-side ambiguity this would otherwise create. */
+static bool hdr_name_eq(const char *a, const char *b) {
+  while (*a != '\0' && *b != '\0') {
+    unsigned char x = (unsigned char)*a;
+    unsigned char y = (unsigned char)*b;
+    if (x >= 'A' && x <= 'Z') x = (unsigned char)(x - 'A' + 'a');
+    if (y >= 'A' && y <= 'Z') y = (unsigned char)(y - 'A' + 'a');
+    if (x != y) return false;
+    a++;
+    b++;
+  }
+  return *a == *b;
+}
+
+kbc_status kbc_response_header(kbc_response *r, const char *name,
+                               const char *value) {
+  if (r == NULL || name == NULL || value == NULL) {
+    return kbc_err_set(NULL, KBC_ERR_INVALID,
+                       "kbc_response_header: NULL response, name or value");
+  }
+  /* An empty name would emit a line the client cannot attribute; an empty
+   * value is legitimate and is how a header is cleared, so only the name is
+   * refused. */
+  if (name[0] == '\0') {
+    return kbc_err_set(NULL, KBC_ERR_INVALID, "response header: empty name");
+  }
+  for (size_t i = 0; i < r->n_headers; i++) {
+    if (hdr_name_eq(r->headers[i].name, name)) {
+      r->headers[i].value = value;
+      return KBC_OK;
+    }
+  }
+  if (r->n_headers >= KBC_RESPONSE_MAX_HEADERS) {
+    /* A refusal, never a drop. Silently dropping the ninth header could drop
+     * Content-Disposition, which for an attachment is the XSS guard. */
+    return kbc_err_set(NULL, KBC_ERR_INVALID,
+                       "response headers: already at the %u header limit",
+                       (unsigned)KBC_RESPONSE_MAX_HEADERS);
+  }
+  r->headers[r->n_headers].name = name;
+  r->headers[r->n_headers].value = value;
+  r->n_headers++;
+  return KBC_OK;
+}
+
 void kbc_response_init(kbc_response *r) {
   if (!r) return;
   r->status = 200;
@@ -360,6 +405,7 @@ void kbc_response_init(kbc_response *r) {
   kbc_str_init(&r->body);
   r->sse = false;
   r->close_after = false;
+  r->n_headers = 0;
 }
 
 void kbc_response_free(kbc_response *r) {
@@ -3236,6 +3282,1278 @@ const kbc_route *kbc_httpd_routes(size_t *n_out) {
   if (n_out != NULL) *n_out = g_view_n;
   return g_view;
 }
+/* The attachment and verdict contract lives in include/kbc/store.h. It was
+ * hand-copied here while that header was the orchestrator's to edit, and
+ * it is gone rather than reconciled. */
+
+/* ================================================== review, comments, ... ==
+ *
+ * Three features that the original keeps in one JSON file per (kb, artifact)
+ * and kb-c keeps in tables, so they are one section: a comment is what
+ * carries an anchor, an anchor is what a verdict is read against, and an
+ * attachment belongs to a comment. Splitting them across three sections here
+ * would be three descriptions of one document.
+ *
+ * THE STORAGE DIVERGENCE, stated once. `kb_core::review` is a `ReviewFile`
+ * — schema `kb-comments/1` — written per (kb, artifact) to `<state>/<kb>/
+ * .review/<id>.json` under a per-kb `review_lock`, with an ETag and a
+ * whole-file read-modify-write for every mutation. kb-c's `comments` is a
+ * TABLE in the same database as the artifact, so each mutation here is one
+ * statement in one transaction and there is no lock, no ETag and no
+ * read-modify-write. That is not a simplification of the original's
+ * behaviour; it is the same behaviour with the lost-update window removed,
+ * and it is why these handlers are short.
+ */
+
+/* A registered handler's own response header lines.
+ *
+ * WHY THIS EXISTS AT ALL. `kbc_response` is frozen and carries no header
+ * list, and the attachment serve route cannot be correct without
+ * `Content-Disposition` — the XSS guard (root invariant #18) is "only raster
+ * images go inline, everything else is force-downloaded", and a force-download
+ * IS that header. The write path already emits `nosniff` on every response,
+ * so the keystone is there; the disposition is the part with no other home.
+ * The conn-level `extra` buffer the switch uses cannot help, because a
+ * registered handler has no `conn` and `kbc_httpd_handle` has none either.
+ *
+ * WHY A THREAD-LOCAL AND NOT A PLAIN STATIC. It is per-CALL state, not
+ * shared state: dispatch points it at its own `local_hdrs` immediately
+ * before the handler runs and clears it immediately after, so only the
+ * calling thread can ever read it and it never names another request's
+ * buffer. That is a different thing from the global mutable state rule 5
+ * forbids — there is no singleton, no lazy initialisation and no value that
+ * outlives a call — and it is the same lifetime discipline the parameter
+ * scratch beside it already has.
+ *
+ * It is deleted the moment `kbc_response` grows a header field, which is the
+ * change this belongs in; see the port report. */
+
+/* Appends one header line. Returns KBC_OK and does nothing when no channel
+ * is armed, so a handler called directly (a test driving it, say) does not
+ * have to know whether the dispatcher is there. A NULL name or value is
+ * refused rather than formatted: a header with an empty value is a header
+ * the client will read as present-and-blank. */
+static kbc_status route_header(kbc_response *out, const char *name,
+                               const char *value) {
+  return kbc_response_header(out, name, value);
+}
+
+/* Bound-parameter lookup, the row writer and the id predicate. Declared
+ * here because the handlers are ordered by the document they act on rather
+ * than by the order they happen to need each other in, and a handler that
+ * has to be moved up two screens to find its helper is a handler whose
+ * helper somebody will eventually duplicate. */
+static const char *param_value(const kbc_route_params *p, const char *name);
+static kbc_status attachment_json(kbc_str *out, const kbc_attachment *at);
+static bool sub_id_is(const char *s);
+
+/* ---------------------------------------------- the review document ---- */
+
+/* Resolves `{id}` to an artifact, and refuses a corpus that does not hold
+ * it. The corpus check is the load-bearing half and it is a real lookup, not
+ * a string compare: an artifact id is a hash of (corpus, path), so an id
+ * presented under the WRONG corpus names a document in another corpus and
+ * answering with it would let a client holding one token read across
+ * corpora. The original makes the same check in `validate(&state, &kb, &id)`.
+ *
+ * THE RETURN VALUE IS THE STATUS OF THE LOOKUP, NOT OF THE ERROR BODY, and
+ * that distinction is the whole of why this function is written the way it
+ * is. `resp_error` returns what `kbc_response_error_json` returned, which is
+ * the status of BUILDING the problem+json — `KBC_OK` on a perfectly good 404.
+ * Returning that from here made every one of the nine callers' `if
+ * (kbc_failed(st)) goto done;` guards dead, so a route that had just been
+ * told "no such document" carried on into its body-building with the
+ * `kbc_artifact` still zeroed by the caller's `memset`, and read
+ * `strlen(art.corpus)` off a NULL. That is the segfault: a 404 for a
+ * well-formed id that names nothing took the whole daemon down.
+ *
+ * So the error body is written here and the MISS is returned here, and the
+ * two are kept apart on purpose. `dispatch` treats a failed handler that
+ * already wrote a body as a finished answer — it drops the header lines and
+ * keeps the 404 — which is what a lookup that failed is. */
+static kbc_status review_doc(kbc_app *app, kbc_arena *a, const char *kb,
+                             const char *id, kbc_artifact *out,
+                             kbc_response *rsp) {
+  kbc_err local;
+  kbc_err_reset(&local);
+  kbc_status st = kbc_app_get_artifact(app, a, id, false, out, &local);
+  if (kbc_failed(st)) {
+    (void)resp_error(rsp, 404, KBC_ERR_NOTFOUND, "document %s: %s", id,
+                     local.msg);
+    return st;
+  }
+  /* `corpus` is a column, so it is non-NULL for any row `get_artifact`
+   * returned; the NULL arm is here so a future SLIM select that drops it
+   * cannot turn a lookup into a strcmp on NULL. */
+  if (out->corpus == NULL || strcmp(out->corpus, kb) != 0) {
+    (void)resp_error(rsp, 404, KBC_ERR_NOTFOUND,
+                     "document %s is not in corpus %s", id, kb);
+    return KBC_ERR_NOTFOUND;
+  }
+  return KBC_OK;
+}
+
+/* The anchor state as it travels on the wire.
+ *
+ * THREE NAMES AND NO FOURTH, and the third one is the whole point.
+ * `undecidable` is NOT a synonym for `unresolved`: unresolved is the clean
+ * negative — the heading the comment named is not in the document — and
+ * undecidable is "something is at this id now, it is not the thing the
+ * comment was written about, and the store cannot see which explanation is
+ * true". A client that renders the two identically is told a claim was
+ * checked and failed when it was never settled, and a client that renders
+ * undecidable as `resolved` shows a comment attached to a heading nobody
+ * wrote it on.
+ *
+ * `unjudged` is a FOURTH wire name and it is not a fourth STATE: it is the
+ * absence of a row, which `kbc_store_get_anchor` reports as NOTFOUND and
+ * which is a question nobody has asked. Collapsing it into `undecidable`
+ * would claim somebody tried. */
+static const char *anchor_state_name(kbc_anchor_state st) {
+  if (st == KBC_ANCHOR_RESOLVED) return "resolved";
+  if (st == KBC_ANCHOR_UNRESOLVED) return "unresolved";
+  return "undecidable";
+}
+
+/* One comment, with its anchor's verdict beside it.
+ *
+ * The verdict is read from the PERSISTED machine
+ * (`kbc_store_get_anchor`), never recomputed here and never inferred from
+ * the claim. A recomputation would be the second opinion this whole design
+ * refuses: it is the computation that already failed to settle the claim,
+ * run again at read time, on a document the store has not been told about.
+ *
+ * `resolves_to` is the FOLLOW TARGET and is emitted only when the state is
+ * RESOLVED. An undecidable comment gets no jump target at all, because
+ * pointing one is the silent re-anchor the three states exist to prevent —
+ * the client would scroll a reader to a heading the store explicitly will
+ * not vouch for. */
+static kbc_status comment_json(kbc_store *store, kbc_arena *a, kbc_str *out,
+                               const kbc_comment *c, kbc_err *err) {
+  kbc_anchor_row row;
+  kbc_anchor_state st = KBC_ANCHOR_UNDECIDABLE;
+  int64_t ord = -1;
+  const char *where = "";
+  kbc_err local;
+  kbc_err_reset(&local);
+  memset(&row, 0, sizeof row);
+  if (kbc_failed(kbc_store_get_anchor(store, a, c->id, &row, &local))) {
+    /* NOTFOUND is "never judged", and it is the ONE case that is not a
+     * verdict at all, so it gets its own name rather than borrowing
+     * `undecidable`. Any other failure is a read that did not happen, and
+     * reporting it as "unjudged" would be a store outage dressed as an
+     * answer about the document. */
+    if (local.status != KBC_ERR_NOTFOUND) {
+      return kbc_err_set(err, KBC_ERR_INTERNAL, "anchor for comment %s: %s",
+                         c->id, local.msg);
+    }
+    kbc_status st2 = kbc_str_puts(out, "{\"anchor_state\":\"unjudged\"");
+    if (kbc_failed(st2)) return st2;
+  } else {
+    st = row.state;
+    ord = row.resolved_ord;
+    where = row.resolves_to != NULL ? row.resolves_to : "";
+    kbc_status st2 = kbc_str_puts(out, "{\"anchor_state\":");
+    if (kbc_failed(st2)) return st2;
+    st2 = kbc_str_append_json_string(out, anchor_state_name(st),
+                                     strlen(anchor_state_name(st)));
+    if (kbc_failed(st2)) return st2;
+    if (st == KBC_ANCHOR_RESOLVED) {
+      st2 = kbc_str_puts(out, ",\"resolves_to\":");
+      if (kbc_failed(st2)) return st2;
+      st2 = kbc_str_append_json_string(out, where, strlen(where));
+      if (kbc_failed(st2)) return st2;
+      st2 = kbc_str_printf(out, ",\"resolved_ord\":%lld", (long long)ord);
+      if (kbc_failed(st2)) return st2;
+    }
+    st2 = kbc_str_putc(out, '}');
+    if (kbc_failed(st2)) return st2;
+  }
+  kbc_status st2 = kbc_str_puts(out, ",\"id\":");
+  if (kbc_failed(st2)) return st2;
+  st2 = kbc_str_append_json_string(out, c->id, strlen(c->id));
+  if (kbc_failed(st2)) return st2;
+  st2 = kbc_str_puts(out, ",\"anchor\":");
+  if (kbc_failed(st2)) return st2;
+  st2 = kbc_str_append_json_string(out, c->anchor, strlen(c->anchor));
+  if (kbc_failed(st2)) return st2;
+  st2 = kbc_str_puts(out, ",\"author\":");
+  if (kbc_failed(st2)) return st2;
+  st2 = kbc_str_append_json_string(out, c->author, strlen(c->author));
+  if (kbc_failed(st2)) return st2;
+  st2 = kbc_str_puts(out, ",\"body\":");
+  if (kbc_failed(st2)) return st2;
+  st2 = kbc_str_append_json_string(out, c->body, strlen(c->body));
+  if (kbc_failed(st2)) return st2;
+  st2 = kbc_str_puts(out, ",\"created_at\":");
+  if (kbc_failed(st2)) return st2;
+  st2 = kbc_str_append_json_string(out, c->created_at, strlen(c->created_at));
+  if (kbc_failed(st2)) return st2;
+  st2 = kbc_str_printf(out, ",\"resolved\":%s", c->resolved ? "true" : "false");
+  return st2;
+}
+
+/* `GET /api/kb/{kb}/review/{id}` — the whole document: schema discriminator,
+ * the artifact it is about, every comment with its anchor verdict, the
+ * verdict itself when there is one, and the attachment rows.
+ *
+ * The counts are the original's `open_count` and the total, and they are
+ * counted HERE from the rows rather than kept on the artifact: a counter that
+ * has to be maintained by every mutation is a counter that can disagree with
+ * the list, and a client that reads both in one response can then see them
+ * disagree. */
+static kbc_status route_review(kbc_app *app, const kbc_request *req,
+                               const kbc_route_params *p, kbc_response *out,
+                               kbc_err *err) {
+  (void)req;
+  (void)err;
+  const char *kb = param_value(p, "kb");
+  const char *id = param_value(p, "id");
+  kbc_arena *a = kbc_arena_new(16384);
+  if (a == NULL) return resp_error(out, 500, KBC_ERR_NOMEM, "review: no arena");
+  kbc_status st = KBC_OK;
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  st = review_doc(app, a, kb, id, &art, out);
+  if (kbc_failed(st)) goto done;
+  kbc_store *store = kbc_app_store(app);
+  if (store == NULL) {
+    st = resp_error(out, 500, KBC_ERR_INTERNAL, "review: no store");
+    goto done;
+  }
+  kbc_comment *cs = NULL;
+  size_t n = 0;
+  kbc_err local;
+  kbc_err_reset(&local);
+  st = kbc_store_list_comments(store, a, id, KBC_MAX_HITS, &cs, &n, &local);
+  if (kbc_failed(st)) {
+    st = resp_error(out, 500, st, "review %s: %s", id, local.msg);
+    goto done;
+  }
+  size_t open = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (!cs[i].resolved) open++;
+  }
+  st = kbc_str_puts(&out->body, "{\"schema\":\"kb-comments/1\",\"artifact\":{");
+  if (st == KBC_OK) st = kbc_str_puts(&out->body, "\"kb\":");
+  if (st == KBC_OK)
+    st = kbc_str_append_json_string(&out->body, art.corpus, strlen(art.corpus));
+  if (st == KBC_OK) st = kbc_str_puts(&out->body, ",\"id\":");
+  if (st == KBC_OK)
+    st = kbc_str_append_json_string(&out->body, art.id, strlen(art.id));
+  if (st == KBC_OK) st = kbc_str_puts(&out->body, ",\"title\":");
+  if (st == KBC_OK)
+    st = kbc_str_append_json_string(&out->body, art.title, strlen(art.title));
+  if (st == KBC_OK) st = kbc_str_puts(&out->body, ",\"path\":");
+  if (st == KBC_OK)
+    st = kbc_str_append_json_string(&out->body, art.path, strlen(art.path));
+  if (st == KBC_OK)
+    st = kbc_str_printf(&out->body, "},\"open_count\":%zu,\"total\":%zu,"
+                                "\"comments\":[",
+                        open, n);
+  for (size_t i = 0; st == KBC_OK && i < n; i++) {
+    if (i > 0) st = kbc_str_putc(&out->body, ',');
+    if (st == KBC_OK) st = comment_json(store, a, &out->body, &cs[i], err);
+  }
+  if (st == KBC_OK) st = kbc_str_puts(&out->body, "],\"verdict\":");
+  if (st == KBC_OK) {
+    kbc_verdict v;
+    memset(&v, 0, sizeof v);
+    kbc_err_reset(&local);
+    if (kbc_failed(kbc_store_get_verdict(store, a, id, &v, &local))) {
+      /* `null` is the original's own spelling for "no verdict", and
+       * skip_serializing_if keeps the key OUT of the file rather than
+       * writing it null. Emitting it is the better wire shape for a client
+       * that reads one document: an absent key and a null value are the same
+       * fact and only one of them is a shape the client has to handle. */
+      st = kbc_str_puts(&out->body, "null");
+    } else {
+      const char *name = v.state == KBC_VERDICT_APPROVE
+                             ? "approve"
+                             : (v.state == KBC_VERDICT_REQUEST_CHANGES
+                                    ? "request_changes"
+                                    : "comment");
+      char when[32];
+      (void)kbc_now_iso8601(when, sizeof when);
+      st = kbc_str_puts(&out->body, "{\"state\":");
+      if (st == KBC_OK)
+        st = kbc_str_append_json_string(&out->body, name, strlen(name));
+      if (st == KBC_OK)
+        st = kbc_str_printf(&out->body, ",\"decided_at\":%ld",
+                            (long)v.decided_at);
+      if (st == KBC_OK) st = kbc_str_puts(&out->body, ",\"by\":");
+      if (st == KBC_OK)
+        st = kbc_str_append_json_string(&out->body, v.decided_by,
+                                        strlen(v.decided_by));
+      if (st == KBC_OK && v.note != NULL) {
+        st = kbc_str_puts(&out->body, ",\"note\":");
+        if (st == KBC_OK)
+          st = kbc_str_append_json_string(&out->body, v.note, strlen(v.note));
+      }
+      if (st == KBC_OK) st = kbc_str_putc(&out->body, '}');
+      (void)when;
+    }
+  }
+  if (st == KBC_OK) st = kbc_str_puts(&out->body, ",\"attachments\":[");
+  if (st == KBC_OK) {
+    kbc_attachment *ats = NULL;
+    size_t na = 0;
+    kbc_err_reset(&local);
+    if (kbc_failed(kbc_store_list_attachments(store, a, id, KBC_MAX_HITS, &ats,
+                                              &na, &local))) {
+      st = resp_error(out, 500, local.status, "review %s attachments: %s", id,
+                      local.msg);
+      goto done;
+    }
+    for (size_t i = 0; st == KBC_OK && i < na; i++) {
+      if (i > 0) st = kbc_str_putc(&out->body, ',');
+      if (st == KBC_OK) st = attachment_json(&out->body, &ats[i]);
+    }
+  }
+  if (st == KBC_OK) st = kbc_str_puts(&out->body, "]}");
+  if (kbc_failed(st) && out->body.len > 0) kbc_str_clear(&out->body);
+  if (kbc_failed(st) && st != KBC_ERR_NOMEM) {
+    st = resp_error(out, 500, st, "review %s: %s", id, err_msg(err, st));
+  }
+done:
+  kbc_arena_free(a);
+  return st;
+}
+
+/* The shared bound-parameter lookup. `NULL` rather than a crash on a
+ * template that forgot the parameter: `tmpl_well_formed` guarantees the
+ * segment, and a NULL here means the two disagree, which is a bug in the
+ * route table rather than a request. */
+static const char *param_value(const kbc_route_params *p, const char *name) {
+  for (size_t i = 0; i < p->n; i++) {
+    if (strcmp(p->v[i].name, name) == 0) return p->v[i].value;
+  }
+  return NULL;
+}
+
+/* ------------------------------------------------- comment mutations ---- */
+
+/* `POST /api/kb/{kb}/review/{id}/comments` — add one.
+ *
+ * The body is JSON, and the fields are the ones a client may set: `anchor`,
+ * `author`, `body`. `created_at` and the id are NOT among them, for the
+ * reason the original gives for `Comment.created_at` and `Verdict.at`:
+ * "stamped by the writer, never client-supplied". A client that could set
+ * the timestamp could order a thread to put a resolution before the comment
+ * it resolves.
+ *
+ * `anchor` is REQUIRED and is a claim about the document's headings, so an
+ * empty one is refused rather than defaulted: an anchor of "" would be a
+ * claim that the document has an element with no id, and the machine would
+ * judge it UNRESOLVED forever for a reason nobody chose. */
+static kbc_status route_add_comment(kbc_app *app, const kbc_request *req,
+                                    const kbc_route_params *p,
+                                    kbc_response *out, kbc_err *err) {
+  (void)err;
+  const char *kb = param_value(p, "kb");
+  const char *id = param_value(p, "id");
+  kbc_arena *a = kbc_arena_new(8192);
+  if (a == NULL) return resp_error(out, 500, KBC_ERR_NOMEM, "comment: no arena");
+  kbc_status st = KBC_OK;
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  st = review_doc(app, a, kb, id, &art, out);
+  if (kbc_failed(st)) goto done;
+  kbc_err local;
+  kbc_err_reset(&local);
+  kbc_json *body =
+      kbc_json_parse(a, req->body, req->body_len, &local);
+  if (body == NULL || !kbc_json_is(body, KBC_JSON_OBJ)) {
+    st = resp_error(out, 400, KBC_ERR_PARSE, "comment body: %s",
+                    body == NULL ? local.msg : "not a JSON object");
+    goto done;
+  }
+  const char *anchor = kbc_json_str(body, "anchor", "");
+  const char *author = kbc_json_str(body, "author", "you");
+  const char *text = kbc_json_str(body, "body", "");
+  if (anchor[0] == '\0') {
+    st = resp_error(out, 400, KBC_ERR_INVALID,
+                    "comment: `anchor` is required and names the element or "
+                    "`section:<id>` the comment is about");
+    goto done;
+  }
+  if (text[0] == '\0') {
+    st = resp_error(out, 400, KBC_ERR_INVALID, "comment: `body` is empty");
+    goto done;
+  }
+  kbc_store *store = kbc_app_store(app);
+  st = kbc_store_add_comment(store, id, anchor, author, text, &local);
+  if (kbc_failed(st)) {
+    st = resp_error(out, st == KBC_ERR_CONFLICT ? 409 : 400, st,
+                    "add comment on %s: %s", id, local.msg);
+    goto done;
+  }
+  /* The verdict of record for a brand-new comment is UNJUDGED, and it says
+   * so rather than guessing: the first anchor pass writes the row. A client
+   * that read `unresolved` here would be told the claim was checked and
+   * failed before anything checked it. */
+  kbc_comment cs;
+  memset(&cs, 0, sizeof cs);
+  st = kbc_str_puts(&out->body, "{\"ok\":true,\"anchor_state\":\"unjudged\"");
+  if (st == KBC_OK) st = kbc_str_putc(&out->body, '}');
+  out->status = 201;
+done:
+  kbc_arena_free(a);
+  return st;
+}
+
+/* `POST …/comments/{cid}/resolve` and `…/unresolve`, and they are ONE
+ * function for the reason the original's is: "Unresolve (and any future
+ * non-resolve status) must not touch the stale-anchor sidecar. The shared
+ * path already holds the review lock for the file rewrite; there is no
+ * sidecar write to sequence with it." Here the anchor row is IN the
+ * transaction's reach, and the same rule holds for a different reason:
+ * clearing a verdict on resolve and restoring it on un-resolve would make
+ * re-opening a comment re-fire a transition the subscriber already saw.
+ * `kbc_store_prune_anchors` is what drops the row, and it runs on the
+ * resolved side only. */
+/* The two verbs are one function and TWO handlers, because the frozen
+ * `kbc_route_handler` signature has nowhere to carry the `resolved` flag. A
+ * single handler that guessed it from the method would be a second parse of
+ * the same string the router already matched, and the two could disagree. */
+static kbc_status route_resolve(kbc_app *app, const kbc_request *req,
+                                const kbc_route_params *p, kbc_response *out,
+                                kbc_err *err);
+static kbc_status route_unresolve(kbc_app *app, const kbc_request *req,
+                                  const kbc_route_params *p, kbc_response *out,
+                                  kbc_err *err);
+
+static kbc_status set_comment_resolved(kbc_app *app, const kbc_route_params *p,
+                                       kbc_response *out, bool resolved,
+                                       kbc_err *err) {
+  (void)err;
+  const char *kb = param_value(p, "kb");
+  const char *id = param_value(p, "id");
+  const char *cid = param_value(p, "cid");
+  kbc_arena *a = kbc_arena_new(4096);
+  if (a == NULL) return resp_error(out, 500, KBC_ERR_NOMEM, "resolve: no arena");
+  kbc_status st = KBC_OK;
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  st = review_doc(app, a, kb, id, &art, out);
+  if (kbc_failed(st)) goto done;
+  kbc_store *store = kbc_app_store(app);
+  kbc_err local;
+  kbc_err_reset(&local);
+  st = kbc_store_set_comment_resolved(store, cid, resolved, &local);
+  if (kbc_failed(st)) {
+    st = resp_error(out, st == KBC_ERR_NOTFOUND ? 404 : 400, st,
+                    "comment %s: %s", cid, local.msg);
+    goto done;
+  }
+  if (resolved) {
+    /* The original prunes the stale key when a comment is RESOLVED and does
+     * nothing on an un-resolve, because "reopening must not clear a flag the
+     * indexer still owns" (anchors.rs:172-190). A resolved comment is still a
+     * live comment with a question attached, so the row goes and the comment
+     * stays; re-opening it makes the next pass judge it fresh. */
+    int64_t pruned = 0;
+    kbc_err_reset(&local);
+    st = kbc_store_prune_anchors(store, &pruned, &local);
+    if (kbc_failed(st)) {
+      st = resp_error(out, 500, st, "prune anchors: %s", local.msg);
+      goto done;
+    }
+  }
+  st = kbc_str_printf(&out->body, "{\"ok\":true,\"resolved\":%s}",
+                      resolved ? "true" : "false");
+done:
+  kbc_arena_free(a);
+  return st;
+}
+
+/* `DELETE …/comments/{cid}` — and the cascade is the point. One statement
+ * takes the comment, its persisted anchor verdict, and every attachment it
+ * adopted, in one commit: `comments.id` is the parent of `comment_anchors`
+ * and of `attachments.comment_id`, both `ON DELETE CASCADE`, and
+ * `kbc_store_open` runs `PRAGMA foreign_keys = ON` so the engine really
+ * applies them on this connection. The original leaves the blob bytes for a
+ * reference-counted GC; here the bytes are in the row, so there is nothing
+ * left behind and nothing to reap. */
+static kbc_status route_delete_comment(kbc_app *app, const kbc_request *req,
+                                       const kbc_route_params *p,
+                                       kbc_response *out, kbc_err *err) {
+  (void)req;
+  (void)err;
+  (void)err;
+  const char *kb = param_value(p, "kb");
+  const char *id = param_value(p, "id");
+  const char *cid = param_value(p, "cid");
+  kbc_arena *a = kbc_arena_new(4096);
+  if (a == NULL)
+    return resp_error(out, 500, KBC_ERR_NOMEM, "delete comment: no arena");
+  kbc_status st = KBC_OK;
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  st = review_doc(app, a, kb, id, &art, out);
+  if (kbc_failed(st)) goto done;
+  kbc_store *store = kbc_app_store(app);
+  kbc_err local;
+  kbc_err_reset(&local);
+  st = kbc_store_delete_comment(store, cid, &local);
+  if (kbc_failed(st)) {
+    st = resp_error(out, st == KBC_ERR_NOTFOUND ? 404 : 400, st,
+                    "delete comment %s: %s", cid, local.msg);
+    goto done;
+  }
+  st = kbc_str_puts(&out->body, "{\"ok\":true}");
+done:
+  kbc_arena_free(a);
+  return st;
+}
+
+static kbc_status route_resolve(kbc_app *app, const kbc_request *req,
+                                const kbc_route_params *p, kbc_response *out,
+                                kbc_err *err) {
+  (void)req;
+  return set_comment_resolved(app, p, out, true, err);
+}
+
+static kbc_status route_unresolve(kbc_app *app, const kbc_request *req,
+                                  const kbc_route_params *p, kbc_response *out,
+                                  kbc_err *err) {
+  (void)req;
+  return set_comment_resolved(app, p, out, false, err);
+}
+
+/* `GET /api/kb/{kb}/anchors/stale` — the PERSISTED stale set, which is the
+ * original's cold-load endpoint for a SPA that has just reconnected.
+ *
+ * It reads `comment_anchors` and nothing else. It does not re-resolve, does
+ * not re-sniff a document and does not consult the in-process set the httpd
+ * used to keep: a set computed at read time has no edge in it, so every call
+ * would re-report every stale anchor and the endpoint would stop being a
+ * change feed. */
+static kbc_status route_stale_anchors(kbc_app *app, const kbc_request *req,
+                                      const kbc_route_params *p,
+                                      kbc_response *out, kbc_err *err) {
+  (void)err;
+  const char *kb = param_value(p, "kb");
+  kbc_arena *a = kbc_arena_new(16384);
+  if (a == NULL)
+    return resp_error(out, 500, KBC_ERR_NOMEM, "anchors: no arena");
+  kbc_status st = KBC_OK;
+  const char *doc = NULL;
+  const char *lim = NULL;
+  /* A malformed `limit` is a 400, not a default: a caller that asked for 0
+   * rows and got 200 was told a question it did not ask. The parse status
+   * itself is ignored because an absent key is KBC_OK with `lim` NULL, and a
+   * value that is not a number is caught by the range test below. */
+  (void)query_get(a, req->query, "artifact_id", &doc, NULL);
+  (void)query_get(a, req->query, "limit", &lim, NULL);
+  size_t limit = 200;
+  if (lim != NULL && lim[0] != '\0') {
+    char *endp = NULL;
+    const long v = strtol(lim, &endp, 10);
+    if (endp == lim || *endp != '\0' || v <= 0) {
+      st = resp_error(out, 400, KBC_ERR_INVALID,
+                      "limit: \"%s\" is not a positive integer", lim);
+      goto done;
+    }
+    limit = (size_t)v;
+  }
+  kbc_store *store = kbc_app_store(app);
+  kbc_anchor_row *rows = NULL;
+  size_t n = 0;
+  kbc_err local;
+  kbc_err_reset(&local);
+  st = kbc_store_list_anchors(store, a, doc, true, limit, &rows, &n, &local);
+  if (kbc_failed(st)) {
+    st = resp_error(out, 500, st, "list anchors: %s", local.msg);
+    goto done;
+  }
+  st = kbc_str_printf(&out->body, "{\"kb\":");
+  if (st == KBC_OK) st = kbc_str_append_json_string(&out->body, kb, strlen(kb));
+  if (st == KBC_OK)
+    st = kbc_str_printf(&out->body, ",\"count\":%zu,\"stale\":[", n);
+  for (size_t i = 0; st == KBC_OK && i < n; i++) {
+    if (i > 0) st = kbc_str_putc(&out->body, ',');
+    if (st == KBC_OK) st = kbc_str_puts(&out->body, "{\"comment_id\":");
+    if (st == KBC_OK)
+      st = kbc_str_append_json_string(&out->body, rows[i].comment_id,
+                                      strlen(rows[i].comment_id));
+    if (st == KBC_OK) st = kbc_str_puts(&out->body, ",\"artifact_id\":");
+    if (st == KBC_OK)
+      st = kbc_str_append_json_string(&out->body, rows[i].doc_id,
+                                      strlen(rows[i].doc_id));
+    if (st == KBC_OK) st = kbc_str_puts(&out->body, ",\"anchor\":");
+    if (st == KBC_OK)
+      st = kbc_str_append_json_string(&out->body, rows[i].anchor,
+                                      strlen(rows[i].anchor));
+    if (st == KBC_OK) {
+      const char *nm = anchor_state_name(rows[i].state);
+      st = kbc_str_puts(&out->body, ",\"anchor_state\":");
+      if (st == KBC_OK)
+        st = kbc_str_append_json_string(&out->body, nm, strlen(nm));
+    }
+    if (st == KBC_OK) st = kbc_str_putc(&out->body, '}');
+  }
+  if (st == KBC_OK) st = kbc_str_puts(&out->body, "]}");
+  if (kbc_failed(st) && out->body.len > 0) kbc_str_clear(&out->body);
+done:
+  kbc_arena_free(a);
+  return st;
+}
+
+/* ---------------------------------------------------------- verdicts ---- */
+
+/* The three wire names, and the reason the mapping is not a cast. The Rust
+ * serialises `VerdictState` `snake_case`, so `request_changes` is the string
+ * on the wire and anything else is a client guessing. */
+static kbc_status verdict_from_name(const char *name, kbc_verdict_state *out,
+                                    kbc_err *err) {
+  if (strcmp(name, "comment") == 0) {
+    *out = KBC_VERDICT_COMMENT;
+    return KBC_OK;
+  }
+  if (strcmp(name, "approve") == 0) {
+    *out = KBC_VERDICT_APPROVE;
+    return KBC_OK;
+  }
+  if (strcmp(name, "request_changes") == 0) {
+    *out = KBC_VERDICT_REQUEST_CHANGES;
+    return KBC_OK;
+  }
+  return kbc_err_set(err, KBC_ERR_INVALID,
+                     "verdict state \"%s\": expected comment, approve or "
+                     "request_changes",
+                     name);
+}
+
+static kbc_status route_set_verdict(kbc_app *app, const kbc_request *req,
+                                   const kbc_route_params *p,
+                                   kbc_response *out, kbc_err *err) {
+  (void)err;
+  const char *kb = param_value(p, "kb");
+  const char *id = param_value(p, "id");
+  kbc_arena *a = kbc_arena_new(8192);
+  if (a == NULL)
+    return resp_error(out, 500, KBC_ERR_NOMEM, "verdict: no arena");
+  kbc_status st = KBC_OK;
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  st = review_doc(app, a, kb, id, &art, out);
+  if (kbc_failed(st)) goto done;
+  kbc_err local;
+  kbc_err_reset(&local);
+  kbc_json *body = kbc_json_parse(a, req->body, req->body_len, &local);
+  if (body == NULL || !kbc_json_is(body, KBC_JSON_OBJ)) {
+    st = resp_error(out, 400, KBC_ERR_PARSE, "verdict body: %s",
+                    body == NULL ? local.msg : "not a JSON object");
+    goto done;
+  }
+  /* Initialised because `verdict_from_name` is the only thing that sets it and
+   * a path that skips the call would otherwise reach the store reading a
+   * value the compiler cannot prove was written. */
+  kbc_verdict_state state = KBC_VERDICT_COMMENT;
+  st = verdict_from_name(kbc_json_str(body, "state", ""), &state, &local);
+  if (kbc_failed(st)) {
+    st = resp_error(out, 400, local.status, "%s", local.msg);
+    goto done;
+  }
+  const char *by = kbc_json_str(body, "by", "");
+  if (by[0] == '\0') {
+    st = resp_error(out, 400, KBC_ERR_INVALID, "verdict: `by` is required");
+    goto done;
+  }
+  const char *note = kbc_json_str(body, "note", NULL);
+  kbc_store *store = kbc_app_store(app);
+  st = kbc_store_set_verdict(store, id, state, by, note, &local);
+  if (kbc_failed(st)) {
+    st = resp_error(out, st == KBC_ERR_NOTFOUND ? 404 : 400, st,
+                    "verdict on %s: %s", id, local.msg);
+    goto done;
+  }
+  st = kbc_str_puts(&out->body, "{\"ok\":true}");
+done:
+  kbc_arena_free(a);
+  return st;
+}
+
+/* `DELETE …/verdict` — 404 on absence, mirroring `delete_comment`: a client
+ * clearing a verdict that was never set has made a mistake worth reporting,
+ * and a 200 would tell it the document had been reviewed. */
+static kbc_status route_clear_verdict(kbc_app *app, const kbc_request *req,
+                                     const kbc_route_params *p,
+                                     kbc_response *out, kbc_err *err) {
+  (void)req;
+  (void)err;
+  const char *kb = param_value(p, "kb");
+  const char *id = param_value(p, "id");
+  kbc_arena *a = kbc_arena_new(4096);
+  if (a == NULL)
+    return resp_error(out, 500, KBC_ERR_NOMEM, "verdict: no arena");
+  kbc_status st = KBC_OK;
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  st = review_doc(app, a, kb, id, &art, out);
+  if (kbc_failed(st)) goto done;
+  kbc_store *store = kbc_app_store(app);
+  kbc_err local;
+  kbc_err_reset(&local);
+  st = kbc_store_clear_verdict(store, id, &local);
+  if (kbc_failed(st)) {
+    st = resp_error(out, st == KBC_ERR_NOTFOUND ? 404 : 400, st,
+                    "clear verdict on %s: %s", id, local.msg);
+    goto done;
+  }
+  st = kbc_str_puts(&out->body, "{\"ok\":true}");
+done:
+  kbc_arena_free(a);
+  return st;
+}
+
+/* ------------------------------------------------------- attachments ---- */
+
+static kbc_status attachment_json(kbc_str *out, const kbc_attachment *at) {
+  kbc_status st = kbc_str_puts(out, "{\"id\":");
+  if (st == KBC_OK) st = kbc_str_append_json_string(out, at->id, strlen(at->id));
+  if (st == KBC_OK) st = kbc_str_puts(out, ",\"filename\":");
+  if (st == KBC_OK)
+    st = kbc_str_append_json_string(out, at->filename, strlen(at->filename));
+  if (st == KBC_OK) st = kbc_str_puts(out, ",\"content_type\":");
+  if (st == KBC_OK)
+    st = kbc_str_append_json_string(out, at->content_type,
+                                    strlen(at->content_type));
+  if (st == KBC_OK)
+    st = kbc_str_printf(out, ",\"size\":%lld,\"staged\":%s", 
+                        (long long)at->size_bytes, at->staged ? "true" : "false");
+  if (st == KBC_OK && at->comment_id != NULL) {
+    st = kbc_str_puts(out, ",\"comment_id\":");
+    if (st == KBC_OK)
+      st = kbc_str_append_json_string(out, at->comment_id, strlen(at->comment_id));
+  }
+  if (st == KBC_OK) st = kbc_str_putc(out, '}');
+  return st;
+}
+
+/* How many files one request may carry. The original's stage route accepts a
+ * BATCH (`drain_files` loops until the stream ends) and caps it at
+ * `max_per_comment`; one request here is one file, so the batch question
+ * does not arise and the count is fixed at one. Saying so is better than
+ * accepting several and silently staging only the first. */
+#define REVIEW_MAX_PARTS 8u
+
+/* `POST /api/kb/{kb}/review/{id}/attachments` — stage an upload.
+ *
+ * The gate is the whole of the handler and it runs BEFORE anything is
+ * written: sniff, then sanitize, then insert. A request whose bytes are not
+ * one of the six allowed shapes is refused with 415 and has created no blob
+ * and no row, because the insert is the only thing that writes and it is
+ * after the refusal point. There is no rollback to get wrong, and that is
+ * the point of putting the bytes in the row.
+ *
+ * The filename is sanitized here rather than trusted, and the CONTENT TYPE
+ * the response reports is the sniffed one — a client that uploaded HTML named
+ * `x.png` gets a `text/plain` row, and the serve route force-downloads it
+ * (root invariant #18). */
+static kbc_status route_stage_attachment(kbc_app *app, const kbc_request *req,
+                                         const kbc_route_params *p,
+                                         kbc_response *out, kbc_err *err) {
+  (void)err;
+  const char *kb = param_value(p, "kb");
+  const char *id = param_value(p, "id");
+  kbc_arena *a = kbc_arena_new(req->body_len + 4096u);
+  if (a == NULL)
+    return resp_error(out, 500, KBC_ERR_NOMEM, "attachment: no arena");
+  kbc_status st = KBC_OK;
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  st = review_doc(app, a, kb, id, &art, out);
+  if (kbc_failed(st)) goto done;
+  if (req->body == NULL || req->body_len == 0) {
+    st = resp_error(out, 400, KBC_ERR_INVALID,
+                    "attachment upload needs a multipart/form-data body");
+    goto done;
+  }
+  kbc_multipart_part parts[REVIEW_MAX_PARTS];
+  size_t n_parts = 0;
+  kbc_err local;
+  kbc_err_reset(&local);
+  st = kbc_multipart_parse(req->content_type, req->body, req->body_len, parts,
+                           REVIEW_MAX_PARTS, &n_parts, a, &local);
+  if (kbc_failed(st)) {
+    st = resp_error(out, 400, st, "multipart: %s", local.msg);
+    goto done;
+  }
+  const kbc_multipart_part *file = NULL;
+  const char *author = NULL;
+  for (size_t i = 0; i < n_parts; i++) {
+    if (strcmp(parts[i].name, "author") == 0) {
+      char *v = kbc_arena_strndup(a, parts[i].data, parts[i].len);
+      if (v != NULL && strlen(v) == parts[i].len) author = v;
+      continue;
+    }
+    if (file == NULL && parts[i].len > 0) file = &parts[i];
+  }
+  if (file == NULL) {
+    st = resp_error(out, 400, KBC_ERR_INVALID, "no file part in the upload");
+    goto done;
+  }
+  /* 413 BEFORE the sniff: a body already over the cap is one comparison
+   * rather than a parse that allocated for a request known to be too big
+   * (capture.rs:283-299 does the same for its batch). */
+  if (file->len > (size_t)KBC_ATTACH_MAX_BYTES) {
+    st = resp_error(out, 413, KBC_ERR_INVALID,
+                    "attachment is %zu bytes, over the %u cap", file->len,
+                    (unsigned)KBC_ATTACH_MAX_BYTES);
+    goto done;
+  }
+  const char *sniffed =
+      kbc_store_sniff_attachment(file->data, file->len);
+  if (sniffed == NULL) {
+    st = resp_error(out, 415, KBC_ERR_INVALID,
+                    "unsupported attachment type (allowed: PNG, JPEG, GIF, "
+                    "WEBP, PDF, UTF-8 text)");
+    goto done;
+  }
+  const char *safe = kbc_store_sanitize_filename(a, file->filename);
+  kbc_attachment_in in;
+  memset(&in, 0, sizeof in);
+  in.doc_id = id;
+  in.comment_id = NULL; /* STAGED: the comment adopts it later */
+  in.filename = safe;
+  in.content_type = sniffed;
+  in.author = author;
+  in.body = file->data;
+  in.body_len = file->len;
+  char aid[KBC_ATTACH_ID_LEN + 1];
+  kbc_store *store = kbc_app_store(app);
+  st = kbc_store_add_attachment(store, &in, aid, &local);
+  if (kbc_failed(st)) {
+    st = resp_error(out, st == KBC_ERR_CONFLICT ? 409 : 400, st,
+                    "attachment on %s: %s", id, local.msg);
+    goto done;
+  }
+  kbc_attachment at;
+  memset(&at, 0, sizeof at);
+  st = kbc_store_get_attachment(store, a, aid, &at, &local);
+  if (kbc_failed(st)) {
+    st = resp_error(out, 500, st, "read back %s: %s", aid, local.msg);
+    goto done;
+  }
+  st = kbc_str_printf(&out->body, "{\"url\":\"/api/kb/%s/review/%s"
+                                  "/attachments/%s\",\"attachment\":",
+                      kb, id, aid);
+  if (st == KBC_OK) st = attachment_json(&out->body, &at);
+  if (st == KBC_OK) st = kbc_str_putc(&out->body, '}');
+  if (kbc_failed(st) && out->body.len > 0) kbc_str_clear(&out->body);
+  out->status = 201;
+done:
+  kbc_arena_free(a);
+  return st;
+}
+
+/* `GET /api/kb/{kb}/review/{id}/attachments` — the page. Corkboard ordering,
+ * for the corkboard's reason: newest first, with the id as the tiebreak so a
+ * burst inside one second cannot come back in insertion order. */
+static kbc_status route_list_attachments(kbc_app *app, const kbc_request *req,
+                                         const kbc_route_params *p,
+                                         kbc_response *out, kbc_err *err) {
+  (void)req;
+  (void)err;
+  (void)err;
+  (void)err;
+  const char *kb = param_value(p, "kb");
+  const char *id = param_value(p, "id");
+  kbc_arena *a = kbc_arena_new(16384);
+  if (a == NULL)
+    return resp_error(out, 500, KBC_ERR_NOMEM, "attachments: no arena");
+  kbc_status st = KBC_OK;
+  const char *lim = NULL;
+  (void)query_get(a, req->query, "limit", &lim, NULL);
+  size_t limit = 200;
+  if (lim != NULL && lim[0] != '\0') {
+    char *endp = NULL;
+    const long v = strtol(lim, &endp, 10);
+    if (endp == lim || *endp != '\0' || v <= 0) {
+      st = resp_error(out, 400, KBC_ERR_INVALID,
+                      "limit: \"%s\" is not a positive integer", lim);
+      goto done;
+    }
+    limit = (size_t)v;
+  }
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  st = review_doc(app, a, kb, id, &art, out);
+  if (kbc_failed(st)) goto done;
+  kbc_store *store = kbc_app_store(app);
+  kbc_attachment *ats = NULL;
+  size_t n = 0;
+  kbc_err local;
+  kbc_err_reset(&local);
+  st = kbc_store_list_attachments(store, a, id, limit, &ats, &n, &local);
+  if (kbc_failed(st)) {
+    st = resp_error(out, 500, st, "list attachments: %s", local.msg);
+    goto done;
+  }
+  st = kbc_str_printf(&out->body, "{\"count\":%zu,\"items\":[", n);
+  for (size_t i = 0; st == KBC_OK && i < n; i++) {
+    if (i > 0) st = kbc_str_putc(&out->body, ',');
+    if (st == KBC_OK) st = attachment_json(&out->body, &ats[i]);
+  }
+  if (st == KBC_OK) st = kbc_str_puts(&out->body, "]}");
+  if (kbc_failed(st) && out->body.len > 0) kbc_str_clear(&out->body);
+done:
+  kbc_arena_free(a);
+  return st;
+}
+
+/* `GET /api/kb/{kb}/review/{id}/attachments/{aid}` — the bytes.
+ *
+ * THE XSS GUARD, and every piece of it is load-bearing. `Content-Type` is
+ * the daemon's stored SNIFF, never the client's claim. `nosniff` is emitted
+ * by the write path on every response. And `Content-Disposition` is `inline`
+ * only for a raster image: everything else — a PDF, a text file, and an SVG
+ * or an HTML file that sniffed as `text/plain` — is forced to download, so
+ * nothing a user uploaded can execute from the daemon's origin.
+ *
+ * `Cache-Control: public, max-age=31536000, immutable` because the `aid` is
+ * random and a blob's bytes never change under an id: the Rust says the same
+ * ("the `aid` is random") and the re-attach case below is what makes the
+ * claim true — a second upload of identical bytes gets a SECOND id, so no id
+ * ever names two different byte strings. */
+/* `kbc_response` owns EXACTLY ONE allocation — its body — and `content_type`
+ * and every entry in the header list are BORROWED from it, which the header
+ * says outright: "the name and value must outlive the write, and a handler
+ * that formats one into a local must keep that local alive." The write
+ * happens in `serve_request`, AFTER the handler has returned, so a handler
+ * that points at its own frame or at its own arena is pointing at freed
+ * memory by the time the value is read.
+ *
+ * That was not hypothetical, and it was not cosmetic. The serve route pointed
+ * `out->content_type` at an ARENA string and the attachment disposition at a
+ * `char[512]` on the stack; the arena was freed at `done:` and the frame was
+ * gone, and `dispatch` then formatted both out of dead memory. What reached
+ * the wire was a `Content-Type` whose value was the tail of a previous header
+ * block — complete with a CRLF, so the response carried a blank line in the
+ * middle of its own headers, and the XSS guard's header arrived somewhere no
+ * client can read it.
+ *
+ * The body's allocation is the response's own storage and
+ * `kbc_response_free` is what releases it, so suffix space inside it is the
+ * right home for a value that must outlive the call: the bytes go past the
+ * payload, the reported length is untouched, and the pointer is valid until
+ * the response is freed.
+ *
+ * ONE CALL, and the reason is a realloc. `kbc_str_append` may move the
+ * allocation, so keeping one value and then appending a second leaves the
+ * first pointer dangling — which is the same bug wearing a different hat, and
+ * it is why the content type came back holding the disposition. A caller with
+ * several values to keep packs them into ONE `kbc_str`, NUL-separated,
+ * remembers each offset while packing, and publishes the lot in a single
+ * append. After that append nothing else touches the body, so every offset
+ * into it holds until the response is freed.
+ *
+ * Returns NULL only when the copy could not be made, and the caller turns that
+ * into a 500 rather than publishing a pointer it cannot keep. */
+static const char *response_keep(kbc_response *out, const kbc_str *owned) {
+  if (owned == NULL || owned->len == 0) return NULL;
+  const size_t payload = out->body.len;
+  if (kbc_failed(kbc_str_append(&out->body, owned->ptr, owned->len))) {
+    return NULL;
+  }
+  const char *kept = out->body.ptr + payload;
+  out->body.len = payload; /* the suffix is storage, not payload */
+  return kept;
+}
+
+/* Appends one NUL-terminated value to a run being packed for
+ * `response_keep`, and returns its offset within that run. */
+static bool keep_put(kbc_str *run, size_t *off, const char *text) {
+  *off = run->len;
+  return !kbc_failed(kbc_str_append(run, text, strlen(text) + 1u));
+}
+
+static kbc_status route_serve_attachment(kbc_app *app, const kbc_request *req,
+                                         const kbc_route_params *p,
+                                         kbc_response *out, kbc_err *err) {
+  (void)req;
+  (void)err;
+  (void)err;
+  const char *kb = param_value(p, "kb");
+  const char *id = param_value(p, "id");
+  const char *aid = param_value(p, "aid");
+  kbc_arena *a = kbc_arena_new(4096);
+  if (a == NULL)
+    return resp_error(out, 500, KBC_ERR_NOMEM, "attachment: no arena");
+  kbc_status st = KBC_OK;
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  st = review_doc(app, a, kb, id, &art, out);
+  if (kbc_failed(st)) goto done;
+  /* The aid is checked against its OWN shape before it is used as a key, and
+   * the reason is not a traversal — the id is a primary key, so no path is
+   * ever built from it. It is that a lookup of a nonsense id must be a 400
+   * rather than a 404 that says "this document has no such attachment",
+   * which is a different claim and the wrong one. */
+  if (!sub_id_is(aid)) {
+    st = resp_error(out, 400, KBC_ERR_INVALID,
+                    "attachment id \"%s\" is not `a_` plus 12 hex characters",
+                    aid);
+    goto done;
+  }
+  kbc_store *store = kbc_app_store(app);
+  kbc_attachment at;
+  memset(&at, 0, sizeof at);
+  kbc_err local;
+  kbc_err_reset(&local);
+  st = kbc_store_get_attachment(store, a, aid, &at, &local);
+  if (kbc_failed(st)) {
+    st = resp_error(out, 404, KBC_ERR_NOTFOUND, "%s", local.msg);
+    goto done;
+  }
+  if (strcmp(at.doc_id, id) != 0) {
+    /* The aid is unique across the table, so this is a request that names
+     * another document's blob. 404 rather than 403: the answer a caller must
+     * not get is "that exists, elsewhere". */
+    st = resp_error(out, 404, KBC_ERR_NOTFOUND, "attachment %s: not on %s",
+                    aid, id);
+    goto done;
+  }
+  kbc_str bytes;
+  kbc_str_init(&bytes);
+  kbc_err_reset(&local);
+  st = kbc_store_read_attachment(store, aid, &bytes, &local);
+  if (kbc_failed(st)) {
+    kbc_str_free(&bytes);
+    st = resp_error(out, 404, KBC_ERR_NOTFOUND, "%s", local.msg);
+    goto done;
+  }
+  /* The body first, and only then the values that borrow from it: the suffix
+   * `response_keep` adds lives past the payload, so anything appended after
+   * this point would land on top of it. */
+  st = kbc_str_append(&out->body, bytes.ptr, bytes.len);
+  kbc_str_free(&bytes);
+  if (kbc_failed(st)) goto done;
+
+  /* Both borrowed values are packed into ONE run and published in one append,
+   * because two appends would realloc between them and leave the first
+   * pointer stale. `inline` is a literal with static storage and is not in the
+   * run; only the values that had to be formatted need keeping alive. */
+  const bool inline_image = kbc_store_attachment_inline(at.content_type);
+  char disp[512];
+  if (!inline_image) {
+    /* The filename is already sanitized — no control character, no quote, no
+     * slash — so it cannot break out of the quoted string. That is what the
+     * sanitizer is FOR; this line is where it is load-bearing. */
+    (void)snprintf(disp, sizeof disp, "attachment; filename=\"%s\"",
+                   at.filename);
+  }
+  kbc_str run;
+  kbc_str_init(&run);
+  size_t ct_off = 0;
+  size_t disp_off = 0;
+  st = KBC_OK;
+  if (!keep_put(&run, &ct_off, at.content_type)) {
+    st = KBC_ERR_NOMEM;
+  } else if (!inline_image && !keep_put(&run, &disp_off, disp)) {
+    st = KBC_ERR_NOMEM;
+  }
+  const char *kept = st == KBC_OK ? response_keep(out, &run) : NULL;
+  kbc_str_free(&run);
+  if (kept == NULL) {
+    st = resp_error(out, 500, KBC_ERR_NOMEM,
+                    "attachment: no room for the response headers");
+    goto done;
+  }
+  out->content_type = kept + ct_off;
+  st = inline_image
+           ? route_header(out, "Content-Disposition", "inline")
+           : route_header(out, "Content-Disposition", kept + disp_off);
+  /* `immutable` because the claim is true and the id is what makes it true:
+   * the aid is random, a blob's bytes never change under an id, and a second
+   * upload of identical bytes gets a SECOND id — so no id ever names two
+   * different byte strings and nothing can be stale in the cache. A literal,
+   * so it needs no keeping alive. */
+  if (st == KBC_OK)
+    st = route_header(out, "Cache-Control",
+                      "public, max-age=31536000, immutable");
+done:
+  kbc_arena_free(a);
+  return st;
+}
+
+/* `POST …/comments/{cid}/attachments/{aid}` — adopt a staged upload, and the
+ * route that makes the two-stage flow work: stage during compose, adopt when
+ * the comment is posted. The original does the adoption inside `add_comment`
+ * (`attachment_ids` on the payload); kb-c's `kbc_store_add_comment` is a
+ * frozen signature with no such field, so adoption is its own verb rather
+ * than a second comment shape.
+ *
+ * Adopting an id that is already adopted by another comment is a 409 and
+ * changes nothing, which is the same refusal `adopt_staged` makes ("unknown
+ * or expired attachment") for the case that matters. */
+static kbc_status route_adopt_attachment(kbc_app *app, const kbc_request *req,
+                                         const kbc_route_params *p,
+                                         kbc_response *out, kbc_err *err) {
+  (void)req;
+  (void)err;
+  (void)err;
+  (void)err;
+  const char *kb = param_value(p, "kb");
+  const char *id = param_value(p, "id");
+  const char *cid = param_value(p, "cid");
+  const char *aid = param_value(p, "aid");
+  kbc_arena *a = kbc_arena_new(4096);
+  if (a == NULL)
+    return resp_error(out, 500, KBC_ERR_NOMEM, "adopt: no arena");
+  kbc_status st = KBC_OK;
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  st = review_doc(app, a, kb, id, &art, out);
+  if (kbc_failed(st)) goto done;
+  if (!sub_id_is(aid)) {
+    st = resp_error(out, 400, KBC_ERR_INVALID,
+                    "attachment id \"%s\" is not `a_` plus 12 hex characters",
+                    aid);
+    goto done;
+  }
+  kbc_store *store = kbc_app_store(app);
+  kbc_err local;
+  kbc_err_reset(&local);
+  st = kbc_store_adopt_attachment(store, aid, cid, &local);
+  if (kbc_failed(st)) {
+    int code = st == KBC_ERR_NOTFOUND ? 404 : 400;
+    if (st == KBC_ERR_CONFLICT) code = 409;
+    st = resp_error(out, code, st, "adopt %s onto %s: %s", aid, cid,
+                    local.msg);
+    goto done;
+  }
+  st = kbc_str_puts(&out->body, "{\"ok\":true}");
+done:
+  kbc_arena_free(a);
+  return st;
+}
+
+/* `DELETE …/comments/{cid}/attachments/{aid}` — detach, which here also
+ * drops the bytes, because the row carried them. */
+static kbc_status route_detach_attachment(kbc_app *app, const kbc_request *req,
+                                          const kbc_route_params *p,
+                                          kbc_response *out, kbc_err *err) {
+  (void)req;
+  (void)err;
+  (void)err;
+  (void)err;
+  const char *kb = param_value(p, "kb");
+  const char *id = param_value(p, "id");
+  const char *aid = param_value(p, "aid");
+  kbc_arena *a = kbc_arena_new(4096);
+  if (a == NULL)
+    return resp_error(out, 500, KBC_ERR_NOMEM, "detach: no arena");
+  kbc_status st = KBC_OK;
+  kbc_artifact art;
+  memset(&art, 0, sizeof art);
+  st = review_doc(app, a, kb, id, &art, out);
+  if (kbc_failed(st)) goto done;
+  if (!sub_id_is(aid)) {
+    st = resp_error(out, 400, KBC_ERR_INVALID,
+                    "attachment id \"%s\" is not `a_` plus 12 hex characters",
+                    aid);
+    goto done;
+  }
+  kbc_store *store = kbc_app_store(app);
+  kbc_attachment at;
+  memset(&at, 0, sizeof at);
+  kbc_err local;
+  kbc_err_reset(&local);
+  st = kbc_store_get_attachment(store, a, aid, &at, &local);
+  if (kbc_failed(st) || strcmp(at.doc_id, id) != 0) {
+    st = resp_error(out, 404, KBC_ERR_NOTFOUND, "attachment %s: not on %s", aid,
+                    id);
+    goto done;
+  }
+  kbc_err_reset(&local);
+  st = kbc_store_delete_attachment(store, aid, &local);
+  if (kbc_failed(st)) {
+    st = resp_error(out, st == KBC_ERR_NOTFOUND ? 404 : 400, st, "%s",
+                    local.msg);
+    goto done;
+  }
+  st = kbc_str_puts(&out->body, "{\"ok\":true}");
+done:
+  kbc_arena_free(a);
+  return st;
+}
+
+/* `a_` plus 12 lowercase hex, and nothing else. The Rust's `is_safe_id` is
+ * looser (alnum/-/_/., no `..`, ≤128) because its id is half a filesystem
+ * path; here the id is a key, so the narrow shape is both sufficient and
+ * better: it cannot be a value the table could not have minted. */
+static bool sub_id_is(const char *s) {
+  if (s == NULL || strlen(s) != KBC_ATTACH_ID_LEN) return false;
+  if (s[0] != 'a' || s[1] != '_') return false;
+  for (size_t i = 2; i < KBC_ATTACH_ID_LEN; i++) {
+    const char c = s[i];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+  }
+  return true;
+}
+
+/* ------------------------------------------------------------ the rows -- */
+
+/* Whether the rows below are already in the registry. NOT reset by
+ * `kbc_httpd_stop`: the seal is, so a second start would try to register
+ * again and the duplicate check would fail it. The table is process-wide and
+ * the rows are constants, so "already there" is the correct answer for every
+ * later start. */
+static bool g_review_routes_added;
+
+static const kbc_route_entry REVIEW_ROUTES[] = {
+    {"GET", "/api/kb/{kb}/review/{id}",
+     "the review document: comments with their persisted anchor verdict, the "
+     "verdict, and the attachment rows",
+     true, route_review},
+    {"POST", "/api/kb/{kb}/review/{id}/comments",
+     "add a comment; `anchor` and `body` are required and `created_at` is "
+     "never client-supplied",
+     true, route_add_comment},
+    {"DELETE", "/api/kb/{kb}/review/{id}/comments/{cid}",
+     "delete a comment, cascading its anchor verdict and its adopted "
+     "attachments in one commit",
+     true, route_delete_comment},
+    {"POST", "/api/kb/{kb}/review/{id}/comments/{cid}/resolve",
+     "resolve a comment and drop its anchor verdict; the original's "
+     "`prune_if_resolved`, which never runs on an un-resolve",
+     true, route_resolve},
+    {"POST", "/api/kb/{kb}/review/{id}/comments/{cid}/unresolve",
+     "re-open a comment; its anchor verdict stays absent so the next pass "
+     "judges it fresh rather than re-firing a transition",
+     true, route_unresolve},
+    {"GET", "/api/kb/{kb}/anchors/stale",
+     "the PERSISTED stale-anchor set, `?artifact_id=` narrows and `?limit=` "
+     "pages; never recomputed at read time",
+     true, route_stale_anchors},
+    {"POST", "/api/kb/{kb}/review/{id}/verdict",
+     "comment|approve|request_changes; the status-* kb-tag is derived from it "
+     "in the same transaction and is never the source of truth",
+     true, route_set_verdict},
+    {"DELETE", "/api/kb/{kb}/review/{id}/verdict",
+     "withdraw the verdict and the tag it projected; 404 when there was none",
+     true, route_clear_verdict},
+    {"POST", "/api/kb/{kb}/review/{id}/attachments",
+     "stage an upload; the magic-byte sniff IS the gate, 415 creates no blob "
+     "and no row, and the stored content type is the sniffed one",
+     true, route_stage_attachment},
+    {"GET", "/api/kb/{kb}/review/{id}/attachments",
+     "a page of this document's rows, newest first, staged rows included",
+     true, route_list_attachments},
+    {"GET", "/api/kb/{kb}/review/{id}/attachments/{aid}",
+     "the bytes, with the daemon's sniffed type, nosniff, and inline only for "
+     "a raster image",
+     true, route_serve_attachment},
+    {"POST", "/api/kb/{kb}/review/{id}/comments/{cid}/attachments/{aid}",
+     "adopt a staged upload onto a comment, once; a second adoption is a 409",
+     true, route_adopt_attachment},
+    {"DELETE", "/api/kb/{kb}/review/{id}/comments/{cid}/attachments/{aid}",
+     "detach: the row and the bytes go together",
+     true, route_detach_attachment},
+};
 
 static kbc_status dispatch(kbc_app *app, const kbc_config *cfg,
                            const kbc_request *req, const req_ctx *ctx,
@@ -3280,14 +4598,40 @@ static kbc_status dispatch(kbc_app *app, const kbc_config *cfg,
       goto done;
     }
     result = hit.handler(app, req, &hit.params, out, err);
+    /* Whatever headers the handler put on `out` become this response's header
+     * lines. Moved AFTER the call, not during it: a handler that fails half
+     * way must not leave a Content-Disposition behind for a body that was
+     * never sent. */
+    if (result == KBC_OK) {
+      for (size_t hi = 0; hi < out->n_headers; hi++) {
+        if (hdrs != NULL &&
+            kbc_failed(kbc_str_printf(hdrs, "%s: %s\r\n",
+                                      out->headers[hi].name,
+                                      out->headers[hi].value))) {
+          result = kbc_err_set(err, KBC_ERR_NOMEM,
+                               "response header `%s`: no room",
+                               out->headers[hi].name);
+          break;
+        }
+      }
+    }
+    out->n_headers = 0;
     /* A handler owns its response: status, content type and body are whatever
      * it set, and `out` was already initialised for it. A handler that
      * returns a failure WITHOUT having written a body is a bug in the
      * handler, and the daemon's own answer for that is the 500 below rather
-     * than a 200 with an empty body. */
+     * than a 200 with an empty body.
+     *
+     * The header lines are DROPPED on a failure, for the reason the switch's
+     * own comment gives: they describe a body that is not being sent, and a
+     * `Content-Disposition` left on a problem+json answer is a header
+     * describing a file that does not exist. */
     if (kbc_failed(result) && out->body.len == 0) {
       kbc_str_clear(&out->body);
+      kbc_str_clear(hdrs);
       result = resp_error(out, 500, result, "%s %s: %s", m, p, err_msg(err, result));
+    } else if (kbc_failed(result)) {
+      kbc_str_clear(hdrs);
     }
     goto done;
   }
@@ -3929,84 +5273,31 @@ done:
  * (parse.c:715-720) — the same "is this still addressable" question the
  * original asks of `[id]` and `[data-kb-id]` in the re-rendered HTML.
  *
- * THE STATE IS IN-PROCESS AND IS NOT PERSISTED, matching `anchor_state`
- * (indexer.rs:3045-3048). A daemon restart therefore re-fires `anchor_stale`
- * for every anchor that is still stale, because the tracker no longer knows it
- * was. That is the original's behaviour, not a leak here: a subscriber that
- * reconnects after a restart wants to be told the state it cannot remember
- * either.
+ * THE STATE IS PERSISTED, and this pass no longer keeps a copy of it.
+ *
+ * The httpd used to hold its own (doc_id, comment_id) key set so it could
+ * tell a first stale from a steady one, and re-derived the verdict itself out
+ * of `kbc_parsed_has_anchor`. That was a SECOND OPINION: the same question,
+ * answered twice, in two places, from two different notions of what a
+ * document exposes. The verdicts now live in `comment_anchors` (schema v13),
+ * the pass calls `kbc_store_judge_anchors` and publishes what it is handed,
+ * and `kbc_anchor_judgement.transitioned` IS the edge the key set was
+ * standing in for.
+ *
+ * Two defects go with it, and both are the ones `kb-core/src/anchors.rs`
+ * exists to prevent. The old set died with the process, so the first re-index
+ * after a restart re-fired `anchor_stale` for every anchor that was still
+ * stale — the v0.5 P4 bug, verbatim ("it died on restart, so the first
+ * reindex after a restart could never fire comment.anchor_resolved"). And a
+ * boolean answer could not be told from an unanswerable one, so a slug
+ * collision was reported as a resolved anchor at the wrong heading; that is
+ * the third state the store now carries and this file now reports verbatim.
+ *
+ * `section:` stripping moved with the decision. It used to happen here, in the
+ * pass, before a lookup; the store does it inside `anchor_judge` now, next to
+ * the comparison it feeds, and there is one copy of the rule rather than two
+ * that can disagree about which string a claim names.
  */
-
-/* The element id an anchor names. `section:` is the only prefix kb-c's store
- * accepts, and it is stripped rather than searched for: `[[section:x]]` in a
- * document that declares `id="section:x"` is a DIFFERENT anchor from one that
- * declares `id="x"`, and searching for the whole string would collapse them. */
-static const char *anchor_element_id(const char *anchor) {
-  static const char kSection[] = "section:";
-  if (strncmp(anchor, kSection, sizeof kSection - 1) == 0) {
-    return anchor + sizeof kSection - 1;
-  }
-  return anchor;
-}
-
-static size_t anchors_find(const kbc_httpd *h, const char *doc,
-                           const char *cid) {
-  for (size_t i = 0; i < h->anchors_len; i++) {
-    if (strcmp(h->anchors[i].doc_id, doc) == 0 &&
-        strcmp(h->anchors[i].comment_id, cid) == 0) {
-      return i;
-    }
-  }
-  return SIZE_MAX;
-}
-
-/* GROWS under `anchors_mu` by doubling, with the overflow checked: the set is
- * one entry per stale comment, so its size is bounded by the number of
- * comments the corpus has, and a corpus whose comment count is large enough to
- * overflow a size_t would have exhausted the address space first. The check is
- * here anyway because "provably in range" is the rule, not "it cannot
- * happen". */
-static kbc_status anchors_add(kbc_httpd *h, const char *doc, const char *cid,
-                              kbc_err *err) {
-  /* Both ids are minted at KBC_MAX_ID_LEN by `mint_id`; a longer one is a row
-   * this fixed-width key cannot represent, and half-tracking it would be worse
-   * than not tracking it — so it is refused, and the caller says so. */
-  if (strlen(doc) > KBC_MAX_ID_LEN || strlen(cid) > KBC_MAX_ID_LEN) {
-    return kbc_err_set(err, KBC_ERR_INVALID,
-                       "anchor key (%zu, %zu bytes) exceeds the %u an id has",
-                       strlen(doc), strlen(cid), KBC_MAX_ID_LEN);
-  }
-  if (h->anchors_len == h->anchors_cap) {
-    size_t want = h->anchors_cap != 0 ? h->anchors_cap * 2u : 16u;
-    if (want < h->anchors_cap || want > SIZE_MAX / sizeof(*h->anchors)) {
-      return kbc_err_set(err, KBC_ERR_NOMEM, "anchor set would exceed %zu",
-                         SIZE_MAX / sizeof(*h->anchors));
-    }
-    anchor_key *grown = realloc(h->anchors, want * sizeof(*grown));
-    if (grown == NULL) {
-      return kbc_err_set(err, KBC_ERR_NOMEM, "anchor set: %zu entries", want);
-    }
-    h->anchors = grown;
-    h->anchors_cap = want;
-  }
-  /* memcpy at the MEASURED length, not a formatted copy into a fixed buffer:
-   * both bounds were just checked against KBC_MAX_ID_LEN, which is the size of
-   * each field minus its terminator. */
-  size_t dl = strlen(doc);
-  size_t cl = strlen(cid);
-  memcpy(h->anchors[h->anchors_len].doc_id, doc, dl);
-  h->anchors[h->anchors_len].doc_id[dl] = '\0';
-  memcpy(h->anchors[h->anchors_len].comment_id, cid, cl);
-  h->anchors[h->anchors_len].comment_id[cl] = '\0';
-  h->anchors_len++;
-  return KBC_OK;
-}
-
-static void anchors_del(kbc_httpd *h, size_t at) {
-  if (at == SIZE_MAX || at >= h->anchors_len) return;
-  h->anchors[at] = h->anchors[h->anchors_len - 1u];
-  h->anchors_len--;
-}
 
 /* The `comment.anchor_stale` payload (indexer.rs:3067-3081). `fuzzy_score` is
  * the resolver's best-tried similarity and `Resolution::Stale` is a unit
@@ -4071,93 +5362,123 @@ static void publish_anchor_resolved(kbc_app *app, const kbc_artifact *art,
   kbc_str_free(&p);
 }
 
-/* ONE document's open comments, and the only place a transition is decided.
- * The four arms are the original's table (indexer.rs:3049-3112) exactly:
+/* The document's ANCHOR TABLE, in document order, which is what the store's
+ * judge consumes.
  *
- *   resolves && !was_stale → nothing (a steady state, and the common one)
- *   !resolves && !was_stale → record + `comment.anchor_stale`
- *   !resolves && was_stale  → nothing (indexer.rs:3083-3086: the SPA already
+ * The entries are the parse's own anchor index, filtered to the blocks the
+ * index names. That filter is the whole correctness of the table and it is not
+ * optional: a plain prose paragraph has an id (`b<N>`) but is NOT addressable,
+ * so handing the judge every block would make `b3` resolvable and a comment
+ * anchored to a paragraph would read RESOLVED at a target the parser never
+ * offered. `kbc_parsed_has_anchor` is the same predicate the parser used to
+ * build the index ("a heading, a fenced block, or any block that carries an
+ * explicit id", parse.c:761-766), so the table and the index cannot disagree.
+ *
+ * `text` is the block's own text, which for a heading is the heading text —
+ * the identity the store compares across passes to detect a slug collision.
+ * BORROWED for the call; the store copies what it keeps. */
+static kbc_status anchors_table(kbc_arena *a, const kbc_parsed *p,
+                                kbc_anchor_heading **out, size_t *n_out,
+                                kbc_err *err) {
+  *out = NULL;
+  *n_out = 0;
+  const kbc_blocks *blocks = kbc_parsed_blocks(p);
+  if (blocks == NULL || blocks->len == 0) return KBC_OK;
+  kbc_anchor_heading *t =
+      kbc_arena_alloc(a, blocks->len * sizeof(*t));
+  if (t == NULL)
+    return kbc_err_set(err, KBC_ERR_NOMEM, "anchors: %zu headings",
+                       blocks->len);
+  size_t n = 0;
+  for (size_t i = 0; i < blocks->len; i++) {
+    if (!kbc_parsed_has_anchor(p, blocks->items[i].id)) continue;
+    t[n].id = blocks->items[i].id;
+    t[n].text = blocks->items[i].text;
+    n++;
+  }
+  *out = t;
+  *n_out = n;
+  return KBC_OK;
+}
+
+/* ONE document, and the ONLY place a transition is decided — because the
+ * transition is a property of the PERSISTED set, and the store computes it.
+ *
+ * The four arms of the original's table (indexer.rs:3049-3112) are exactly
+ * what `kbc_anchor_judgement.transitioned` already is:
+ *
+ *   resolves && !was_stale -> nothing (a steady state, and the common one)
+ *   !resolves && !was_stale -> record + `comment.anchor_stale`
+ *   !resolves && was_stale  -> nothing (indexer.rs:3083-3086: the SPA already
  *                             painted the badge)
- *   resolves && was_stale  → forget  + `comment.anchor_resolved`
+ *   resolves && was_stale  -> forget  + `comment.anchor_resolved`
  *
- * A comment is visited ONCE per pass and takes ONE arm, so an anchor that
- * flaps cannot produce two events out of one evaluation: a document edited
- * into staleness and back within one re-index is not two observations, it is
- * one, and the one observation is the state the re-indexed bytes leave behind.
+ * `transitioned` is `is_stale(now) != is_stale(before)`, so the two arms that
+ * fire are the two arms where the flags differ, and the two that do not are
+ * the two where they agree. The httpd used to reimplement that comparison
+ * against its OWN in-process set, which is the second opinion the three-state
+ * machine exists to prevent: the set died with the process, so every restart
+ * re-fired `anchor_stale` for everything still stale — the exact defect
+ * `anchors.rs` was written to fix in the original. There is one set now and it
+ * is in the database.
  *
- * The return value is the number of EVENTS this document fired, which is what
- * the pass logs. A key whose comment was DELETED is pruned here — the
- * original's R5 (indexer.rs:3114-3123) — by matching the document's keys
- * against the ids it actually still has. A comment that is merely RESOLVED
- * keeps its key, exactly as it does there: a resolved comment is still in the
- * file, and dropping its key would make reopening it re-fire a stale event the
- * subscriber has already seen. */
+ * A comment is visited ONCE per pass by the store, so an anchor that flaps
+ * cannot produce two events out of one evaluation: a document edited into
+ * staleness and back within one re-index is not two observations, it is one.
+ *
+ * R5 — a key whose comment was DELETED — is no longer this function's job. The
+ * foreign key does it: `comment_anchors.comment_id REFERENCES comments(id) ON
+ * DELETE CASCADE`, and `foreign_keys` is ON, so deleting a comment takes its
+ * verdict in the same commit. What the FK cannot reach (a writer without the
+ * pragma) is swept by `kbc_store_reconcile_anchors` on every open. A comment
+ * that is merely RESOLVED keeps its row, exactly as it does in the original:
+ * a resolved comment is still a live comment with a question attached. */
 static size_t anchors_one_doc(kbc_httpd *h, kbc_store *store, kbc_arena *a,
                               const kbc_artifact *art) {
   kbc_err local;
-  kbc_comment *cs = NULL;
-  size_t n = 0;
   kbc_err_reset(&local);
-  if (kbc_failed(kbc_store_list_comments(store, a, art->id, KBC_MAX_HITS, &cs,
-                                         &n, &local))) {
-    KBC_LOGW("anchors: comments of %s: %s", art->id, local.msg);
+  const char *src = art->source != NULL ? art->source : "";
+  kbc_parsed *p = kbc_parse(a, src, strlen(src), art->path, &local);
+  kbc_anchor_heading *table = NULL;
+  size_t n_heads = 0;
+  /* `judgeable` is FALSE for a document that would not parse, and that is the
+   * one input the store needs to say UNDECIDABLE instead of UNRESOLVED. It is
+   * not a degradation: a store that reported "every anchor on this document is
+   * gone" for a file it could not read would be making a claim about the
+   * document it has not looked at. */
+  bool judgeable = p != NULL;
+  if (judgeable) {
+    kbc_err_reset(&local);
+    if (kbc_failed(anchors_table(a, p, &table, &n_heads, &local))) {
+      KBC_LOGW("anchors: %s/%s: %s", art->id, art->path, local.msg);
+      judgeable = false;
+    }
+  } else {
+    KBC_LOGW("anchors: %s/%s will not parse, no anchor judged: %s", art->id,
+             art->path, local.msg);
+  }
+  kbc_anchor_judgement *js = NULL;
+  size_t nj = 0;
+  kbc_err_reset(&local);
+  if (kbc_failed(kbc_store_judge_anchors(store, art->id, table, n_heads,
+                                         judgeable, a, &js, &nj, &local))) {
+    KBC_LOGW("anchors: judging %s: %s", art->id, local.msg);
     return 0;
   }
-  const char *src = art->source != NULL ? art->source : "";
-  kbc_parsed *p = NULL;
   size_t transitions = 0;
-  for (size_t i = 0; i < n; i++) {
-    if (cs[i].resolved) continue; /* the original walks `c.is_open()` only */
-    if (p == NULL) {
-      kbc_err_reset(&local);
-      p = kbc_parse(a, src, strlen(src), art->path, &local);
-      if (p == NULL) {
-        /* One parse serves every open comment on this document. A document
-         * whose bytes will not parse cannot resolve any anchor, and saying so
-         * as "everything is stale" would flag every comment on it. */
-        KBC_LOGW("anchors: %s/%s will not parse, no anchor judged: %s", art->id,
-                 art->path, local.msg);
-        return transitions;
-      }
+  for (size_t i = 0; i < nj; i++) {
+    if (!js[i].transitioned) continue;
+    /* One test, and it is the same test the store makes: anything that is not
+     * RESOLVED is stale FOR THE EVENT SET, including UNDECIDABLE. A subscriber
+     * needs to know about both — an undecidable anchor is exactly as
+     * un-actionable as a missing one — and a set that dropped the third state
+     * would be the two-state collapse this design refuses. */
+    if (js[i].state == KBC_ANCHOR_RESOLVED) {
+      publish_anchor_resolved(h->app, art, js[i].comment_id);
+    } else {
+      publish_anchor_stale(h->app, art, js[i].comment_id);
     }
-    const char *id = anchor_element_id(cs[i].anchor);
-    bool resolves = kbc_parsed_has_anchor(p, id);
-    size_t at = anchors_find(h, art->id, cs[i].id);
-    if (!resolves && at == SIZE_MAX) {
-      kbc_err ke;
-      kbc_err_reset(&ke);
-      if (kbc_failed(anchors_add(h, art->id, cs[i].id, &ke))) {
-        KBC_LOGW("anchors: %s/%s not tracked: %s", art->id, cs[i].id, ke.msg);
-        continue;
-      }
-      publish_anchor_stale(h->app, art, cs[i].id);
-      transitions++;
-    } else if (resolves && at != SIZE_MAX) {
-      anchors_del(h, at);
-      publish_anchor_resolved(h->app, art, cs[i].id);
-      transitions++;
-    }
-  }
-  /* R5: a key whose comment no longer exists is dropped, so a deleted comment
-   * cannot leave a phantom the next re-index re-publishes. This runs after the
-   * loop, so a key added above is matched against the ids this document really
-   * has and cannot be pruned by its own addition. */
-  size_t i = 0;
-  while (i < h->anchors_len) {
-    if (strcmp(h->anchors[i].doc_id, art->id) == 0) {
-      bool still_there = false;
-      for (size_t j = 0; j < n; j++) {
-        if (strcmp(h->anchors[i].comment_id, cs[j].id) == 0) {
-          still_there = true;
-          break;
-        }
-      }
-      if (!still_there) {
-        anchors_del(h, i);
-        continue;
-      }
-    }
-    i++;
+    transitions++;
   }
   return transitions;
 }
@@ -4194,18 +5515,12 @@ static void anchors_scan_locked(kbc_httpd *h) {
     kbc_err_reset(&local);
     if (kbc_failed(kbc_app_get_artifact(h->app, a, docs.items[i], true, &art,
                                          &local))) {
-      /* The document is gone. Its comment rows went with it (the cascade
-       * deletes comments by foreign key, INVENTORY.md:182), so there is
-       * nothing to re-resolve and nothing to report: a comment on a deleted
-       * document is not a stale anchor, it is a deleted thread. */
-      size_t at = 0;
-      while (at < h->anchors_len) {
-        if (strcmp(h->anchors[at].doc_id, docs.items[i]) == 0) {
-          anchors_del(h, at);
-          continue;
-        }
-        at++;
-      }
+      /* The document is gone. Its comment rows went with it, and their anchor
+       * verdicts with them: the comment cascade is the foreign key and this
+       * connection runs `foreign_keys = ON`. So there is nothing to re-resolve,
+       * nothing to report, and — before this pass consulted the store — no key
+       * to prune. A comment on a deleted document is not a stale anchor, it is
+       * a deleted thread. */
       continue;
     }
     fired += anchors_one_doc(h, store, a, &art);
@@ -6346,6 +7661,19 @@ static void serve_request(conn *c, const http_req *r) {
   req.client_addr = c->peer;
   req.body = c->in.ptr + c->body_off;
   req.body_len = c->body_want;
+  /* `Content-Type` reaches the handler on BOTH carriers, and the two are not
+   * redundant. `ctx.content_type` is the capture route's, off the parsed
+   * header table; `req.content_type` is the field `kbc_request` documents and
+   * the one `route_stage_attachment` reads to find the multipart boundary.
+   * It was left NULL here, and `kbc_multipart_parse` refuses a NULL
+   * content_type, so every multipart upload over a socket was a 400 saying
+   * "all required" for a field that had arrived in the request. The
+   * socketless `kbc_httpd_handle` seam sets it from its caller, which is why
+   * the same route is reachable from a test and not from a client. */
+  req.content_type = hdr_find(r, "Content-Type");
+  if (req.content_type == NULL) req.content_type = "";
+  req.x_requested_by = hdr_find(r, "X-Requested-By");
+  if (req.x_requested_by == NULL) req.x_requested_by = "";
 
   kbc_response resp;
   kbc_response_init(&resp);
@@ -6389,7 +7717,15 @@ static void serve_request(conn *c, const http_req *r) {
     if (c->eof) c->close_after = true;
     return;
   }
-  if (kbc_failed(st)) {
+  /* A handler that failed AND wrote a body has already answered: `dispatch`
+   * applies the same rule when it drops the header lines, and the 500 here
+   * was throwing that answer away. `review_doc` writes a 404 and returns
+   * NOTFOUND, which is the honest pairing — the response says "no such
+   * document" and the status says the lookup failed — and the overwrite
+   * turned every one of those into a 500, which is a different and wrong
+   * claim about the same request. The 500 is for a handler that failed
+   * SILENTLY, which is the bug it was written for. */
+  if (kbc_failed(st) && resp.body.len == 0) {
     kbc_response_free(&resp);
     kbc_response_init(&resp);
     (void)resp_error(&resp, 500, st, "%s", err.msg);
@@ -7088,12 +8424,41 @@ kbc_httpd *kbc_httpd_start(kbc_app *app, const kbc_config *cfg, kbc_err *err) {
       return NULL;
     }
   }
+  /* The review subsystem's rows, registered BEFORE the seal below — `add`
+   * refuses while the seal is set, which is the whole safety argument for
+   * the lock-free read in the dispatcher, and a registration that ignored it
+   * would put a write concurrent with the workers' reads.
+   *
+   * Registered from the daemon rather than from a subsystem initialiser
+   * because there is no other initialiser in this port: every route is one
+   * table today, and the registry exists so the next twenty features do not
+   * have to be. The guard below is what makes a second `kbc_httpd_start` in
+   * the same process safe — the seal is cleared in `kbc_httpd_stop`, so the
+   * second start WOULD try to register again, and without the guard the
+   * duplicate check would fail every start after the first. */
+  if (!g_review_routes_added) {
+    kbc_err local;
+    kbc_err_reset(&local);
+    if (kbc_failed(kbc_httpd_routes_add(
+            REVIEW_ROUTES, sizeof REVIEW_ROUTES / sizeof REVIEW_ROUTES[0],
+            &local))) {
+      /* A refusal here is a bug in THIS file's route table — a malformed
+       * template, a duplicate, or the table being full — and it is not
+       * something a running daemon can do without. Failing the start is the
+       * loud version; serving a daemon that silently lacks its comment
+       * surface is the quiet one. */
+      (void)kbc_err_set(err, KBC_ERR_INTERNAL, "review routes: %s", local.msg);
+      kbc_httpd_stop(h);
+      return NULL;
+    }
+    g_review_routes_added = true;
+  }
+
   /* SEAL THE ROUTE TABLE. From here the workers exist and can be dispatching,
    * so kbc_httpd_routes_add must refuse: that refusal is what makes the
    * dispatcher's lock-free read of g_view correct. Cleared again in
    * kbc_httpd_stop, so a test that stops its daemon can register again. */
   atomic_store(&g_registry_sealed, true);
-
 
   h->sub_id = kbc_app_subscribe(app, httpd_on_event, h);
   h->subscribed = true;
@@ -7166,7 +8531,6 @@ void kbc_httpd_stop(kbc_httpd *h) {
   free(h->w);
   free(h->threads);
   pthread_mutex_destroy(&h->conns_mu);
-  free(h->anchors);
   pthread_mutex_destroy(&h->anchors_mu);
   pthread_mutex_destroy(&h->ring_mu);
   free(h);

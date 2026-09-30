@@ -49,13 +49,43 @@ typedef struct {
   const char *client_addr;
 } kbc_request;
 
+/* One response header beyond Content-Type. BORROWED, like `content_type`
+ * above: the name and value must outlive the write, and a handler that
+ * formats one into a local must keep that local alive. */
+typedef struct {
+  const char *name;
+  const char *value;
+} kbc_header;
+
+/* Eight is not a guess: it is what the routes need at once. The artifact
+ * route sets Content-Disposition and Cache-Control; an attachment adds
+ * X-Content-Type-Options; the subdomain adds CSP; a registered handler can
+ * add its own. A handler that needs a ninth gets a refusal naming the count,
+ * not a truncated response with a missing security header on it. */
+#define KBC_RESPONSE_MAX_HEADERS 8
+
 typedef struct {
   int status;             /* HTTP status code */
   const char *content_type;
   kbc_str body;           /* KBC_OWN, moved out to the socket */
   bool sse;               /* stream until the client disconnects */
   bool close_after;       /* send Connection: close */
+  kbc_header headers[KBC_RESPONSE_MAX_HEADERS];
+  size_t n_headers;
 } kbc_response;
+
+/* Adds a response header, replacing any existing one with the same name
+ * (case-insensitively, as HTTP requires). KBC_ERR_INVALID past the bound,
+ * with the count in the message.
+ *
+ * THIS EXISTS because the alternative was a thread-local side channel that
+ * a registered handler wrote to and `dispatch` copied out. A hidden channel
+ * between a handler and the write path is a bug waiting for a better home,
+ * and the header that needed it was `Content-Disposition` — which for an
+ * attachment is the XSS guard, not a nicety. A security control must not
+ * travel by a route the type system does not describe. */
+kbc_status kbc_response_header(kbc_response *r, const char *name,
+                               const char *value);
 
 void kbc_response_init(kbc_response *r);
 void kbc_response_free(kbc_response *r);

@@ -741,6 +741,141 @@ kbc_status kbc_store_prune_anchors(kbc_store *s, int64_t *n_removed,
 kbc_status kbc_store_reconcile_anchors(kbc_store *s, int64_t *n_reset,
                                        kbc_err *err);
 
+/* --------------------------------------------------------- attachments --
+ *
+ * THE MODEL IS THE ORIGINAL'S, and two of its properties are surprising
+ * enough to be worth stating before the signatures.
+ *
+ * There is NO content hash and NO DEDUP on the upload path. `prepare_entries`
+ * mints a fresh id per file and the manifest is a plain map, so two uploads
+ * of identical bytes are two ids and two rows. That is not an oversight to
+ * fix here: deduplicating would make a second comment share the first one's
+ * row, and detaching it would take the first comment's picture with it.
+ *
+ * The id is a fresh `a_` + 12 hex from six RANDOM bytes, not derived from
+ * the content. So a document move cannot collide with it, and `kbc_store_
+ * rekey_artifact` has to carry `doc_id` explicitly rather than infer it.
+ *
+ * `comment_id == NULL` is STAGED — uploaded, not yet attached to a comment.
+ * That is the original's `adopted: false`, and `prune_attachments` reaps
+ * staged rows past the grace window. */
+#define KBC_ATTACH_ID_LEN 14u
+#define KBC_ATTACH_MAX_BYTES (10u * 1024u * 1024u)
+#define KBC_ATTACH_MAX_PER_COMMENT 20u
+#define KBC_ATTACH_GC_GRACE_SECONDS (24ll * 3600ll)
+/* 120 CHARACTERS is the contract and this is the byte ceiling for it, since
+ * a character can be four bytes. */
+#define KBC_ATTACH_MAX_FILENAME_BYTES (120u * 4u)
+/* Bounds on the free-text fields, which are attacker-influenced and would
+ * otherwise be the only columns in the table without one. A content type is
+ * short by construction; an author is a name; a verdict note is prose. */
+#define KBC_ATTACH_MAX_TYPE_BYTES 128u
+#define KBC_ATTACH_MAX_AUTHOR_BYTES 128u
+#define KBC_VERDICT_MAX_BYTES 128u
+#define KBC_VERDICT_MAX_NOTE_BYTES 4096u
+
+typedef struct {
+  const char *id;           /* KBC_ARENA, "a_" + 12 hex */
+  const char *doc_id;       /* KBC_ARENA */
+  const char *comment_id;   /* KBC_ARENA, NULL while staged */
+  const char *filename;     /* KBC_ARENA — a DISPLAY basename, never a path */
+  const char *content_type; /* KBC_ARENA — the SNIFFED type, never the claim */
+  const char *author;       /* KBC_ARENA */
+  int64_t created_at;
+  int64_t size_bytes;
+  bool staged;
+} kbc_attachment;
+
+/* `body` is BORROWED and `body_len` travels beside it, because a blob may
+ * contain a NUL. */
+typedef struct {
+  const char *doc_id;
+  const char *comment_id; /* NULL to stage */
+  const char *filename;
+  const char *content_type; /* the client's claim; the SNIFF decides */
+  const char *author;
+  const void *body;
+  size_t body_len;
+} kbc_attachment_in;
+
+/* The verdict, which is a three-state machine for the same reason the anchor
+ * is: "no verdict" and "a verdict of comment" are different answers, and
+ * collapsing them makes an unreviewed document look reviewed. */
+typedef enum {
+  KBC_VERDICT_COMMENT = 0,
+  KBC_VERDICT_APPROVE = 1,
+  KBC_VERDICT_REQUEST_CHANGES = 2
+} kbc_verdict_state;
+
+typedef struct {
+  kbc_verdict_state state;
+  int64_t decided_at; /* stamped by the STORE, never from the request */
+  const char *decided_by; /* KBC_ARENA */
+  const char *note;       /* KBC_ARENA */
+} kbc_verdict;
+
+/* ONE insert is the whole transaction: the blob lives in the row, so "an
+ * attachment stored without its record" is unrepresentable rather than merely
+ * rolled back. Cascade is real — comment_id and doc_id both CASCADE, and
+ * `kbc_store_open` runs `PRAGMA foreign_keys = ON`. */
+kbc_status kbc_store_add_attachment(kbc_store *s, const kbc_attachment_in *in,
+                                    char id_out[KBC_ATTACH_ID_LEN + 1],
+                                    kbc_err *err);
+kbc_status kbc_store_get_attachment(kbc_store *s, kbc_arena *a, const char *id,
+                                    kbc_attachment *out, kbc_err *err);
+kbc_status kbc_store_read_attachment(kbc_store *s, const char *id, kbc_str *out,
+                                     kbc_err *err);
+kbc_status kbc_store_list_attachments(kbc_store *s, kbc_arena *a,
+                                      const char *doc_id, size_t limit,
+                                      kbc_attachment **out, size_t *n_out,
+                                      kbc_err *err);
+/* Adoption is ONCE: a second call is KBC_ERR_CONFLICT and does not change
+ * the owner. */
+kbc_status kbc_store_adopt_attachment(kbc_store *s, const char *id,
+                                      const char *comment_id, kbc_err *err);
+kbc_status kbc_store_delete_attachment(kbc_store *s, const char *id,
+                                       kbc_err *err);
+/* Reaps STAGED rows older than the grace window. A negative grace reaps
+ * nothing, which is a different answer from "reap everything". */
+kbc_status kbc_store_prune_attachments(kbc_store *s, int64_t now_unix,
+                                       int64_t grace_seconds, int64_t *rows,
+                                       kbc_err *err);
+/* Deleting a comment takes its attachments with it. The ORIGINAL leaves the
+ * blob file on disk and reaps it on the next mutation; here the bytes are in
+ * the row, so the cascade is the whole of it. */
+kbc_status kbc_store_delete_comment(kbc_store *s, const char *comment_id,
+                                    kbc_err *err);
+
+kbc_status kbc_store_set_verdict(kbc_store *s, const char *doc_id,
+                                 kbc_verdict_state state,
+                                 const char *decided_by, const char *note,
+                                 kbc_err *err);
+/* KBC_ERR_NOTFOUND is a FOURTH answer to "what is the verdict", and it is
+ * not KBC_VERDICT_COMMENT. */
+kbc_status kbc_store_get_verdict(kbc_store *s, kbc_arena *a, const char *doc_id,
+                                 kbc_verdict *out, kbc_err *err);
+kbc_status kbc_store_clear_verdict(kbc_store *s, const char *doc_id,
+                                   kbc_err *err);
+
+/* THE GATE, and it is public because the upload gate is its decision and the
+ * serve route's is its consequence — a second copy in httpd.c is a second
+ * opinion about what an image is.
+ *
+ * `sniff_attachment` reads the BYTES, never the client's claim. It accepts
+ * exactly PNG, JPEG, GIF87a/89a, WEBP and %PDF- plus valid UTF-8 text. SVG
+ * and HTML are NOT image types: they are valid UTF-8, so they sniff as
+ * text/plain and the serve route force-downloads them. */
+const char *kbc_store_sniff_attachment(const void *bytes, size_t n);
+/* A display basename and never a path: rsplit on the last separator, control
+ * characters dropped, `"` to `_`, capped at 120 CHARACTERS, empty/./.. mapped
+ * to "file". Returns KBC_ARENA memory. */
+const char *kbc_store_sanitize_filename(kbc_arena *a, const char *raw);
+/* True for exactly the four RASTER types, and false for everything else —
+ * including PDF, which is a legitimate upload and must be downloaded rather
+ * than rendered inline. */
+bool kbc_store_attachment_inline(const char *content_type);
+
+
 #ifdef __cplusplus
 }
 #endif

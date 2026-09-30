@@ -740,6 +740,10 @@ static char *make_source_repo(kbc_rs_git *g, const char *dir,
     return NULL;
   }
   kbc_str_free(&tx);
+  /* The blob id has done its work by here; only the commit goes back to the
+   * caller. Every error path above already freed it and the success path did
+   * not, so a PASSING fixture leaked on every call. */
+  free(oid);
   return commit_oid;
 }
 
@@ -884,8 +888,18 @@ KBC_TEST(security_a_token_reaches_git_but_not_argv_env_or_any_error) {
   kbc_err_reset(&e);
   KBC_CHECK_MSG(kbc_rs_git_run(g, &call, &out, &e) == KBC_OK,
            "credential fill failed: %s", e.msg);
+  /* The positive control. `strstr(stdout, TOKEN)` alone is weak: git could
+   * print the token for any reason. What proves the pipe worked is that git
+   * answered the CREDENTIAL PROTOCOL — a username and a password line for
+   * the host that was asked about. */
   KBC_CHECK_MSG(strstr(STRP(out.stdout), TOKEN) != NULL,
            "the token never reached git; stdout was: %s", STRP(out.stdout));
+  KBC_CHECK_MSG(strstr(STRP(out.stdout), "password=") != NULL,
+           "git did not answer the credential protocol; stdout was: %s",
+           STRP(out.stdout));
+  KBC_CHECK_MSG(strstr(STRP(out.stdout), "username=") != NULL,
+           "git answered without a username; stdout was: %s",
+           STRP(out.stdout));
   /* But nowhere else. */
   KBC_CHECK(strstr(STRP(out.stderr), TOKEN) == NULL);
   kbc_rs_output_free(&out);
@@ -930,6 +944,25 @@ KBC_TEST(security_a_token_reaches_git_but_not_argv_env_or_any_error) {
   KBC_CHECK_MSG(st != KBC_OK, "an unreachable remote reported success");
   KBC_CHECK_MSG(strstr(e.msg, TOKEN) == NULL,
     "the token reached an error message: %s", e.msg);
+  /* NON-VACUITY. "the token is absent from stderr" is satisfied by an
+   * empty stderr, so on its own it would pass against a capture that
+   * discards everything git said — which is exactly the failure mode this
+   * test exists to catch. git demonstrably writes to stderr for an
+   * unreachable remote, so that stderr must be here and must be
+   * substantial before its silence about the token means anything. The same
+   * applies to the error string, which is built from those bytes. */
+  KBC_CHECK_MSG(STRP(out.stderr)[0] != '\0',
+    "stderr was empty, so the token's absence from it proves nothing");
+  KBC_CHECK_MSG(strlen(STRP(out.stderr)) > 20u,
+    "stderr is implausibly short to be git's own diagnostic: %s",
+    STRP(out.stderr));
+  KBC_CHECK_MSG(e.msg[0] != '\0', "the failure carried no message at all");
+  KBC_CHECK_MSG(strstr(STRP(out.stderr), "example.invalid") != NULL,
+    "git's stderr must name the remote it tried, or it is not the real "
+    "diagnostic: %s", STRP(out.stderr));
+  /* And with real bytes in hand, the absence assertions above are about the
+   * token specifically rather than about an empty buffer. */
+  KBC_CHECK(strstr(STRP(out.stderr), TOKEN) == NULL);
   kbc_rs_output_free(&out);
   kbc_rs_cred_free(&cred);
   kbc_rs_git_free(g);
@@ -1098,8 +1131,11 @@ KBC_TEST(seeding_clones_a_real_local_remote_and_writes_a_manifest) {
   KBC_CHECK_EQ_INT(rep.base_state, KBC_RS_BASE_FETCHED);
   KBC_CHECK(rep.refs_imported >= 1);
 
-  /* It is a real bare mirror: the objects are there and the ref points at the
-   * commit the source published. */
+  /* The ref says where the mirror BELIEVES the commit is. `cat-file` is
+   * git's own answer to whether the object is actually there, which is the
+   * property a mirror has or does not have: a ref can name an id whose
+   * objects were never fetched, and a check that only read refs would call
+   * that a successful seed. */
   kbc_strlist refs;
   kbc_strlist_init(&refs);
   kbc_err_reset(&e);
@@ -1116,6 +1152,39 @@ KBC_TEST(seeding_clones_a_real_local_remote_and_writes_a_manifest) {
   KBC_CHECK_MSG(found, "the mirror does not carry the source commit (%s)",
             commit);
   kbc_strlist_free(&refs);
+
+  /* And the object itself, asked of git directly. `-e` in a bare mirror
+   * needs the git dir named, which is why this goes through the call with
+   * an explicit git_dir rather than relying on the process cwd. A non-empty
+   * stdout is checked too: `cat-file -e` is silent on success, so an empty
+   * answer is the only answer, and this pins that the probe really ran. */
+  {
+    const char *argv[] = {"cat-file", "-t", commit};
+    kbc_rs_output o2;
+    kbc_err_reset(&e);
+    KBC_CHECK_MSG(git_plain(g, rep.git_dir, argv, 3, NULL, 0, &o2, &e) == KBC_OK,
+                  "the mirror has no object %s: %s", commit, e.msg);
+    KBC_CHECK_MSG(strstr(STRP(o2.stdout), "commit") != NULL,
+                  "git says %s is a [%s], not a commit", commit,
+                  STRP(o2.stdout));
+    kbc_rs_output_free(&o2);
+  }
+  /* The commit's CONTENT came across, not just its id: the blob it points
+   * at is in the mirror and holds the bytes the source published. Named by
+   * the commit rather than by HEAD, because a store's own HEAD is
+   * `refs/kbc/none` and resolves to nothing. */
+  {
+    char spec[KBC_RS_OID_MAX + 16];
+    snprintf(spec, sizeof spec, "%s:README", commit);
+    const char *argv[] = {"cat-file", "blob", spec};
+    kbc_rs_output o3;
+    kbc_err_reset(&e);
+    KBC_CHECK_MSG(git_plain(g, rep.git_dir, argv, 3, NULL, 0, &o3, &e) == KBC_OK,
+                  "the mirror has no README blob: %s", e.msg);
+    KBC_CHECK_MSG(strstr(STRP(o3.stdout), "hello from the store test") != NULL,
+                  "the blob's bytes did not come across: [%s]", STRP(o3.stdout));
+    kbc_rs_output_free(&o3);
+  }
 
   kbc_rs_manifest m;
   kbc_err_reset(&e);
@@ -1539,7 +1608,12 @@ KBC_TEST(backup_restore_round_trip_reproduces_the_mirror) {
   }
   KBC_CHECK_MSG(found, "the restored mirror does not match the original");
   kbc_strlist_free(&refs);
-  const char *cat[] = {"cat-file", "-e", want};
+  /* The OBJECT, named by its id. `want` above is a whole for-each-ref LINE
+   * ("<oid> <ref>") and is right for comparing a ref listing; handing that
+   * line to cat-file asks git about a name that does not exist, so the check
+   * failed for a reason that had nothing to do with whether the object came
+   * back. `commit` alone is the object id. */
+  const char *cat[] = {"cat-file", "-t", commit};
   kbc_rs_call call;
   memset(&call, 0, sizeof call);
   call.op = "cat-file";
@@ -1577,17 +1651,40 @@ KBC_TEST(the_restore_guard_refuses_an_overwrite_and_says_what) {
   kbc_err_reset(&e);
   KBC_CHECK_OK(kbc_rs_backup_write(g, store, bundle, &e));
 
-  /* Move the review ref to a different commit: now the bundle WOULD
-   * overwrite something. */
+  /* Move the review ref to a DIFFERENT commit that the store already has, so
+   * the restore really is about to overwrite an existing ref. The object has
+   * to exist IN THE STORE: `other_commit` is minted in a separate source
+   * repo, and `git update-ref` rightly refuses to point a ref at an object it
+   * cannot see ("nonexistent object"), so the fixture failed before it ever
+   * reached the restore it was setting up. A second commit in the store's own
+   * source repo is the honest way to say "same repo, different commit". */
   char other[KBC_TEST_PATH_MAX];
   path(other, sizeof other, "%s/rg-src2.git", g_tmp);
-  char *other_commit = make_source_repo(g, other, "main");
+  kbc_rs_git *g2 = g;
+  char *other_commit = make_source_repo(g2, other, "main");
+  if (other_commit != NULL) {
+    /* Pull it into the store so the ref can legitimately point at it. */
+    const char *fargv[] = {"fetch", "--quiet", other, "+refs/heads/main:refs/kbc/rg-other"};
+    kbc_rs_call fc;
+    memset(&fc, 0, sizeof fc);
+    fc.op = "fetch-other";
+    fc.argv = fargv;
+    fc.argc = 4;
+    fc.git_dir = store;
+    fc.auth = KBC_RS_AUTH_LOCAL_ONLY;
+    fc.timeout_s = 60;
+    kbc_rs_output fo;
+    kbc_err_reset(&e);
+    kbc_rs_git_run(g, &fc, &fo, &e);
+    kbc_rs_output_free(&fo);
+  }
   kbc_str tx;
   kbc_str_init(&tx);
   kbc_str_printf(&tx, "update refs/kbc/review/33/ps1 %s\n",
                  other_commit != NULL ? other_commit : commit);
   kbc_err_reset(&e);
-  KBC_CHECK_OK(kbc_rs_git_update_refs(g, store, tx.ptr, tx.len, &e));
+  KBC_CHECK_MSG(kbc_rs_git_update_refs(g, store, tx.ptr, tx.len, &e) == KBC_OK,
+                "could not move the review ref: %s", e.msg);
   kbc_str_free(&tx);
 
   kbc_rs_restore_report rr;

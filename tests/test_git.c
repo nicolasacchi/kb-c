@@ -202,14 +202,18 @@ static int shim_install(void)
           "for a in \"$@\"; do printf '%%s\\n' \"$a\" >> \"$KBC_TEST_ARGV_LOG\";"
           " done\n"
           "printf '\\n' >> \"$KBC_TEST_ARGV_LOG\"\n"
-          /* KBC_TEST_SHIM_SLEEP turns the shim into a git that never
-           * answers, which is the only honest way to test a deadline: a
-           * real git on a real repository finishes in milliseconds, so
-           * the timeout path would otherwise be untestable. */
-          "if [ -n \"$KBC_TEST_SHIM_SLEEP\" ]; then"
-          " sleep \"$KBC_TEST_SHIM_SLEEP\"; exit 0; fi\n"
+          /* A marker FILE turns the shim into a git that never answers,
+           * which is the only honest way to test a deadline: a real git on
+           * a real repository finishes in milliseconds, so the timeout
+           * path would otherwise be untestable. The path is BAKED IN
+           * rather than passed through the environment because a repo
+           * handle snapshots its environment once, at open: a variable set
+           * after the open would never reach the child. The shim tests for
+           * the file at exec time, which the test alone controls. */
+          "if [ -f '%s/sleep' ]; then"
+          " sleep \"$(cat '%s/sleep')\"; exit 0; fi\n"
           "exec '%s' \"$@\"\n",
-          g_real_git);
+          g_shim_dir, g_shim_dir, g_real_git);
   fclose(f);
   return chmod(path, 0755) == 0 ? 0 : -1;
 }
@@ -225,6 +229,23 @@ static void shim_activate(const char *log)
   snprintf(path, sizeof path, "%s:%s", g_shim_dir, g_orig_path);
   KBC_CHECK_MSG(setenv("PATH", path, 1) == 0, "shim: setenv PATH");
   KBC_CHECK_MSG(setenv("KBC_TEST_ARGV_LOG", log, 1) == 0, "shim: setenv");
+}
+
+/* Turns the installed shim into a git that never answers, and back. The
+ * path is the one baked into the script at install time, so arming works
+ * after the handle was opened and its environment was snapshotted. */
+static void shim_sleep_arm(const char *seconds)
+{
+  char path[KBC_TEST_PATH_MAX + 64];
+  join(path, sizeof path, g_shim_dir, "/sleep");
+  kbc_test_write_file(path, seconds);
+}
+
+static void shim_sleep_disarm(void)
+{
+  char path[KBC_TEST_PATH_MAX + 64];
+  join(path, sizeof path, g_shim_dir, "/sleep");
+  kbc_test_rmrf(path);
 }
 
 /* Restores the pre-shim PATH exactly. Leaving a recording `git` first on
@@ -1029,16 +1050,47 @@ KBC_TEST(blame_regions_are_byte_identical_to_gits_own_output)
 
   /* The fixture is only interesting if some sha really did repeat, and
    * only if git really did omit its metadata the second time. That is the
-   * behaviour under test, so it is asserted rather than assumed. */
+   * behaviour under test, so it is asserted rather than assumed.
+   *
+   * The omission is checked against git's RAW bytes, not against `want`:
+   * the oracle re-attaches metadata to every region before returning it (it
+   * has to, or the comparison above would be against blanks), so `want` is
+   * filled in for a repeat by construction and asserting on it would be
+   * asserting that the oracle works. Only the raw stream still shows what
+   * git left out. */
   {
     size_t repeats = 0, omissions = 0;
     for (size_t i = 1; i < nwant; i++) {
       if (strcmp(want[i].sha, want[i - 1].sha) != 0)
         continue;
       repeats++;
-      /* A repeat region's own metadata block, before re-attachment. */
-      if (want[i].author[0] == '\0' || want[i].subject[0] == '\0')
-        omissions++;
+    }
+    /* Count the header blocks in the raw stream that carry no author line
+     * of their own, which is exactly the region git elided. */
+    {
+      const char *p = raw;
+      while (p != NULL && *p != '\0') {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl != NULL ? (size_t)(nl - p) : strlen(p);
+        if (len > 41 && hex40(p)) {
+          /* Walk this block to its filename line and see whether it
+           * brought an author with it. */
+          const char *q = nl != NULL ? nl + 1 : p + len;
+          bool author = false, saw_filename = false;
+          while (q != NULL && *q != '\0' && !saw_filename) {
+            const char *e = strchr(q, '\n');
+            size_t l = e != NULL ? (size_t)(e - q) : strlen(q);
+            if (l > 9 && strncmp(q, "filename ", 9) == 0)
+              saw_filename = true;
+            else if (l > 7 && strncmp(q, "author ", 7) == 0)
+              author = true;
+            q = e != NULL ? e + 1 : NULL;
+          }
+          if (saw_filename && !author)
+            omissions++;
+        }
+        p = nl != NULL ? nl + 1 : NULL;
+      }
     }
     KBC_CHECK_MSG(repeats > 0, "fixture must repeat a sha");
     KBC_CHECK_MSG(omissions > 0,
@@ -1144,9 +1196,16 @@ KBC_TEST(blame_at_a_pinned_revision_and_with_a_line_range)
 
 KBC_TEST(a_revspec_that_would_inject_a_flag_never_reaches_a_process)
 {
-  /* The actual documented vector: --upload-pack=<program> turns a ref name
-   * into the command git runs on the far end. If this string ever reaches
-   * an option parser, a request field becomes execution. */
+  /* The documented vector: --upload-pack=<program> turns a ref name into
+   * the command git runs on the far end, so a request field that reached
+   * an option parser would be execution.
+   *
+   * Every entry here is one the VALIDATOR must refuse. A well-formed name
+   * git does not have ("refs/heads/ok-branch_1.2") is deliberately absent:
+   * it is legal input, so it must reach a process and be answered with a
+   * named ref failure — asserting it is rejected would assert the opposite
+   * of the property under test. The legal-but-absent case is covered in
+   * the `switch` case, which asks git for exactly that name. */
   static const char *const vectors[] = {
       "--upload-pack=touch /tmp/kbc-pwned",
       "--upload-pack=/bin/sh",
@@ -1162,7 +1221,6 @@ KBC_TEST(a_revspec_that_would_inject_a_flag_never_reaches_a_process)
       "main..HEAD",
       "HEAD@{1}",
       "",
-      "refs/heads/ok-branch_1.2",
   };
   char dir[KBC_TEST_PATH_MAX + 64];
   kbc_git_repo *repo = NULL;
@@ -1175,9 +1233,13 @@ KBC_TEST(a_revspec_that_would_inject_a_flag_never_reaches_a_process)
   make_repo(dir, sizeof dir);
   join(log, sizeof log, dir, "/argv.log");
 
-  KBC_CHECK_OK(kbc_git_repo_open(dir, &repo, &err));
+  /* The shim goes on PATH BEFORE the handle is opened: a handle snapshots
+   * the sanitized environment once, at open, and every later call reuses
+   * that snapshot. Activating afterwards would leave the shim invisible to
+   * the very calls this case is trying to observe. */
   KBC_CHECK_EQ_INT(shim_install(), 0);
   shim_activate(log);
+  KBC_CHECK_OK(kbc_git_repo_open(dir, &repo, &err));
 
   /* Positive control, in the same environment and against the same
    * handle: a legal revspec DOES reach a process. Without this the
@@ -1242,9 +1304,9 @@ KBC_TEST(a_path_that_would_escape_the_repository_never_reaches_a_process)
 
   make_repo(dir, sizeof dir);
   join(log, sizeof log, dir, "/argv.log");
-  KBC_CHECK_OK(kbc_git_repo_open(dir, &repo, &err));
   KBC_CHECK_EQ_INT(shim_install(), 0);
   shim_activate(log);
+  KBC_CHECK_OK(kbc_git_repo_open(dir, &repo, &err));
 
   kbc_str_init(&blob);
   kbc_err_reset(&err);
@@ -1392,11 +1454,12 @@ KBC_TEST(a_child_that_never_answers_is_killed_at_its_deadline)
 
   make_repo(dir, sizeof dir);
   join(log, sizeof log, dir, "/argv.log");
-  KBC_CHECK_OK(kbc_git_repo_open(dir, &repo, &err));
-
   KBC_CHECK_EQ_INT(shim_install(), 0);
   shim_activate(log);
-  setenv("KBC_TEST_SHIM_SLEEP", "30", 1);
+  KBC_CHECK_OK(kbc_git_repo_open(dir, &repo, &err));
+  /* Armed AFTER the open: the handle is already resolved, and a git that
+   * never answers from here on is what the deadline is measured against. */
+  shim_sleep_arm("30");
 
   memset(&o, 0, sizeof o);
   o.path = "a.txt";
@@ -1407,7 +1470,7 @@ KBC_TEST(a_child_that_never_answers_is_killed_at_its_deadline)
   KBC_CHECK_EQ_INT(kbc_git_error(&err), KBC_GIT_E_TIMEOUT);
 
   /* The deadline is only real if the child is gone, not merely abandoned. */
-  unsetenv("KBC_TEST_SHIM_SLEEP");
+  shim_sleep_disarm();
   KBC_CHECK_MSG(no_children(), "the timed-out child was not reaped");
 
   shim_deactivate();

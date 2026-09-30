@@ -144,6 +144,20 @@ static bool oid_ok(const char *hex) {
   return true;
 }
 
+/* The same rule as oid_ok, for bytes that are not NUL-terminated — git's
+ * own stdout, whose trailing newline the caller trimmed off. */
+static bool oid_ok_len(const char *hex, size_t n) {
+  if (hex == NULL || (n != 40 && n != 64)) {
+    return false;
+  }
+  for (size_t i = 0; i < n; i++) {
+    if (!isxdigit((unsigned char)hex[i]) || isupper((unsigned char)hex[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /* A full ref name, in the narrower sense the store's own refspecs need: a
  * revspec predicate PLUS git's check-ref-format characters, which are legal
  * in a revspec but not in a ref name. Every name that reaches argv from
@@ -2104,8 +2118,12 @@ kbc_status kbc_rs_git_run(kbc_rs_git *g, const kbc_rs_call *call,
     if (pipe(in_pipe) != 0) {
       st = kbc_err_set(err, KBC_ERR_IO, "pipe: %s", strerror(errno));
     } else {
-      int flags = fcntl(in_pipe[0], F_GETFL);
-      fcntl(in_pipe[0], F_SETFL, flags | O_NONBLOCK);
+      /* NONBLOCK belongs on the PARENT'S WRITE end only. The read end is
+       * the child's stdin, and a non-blocking stdin makes git's own
+       * credential parser see EAGAIN where it expects the payload — it
+       * answers "missing host field" for a request that named a host. */
+      int flags = fcntl(in_pipe[1], F_GETFL);
+      fcntl(in_pipe[1], F_SETFL, flags | O_NONBLOCK);
       /* The child gets the READ end; the parent writes to the WRITE end. */
       in_w = fcntl(in_pipe[1], F_DUPFD_CLOEXEC, 10);
       close(in_pipe[1]);
@@ -2138,8 +2156,15 @@ kbc_status kbc_rs_git_run(kbc_rs_git *g, const kbc_rs_call *call,
    * stderr. That is silent, it is invisible, and it looks exactly like a git
    * that decided to say nothing.
    *
-   * `in_pipe` is different again: the child holds the READ end and the parent
-   * holds `in_w` (closed just below), so BOTH halves of in_pipe go now. */
+   * `in_w` is the exception and must stay open: it is the parent's only
+   * handle on the stdin WRITE end, and the payload pump below writes through
+   * it. Closing it here closed the pipe before the loop ran, so the child saw
+   * EOF on its first read and every `--stdin` command silently operated on
+   * nothing — `hash-object --stdin` returned the empty blob's id, `mktree`
+   * returned the empty tree's id, and `update-ref --stdin` wrote no ref at
+   * all, all while reporting success. The child holds the READ end, so
+   * closing in_pipe entirely here is correct and is what lets the child see
+   * EOF once the pump is done with it. */
   if (out_pipe[1] >= 0) {
     close(out_pipe[1]);
   }
@@ -2150,9 +2175,6 @@ kbc_status kbc_rs_git_run(kbc_rs_git *g, const kbc_rs_call *call,
     if (in_pipe[i] >= 0) {
       close(in_pipe[i]);
     }
-  }
-  if (in_w >= 0) {
-    close(in_w);
   }
   if (helper_fd >= 0) {
     close(helper_fd);
@@ -2207,6 +2229,14 @@ kbc_status kbc_rs_git_run(kbc_rs_git *g, const kbc_rs_call *call,
       } else if (w < 0 && errno != EAGAIN && errno != EINTR) {
         stdin_open = false; /* the child closed stdin: its decision, not ours */
       }
+      /* Delivered in full: close the write end so the child sees EOF. Every
+       * `--stdin` command waits for that EOF before it acts, so a write end
+       * left open is a call that hangs until the deadline. */
+      if (stdin_open && stdin_off >= stdin_len) {
+        close(in_w);
+        in_w = -1;
+        stdin_open = false;
+      }
     }
     if (exited_unreaped(pid)) {
       /* Kill the group on EVERY exit path, so no helper or remote-helper the
@@ -2229,6 +2259,13 @@ kbc_status kbc_rs_git_run(kbc_rs_git *g, const kbc_rs_call *call,
       reaped = true;
       break;
     }
+  }
+  /* Whichever way the loop ended — delivered, child gone, or deadline — the
+   * parent's write end must not survive it, or the child would be left
+   * waiting on a pipe whose other end this process no longer holds. */
+  if (in_w >= 0) {
+    close(in_w);
+    in_w = -1;
   }
   /* A bounded final drain: only a process that escaped the group (setsid)
    * can still hold a pipe, and it must not hold the call open. */
@@ -2274,14 +2311,18 @@ kbc_status kbc_rs_git_run(kbc_rs_git *g, const kbc_rs_call *call,
                                        &secrets, KBC_RS_STDERR_CAP);
   kbc_str_free(&se.buf);
   if (rst != KBC_OK) {
-    kbc_rs_output_free(out);
     return kbc_err_set(err, KBC_ERR_NOMEM, "out of memory for stderr");
   }
   if (se.truncated) {
     kbc_str_puts(&out->stderr, "\n...[stderr truncated]");
   }
   if (timed_out) {
-    kbc_rs_output_free(out);
+    /* `out` is deliberately NOT freed here, nor on the failure path below:
+     * the header makes the kbc_rs_output KBC_OWN, which means the CALLER
+     * frees it. Freeing it inside this function and then returning an error
+     * left the caller reading a zeroed struct — so a caller that captured
+     * git's real diagnostic and then asked the same struct for it found
+     * nothing, which is indistinguishable from a git that said nothing. */
     return kbc_err_set(err, KBC_ERR_TIMEOUT,
                        "store git `%s` timed out after %us; process group "
                        "killed (class %s): %s",
@@ -2300,11 +2341,9 @@ kbc_status kbc_rs_git_run(kbc_rs_git *g, const kbc_rs_call *call,
                         KBC_RS_DETAIL_MAX);
     snprintf(detail, sizeof detail, "%s", cap.ptr);
     kbc_str_free(&cap);
-    kbc_status rc = kbc_err_set(err, KBC_ERR_IO,
-                                "store git `%s` failed (exit=%d, %s): %s", op,
-                                exit_code, kbc_rs_class_slug(cls), detail);
-    kbc_rs_output_free(out);
-    return rc;
+    return kbc_err_set(err, KBC_ERR_IO,
+                       "store git `%s` failed (exit=%d, %s): %s", op,
+                       exit_code, kbc_rs_class_slug(cls), detail);
   }
   return KBC_OK;
 }
@@ -2381,10 +2420,13 @@ kbc_status kbc_rs_git_config_remote(kbc_rs_git *g, const char *git_dir,
   return st;
 }
 
-/* One line "<oid> <refname>". */
+/* One line "<oid> <refname>". The separator is a TAB in `git ls-remote` and
+ * a SPACE in `for-each-ref` and `bundle list-heads`; git is not consistent
+ * about it, so this accepts either rather than silently dropping every ref
+ * a tab-separated source published. */
 static bool split_oid_ref(const char *line, char *oid, size_t oid_cap,
                           char *ref, size_t ref_cap) {
-  const char *sp = strchr(line, ' ');
+  const char *sp = strpbrk(line, " \t");
   if (sp == NULL) {
     return false;
   }
@@ -3774,12 +3816,18 @@ const char *kbc_rs_base_source_slug(kbc_rs_base_source s) {
 /* Classify one remote. Returns false for a remote that is simply not a
  * forge remote (a local path) — that is nothing to report. A remote that is
  * REFUSED as unsafe is reported through `reason`, because dropping it
- * silently is how a repo with a real forge remote ends up keyed as local. */
+ * silently is how a repo with a real forge remote ends up keyed as local.
+ *
+ * `reason` is COPIED into the caller's buffer, not pointed at. It used to be
+ * set to `err.msg`, a field of a kbc_err that lives in THIS frame: the
+ * pointer outlived the frame and the caller read a returned-from stack
+ * address, which ASan reports as stack-use-after-return and which prints as
+ * a refused remote with a garbage reason. */
 static bool remote_key(const kbc_rs_remote_info *r, char *key, size_t cap,
-                       const char **reason) {
-  *reason = NULL;
+                       char *reason, size_t reason_cap) {
+  *reason = '\0';
   if (r->url == NULL || *r->url == '\0') {
-    *reason = "the remote has no url";
+    snprintf(reason, reason_cap, "the remote has no url");
     return false;
   }
   /* A local path is not a forge project: that is nothing to report, and a
@@ -3791,11 +3839,11 @@ static bool remote_key(const kbc_rs_remote_info *r, char *key, size_t cap,
   kbc_err err;
   kbc_err_reset(&err);
   if (kbc_rs_url_parse_remote(r->url, &u, &err) != KBC_OK) {
-    *reason = err.msg;
+    snprintf(reason, reason_cap, "%s", err.msg);
     return false;
   }
   if (kbc_rs_store_key(&u, key, cap, &err) != KBC_OK) {
-    *reason = err.msg;
+    snprintf(reason, reason_cap, "%s", err.msg);
     return false;
   }
   return true;
@@ -3832,8 +3880,8 @@ kbc_status kbc_rs_base_ladder_run(const kbc_rs_base_input *in,
   for (size_t i = 0; i < in->n_existing; i++) {
     for (size_t j = 0; j < in->n_remotes; j++) {
       char key[KBC_RS_KEY_MAX];
-      const char *why = NULL;
-      if (!remote_key(&in->remotes[j], key, sizeof key, &why)) {
+      char why[KBC_RS_DETAIL_MAX];
+      if (!remote_key(&in->remotes[j], key, sizeof key, why, sizeof why)) {
         continue;
  }
       if (in->existing[i].member_store_key != NULL &&
@@ -3851,8 +3899,8 @@ kbc_status kbc_rs_base_ladder_run(const kbc_rs_base_input *in,
   if (in->pr_slug != NULL && *in->pr_slug != '\0') {
     for (size_t j = 0; j < in->n_remotes; j++) {
       char key[KBC_RS_KEY_MAX];
-      const char *why = NULL;
-      if (!remote_key(&in->remotes[j], key, sizeof key, &why)) {
+      char why[KBC_RS_DETAIL_MAX];
+      if (!remote_key(&in->remotes[j], key, sizeof key, why, sizeof why)) {
         continue;
       }
       const char *slash = strchr(key, '/');
@@ -3877,12 +3925,12 @@ kbc_status kbc_rs_base_ladder_run(const kbc_rs_base_input *in,
         continue;
       }
       char key[KBC_RS_KEY_MAX];
-      const char *why = NULL;
-      if (!remote_key(&in->remotes[j], key, sizeof key, &why)) {
+      char why[KBC_RS_DETAIL_MAX];
+      if (!remote_key(&in->remotes[j], key, sizeof key, why, sizeof why)) {
         /* A refused remote is never silently dropped: "this remote is not a
          * forge URL" and "this remote is not one kb will fetch from" are
          * different answers for the operator. */
-        if (why != NULL) {
+        if (why[0] != '\0') {
           out->refused_count++;
           if (out->refused_reason[0] == '\0') {
             snprintf(out->refused_reason, sizeof out->refused_reason, "%s",
@@ -4263,8 +4311,55 @@ static kbc_status bundle_heads(kbc_rs_git *g, const char *git_dir,
     return st;
   }
   for (size_t i = 0; i < n_cover; i++) {
-    if (!kbc_strlist_contains(&heads, cover[i].refname)) {
-      st = kbc_strlist_push(&heads, cover[i].refname);
+    /* `heads` holds "<oid> <ref>" lines and cover[i].refname is a bare
+     * name, so a substring test over the whole line would either never match
+     * (the ref gets added twice) or match a ref that merely ends with the
+     * same bytes. Compare the parsed refname. */
+    bool have = false;
+    for (size_t j = 0; j < heads.len; j++) {
+      char oid[KBC_RS_OID_MAX];
+      char ref[KBC_RS_REFNAME_MAX];
+      if (split_oid_ref(heads.items[j], oid, sizeof oid, ref, sizeof ref) &&
+          strcmp(ref, cover[i].refname) == 0) {
+        have = true;
+        break;
+      }
+    }
+    if (!have) {
+      /* Push the full "<oid> <ref>" line, not the bare name: `heads` is
+       * walked again below to write the .refs manifest, which needs the oid,
+       * and a bare name would silently drop that ref from the manifest. Ask
+       * git for the line rather than inventing one. */
+      const char *pargv[] = {"rev-parse", "--verify", "--quiet",
+                             cover[i].refname};
+      kbc_rs_call probe;
+      memset(&probe, 0, sizeof probe);
+      probe.op = "rev-parse";
+      probe.argv = pargv;
+      probe.argc = 4;
+      probe.git_dir = git_dir;
+      probe.auth = KBC_RS_AUTH_LOCAL_ONLY;
+      probe.timeout_s = 60;
+      kbc_rs_output po;
+      st = kbc_rs_git_run(g, &probe, &po, err);
+      if (st == KBC_OK) {
+        const char *t = po.stdout.ptr;
+        size_t tl = po.stdout.len;
+        char line[KBC_RS_OID_MAX + KBC_RS_REFNAME_MAX + 2];
+        while (tl > 0 && (t[tl - 1] == '\n' || t[tl - 1] == '\r')) {
+          tl--;
+        }
+        if (oid_ok_len(t, tl) &&
+            snprintf(line, sizeof line, "%.*s %s", (int)tl, t,
+                     cover[i].refname) < (int)sizeof line) {
+          st = kbc_strlist_push(&heads, line);
+        } else {
+          st = kbc_err_set(err, KBC_ERR_NOTFOUND,
+                           "the store has no ref named %s to bundle",
+                           cover[i].refname);
+        }
+      }
+      kbc_rs_output_free(&po);
       if (st != KBC_OK) {
         break;
       }
@@ -4272,7 +4367,7 @@ static kbc_status bundle_heads(kbc_rs_git *g, const char *git_dir,
   }
   if (st != KBC_OK) {
     kbc_strlist_free(&heads);
-    return kbc_err_set(err, KBC_ERR_NOMEM, "out of memory for bundle heads");
+    return st;
   }
   if (heads.len == 0) {
     kbc_strlist_free(&heads);
@@ -4295,6 +4390,10 @@ static kbc_status bundle_heads(kbc_rs_git *g, const char *git_dir,
     kbc_strlist_free(&excl);
     return kbc_err_set(err, KBC_ERR_NOMEM, "out of memory for a bundle");
   }
+  /* Owned by this function for the whole call, and released after the run:
+   * the argv below points into them. */
+  char **atoms_all = NULL;
+  size_t n_atoms = 0;
 #define BUNDLE_PUSH(s)                             \
   do {                                             \
     if (argv != NULL) {                            \
@@ -4306,15 +4405,52 @@ static kbc_status bundle_heads(kbc_rs_git *g, const char *git_dir,
   BUNDLE_PUSH("--quiet");
   BUNDLE_PUSH("--end-of-options");
   BUNDLE_PUSH(dest);
-  for (size_t i = 0; i < heads.len; i++) {
-    BUNDLE_PUSH(heads.items[i]);
-  }
-  /* refs/remotes/base/ are EXCLUSIONS, never heads: those objects are
-   * re-fetchable from the base remote, so a bundle need not carry them. */
-  for (size_t i = 0; i < excl.len; i++) {
-    char neg[KBC_RS_REFNAME_MAX + 2];
-    snprintf(neg, sizeof neg, "^%s", excl.items[i]);
-    BUNDLE_PUSH(neg);
+  /* BARE ref names, never the "<oid> <ref>" lines kbc_rs_git_list_refs
+   * returns. `git bundle create` takes a revision per argument and splits
+   * argv on whitespace, so a whole line reaches it as one unresolvable
+   * token: "ambiguous argument '<oid> refs/kbc/...'". The oids are still
+   * known — they are what the .refs manifest below records — but the bundle
+   * names its heads, not their ids. */
+  /* Every atom here is a strdup the argv OWNS for the duration of the run,
+   * and is freed after it. Pointing argv at a scratch buffer or a block
+   * that goes out of scope would hand the child freed bytes: the error then
+   * reads "ambiguous argument '<garbage>'", which is what a use-after-free
+   * looks like from the far side. */
+  {
+    char **atoms = calloc(heads.len + excl.len + 1, sizeof *atoms);
+    if (atoms == NULL) {
+      free(argv);
+      kbc_strlist_free(&heads);
+      kbc_strlist_free(&excl);
+      return kbc_err_set(err, KBC_ERR_NOMEM, "out of memory for a bundle");
+    }
+    size_t nn = 0;
+    for (size_t i = 0; i < heads.len; i++) {
+      char oid[KBC_RS_OID_MAX];
+      char ref[KBC_RS_REFNAME_MAX];
+      if (!split_oid_ref(heads.items[i], oid, sizeof oid, ref, sizeof ref)) {
+        continue;
+      }
+      atoms[nn] = strdup(ref);
+      if (atoms[nn] == NULL) {
+        break;
+      }
+      nn++;
+    }
+    /* NO "^<ref>" exclusions. A bundle exclusion is a REACHABILITY
+     * exclusion — it drops every object reachable from that ref — and the
+     * store's own refs/kbc review refs are built ON the base remote's
+     * history, so excluding the base excludes the review objects too and
+     * git answers "Refusing to create empty bundle". Carrying a few base
+     * objects the restore does not strictly need is the cheap, correct
+     * trade; an empty bundle is not a bundle. */
+    for (size_t i = 0; i < nn; i++) {
+      BUNDLE_PUSH(atoms[i]);
+    }
+    /* NOT freed here: argv holds these pointers and the child has not been
+     * spawned yet. Released after kbc_rs_git_run returns. */
+    atoms_all = atoms;
+    n_atoms = nn;
   }
 #undef BUNDLE_PUSH
   kbc_rs_call call;
@@ -4329,6 +4465,10 @@ static kbc_status bundle_heads(kbc_rs_git *g, const char *git_dir,
   st = kbc_rs_git_run(g, &call, &out, err);
   kbc_rs_output_free(&out);
   free(argv);
+  for (size_t i = 0; i < n_atoms; i++) {
+    free(atoms_all[i]);
+  }
+  free(atoms_all);
   if (st == KBC_OK) {
     /* The manifest records every ref name and the oid it pointed at, even
      * for a ref whose tip needed no new objects because base already carries
@@ -4610,6 +4750,13 @@ bundle, out->n, what.ptr);
   for (size_t i = 0; i < sizeof rflags / sizeof rflags[0]; i++) {
     fargv[na++] = rflags[i];
   }
+  /* The BUNDLE is the remote this fetch reads from, and it belongs in argv
+   * before the refspecs. Without it git takes the first refspec as the
+   * repository to clone from and answers "'<refspec>' does not appear to be a
+   * git repository" — which reads like a corrupt bundle and is really a
+   * missing argument. */
+  fargv[na++] = bundle;
+  /* Everything from here on is a strdup this function owns and frees. */
   size_t first_spec = na;
   for (size_t i = 0; i < heads.len; i++) {
     char oid[KBC_RS_OID_MAX];

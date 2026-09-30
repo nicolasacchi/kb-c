@@ -96,10 +96,11 @@ struct kbc_store {
 /* The child column that names a violating row, per child table. Matched
  * against the table name the pragma reports and never interpolated blindly:
  * a table with no entry here is reported by rowid alone rather than by a
- * statement assembled from a name the schema chose. These four are the whole
- * of the foreign keys the ladder creates (v1's chunks and comments onto
+ * statement assembled from a name the schema chose. These are the whole of
+ * the foreign keys the ladder creates (v1's chunks and comments onto
  * artifacts, v5's index_runs onto sources, v13's comment_anchors onto
- * comments), so this list and the schema are two views of the same four
+ * comments, v14's attachments onto artifacts and comments, v15's verdicts
+ * onto artifacts), so this list and the schema are two views of the same
  * edges.
  *
  * `comment_anchors` is keyed on `comment_id` and NOT on `doc_id` on purpose.
@@ -107,7 +108,16 @@ struct kbc_store {
  * `comments.id` (store.c:3963 — the id is minted and a move must not remint
  * it), so an edge on `comment_id` rides through a move untouched while an
  * edge on `doc_id` would have to be added to that transaction and could be
- * forgotten in it. */
+ * forgotten in it.
+ *
+ * The same argument picks `attachments`' key, and it picks it ONCE: the row
+ * has a stable minted id of its own, and it is the only column a rekey never
+ * rewrites. `doc_id` moves and `comment_id` does not, so naming either of
+ * them would name a value that is a different one after every move.
+ *
+ * `verdicts` is keyed on `doc_id` alone, and the rekey rewrites it directly —
+ * a verdict is about a document and about nothing on it, so it has no second
+ * edge to be careful about. */
 static const struct {
   const char *table;
   const char *column;
@@ -116,6 +126,8 @@ static const struct {
     {"comments", "doc_id"},
     {"index_runs", "corpus"},
     {"comment_anchors", "comment_id"},
+    {"attachments", "id"},
+    {"verdicts", "doc_id"},
 };
 
 /* The child row's own key value, with the COLUMN it came from, so the log
@@ -124,6 +136,7 @@ static const struct {
  * table, or when the lookup found no row (a row deleted between the pragma's
  * read and this one) — both fall back to naming the rowid alone, which is
  * still a real identification, just a weaker one. */
+
 static bool fk_child_key(const kbc_store *s, const char *table,
                          sqlite3_int64 rowid, const char **col_out,
                          char *out, size_t cap) {
@@ -577,6 +590,119 @@ static const char *const SCHEMA_V13 =
     "CREATE INDEX IF NOT EXISTS idx_comment_anchors_stale"
     " ON comment_anchors(state, doc_id) WHERE state <> 1;";
 
+/* v14 — `attachments`, the blob and its row in ONE place.
+ *
+ * WHAT THE RUST ACTUALLY SPECIFIES, because the shape here is not a
+ * transcription of it. `kb-core/src/attachments.rs` puts the bytes at
+ * `<state>/<kb>/.attachments/<artifact_id>/<aid>` under a random
+ * `a_<12 hex>` key, and the metadata in a sibling `_manifest.json`. The
+ * reason it needs two files and a GC is spelled out in its own header: the
+ * comment that OWNS an attachment lives in a per-artifact JSON review file
+ * OUTSIDE the database (`review.rs`, `indexer.rs:3001`), so there is no
+ * transaction to write a blob and its owning row in together, and the
+ * manifest exists to make the un-owned half recoverable.
+ *
+ * kb-c has no such split: `comments` is a TABLE in the SAME database. So
+ * the split buys a grace window, an fsync-and-rename protocol, a
+ * `review_lock` critical section and a crash window in which a blob exists
+ * with no manifest entry, in exchange for nothing. One row here carries
+ * the bytes AND the claim, so "an attachment stored without its row" is not
+ * a state the schema can represent.
+ *
+ * `comment_id` NULL IS A STAGED UPLOAD, and that is the Rust's `adopted:
+ * false` (attachments.rs ManifestEntry). A blob is staged when a composer
+ * has uploaded it and not yet put it in a comment; the GC reaps a staged row
+ * once it is past the grace window, and never reaps an adopted one by age.
+ *
+ * `content_type` is the SNIFFED type and never the client's claim
+ * (`sniff_allowed`, "this sniff IS the upload gate"). The route enforces
+ * that; storing the sniffed value is what makes the serve route unable to
+ * drift from it, because the serve route reads the column rather than
+ * re-deriving the answer.
+ *
+ * `filename` is a DISPLAY basename and never a path (`sanitize_filename`).
+ * The `aid` is the only key, and it is minted rather than derived from the
+ * name, so nothing that arrived on a request ever reaches a path.
+ *
+ * TWO CASCADES, and both are real on this connection: `kbc_store_open` runs
+ * `PRAGMA foreign_keys = ON` (store.c:990), so deleting a comment takes its
+ * adopted rows and their bytes in the same commit, and deleting an artifact
+ * takes its staged ones. The Rust does neither eagerly — it leaves the blob
+ * and lets the reference-counted `gc_plan` reap it — but the Rust cannot do
+ * it eagerly, for the reason in the first paragraph.
+ *
+ * A NEW RUNG AND NOT A FOLD INTO v13, for v12's and v13's reason unchanged:
+ * `migrate_locked` skips every version at or below what a volume has
+ * recorded, so a volume that already applied 13 would keep a schema whose
+ * own version number says it is current with no `attachments` table. That is
+ * the silent drift the epoch guard exists to make loud. Re-runnable on its
+ * own, like v13: both statements are IF NOT EXISTS. */
+static const char *const SCHEMA_V14 =
+    "CREATE TABLE IF NOT EXISTS attachments ("
+    " id TEXT PRIMARY KEY,"
+    " doc_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,"
+    /* NULL is a STAGED upload, not an unattached adopted one: a blob is
+     * staged until a comment claims it and stays with that comment for as
+     * long as the comment lives. */
+    " comment_id TEXT REFERENCES comments(id) ON DELETE CASCADE,"
+    " filename TEXT NOT NULL,"
+    " content_type TEXT NOT NULL,"
+    " size_bytes INTEGER NOT NULL,"
+    /* The bytes. In the row, so the row and the bytes cannot disagree. */
+    " body BLOB NOT NULL,"
+    " author TEXT NOT NULL DEFAULT 'you',"
+    " created_at TEXT NOT NULL);"
+    /* The listing is per document, and a document's staged rows are part of
+     * it: a composer that uploaded and has not posted yet still has to be
+     * able to see what it uploaded. */
+    "CREATE INDEX IF NOT EXISTS idx_attachments_doc ON attachments(doc_id);"
+    /* PARTIAL, and for idx_errors_open's reason: the per-comment question is
+     * asked only of ADOPTED rows, and carrying the staged ones forever to
+     * answer a query that never wants them is what turns a lookup into a
+     * scan. */
+    "CREATE INDEX IF NOT EXISTS idx_attachments_comment"
+    " ON attachments(comment_id) WHERE comment_id IS NOT NULL;";
+
+/* v15 — `verdicts`, the review pass's own answer about a document.
+ *
+ * THREE STATES and they are not the comment's open/resolved: `VerdictState`
+ * is Comment (a working note, no pass/fail signal), Approve and
+ * RequestChanges (review.rs, W2.15a). A document can be approved with three
+ * comments open, and it can hold an open comment with no verdict at all, so
+ * a boolean on the comment cannot carry it and a flag beside the document is
+ * the only place it fits.
+ *
+ * ONE ROW PER DOCUMENT, which is what makes `decided_at` and `decided_by`
+ * attributes of the DOCUMENT rather than of a thread: `set_verdict` stamps
+ * both server-side and never client-supplied ("never client-supplied,
+ * mirroring Comment::created_at/author").
+ *
+ * The `status-approved` / `status-changes-requested` kb-tag the original
+ * mirrors onto the artifact is DERIVED from this row and written in the same
+ * transaction, and the derivation only ever runs one way — invariant #12 says
+ * the field is "the verdict of record; the tag is derived, never the other
+ * way around". A `Comment` verdict writes NO tag: the display shortcut drops
+ * any prior `status-*` rather than writing one for a state that carries no
+ * pass/fail signal.
+ *
+ * FK to artifacts with a cascade, unlike the corkboard and the pins: a
+ * verdict is a claim ABOUT a document, so there is nothing for it to say once
+ * the document is gone. A reading visit is the opposite case and outlives
+ * what it was about.
+ *
+ * A NEW RUNG AND NOT A FOLD INTO v14, for the same reason v14 is not folded
+ * into v13. */
+static const char *const SCHEMA_V15 =
+    "CREATE TABLE IF NOT EXISTS verdicts ("
+    " doc_id TEXT PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,"
+    /* 0 comment, 1 approve, 2 request_changes. A CHECK, because the three
+     * are an invariant of the TABLE and not of every writer that reaches it
+     * — v6's argument for the history `kind`, applied again. */
+    " state INTEGER NOT NULL CHECK (state IN (0,1,2)),"
+    " decided_at INTEGER NOT NULL,"
+    " decided_by TEXT NOT NULL,"
+    " note TEXT);";
+
 /* The ladder, in the shape refinery's Runner has it: an ordered list of
  * (version, sql), applied FORWARD-ONLY, one transaction per version. Rust
  * reads its binary epoch from the runner rather than from a second constant
@@ -592,7 +718,7 @@ static const kbc_migration MIGRATIONS[] = {
     {1, SCHEMA_V1},   {2, SCHEMA_V2},   {3, SCHEMA_V3},   {4, SCHEMA_V4},
     {5, SCHEMA_V5},   {6, SCHEMA_V6},   {7, SCHEMA_V7},   {8, SCHEMA_V8},
     {9, SCHEMA_V9},   {10, SCHEMA_V10},  {11, SCHEMA_V11},
-    {12, SCHEMA_V12}, {13, SCHEMA_V13},
+    {12, SCHEMA_V12}, {13, SCHEMA_V13}, {14, SCHEMA_V14}, {15, SCHEMA_V15},
 };
 
 #define MIGRATION_COUNT (sizeof(MIGRATIONS) / sizeof(MIGRATIONS[0]))
@@ -656,6 +782,15 @@ static kbc_status page_block(kbc_err *err, kbc_store *s, kbc_arena *a,
                              const char *count_sql, const char *corpus,
                              size_t limit, size_t elem_size, void **out,
                              size_t *n_out);
+
+/* The attachment and verdict contract — the constants, the three types and
+ * the fourteen functions — now lives in include/kbc/store.h, which is where
+ * a caller reads it. It was carried here as a hand-copied block because that
+ * header was the orchestrator's file, and it is gone rather than reconciled:
+ * a hand-copied mirror of a frozen contract is the drift a frozen header
+ * exists to prevent, not the mitigation for it. The reasoning for each of
+ * them stays below, with the implementation, because it is about the
+ * algorithm and not the signature. */
 
 /* The anchor state machine. Its contract — the three states and why there are
  * three, the persisted stale set, and the six functions — now lives in
@@ -2056,11 +2191,33 @@ kbc_status kbc_store_docs_with_meta(kbc_store *s, const char *corpus,
 /* --------------------------------------------------------------- metas --- */
 
 
-/* REPLACE, not merge. A document is re-ingested with the facets it declares
- * NOW, so a tag the author removed stops matching on the next reindex
- * instead of living on as a row nothing will ever clean up. ONE transaction,
- * for the reason replace_edges has: a half-applied facet set is a filter
- * matching a document that never existed. */
+/* REPLACE, not merge — EXCEPT for the two keys the verdict owns.
+ *
+ * A document is re-ingested with the facets it declares NOW, so a tag the
+ * author removed stops matching on the next reindex instead of living on as
+ * a row nothing will ever clean up. ONE transaction, for the reason
+ * replace_edges has: a half-applied facet set is a filter matching a
+ * document that never existed.
+ *
+ * The exception is `kb-tags = status-approved` / `status-changes-requested`,
+ * which are NOT the document's to declare. They are the display shortcut the
+ * original mirrors off a review verdict (review.rs, invariant #12: "this
+ * field stays the verdict of record; the tag is derived, never the other way
+ * around"), and `kbc_store_set_verdict` is their only writer. Deleting them
+ * here would let every reindex silently un-approve a document — a facet
+ * filter that answers "which documents are approved" would go empty while
+ * `verdicts` still says the document was approved, which is precisely the
+ * "a filter that matches nothing must never look like a filter that was
+ * ignored" failure `kbc_store_docs_with_meta` exists to avoid.
+ *
+ * This is the same discipline `kbc_store_put_source` applies to `paused`:
+ * derived state is not an ingest's to undo. The two values are named
+ * literally rather than matched with LIKE, because the primary key is
+ * (corpus, path, key, value) and this stays a seek. */
+/* The `status-*` facet values a derived verdict owns, named once so the
+ * writer and the thing that refuses to delete them cannot drift. */
+static const char *const VERDICT_TAG_VALUES[2] = {
+    "status-approved", "status-changes-requested"};
 kbc_status kbc_store_replace_metas(kbc_store *s, const char *corpus,
                                    const char *path,
                                    const char *const *keys,
@@ -2098,7 +2255,10 @@ kbc_status kbc_store_replace_metas(kbc_store *s, const char *corpus,
   }
   sqlite3_stmt *del = NULL;
   st = prepare(err, s,
-               "DELETE FROM doc_metas WHERE corpus = ?1 AND path = ?2;", &del);
+               "DELETE FROM doc_metas WHERE corpus = ?1 AND path = ?2"
+               " AND NOT (key = 'kb-tags' AND (value = 'status-approved'"
+               " OR value = 'status-changes-requested'));",
+               &del);
   if (st == KBC_OK) st = bind_text(err, s, del, 1, corpus);
   if (st == KBC_OK) st = bind_text(err, s, del, 2, path);
   if (st == KBC_OK) {
@@ -4611,6 +4771,41 @@ static kbc_status rekey_corp_del(kbc_err *err, kbc_store *s, const char *sql,
  * end, against the finished state. It is per-transaction and auto-resets —
  * a write after this transaction commits is checked normally, which is
  * verified by a test rather than assumed. */
+/* The derived-tag projection, defined with the verdict section at the foot
+ * of this file. A move needs it because the tag is keyed on (corpus, path)
+ * and a move changes the path: without re-projecting, the document at the
+ * NEW path carries a verdict and no tag, and the document at the OLD path
+ * carries a tag and no document. Forward-declared rather than moved so the
+ * verdict section stays in one readable piece. */
+static kbc_status verdict_retag(kbc_err *err, kbc_store *s, const char *corpus,
+                                const char *path, kbc_verdict_state state);
+
+/* The verdict that SURVIVED a rekey, which is not necessarily the one that
+ * was there before: `UPDATE OR IGNORE` means a destination that already had
+ * a verdict keeps ITS OWN, and the tag has to be re-derived from the winner
+ * rather than copied from the loser. A document with no surviving verdict
+ * gets no tag, which is the withdrawal rather than a stale projection. */
+static kbc_status verdict_after_move(kbc_err *err, kbc_store *s,
+                                     const char *new_id,
+                                     kbc_verdict_state *state, bool *found) {
+  *found = false;
+  sqlite3_stmt *q = NULL;
+  kbc_status st = prepare(
+      err, s, "SELECT state FROM verdicts WHERE doc_id = ?1;", &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, new_id);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_ROW) {
+      *state = (kbc_verdict_state)sqlite3_column_int(q, 0);
+      *found = true;
+    } else if (step != SQLITE_DONE) {
+      st = sql_fail(err, s, "read moved verdict", step);
+    }
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  return st != KBC_OK ? st : fin;
+}
+
 kbc_status kbc_store_rekey_artifact(kbc_store *s, const char *old_id,
                                     const char *new_id, const char *old_rel,
                                     const char *new_rel, kbc_err *err) {
@@ -4691,6 +4886,44 @@ kbc_status kbc_store_rekey_artifact(kbc_store *s, const char *old_id,
    " WHERE artifact_id IS NOT NULL AND artifact_id = ?1;",
                    old_id, new_id);
 
+  /* `attachments`: PK is the MINTED `id`, which no other row can share and
+   * which a move never rewrites, so a plain UPDATE cannot collide and there
+   * is nothing to delete afterwards — the same shape `history` gets above and
+   * for the same reason.
+   *
+   * `comment_id` is deliberately NOT rewritten, and that is what keeps an
+   * attachment riding through a move: the comment it belongs to keeps its
+   * own id (store.c's `comments` UPDATE rewrites `doc_id` and never `id`),
+   * so the edge stays valid with no change at all. The corollary is that an
+   * attachment whose `comment_id` names a comment of ANOTHER document would
+   * be left pointing across a move — which the schema forbids, because the
+   * comment_id FK cannot name a comment on a different artifact unless
+   * somebody wrote it outside the API, and that is an orphan the open-time
+   * `foreign_key_check` reports by name. */
+  if (st == KBC_OK)
+    st = rekey_two(err, s,
+                   "UPDATE attachments SET doc_id = ?2 WHERE doc_id = ?1;",
+                   old_id, new_id);
+
+  /* `verdicts`: PK is `doc_id`, so a destination that already carries a
+   * verdict IS a real collision and the OR IGNORE + delete-leftover shape
+   * applies — the destination's verdict wins, as everywhere else here. The
+   * LEFTOVER is not silently dropped, though: the tag the old verdict
+   * projected onto the old (corpus, path) has to go with it, or the document
+   * at the old path keeps matching `kb-tags:status-approved` after it has
+   * stopped existing. The old path is not known at this point in the
+   * transaction (the corpus is read further down, before the path half), so
+   * the withdrawal is deferred to `verdict_retag` at the call site below,
+   * which runs after the corpus read. */
+  if (st == KBC_OK)
+    st = rekey_two(err, s,
+                   "UPDATE OR IGNORE verdicts SET doc_id = ?2"
+                   " WHERE doc_id = ?1;",
+                   old_id, new_id);
+  if (st == KBC_OK)
+    st = rekey_del(err, s, "DELETE FROM verdicts WHERE doc_id = ?1;", old_id);
+
+
   /* `edges` and `pending_links` are keyed by (corpus, path) — the path alone
    * is not a key — so the path half of the move is what rewrites them. BOTH
    * columns: a document that is itself a link TARGET has its inbound edges
@@ -4759,6 +4992,21 @@ kbc_status kbc_store_rekey_artifact(kbc_store *s, const char *old_id,
    * statements above are left to run; they are no-ops without a parent row,
    * and the trailing `DELETE FROM artifacts` is one too. */
   if (st == KBC_OK && have_corpus) {
+    /* The derived tag, withdrawn from the old path and re-projected onto the
+     * new one, from the verdict that actually SURVIVED rather than the one
+     * that was there before. Without this the move leaves a `status-approved`
+     * facet pointing at a path with no document, and the destination has a
+     * verdict no filter can see — both halves wrong, in opposite directions,
+     * and neither of them is something a later pass would notice. */
+    if (st == KBC_OK) {
+      kbc_verdict_state state = KBC_VERDICT_COMMENT;
+      bool has = false;
+      st = verdict_after_move(err, s, new_id, &state, &has);
+      if (st == KBC_OK)
+        st = verdict_retag(err, s, corpus, old_rel, KBC_VERDICT_COMMENT);
+      if (st == KBC_OK && has)
+        st = verdict_retag(err, s, corpus, new_rel, state);
+    }
     if (st == KBC_OK)
       st = rekey_corp_two(err, s,
                           "UPDATE OR IGNORE edges SET src_path = ?3"
@@ -5472,4 +5720,1031 @@ kbc_status kbc_store_get_first_seen(kbc_store *s, const char *artifact_id,
   kbc_status fin = finalize(err, s, q, st);
   unlock(s);
   return st != KBC_OK ? st : fin;
+}
+
+/* ======================================================== attachments ==
+ *
+ * The blob and its row are ONE ROW. Everything else here follows from that,
+ * so the section opens with what it bought and what it cost, because the
+ * shape is a deliberate divergence from the original rather than a
+ * transcription of it.
+ *
+ * THE RUST'S MODEL, and why it is a split. `kb-core/src/attachments.rs`
+ * stores bytes at `<state>/<kb>/.attachments/<artifact_id>/<aid>` and the
+ * metadata in a sibling `_manifest.json`, and its own header says why the
+ * manifest is "non-authoritative cache-like state": the comment that OWNS an
+ * attachment lives in a per-artifact JSON review file OUTSIDE the database
+ * (`review.rs`, `indexer.rs:3001`). With the owner in one file and the bytes
+ * in another there is no transaction to join them in, so a reader can find a
+ * manifest entry whose blob is not there, a saver can find a blob no entry
+ * names, and `gc_plan` plus a 24-hour grace window plus a per-kb
+ * `review_lock` plus tmpfile-rename-fsync are what stand in for the
+ * transaction the original cannot have.
+ *
+ * WHAT IT BUYS HERE. `comments` is a TABLE in the SAME database, so the join
+ * is available and the whole apparatus retires. One statement carries the
+ * bytes and the claim, which makes "an attachment stored without its row"
+ * not a state the schema can represent — let alone one a crash window can
+ * produce. There is no `aid` that ever reaches a path, so there is no
+ * traversal to guard: the Rust needs `is_safe_id` on every attachment id
+ * because the id IS half a path, and here the id is a primary key.
+ *
+ * WHAT IT COSTS, said plainly. Bytes now live in the database file rather
+ * than beside it, so they are in the backup (a plus) and in the page cache
+ * under a corpus-wide cap the original never had (a minus). The size limit
+ * below is what bounds that.
+ */
+
+/* The id minting the Rust uses, byte for byte: `a_` + 12 lowercase hex from
+ * 6 random bytes (review.rs::new_attachment_id). RANDOM, not derived from
+ * the content and not derived from the filename — the original has no
+ * content hash on an attachment and no dedup, so two uploads of identical
+ * bytes produce two ids and two rows, and that is the documented behaviour
+ * rather than a defect to be fixed here. A content-addressed blob would be
+ * a different design with a different question attached (who may read the
+ * other one), and inventing it would silently deduplicate uploads the
+ * original keeps. */
+static void mint_attachment_id(char out[KBC_ATTACH_ID_LEN + 1]) {
+  /* The randomness comes from the same source `mint_id` uses, because two
+   * id minters in one file is two places for a weak fallback to hide. */
+  char hex[KBC_MAX_ID_LEN + 1];
+  mint_id(hex);
+  out[0] = 'a';
+  out[1] = '_';
+  memcpy(out + 2, hex, KBC_MAX_ID_LEN);
+  out[KBC_ATTACH_ID_LEN] = '\0';
+}
+
+/* The decoded code point at `*i`, advancing it past the sequence, or 0 with
+ * `*i` left where it was when the bytes are not a well-formed UTF-8
+ * sequence. Strict in the sense Rust's `str::from_utf8` is: no overlongs, no
+ * surrogates, nothing above U+10FFFF, no truncated tail. */
+static uint32_t utf8_next(const unsigned char *b, size_t n, size_t *i) {
+  const size_t at = *i;
+  const unsigned char c = b[at];
+  if (c < 0x80u) {
+    *i = at + 1;
+    return c;
+  }
+  /* The lead byte carries the length in its top bits and the first payload
+   * bits in its bottom ones, so the two agree exactly on the ranges below. */
+  size_t need;
+  uint32_t cp;
+  if (c >= 0xC2u && c <= 0xDFu) {
+    need = 2;
+    cp = c & 0x1Fu;
+  } else if (c >= 0xE0u && c <= 0xEFu) {
+    need = 3;
+    cp = c & 0x0Fu;
+  } else if (c >= 0xF0u && c <= 0xF4u) {
+    need = 4;
+    cp = c & 0x07u;
+  } else {
+    return 0; /* a continuation byte in lead position, or C0/C1/F5..FF */
+  }
+  if (at + need > n) return 0;
+  for (size_t k = 1; k < need; k++) {
+    const unsigned char t = b[at + k];
+    if ((t & 0xC0u) != 0x80u) return 0;
+    cp = (cp << 6) | (uint32_t)(t & 0x3Fu);
+  }
+  /* The three ranges an overlong encoding, a surrogate and an out-of-range
+   * scalar would land in. Rust rejects all three, so this does too. */
+  if (need == 3 && (cp < 0x800u || (cp >= 0xD800u && cp <= 0xDFFFu)))
+    return 0;
+  if (need == 4 && (cp < 0x10000u || cp > 0x10FFFFu)) return 0;
+  *i = at + need;
+  return cp;
+}
+
+/* `is_plain_text`, attachments.rs:86-96: valid, non-empty UTF-8 with no
+ * control characters other than tab, newline and carriage return.
+ *
+ * "control character" is Rust's `char::is_control`, which is the Unicode Cc
+ * category — so the C0 range, DEL, and U+0080..U+009F (which arrive as the
+ * two-byte C2 80..C2 9F). Testing only the C0 range would let a NEL
+ * (U+0085) through, and a NEL is exactly the kind of byte that makes a
+ * "text" blob render as something else. U+2028 and U+2029 are NOT Cc and
+ * are allowed here, matching Rust. */
+static bool is_plain_text(const unsigned char *b, size_t n) {
+  if (n == 0) return false;
+  size_t i = 0;
+  while (i < n) {
+    const uint32_t cp = utf8_next(b, n, &i);
+    if (cp == 0) return false; /* covers U+0000 too, which is a control char */
+    if (cp == '\t' || cp == '\n' || cp == '\r') continue;
+    if (cp < 0x20u || cp == 0x7Fu || (cp >= 0x80u && cp <= 0x9Fu)) return false;
+  }
+  return true;
+}
+
+/* `sniff_allowed`, attachments.rs:62-82, and it IS the upload gate — "NEVER
+ * trusts a client-supplied type". Six accepted shapes and nothing else:
+ * PNG, JPEG, GIF87a/89a, WEBP (RIFF....WEBP, so the container AND the form
+ * are both checked), %PDF-, and UTF-8 text.
+ *
+ * SVG, HTML and JS are DELIBERATELY not image types. They are valid UTF-8,
+ * so markup sniffs as `text/plain` and the serve route force-downloads it;
+ * that is the XSS guard (root invariant #18) and it is why this is a
+ * byte-level function and not a lookup of what the client declared.
+ *
+ * The returned strings are the `&'static str` the serve route emits
+ * verbatim, so a stored `content_type` is always one of six and a caller
+ * cannot smuggle a header through the column. */
+const char *kbc_store_sniff_attachment(const void *bytes, size_t n) {
+  const unsigned char *b = bytes;
+  if (n >= 8 && memcmp(b, "\x89PNG\r\n\x1a\n", 8) == 0) return "image/png";
+  if (n >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF)
+    return "image/jpeg";
+  if (n >= 6 && (memcmp(b, "GIF87a", 6) == 0 || memcmp(b, "GIF89a", 6) == 0))
+    return "image/gif";
+  if (n >= 12 && memcmp(b, "RIFF", 4) == 0 && memcmp(b + 8, "WEBP", 4) == 0)
+    return "image/webp";
+  if (n >= 5 && memcmp(b, "%PDF-", 5) == 0) return "application/pdf";
+  return is_plain_text(b, n) ? "text/plain; charset=utf-8" : NULL;
+}
+
+/* `is_inline_image`, attachments.rs:101-106. THE keystone of the attachment
+ * XSS guard and the reason this is a function of the SNIFFED type rather
+ * than of anything a client sent: a browser will run script served inline
+ * from the daemon's own origin, and a PDF or an SVG served inline is that
+ * script. Everything not on this list is force-downloaded. */
+bool kbc_store_attachment_inline(const char *content_type) {
+  return strcmp(content_type, "image/png") == 0 ||
+         strcmp(content_type, "image/jpeg") == 0 ||
+         strcmp(content_type, "image/gif") == 0 ||
+         strcmp(content_type, "image/webp") == 0;
+}
+
+/* `sanitize_filename`, attachments.rs:113-127, and every clause of it is
+ * load-bearing because the value is attacker-influenced (AGENTS.md rule 9):
+ *
+ *  - rsplit on the last `/` or `\`, so `../../etc/passwd` becomes
+ *    `passwd`. The result is never used to build a path here — the key is
+ *    the minted aid — but it IS put in a quoted `Content-Disposition`, and a
+       slash there is a header the client will believe about a path.
+ *  - control characters dropped, which is what keeps a newline out of a
+ *    response header;
+ *  - `"` becomes `_`, because a quote ends the Content-Disposition
+ *    filename and the rest of it becomes attacker-chosen header text;
+ *  - capped at 120 CHARACTERS, not 120 bytes, so a cap cannot land inside
+ *    a multi-byte sequence and produce a name that is not valid UTF-8;
+ *  - empty, `.` and `..` become `file`, because those three are the only
+ *    names that name nothing.
+ *
+ * ARENA, and bounded on both ends: the caller supplies the arena and the
+ * 120-character cap makes the result at most 480 bytes. */
+const char *kbc_store_sanitize_filename(kbc_arena *a, const char *raw) {
+  if (raw == NULL) raw = "";
+  const char *base = raw;
+  for (const char *p = raw; *p != '\0'; p++) {
+    if (*p == '/' || *p == '\\') base = p + 1;
+  }
+  /* Two passes so the result is trimmed at both ends exactly as
+   * `cleaned.trim().take(120).trim()` does: leading whitespace is dropped
+   * BEFORE the count, or a name that is 119 visible characters and 400
+   * spaces would be counted as mostly spaces and lose its tail. */
+  char stack[KBC_ATTACH_MAX_FILENAME_BYTES + 1];
+  size_t w = 0;
+  for (const unsigned char *p = (const unsigned char *)base; *p != '\0'; p++) {
+    if (*p < 0x20u || *p == 0x7Fu) continue; /* a control char, ASCII */
+    if (*p == '"') {
+      if (w + 1 < sizeof stack) stack[w++] = '_';
+      continue;
+    }
+    if (*p >= 0x80u) {
+      /* Counted in CHARACTERS: the whole sequence is appended or the name is
+       * left unshortened, because appending half of one produces a string
+       * that is not valid UTF-8 and goes into a response header. */
+      size_t seqlen = 1;
+      if (*p >= 0xC0u) seqlen = *p < 0xE0u ? 2 : (*p < 0xF0u ? 3 : 4);
+      if (w + seqlen >= sizeof stack) break;
+      memcpy(stack + w, p, seqlen);
+      w += seqlen;
+      p += seqlen - 1;
+      continue;
+    }
+    if (w + 1 < sizeof stack) stack[w++] = (char)*p;
+  }
+  stack[w] = '\0';
+  char *s = stack;
+  while (*s == ' ' || *s == '\t') s++;
+  size_t keep = 0;
+  uint32_t chars = 0;
+  /* The 120-character cap, counted on CODE POINTS and cutting on a
+   * boundary, which is the only way the result is still a valid name. */
+  const unsigned char *p = (const unsigned char *)s;
+  while (p[keep] != '\0') {
+    size_t seqlen = 1;
+    if (p[keep] >= 0xC0u)
+      seqlen = p[keep] < 0xE0u ? 2 : (p[keep] < 0xF0u ? 3 : 4);
+    if (chars == 120u) break;
+    keep += seqlen;
+    chars++;
+  }
+  size_t end = keep;
+  while (end > 0 && (s[end - 1] == ' ' || s[end - 1] == '\t')) end--;
+  if (end == 0 || (end == 1 && s[0] == '.') ||
+      (end == 2 && s[0] == '.' && s[1] == '.')) {
+    return kbc_arena_strdup(a, "file");
+  }
+  return kbc_arena_strndup(a, s, end);
+}
+
+/* How many ADOPTED rows a comment already holds. The per-target cap is
+ * checked against this inside the adopting transaction, so a comment cannot
+ * cross the cap between the count and the write. */
+static int64_t attachment_count_for_comment(kbc_err *err, kbc_store *s,
+                                            const char *comment_id) {
+  int64_t n = 0;
+  kbc_status rc = count_query(
+      err, s,
+      "SELECT COUNT(*) FROM attachments WHERE comment_id = ?1;", comment_id,
+      &n);
+  return rc == KBC_OK ? n : -1;
+}
+
+/* ONE statement, and the reason there is no transaction to open.
+ *
+ * The bytes and the row are the same INSERT, so the engine's implicit
+ * per-statement transaction already makes "a blob with no row" and "a row
+ * with no blob" unrepresentable — the failure mode the invariant "an
+ * attachment stored without its row is worse than one refused" is about
+ * cannot be reached by a partial write, because there is no partial write.
+ * The Rust needs BEGIN-equivalent discipline (fsync, rename, manifest save,
+ * rollback of the batch) for exactly the reason this does not.
+ *
+ * `id_out` is the caller's buffer, sized KBC_ATTACH_ID_LEN + 1, and it is
+ * written only on success: a caller that ignores the status cannot act on a
+ * half-formed id. */
+kbc_status kbc_store_add_attachment(kbc_store *s, const kbc_attachment_in *in,
+                                    char id_out[KBC_ATTACH_ID_LEN + 1],
+                                    kbc_err *err) {
+  if (s == NULL || in == NULL || id_out == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "add_attachment: null argument");
+  kbc_status st = require_text(err, "attachment doc id", in->doc_id,
+                               KBC_MAX_ID_LEN);
+  /* An EMPTY comment_id is a STAGED upload, and NULL is the only spelling of
+   * that: a caller that means "adopt me onto nothing" and a caller that
+   * means "I forgot the comment" are the same request, and treating the
+   * empty string as an id to match would be the other reading. */
+  if (st == KBC_OK && in->comment_id != NULL && in->comment_id[0] == '\0')
+    return kbc_err_set(err, KBC_ERR_INVALID, "attachment comment id: empty");
+  if (st == KBC_OK && in->comment_id != NULL)
+    st = require_text(err, "attachment comment id", in->comment_id,
+                      KBC_MAX_ID_LEN);
+  if (st == KBC_OK)
+    st = require_text(err, "attachment filename", in->filename,
+                      KBC_ATTACH_MAX_FILENAME_BYTES);
+  if (st == KBC_OK)
+    st = require_text(err, "attachment content type", in->content_type,
+                      KBC_ATTACH_MAX_TYPE_BYTES);
+  if (st != KBC_OK) return st;
+  if (in->body == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "attachment body: NULL");
+  /* Zero bytes is not an upload. The Rust drops an empty part before it ever
+   * reaches the sniffer (`if !buf.is_empty()`), and a zero-length row would
+   * be a blob that serves as an empty 200 — an answer about nothing. */
+  if (in->body_len == 0)
+    return kbc_err_set(err, KBC_ERR_INVALID, "attachment body: 0 bytes");
+  if (in->body_len > (size_t)KBC_ATTACH_MAX_BYTES)
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "attachment body: %zu bytes exceeds the %u cap",
+                       in->body_len, (unsigned)KBC_ATTACH_MAX_BYTES);
+  const char *author = (in->author != NULL && in->author[0] != '\0')
+                           ? in->author
+                           : "you";
+  st = require_text(err, "attachment author", author,
+                    KBC_ATTACH_MAX_AUTHOR_BYTES);
+  if (st != KBC_OK) return st;
+
+  char id[KBC_ATTACH_ID_LEN + 1];
+  mint_attachment_id(id);
+  const int64_t now = kbc_now_ns() / 1000000000;
+
+  lock(s);
+  /* The per-comment cap, checked HERE as well as in adopt, because a caller
+   * may hand a comment_id straight to the insert. The count and the INSERT
+   * are separated by nothing another caller can interleave: `lock(s)` is held
+   * across both, and one connection behind one mutex is the whole of this
+   * store's concurrency (the header's threading model). */
+  if (st == KBC_OK && in->comment_id != NULL) {
+    const int64_t have = attachment_count_for_comment(err, s, in->comment_id);
+    if (have < 0) {
+      st = kbc_err_set(err, KBC_ERR_SQL, "attachment count on %s failed",
+                       in->comment_id);
+    } else if (have >= (int64_t)KBC_ATTACH_MAX_PER_COMMENT) {
+      st = kbc_err_set(err, KBC_ERR_CONFLICT,
+                       "comment %s already holds %lld attachments, the cap is %u",
+                       in->comment_id, (long long)have,
+                       (unsigned)KBC_ATTACH_MAX_PER_COMMENT);
+    }
+  }
+  sqlite3_stmt *q = NULL;
+  if (st == KBC_OK)
+    st = prepare(err, s,
+                 "INSERT INTO attachments(id, doc_id, comment_id, filename,"
+                 " content_type, size_bytes, body, author, created_at)"
+                 " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);",
+                 &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, id);
+  if (st == KBC_OK) st = bind_text(err, s, q, 2, in->doc_id);
+  /* NULL, not "": comment_id is what says STAGED, and binding an empty
+   * string would make a staged row that no later query can recognise. */
+  if (st == KBC_OK && in->comment_id != NULL)
+    st = bind_text(err, s, q, 3, in->comment_id);
+  if (st == KBC_OK) st = bind_text(err, s, q, 4, in->filename);
+  if (st == KBC_OK) st = bind_text(err, s, q, 5, in->content_type);
+  if (st == KBC_OK)
+    st = bind_i64(err, s, q, 6, (int64_t)in->body_len);
+  if (st == KBC_OK) {
+    /* SQLITE_TRANSIENT, because `in->body` is the request's arena and the
+     * statement must not read from it after the caller has moved on. */
+    int rc = sqlite3_bind_blob(q, 7, in->body, (int)in->body_len,
+                               SQLITE_TRANSIENT);
+    if (rc != SQLITE_OK) st = sql_fail(err, s, "bind attachment body", rc);
+  }
+  if (st == KBC_OK) st = bind_text(err, s, q, 8, author);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 9, now);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_CONSTRAINT)
+      st = constraint_fail(err, s, "attachment on this document", "artifacts");
+    else if (step != SQLITE_DONE)
+      st = sql_fail(err, s, "add attachment", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  unlock(s);
+  if (st != KBC_OK) return st;
+  memcpy(id_out, id, sizeof id);
+  return KBC_OK;
+}
+
+/* One row, decoded. The bytes are NOT selected here: a listing must not walk
+ * a 10 MiB overflow chain per row to print a filename, which is the same
+ * reason ARTIFACT_SLIM_COLS exists. `kbc_store_read_attachment` is the read
+ * that fetches them, and there is exactly one. */
+static void read_attachment(kbc_arena *a, sqlite3_stmt *q,
+                            kbc_attachment *out) {
+  memset(out, 0, sizeof(*out));
+  out->id = col_str(a, q, 0);
+  out->doc_id = col_str(a, q, 1);
+  /* sqlite3_column_text on a NULL column yields NULL, and col_str turns that
+   * into NULL, which is exactly how a STAGED row says so. */
+  out->comment_id = col_str(a, q, 2);
+  out->filename = col_str(a, q, 3);
+  out->content_type = col_str(a, q, 4);
+  out->size_bytes = (int64_t)sqlite3_column_int64(q, 5);
+  out->author = col_str(a, q, 6);
+  out->created_at = (int64_t)sqlite3_column_int64(q, 7);
+  out->staged = out->comment_id == NULL;
+}
+
+#define ATTACHMENT_COLS                                                       \
+  "id, doc_id, comment_id, filename, content_type, size_bytes, author, "       \
+  "created_at"
+
+kbc_status kbc_store_get_attachment(kbc_store *s, kbc_arena *a, const char *id,
+                                    kbc_attachment *out, kbc_err *err) {
+  if (s == NULL || a == NULL || out == NULL || id == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "get_attachment: null argument");
+  kbc_status st = require_text(err, "attachment id", id, KBC_ATTACH_ID_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  char sql[128];
+  (void)snprintf(sql, sizeof sql,
+                 "SELECT " ATTACHMENT_COLS " FROM attachments WHERE id = ?1;");
+  st = prepare(err, s, sql, &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, id);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_ROW) {
+      read_attachment(a, q, out);
+    } else if (step == SQLITE_DONE) {
+      st = kbc_err_set(err, KBC_ERR_NOTFOUND, "attachment %s: not found", id);
+    } else {
+      st = sql_fail(err, s, "get attachment: step", step);
+    }
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  return st != KBC_OK ? st : fin;
+}
+
+/* The bytes, and the ONLY read that fetches them.
+ *
+ * Bounded by `size_bytes`, which is the column the row was written with and
+ * therefore a number this layer controls rather than one a request supplied.
+ * A BLOB whose stored length disagrees with the column would be a corrupt
+ * row, and `sqlite3_column_bytes` is the measurement that decides: the copy
+ * length is the MINIMUM of the two, so a lying column can under-read but
+ * never over-read the blob. */
+kbc_status kbc_store_read_attachment(kbc_store *s, const char *id, kbc_str *out,
+                                     kbc_err *err) {
+  if (s == NULL || out == NULL || id == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "read_attachment: null argument");
+  kbc_status st = require_text(err, "attachment id", id, KBC_ATTACH_ID_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "SELECT size_bytes, body FROM attachments WHERE id = ?1;", &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, id);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_ROW) {
+      const void *blob = sqlite3_column_blob(q, 1);
+      const int got = sqlite3_column_bytes(q, 1);
+      const int64_t said = (int64_t)sqlite3_column_int64(q, 0);
+      if (blob == NULL || got <= 0) {
+        st = kbc_err_set(err, KBC_ERR_INTERNAL,
+                         "attachment %s: row says %lld bytes and holds none",
+                         id, (long long)said);
+      } else {
+        size_t n = (size_t)got;
+        if (said >= 0 && (int64_t)n > said) n = (size_t)said;
+        st = kbc_str_append(out, (const char *)blob, n);
+      }
+    } else if (step == SQLITE_DONE) {
+      st = kbc_err_set(err, KBC_ERR_NOTFOUND, "attachment %s: not found", id);
+    } else {
+      st = sql_fail(err, s, "read attachment: step", step);
+    }
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  return st != KBC_OK ? st : fin;
+}
+
+/* A PAGE, in the corkboard's shape: count-then-fetch over
+ * `ORDER BY created_at DESC, id ASC LIMIT ?n`, which is the ordering every
+ * listing in this file uses and for the reason the corkboard's header gives.
+ * Absence from a page is not evidence about a row.
+ *
+ * `doc_id` NULL is every document, which is the shape a "what has this corpus
+ * got attached" sweep wants. STAGED rows are included, deliberately: a
+ * composer that uploaded and has not posted yet still has to see what it
+ * uploaded, and a listing that hid them would make a staged id
+ * undiscoverable through the API. */
+kbc_status kbc_store_list_attachments(kbc_store *s, kbc_arena *a,
+                                      const char *doc_id, size_t limit,
+                                      kbc_attachment **out, size_t *n_out,
+                                      kbc_err *err) {
+  if (s == NULL || a == NULL || out == NULL || n_out == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "list_attachments: null argument");
+  if (limit > KBC_MAX_HITS) limit = KBC_MAX_HITS;
+  *out = NULL;
+  *n_out = 0;
+  if (limit == 0) return KBC_OK;
+  if (doc_id != NULL && doc_id[0] == '\0')
+    return kbc_err_set(err, KBC_ERR_INVALID, "list_attachments: empty doc id");
+
+  /* Both statements spelled out in full, for `kbc_store_list_anchors`'s
+   * reason: composing a filter from a `where` and an `and` puts
+   * `AND doc_id = ?1` after a table name whenever doc_id is NULL, and
+   * `FROM attachments AND doc_id = ?1` is not a query. */
+  const char *count_sql =
+      doc_id != NULL ? "SELECT COUNT(*) FROM attachments WHERE doc_id = ?1;"
+                     : "SELECT COUNT(*) FROM attachments;";
+  const char *list_sql =
+      doc_id != NULL
+          ? "SELECT " ATTACHMENT_COLS " FROM attachments WHERE doc_id = ?1"
+            " ORDER BY created_at DESC, id ASC LIMIT ?2;"
+          : "SELECT " ATTACHMENT_COLS " FROM attachments"
+            " ORDER BY created_at DESC, id ASC LIMIT ?1;";
+
+  lock(s);
+  void *block = NULL;
+  size_t n = 0;
+  kbc_status st =
+      page_block(err, s, a, count_sql, doc_id, limit, sizeof(kbc_attachment),
+                 &block, &n);
+  sqlite3_stmt *q = NULL;
+  if (st == KBC_OK) st = prepare(err, s, list_sql, &q);
+  if (st == KBC_OK && doc_id != NULL) st = bind_text(err, s, q, 1, doc_id);
+  if (st == KBC_OK)
+    st = bind_i64(err, s, q, doc_id != NULL ? 2 : 1, (int64_t)n);
+  kbc_attachment *arr = block;
+  size_t i = 0;
+  while (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_DONE) break;
+    if (step != SQLITE_ROW) {
+      st = sql_fail(err, s, "list attachments: step", step);
+      break;
+    }
+    if (i >= n) {
+      st = kbc_err_set(err, KBC_ERR_INTERNAL,
+                       "list attachments: row overflow");
+      break;
+    }
+    read_attachment(a, q, &arr[i]);
+    i++;
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  if (st != KBC_OK) return st != KBC_OK ? st : fin;
+  *out = arr;
+  *n_out = i;
+  return KBC_OK;
+}
+
+/* Binds a STAGED row to the comment that will own it, in ONE transaction,
+ * and refuses the two things the Rust's `adopt_staged` refuses.
+ *
+ * The transaction is what makes the cap a cap. `adopt_staged` counts the
+ * target's existing attachments and then pushes, under a `review_lock` that
+ * serialises the same file; here the count and the UPDATE are the same
+ * transaction on the same connection, which is the same guarantee without
+ * inventing a second lock for a table this file already owns.
+ *
+ * The `comment_id IS NULL` predicate is what makes adoption ONE-TIME. An id
+ * already adopted by a DIFFERENT comment updates zero rows, and zero rows is
+ * reported as a CONFLICT naming the id rather than as a success — two
+ * comments sharing one blob is a claim about the blob's owner that nobody
+ * made. */
+kbc_status kbc_store_adopt_attachment(kbc_store *s, const char *id,
+                                      const char *comment_id, kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "adopt_attachment: null store");
+  kbc_status st = require_text(err, "attachment id", id, KBC_ATTACH_ID_LEN);
+  if (st == KBC_OK)
+    st = require_text(err, "adopting comment id", comment_id, KBC_MAX_ID_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  st = exec_plain(err, s, "BEGIN IMMEDIATE;");
+  if (st != KBC_OK) {
+    unlock(s);
+    return st;
+  }
+  const int64_t have = attachment_count_for_comment(err, s, comment_id);
+  if (have < 0) {
+    st = kbc_err_set(err, KBC_ERR_SQL, "attachment count on %s failed",
+                     comment_id);
+  } else if (have >= (int64_t)KBC_ATTACH_MAX_PER_COMMENT) {
+    st = kbc_err_set(err, KBC_ERR_CONFLICT,
+                     "comment %s already holds %lld attachments, the cap is %u",
+                     comment_id, (long long)have,
+                     (unsigned)KBC_ATTACH_MAX_PER_COMMENT);
+  }
+  sqlite3_stmt *q = NULL;
+  if (st == KBC_OK)
+    st = prepare(err, s,
+                 "UPDATE attachments SET comment_id = ?2"
+                 " WHERE id = ?1 AND comment_id IS NULL;",
+                 &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, id);
+  if (st == KBC_OK) st = bind_text(err, s, q, 2, comment_id);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "adopt attachment", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  /* Read HERE, under the mutex, for the reason prune_history gives: the
+   * counter is per-CONNECTION, so a statement another thread steps between
+   * the unlock and the read replaces the value this is about to report. */
+  if (st == KBC_OK && sqlite3_changes(s->db) == 0) {
+    st = kbc_err_set(err, KBC_ERR_CONFLICT,
+                     "attachment %s: not a staged upload, or already adopted",
+                     id);
+  }
+  if (st == KBC_OK) st = exec_plain(err, s, "COMMIT;");
+  if (st != KBC_OK) rollback(s);
+  unlock(s);
+  return st;
+}
+
+/* Detach and drop, and the ORDER is the argument.
+ *
+ * The row goes first, in a transaction, and the caller is told NOTFOUND
+ * when there was no row — so "detach an attachment that was never attached"
+ * is an answer rather than a silent success. The Rust answers the same way
+ * (`remove_comment_attachment` returns NotFound for a missing aid) and then
+ * leaves the blob for `gc_manifest`; here the row and the bytes are the same
+ * row, so the delete takes both and there is nothing left for a GC to find.
+ * The GC below exists for the one case the Rust's GC is really for: a
+ * STAGED upload nobody ever adopted. */
+kbc_status kbc_store_delete_attachment(kbc_store *s, const char *id,
+                                       kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "delete_attachment: null store");
+  kbc_status st = require_text(err, "attachment id", id, KBC_ATTACH_ID_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s, "DELETE FROM attachments WHERE id = ?1;", &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, id);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "delete attachment", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  if (st == KBC_OK && sqlite3_changes(s->db) == 0)
+    st = kbc_err_set(err, KBC_ERR_NOTFOUND, "attachment %s: not found", id);
+  unlock(s);
+  return st;
+}
+
+/* `gc_plan`'s one arm that survives the port, and it is the arm the whole
+ * grace window exists for: a STAGED upload nobody ever adopted
+ * (attachments.rs:213-227, "staged + past grace -> delete (abandoned
+ * upload)").
+ *
+ * The other three arms are GONE and each for a reason rather than for
+ * convenience:
+ *
+ *   adopted + referenced  -> keep. There is no code path here.
+ *   adopted + unreferenced -> delete now. The original has to reach this
+ *     arm by reference-counting, because its bytes outlive the comment that
+ *     named them. Here `attachments.comment_id` CASCADES, so an unreferenced
+ *     adopted row is not a state the schema admits: the delete happened with
+ *     the comment that made it an orphan.
+ *   staged + within grace  -> keep. That is the `comment_id IS NULL`
+ *     predicate below doing nothing.
+ *
+ * So this is not a weakened GC, it is the GC with the other three arms
+ * discharged by construction, and a caller asking it to reap an adopted
+ * attachment is asking for something that cannot be stale.
+ *
+ * A negative `grace_seconds` reaps NOTHING rather than everything, for
+ * `kbc_store_prune_history`'s reason: a maintenance call whose arithmetic
+ * went wrong must not become the verb that destroys the most.
+ *
+ * `created_at` is an INTEGER here rather than the RFC-3339 string the
+ * original's manifest carries, and that is what makes the comparison below
+ * arithmetic. A TEXT timestamp would make "is this older than the grace
+ * window" a string comparison, which is correct exactly as long as every
+ * writer agrees on the format — a property nothing enforces. The wire shape
+ * is unchanged: the route formats it back to ISO-8601 on the way out. */
+kbc_status kbc_store_prune_attachments(kbc_store *s, int64_t now_unix,
+                                       int64_t grace_seconds, int64_t *rows,
+                                       kbc_err *err) {
+  if (s == NULL || rows == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "prune_attachments: null argument");
+  *rows = 0;
+  if (grace_seconds < 0) return KBC_OK;
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  kbc_status st = prepare(
+      err, s,
+      "DELETE FROM attachments WHERE comment_id IS NULL"
+      " AND created_at <= ?1;",
+      &q);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 1, now_unix - grace_seconds);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "prune attachments", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) *rows = (int64_t)sqlite3_changes(s->db);
+  unlock(s);
+  return st != KBC_OK ? st : fin;
+}
+
+/* ------------------------------------------------- deleting a comment --
+ *
+ * The original's `delete_comment` returns the removed comment so its caller
+ * can hand the attachment GC the ids that just lost their owner
+ * (comments.rs, via `adopt_staged`/`gc_manifest` being `pub(crate)` "so the
+ * create-time adoption in routes::comments (add_comment / add_reply /
+ * delete_comment) reuses them"). Here nothing has to be handed anywhere: the
+ * schema's own cascade removes the attachment rows and their bytes in this
+ * commit, and `comment_anchors` goes with them for the same reason it has
+ * since v13.
+ *
+ * The claim is only true because `kbc_store_open` runs
+ * `PRAGMA foreign_keys = ON` (store.c:1122). A writer without it holds
+ * orphans, which is the state `report_foreign_key_violations` names on every
+ * open and `kbc_store_reconcile_anchors` sweeps — so a volume that reached
+ * here by some other writer is repaired on the next open rather than
+ * silently believed.
+ *
+ * ONE transaction and ONE statement. A delete that reported success while
+ * leaving the attachments behind would be the half-applied failure rule 10
+ * is about, and there is no way to get one here: the engine either applies
+ * the cascade or rolls the whole statement back. */
+kbc_status kbc_store_delete_comment(kbc_store *s, const char *comment_id,
+                                    kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "delete_comment: null store");
+  kbc_status st = require_text(err, "comment id", comment_id, KBC_MAX_ID_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s, "DELETE FROM comments WHERE id = ?1;", &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, comment_id);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "delete comment", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  if (st == KBC_OK && sqlite3_changes(s->db) == 0)
+    st = kbc_err_set(err, KBC_ERR_NOTFOUND, "comment %s: not found",
+                     comment_id);
+  unlock(s);
+  return st;
+}
+
+/* ============================================================= verdicts ==
+ *
+ * The review pass's own answer about a document, which is a different thing
+ * from any comment's open/resolved. The original keeps it in the review
+ * file as `ReviewFile.verdict: Option<Verdict>` with a three-state
+ * `VerdictState` — Comment, Approve, RequestChanges — and says why the two
+ * concepts are separate: a document can be APPROVED with three comments
+ * open, and can hold an open comment with no verdict at all.
+ */
+
+/* The facet value a verdict projects onto the document, and the one it
+ * withdraws. A `COMMENT` verdict projects NEITHER: review.rs is explicit
+ * that the display shortcut "drops any prior `status-*` tag rather than
+ * writing one for this state", because Comment carries no pass/fail signal
+ * and a tag saying otherwise would be a claim the verdict never made.
+ * `NULL` here is that withdrawal, and it is a distinct outcome from either
+ * tag rather than an absent case. */
+static const char *verdict_tag(kbc_verdict_state state) {
+  if (state == KBC_VERDICT_APPROVE) return VERDICT_TAG_VALUES[0];
+  if (state == KBC_VERDICT_REQUEST_CHANGES) return VERDICT_TAG_VALUES[1];
+  return NULL;
+}
+
+/* The artifact's (corpus, path), which is what `doc_metas` is keyed on and
+ * the only thing the tag mirror can be written against. Read inside the
+ * caller's transaction so a document deleted by another writer between the
+ * read and the write is a constraint failure rather than a tag on nothing. */
+static kbc_status verdict_target(kbc_err *err, kbc_store *s, const char *doc_id,
+                                 char *corpus, size_t corpus_cap, char *path,
+                                 size_t path_cap, bool *found) {
+  *found = false;
+  sqlite3_stmt *q = NULL;
+  kbc_status st = prepare(
+      err, s, "SELECT corpus, path FROM artifacts WHERE id = ?1;", &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, doc_id);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_ROW) {
+      const char *c = (const char *)sqlite3_column_text(q, 0);
+      const char *p = (const char *)sqlite3_column_text(q, 1);
+      const int cb = sqlite3_column_bytes(q, 0);
+      const int pb = sqlite3_column_bytes(q, 1);
+      /* Bounded, never truncated. `sources` admits a corpus of at most 255
+       * bytes and a path at most KBC_MAX_PATH_LEN, so a longer one was
+       * written outside the API and copying a prefix would put a tag on a
+       * document that is not this one. */
+      if (c == NULL || p == NULL || cb <= 0 || (size_t)cb >= corpus_cap ||
+          pb <= 0 || (size_t)pb >= path_cap) {
+        st = kbc_err_set(err, KBC_ERR_INTERNAL,
+                         "verdict on %s: corpus/path is %d/%d bytes, over the"
+                         " %zu/%zu this table allows",
+                         doc_id, cb, pb, corpus_cap - 1, path_cap - 1);
+      } else {
+        memcpy(corpus, c, (size_t)cb);
+        corpus[cb] = '\0';
+        memcpy(path, p, (size_t)pb);
+        path[pb] = '\0';
+        *found = true;
+      }
+    } else if (step == SQLITE_DONE) {
+      *found = false;
+    } else {
+      st = sql_fail(err, s, "read verdict target: step", step);
+    }
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  return st != KBC_OK ? st : fin;
+}
+
+/* Replaces the whole derived `status-*` set for one document: both values
+ * dropped, then the one the verdict names inserted. Two statements rather
+ * than a conditional, because the interesting case is the one where the
+ * verdict CHANGES and the previous tag has to disappear — a document that
+ * was approved and is now asking for changes must not keep matching
+ * `kb-tags:status-approved`, or the facet filter answers a question about a
+ * state the verdict has moved on from. */
+static kbc_status verdict_retag(kbc_err *err, kbc_store *s, const char *corpus,
+                                const char *path,
+                                kbc_verdict_state state) {
+  sqlite3_stmt *del = NULL;
+  kbc_status st = prepare(
+      err, s,
+      "DELETE FROM doc_metas WHERE corpus = ?1 AND path = ?2"
+      " AND key = 'kb-tags' AND (value = 'status-approved'"
+      " OR value = 'status-changes-requested');",
+      &del);
+  if (st == KBC_OK) st = bind_text(err, s, del, 1, corpus);
+  if (st == KBC_OK) st = bind_text(err, s, del, 2, path);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(del);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "clear verdict tag", step);
+  }
+  kbc_status fin = finalize(err, s, del, st);
+  if (st == KBC_OK) st = fin;
+  const char *tag = verdict_tag(state);
+  if (st != KBC_OK || tag == NULL) return st;
+  sqlite3_stmt *ins = NULL;
+  st = prepare(err, s,
+               "INSERT OR IGNORE INTO doc_metas(corpus, path, key, value)"
+               " VALUES(?1,?2,'kb-tags',?3);",
+               &ins);
+  if (st == KBC_OK) st = bind_text(err, s, ins, 1, corpus);
+  if (st == KBC_OK) st = bind_text(err, s, ins, 2, path);
+  if (st == KBC_OK) st = bind_text(err, s, ins, 3, tag);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(ins);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "write verdict tag", step);
+  }
+  kbc_status fin2 = finalize(err, s, ins, st);
+  return st != KBC_OK ? st : fin2;
+}
+
+/* The verdict AND its tag, in ONE transaction, which is what makes the tag
+ * safe to filter on.
+ *
+ * The original's invariant #12 says the direction of the derivation, and
+ * this is what enforces it in one place: `verdicts` is the verdict of
+ * record, `doc_metas` is the projection, and a transaction that wrote one
+ * without the other would leave `kb-tags:status-approved` matching a
+ * document whose verdict says otherwise. There is no repair pass for that
+ * and there does not need to be one, because the two are never apart.
+ *
+ * `decided_at` is STAMPED HERE and never taken from the caller, for
+ * review.rs's reason: "at/by are stamped by set_verdict (never
+ * client-supplied), mirroring Comment::created_at/author". A caller-supplied
+ * timestamp is a claim about when a human decided, and a client can make it
+ * say anything.
+ *
+ * `decided_by` IS the caller's, because it is attribution rather than
+ * fact: it names who, not when, and the original takes it from the request's
+ * resolved identity the same way. */
+kbc_status kbc_store_set_verdict(kbc_store *s, const char *doc_id,
+                                 kbc_verdict_state state,
+                                 const char *decided_by, const char *note,
+                                 kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "set_verdict: null store");
+  if (state != KBC_VERDICT_COMMENT && state != KBC_VERDICT_APPROVE &&
+      state != KBC_VERDICT_REQUEST_CHANGES)
+    return kbc_err_set(err, KBC_ERR_INVALID, "verdict state %d: not one of "
+                                           "comment|approve|request_changes",
+                       (int)state);
+  kbc_status st = require_text(err, "verdict doc id", doc_id, KBC_MAX_ID_LEN);
+  if (st == KBC_OK)
+    st = require_text(err, "verdict decided_by", decided_by,
+                      KBC_VERDICT_MAX_BYTES);
+  if (st == KBC_OK && note != NULL && strlen(note) > KBC_VERDICT_MAX_NOTE_BYTES)
+    return kbc_err_set(err, KBC_ERR_INVALID,
+                       "verdict note: over the %u byte cap",
+                       (unsigned)KBC_VERDICT_MAX_NOTE_BYTES);
+  if (st != KBC_OK) return st;
+
+  char corpus[256];
+  char path[KBC_MAX_PATH_LEN + 1];
+  bool found = false;
+  const int64_t now = kbc_now_ns() / 1000000000;
+
+  lock(s);
+  st = exec_plain(err, s, "BEGIN IMMEDIATE;");
+  if (st != KBC_OK) {
+    unlock(s);
+    return st;
+  }
+  st = verdict_target(err, s, doc_id, corpus, sizeof corpus, path, sizeof path,
+                     &found);
+  if (st == KBC_OK && !found) {
+    st = kbc_err_set(err, KBC_ERR_NOTFOUND, "artifact %s: not indexed", doc_id);
+  }
+  sqlite3_stmt *q = NULL;
+  if (st == KBC_OK)
+    st = prepare(err, s,
+                 "INSERT INTO verdicts(doc_id, state, decided_at, decided_by,"
+                 " note) VALUES(?1,?2,?3,?4,?5)"
+                 " ON CONFLICT(doc_id) DO UPDATE SET state=excluded.state,"
+                 " decided_at=excluded.decided_at,"
+                 " decided_by=excluded.decided_by, note=excluded.note;",
+                 &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, doc_id);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 2, (int64_t)state);
+  if (st == KBC_OK) st = bind_i64(err, s, q, 3, now);
+  if (st == KBC_OK) st = bind_text(err, s, q, 4, decided_by);
+  /* NULL note is "no note", not an empty one, and the two must not be the
+   * same row: `note: ""` and an absent note are different claims and the
+   * CHECK-free column has no way to tell them apart if the empty string is
+   * written. */
+  if (st == KBC_OK && note != NULL && note[0] != '\0')
+    st = bind_text(err, s, q, 5, note);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_CONSTRAINT)
+      st = constraint_fail(err, s, "verdict on this document", "artifacts");
+    else if (step != SQLITE_DONE)
+      st = sql_fail(err, s, "set verdict", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  if (st == KBC_OK) st = verdict_retag(err, s, corpus, path, state);
+  if (st == KBC_OK) st = exec_plain(err, s, "COMMIT;");
+  if (st != KBC_OK) rollback(s);
+  unlock(s);
+  return st;
+}
+
+kbc_status kbc_store_get_verdict(kbc_store *s, kbc_arena *a, const char *doc_id,
+                                 kbc_verdict *out, kbc_err *err) {
+  if (s == NULL || a == NULL || out == NULL || doc_id == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "get_verdict: null argument");
+  kbc_status st = require_text(err, "verdict doc id", doc_id, KBC_MAX_ID_LEN);
+  if (st != KBC_OK) return st;
+
+  lock(s);
+  sqlite3_stmt *q = NULL;
+  st = prepare(err, s,
+               "SELECT state, decided_at, decided_by, note FROM verdicts"
+               " WHERE doc_id = ?1;",
+               &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, doc_id);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step == SQLITE_ROW) {
+      memset(out, 0, sizeof(*out));
+      /* The CHECK constraint is what makes this cast sound; a value the
+       * table cannot hold cannot arrive here. */
+      out->state = (kbc_verdict_state)sqlite3_column_int(q, 0);
+      out->decided_at = (int64_t)sqlite3_column_int64(q, 1);
+      out->decided_by = col_str(a, q, 2);
+      out->note = col_str(a, q, 3);
+    } else if (step == SQLITE_DONE) {
+      /* NOTFOUND is "nobody has reviewed this", which is a DIFFERENT answer
+       * from a COMMENT verdict — a working note with no pass/fail signal.
+       * Collapsing them would let a client report "under review" for a
+       * document nobody has looked at. */
+      st = kbc_err_set(err, KBC_ERR_NOTFOUND, "verdict for %s: none set",
+                       doc_id);
+    } else {
+      st = sql_fail(err, s, "get verdict: step", step);
+    }
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  unlock(s);
+  return st != KBC_OK ? st : fin;
+}
+
+kbc_status kbc_store_clear_verdict(kbc_store *s, const char *doc_id,
+                                   kbc_err *err) {
+  if (s == NULL)
+    return kbc_err_set(err, KBC_ERR_INVALID, "clear_verdict: null store");
+  kbc_status st = require_text(err, "verdict doc id", doc_id, KBC_MAX_ID_LEN);
+  if (st != KBC_OK) return st;
+
+  char corpus[256];
+  char path[KBC_MAX_PATH_LEN + 1];
+  bool found = false;
+
+  lock(s);
+  st = exec_plain(err, s, "BEGIN IMMEDIATE;");
+  if (st != KBC_OK) {
+    unlock(s);
+    return st;
+  }
+  /* The document is looked up even on the clearing path, because the tag has
+   * to be withdrawn from the same (corpus, path) the verdict was projected
+   * onto. Clearing only the row would leave the tag behind and a filter on
+   * `kb-tags:status-approved` would keep matching a document that has no
+   * verdict at all — a facet answer with nothing behind it. */
+  st = verdict_target(err, s, doc_id, corpus, sizeof corpus, path, sizeof path,
+                     &found);
+  sqlite3_stmt *q = NULL;
+  if (st == KBC_OK)
+    st = prepare(err, s, "DELETE FROM verdicts WHERE doc_id = ?1;", &q);
+  if (st == KBC_OK) st = bind_text(err, s, q, 1, doc_id);
+  if (st == KBC_OK) {
+    const int step = sqlite3_step(q);
+    if (step != SQLITE_DONE) st = sql_fail(err, s, "clear verdict", step);
+  }
+  kbc_status fin = finalize(err, s, q, st);
+  if (st == KBC_OK) st = fin;
+  if (st == KBC_OK && sqlite3_changes(s->db) == 0) {
+    st = kbc_err_set(err, KBC_ERR_NOTFOUND, "verdict for %s: none set", doc_id);
+  }
+  /* Only reached when a row really was there, and `found` then has to be
+   * true: a verdict row cascades with its artifact, so a verdict without a
+   * document is a row this connection's own cascade should have removed. */
+  if (st == KBC_OK && found)
+    st = verdict_retag(err, s, corpus, path, KBC_VERDICT_COMMENT);
+  if (st == KBC_OK) st = exec_plain(err, s, "COMMIT;");
+  if (st != KBC_OK) rollback(s);
+  unlock(s);
+  return st;
 }

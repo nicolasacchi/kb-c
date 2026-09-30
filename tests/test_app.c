@@ -4463,6 +4463,269 @@ KBC_TEST(a_move_carries_the_comments_the_pin_and_the_corkboard_across) {
   fx_teardown(&f);
 }
 
+/* ------------------------------------------------ attachments at the app --
+ *
+ * Two properties the store cases cover and the APP layer did not, which is
+ * why they are here rather than there: both are claims about what a document
+ * removal and a document move do to the rows hanging off a document id, and
+ * both are decided by which table names that id. The store knows the cascade;
+ * the app is what actually calls the delete and the rekey, so a rekey that
+ * forgot the attachments would leave a blob on a document that no longer has
+ * that id, and nothing in the store suite would notice because the store was
+ * never asked.
+ */
+/* Real PNG magic, because the sniffer is a byte test and a body that is not a
+ * PNG is refused at the gate — which is the same trap
+ * `an_attachment_round_trips_byte_for_byte_including_a_nul` fell into. */
+static const char kAppPng[] = "\x89PNG\r\n\x1a\n\x00\x01\x02\x03";
+
+/* One attachment on `doc_id`, adopted onto `cid` when there is one. Returns
+ * the aid, or an empty string. */
+static bool add_app_blob(const kbc_config *cfg, const char *doc_id,
+                         const char *cid, const char *name, char *aid_out) {
+
+  aid_out[0] = '\0';
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = kbc_store_open(cfg, &err);
+  if (s == NULL) return false;
+  kbc_attachment_in in;
+  memset(&in, 0, sizeof in);
+  in.doc_id = doc_id;
+  in.comment_id = cid;
+  in.filename = name;
+  in.content_type = kbc_store_sniff_attachment(kAppPng, sizeof kAppPng - 1u);
+  in.author = "nik";
+  in.body = kAppPng;
+  in.body_len = sizeof kAppPng - 1u;
+  char aid[KBC_ATTACH_ID_LEN + 1];
+  kbc_status st = kbc_store_add_attachment(s, &in, aid, &err);
+  if (st != KBC_OK) {
+    fprintf(stderr, "  add_app_blob: %s\n", err.msg);
+    kbc_store_close(s);
+    return false;
+  }
+  memcpy(aid_out, aid, strlen(aid) + 1u);
+  kbc_store_close(s);
+  return true;
+}
+
+/* Every attachment row on `doc_id`, counted. `doc_id` NULL counts the whole
+ * table, which is the half that matters for a delete: a cascade that dropped
+ * the rows from the listing but left them in the table would pass a
+ * per-document count. */
+static size_t blob_count(const kbc_config *cfg, const char *doc_id,
+                         kbc_arena *a) {
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_store *s = kbc_store_open(cfg, &err);
+  if (s == NULL) return 0;
+  kbc_attachment *rows = NULL;
+  size_t n = 0;
+  (void)kbc_store_list_attachments(s, a, doc_id, 200u, &rows, &n, &err);
+  kbc_store_close(s);
+  return n;
+}
+
+/* A DOCUMENT REMOVAL TAKES ITS ATTACHMENTS WITH IT, bytes included.
+ *
+ * The cascade is the schema's and not this layer's: `attachments.doc_id` and
+ * `attachments.comment_id` both say `ON DELETE CASCADE` and the store runs
+ * `PRAGMA foreign_keys = ON`. What this case is for is that the APP's delete
+ * path reaches that schema at all, and that nothing is left holding bytes for
+ * a document that is gone. Both an ADOPTED row and a STAGED one are placed,
+ * because they sit on different columns and a cascade wired to only one of
+ * them would leave the other behind — and a STAGED row is the one nobody is
+ * looking for, since it belongs to no comment. */
+KBC_TEST(a_document_removal_takes_its_attachments_and_their_bytes) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char doc[KBC_MAX_ID_LEN + 1];
+  const char *id = id_of_path(f.cfg, CORPUS_A, "c.md", a);
+  KBC_CHECK_NOT_NULL(id);
+  if (id == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  memcpy(doc, id, sizeof doc);
+
+  /* A comment with an ADOPTED attachment, and a STAGED one nobody claimed. */
+  kbc_store *st = kbc_store_open(f.cfg, &err);
+  KBC_CHECK_NOT_NULL(st);
+  if (st == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  KBC_CHECK_OK(kbc_store_add_comment(st, doc, "section:digest", "nik", "keep",
+                                     &err));
+  kbc_store_close(st);
+  kbc_arena *ca = kbc_arena_new(8192);
+  kbc_comment *cs = NULL;
+  size_t cn = 0;
+  st = kbc_store_open(f.cfg, &err);
+  if (st != NULL) {
+    KBC_CHECK_OK(kbc_store_list_comments(st, ca, doc, 10, &cs, &cn, &err));
+    kbc_store_close(st);
+  }
+  KBC_CHECK_EQ_INT((int64_t)cn, 1);
+  char cid[KBC_MAX_ID_LEN + 1];
+  cid[0] = '\0';
+  if (cn == 1) memcpy(cid, cs[0].id, sizeof cid);
+  char adopted[KBC_ATTACH_ID_LEN + 1];
+  char staged[KBC_ATTACH_ID_LEN + 1];
+  KBC_CHECK_MSG(add_app_blob(f.cfg, doc, cid, "adopted.png", adopted),
+                "the adopted attachment was refused");
+  KBC_CHECK_MSG(add_app_blob(f.cfg, doc, NULL, "staged.png", staged),
+                "the staged attachment was refused");
+  KBC_CHECK_EQ_INT((int64_t)blob_count(f.cfg, doc, a), 2);
+  /* They are really there, with their bytes, before the delete — otherwise
+   * the assertions after it would pass on an empty table. */
+  {
+    kbc_str bytes;
+    kbc_str_init(&bytes);
+    st = kbc_store_open(f.cfg, &err);
+    if (st != NULL) {
+      KBC_CHECK_OK(kbc_store_read_attachment(st, adopted, &bytes, &err));
+      kbc_store_close(st);
+    }
+    KBC_CHECK_MSG(bytes.len == sizeof kAppPng - 1u,
+                  "the attachment held %zu bytes before the delete", bytes.len);
+    kbc_str_free(&bytes);
+  }
+
+  KBC_CHECK_OK(kbc_app_delete_path(f.app, CORPUS_A, "c.md", &err));
+
+  /* The rows are gone from the document's listing AND from the table. */
+  KBC_CHECK_EQ_INT((int64_t)blob_count(f.cfg, doc, a), 0);
+  KBC_CHECK_EQ_INT((int64_t)blob_count(f.cfg, NULL, a), 0);
+  /* And the BYTES are gone, which is the half a row-only sweep would miss:
+   * here the blob lives in the row, so there is nothing on disk for a later
+   * GC to find and an orphan row would be an orphan file. */
+  {
+    kbc_str bytes;
+    kbc_str_init(&bytes);
+    st = kbc_store_open(f.cfg, &err);
+    if (st != NULL) {
+      KBC_CHECK_ERR(kbc_store_read_attachment(st, adopted, &bytes, &err),
+                    KBC_ERR_NOTFOUND);
+      KBC_CHECK_ERR(kbc_store_read_attachment(st, staged, &bytes, &err),
+                    KBC_ERR_NOTFOUND);
+      kbc_store_close(st);
+    }
+    kbc_str_free(&bytes);
+  }
+  /* The other documents are untouched: a cascade keyed on the table rather
+   * than on the row would have taken the whole corpus with it. */
+  KBC_CHECK_EQ_INT((int64_t)blob_count(f.cfg, NULL, a), 0);
+  KBC_CHECK_EQ_INT(store_count(f.cfg), 2);
+  kbc_arena_free(ca);
+  kbc_arena_free(a);
+  fx_teardown(&f);
+}
+
+/* A MOVE CARRIES THE ATTACHMENTS, and the aid is the reason it is a carry and
+ * not a copy.
+ *
+ * A document id is a hash of (corpus, path), so a move necessarily mints a
+ * new one. An attachment id is six RANDOM bytes and nothing else — it is not
+ * derived from the path, the filename or the content — so a rekey that
+ * rewrote it would break every URL already handed to a reader, and a rekey
+ * that dropped the row would take the picture off a comment that still names
+ * it. `doc_id` is the only column that had to change, and this asserts both
+ * halves: the row is on the new document, and it is the SAME row. */
+KBC_TEST(a_move_carries_the_attachments_under_the_same_id) {
+  fixture f;
+  fx_setup(&f, false);
+  if (f.app == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f.app, &err));
+  kbc_arena *a = kbc_arena_new(64u * 1024u);
+  KBC_CHECK_NOT_NULL(a);
+  if (a == NULL) {
+    fx_teardown(&f);
+    return;
+  }
+  char old_id[KBC_MAX_ID_LEN + 1];
+  const char *id = id_of_path(f.cfg, CORPUS_A, "c.md", a);
+  KBC_CHECK_NOT_NULL(id);
+  if (id == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  memcpy(old_id, id, sizeof old_id);
+  char aid[KBC_ATTACH_ID_LEN + 1];
+  KBC_CHECK_MSG(add_app_blob(f.cfg, old_id, NULL, "chart.png", aid),
+                "the attachment was refused");
+  KBC_CHECK_EQ_INT((int64_t)blob_count(f.cfg, old_id, a), 1);
+
+  KBC_CHECK_OK(kbc_app_move_path(f.app, CORPUS_A, "c.md", "notes/renamed.md",
+                                 &err));
+  const char *new_id = id_of_path(f.cfg, CORPUS_A, "notes/renamed.md", a);
+  KBC_CHECK_NOT_NULL(new_id);
+  if (new_id == NULL) {
+    kbc_arena_free(a);
+    fx_teardown(&f);
+    return;
+  }
+  char moved[KBC_MAX_ID_LEN + 1];
+  memcpy(moved, new_id, sizeof moved);
+  KBC_CHECK_MSG(strcmp(moved, old_id) != 0,
+                "the move did not mint a new document id, so this case is "
+                "not testing the rekey at all");
+
+  /* It followed, and nothing was left behind on the dead id — which is what
+   * makes the rekey a move rather than a copy. */
+  KBC_CHECK_EQ_INT((int64_t)blob_count(f.cfg, moved, a), 1);
+  KBC_CHECK_EQ_INT((int64_t)blob_count(f.cfg, old_id, a), 0);
+  KBC_CHECK_EQ_INT((int64_t)blob_count(f.cfg, NULL, a), 1);
+  /* Under the SAME aid: the id is minted, not derived, so it is the one thing
+   * a move must not remint. */
+  {
+    kbc_store *s = kbc_store_open(f.cfg, &err);
+    KBC_CHECK_NOT_NULL(s);
+    if (s != NULL) {
+      kbc_attachment at;
+      memset(&at, 0, sizeof at);
+      KBC_CHECK_OK(kbc_store_get_attachment(s, a, aid, &at, &err));
+      KBC_CHECK_EQ_STR(at.id, aid);
+      KBC_CHECK_EQ_STR(at.doc_id, moved);
+      /* And the filename and the sniffed type came with it, so the served
+       * headers after a move are the ones the upload produced. */
+      KBC_CHECK_EQ_STR(at.filename, "chart.png");
+      KBC_CHECK_EQ_STR(at.content_type, "image/png");
+      kbc_str bytes;
+      kbc_str_init(&bytes);
+      KBC_CHECK_OK(kbc_store_read_attachment(s, aid, &bytes, &err));
+      KBC_CHECK_MSG(bytes.len == sizeof kAppPng - 1u,
+                    "the moved attachment held %zu bytes", bytes.len);
+      kbc_str_free(&bytes);
+      kbc_store_close(s);
+    }
+  }
+  kbc_arena_free(a);
+  fx_teardown(&f);
+}
+
 /* The resolution flag is a decision about a thread, exactly as a pin is, so
  * it comes across with the thread. kbc_store_add_comment mints it false,
  * which is precisely why this needs its own case. */
@@ -8055,6 +8318,10 @@ int main(void) {
      a_body_longer_than_the_array_reports_the_true_count_so_a_retry_fits},
     {"a_move_carries_the_comments_the_pin_and_the_corkboard_across",
      a_move_carries_the_comments_the_pin_and_the_corkboard_across},
+      {"a_document_removal_takes_its_attachments_and_their_bytes",
+       a_document_removal_takes_its_attachments_and_their_bytes},
+      {"a_move_carries_the_attachments_under_the_same_id",
+       a_move_carries_the_attachments_under_the_same_id},
     {"a_resolved_comment_is_still_resolved_after_a_move",
      a_resolved_comment_is_still_resolved_after_a_move},
     {"a_move_refuses_its_bad_targets_before_it_touches_anything",

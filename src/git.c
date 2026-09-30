@@ -583,6 +583,11 @@ static kbc_git_ecode classify(int code, const char *err, size_t err_len)
       "no such ref",          "invalid reference",   "not a valid object name",
       "reference is not a tree", "could not resolve", "bad object",
       "unknown revision or path",
+      /* `git checkout <name>` on a name no ref carries says exactly this,
+       * and it is the same answer as "unknown revision" wearing a
+       * pathspec's clothes: the operator named something git cannot
+       * resolve, not something that is merely missing on disk. */
+      "did not match any file",
   };
   static const char *const not_found[] = {
       "no such path", "does not exist in", "exists on disk, but not in",
@@ -2573,7 +2578,8 @@ kbc_status kbc_git_dirty_paths(const kbc_git_repo *repo, kbc_arena *a,
   run_result res;
   kbc_status st;
   char *scratch;
-  size_t n, i, start = 0;
+  const char *path;
+  size_t n;
 
   if (repo == NULL || a == NULL || out == NULL)
     return fail(err, KBC_GIT_E_REJECTED, "status: missing argument");
@@ -2593,38 +2599,52 @@ kbc_status kbc_git_dirty_paths(const kbc_git_repo *repo, kbc_arena *a,
     return st;
   }
   n = buf.len;
-  scratch = kbc_arena_strndup(a, buf.ptr, n);
+  /* An empty capture is a CLEAN tree, which is the common case and not a
+   * failure: kbc_str leaves ptr NULL at length 0, so the arena copy is
+   * only something to make when there are bytes to copy. */
+  scratch = (n > 0) ? kbc_arena_strndup(a, buf.ptr, n) : NULL;
   kbc_str_free(&buf);
-  if (scratch == NULL)
+  if (n > 0 && scratch == NULL)
     return kbc_err_set(err, KBC_ERR_NOMEM, "status: arena");
-  /* "XY <path>" and, for a rename or a copy, a second NUL-terminated
-   * record holding the source path. The two-character status prefix is
-   * dropped: callers want the paths, and the status is recoverable from
-   * `git status` itself. */
-  for (i = 0; i < n; i++) {
-    const char *path;
-    char *rec = scratch + start;
-    size_t reclen = i - start;
-    start = i + 1;
-    if (reclen < 4)
-      continue;
-    path = kbc_arena_strndup(a, rec + 3, reclen - 3);
-    if (path == NULL)
-      return kbc_err_set(err, KBC_ERR_NOMEM, "status: arena");
-    st = grow_arena_array((void **)&out->items, &out->cap, out->len + 1,
-                          sizeof *out->items, a);
-    if (st != KBC_OK)
-      return kbc_err_set(err, KBC_ERR_NOMEM, "status: %zu paths", out->len + 1);
-    out->items[out->len++] = path;
-    /* A rename or a copy is reported as "XY new\0old\0". Only the
-     * destination exists in the working tree, so the source record is
-     * consumed and dropped rather than listed as a path that is not
-     * there. */
-    if (rec[0] == 'R' || rec[0] == 'C') {
-      size_t j;
-      for (j = i + 1; j < n && scratch[j] != '\0'; j++) {
+  /* -z makes each record NUL-terminated, so the scan is record-by-record
+   * and never a byte walk: "XY <path>" must arrive as ONE record or the
+   * two-character status prefix is not a prefix of anything. */
+  {
+    size_t pos = 0;
+    while (pos < n) {
+      size_t end = pos;
+      char *rec = scratch + pos;
+      size_t reclen;
+      while (end < n && scratch[end] != '\0') {
+        end++;
       }
-      i = j;
+      reclen = end - pos;
+      pos = end + 1;
+      /* "XY <path>": the two-character status prefix is dropped because
+       * callers want the paths, and the status is recoverable from git. */
+      if (reclen < 4) {
+        continue;
+      }
+      path = kbc_arena_strndup(a, rec + 3, reclen - 3);
+      if (path == NULL) {
+        return kbc_err_set(err, KBC_ERR_NOMEM, "status: arena");
+      }
+      st = grow_arena_array((void **)&out->items, &out->cap, out->len + 1,
+                            sizeof *out->items, a);
+      if (st != KBC_OK) {
+        return kbc_err_set(err, KBC_ERR_NOMEM, "status: %zu paths", out->len + 1);
+      }
+      out->items[out->len++] = path;
+      /* A rename or a copy is reported as "XY new\0old\0". Only the
+       * destination exists in the working tree, so the source record is
+       * consumed and dropped rather than listed as a path that is not
+       * there. */
+      if (rec[0] == 'R' || rec[0] == 'C') {
+        while (pos < n && scratch[pos] != '\0') {
+          pos++;
+        }
+        pos++;
+      }
     }
   }
   return KBC_OK;

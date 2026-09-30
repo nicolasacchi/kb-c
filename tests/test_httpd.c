@@ -24,6 +24,7 @@
 #include "kbc/config.h"
 #include "kbc/httpd.h"
 #include "kbc/mem.h"
+#include "kbc/types.h"
 #include "kbc_test.h"
 
 #define TOKEN "s3cr3t-token"
@@ -5253,10 +5254,887 @@ KBC_TEST(a_url_share_with_no_file_writes_a_stub) {
   fx_teardown(&f);
 }
 
+  /* ======================================= review, comments, attachments, verdict
+ *
+ * Every case here goes over a REAL SOCKET, and that is the point rather than
+ * an accident. The socketless `kbc_httpd_handle` seam cannot express a
+ * multipart boundary, so a stage-upload case driven through it would be a 400
+ * for a reason that has nothing to do with the code under test — and the
+ * attachment serve route's whole security argument is headers the write path
+ * emits, which only exist once a connection has been parsed and answered.
+ */
+
+/* One POST over the socket with a real multipart body, and the reply. The
+ * request is built rather than formatted with a fixed boundary so a case can
+ * reuse the same boundary for two requests on one connection without the
+ * daemon seeing a body that does not match its header. */
+static bool post_multipart(server *s, const char *path, const char *boundary,
+                           const char *filename, const void *bytes, size_t n,
+                           int *status, char *reply, size_t cap) {
+  /* The body is built FIRST so `Content-Length` is a measurement rather than a
+   * guess: a header that disagrees with the body is exactly what the request
+   * parser exists to refuse, and a test that guessed would be testing the
+   * guess. */
+  kbc_str body;
+  kbc_str_init(&body);
+  (void)kbc_str_printf(&body, "--%s\r\n", boundary);
+  if (filename != NULL) {
+    (void)kbc_str_printf(&body,
+                         "Content-Disposition: form-data; name=\"file\";"
+                         " filename=\"%s\"\r\n"
+                         "Content-Type: application/octet-stream\r\n\r\n",
+                         filename);
+  }
+  (void)kbc_str_append(&body, bytes, n);
+  (void)kbc_str_printf(&body, "\r\n--%s--\r\n", boundary);
+  kbc_str req;
+  kbc_str_init(&req);
+  (void)kbc_str_printf(&req,
+                       "POST %s HTTP/1.1\r\n"
+                       "Host: kb\r\n"
+                       "Content-Type: multipart/form-data; boundary=%s\r\n"
+                       "Content-Length: %zu\r\n"
+                       "Connection: close\r\n\r\n",
+                       path, boundary, body.len);
+  (void)kbc_str_append(&req, body.ptr, body.len);
+  const bool ok = raw_exchange(s, req.ptr, req.len, status, reply, cap);
+  kbc_str_free(&req);
+  kbc_str_free(&body);
+  return ok;
+}
+
+/* One JSON POST over the socket. */
+static bool post_json(server *s, const char *path, const char *json, int *status,
+                      char *reply, size_t cap) {
+  kbc_str req;
+  kbc_str_init(&req);
+  (void)kbc_str_printf(&req,
+                       "POST %s HTTP/1.1\r\n"
+                       "Host: kb\r\n"
+                       "Content-Type: application/json\r\n"
+                       "Content-Length: %zu\r\n"
+                       "Connection: close\r\n\r\n%s",
+                       path, strlen(json), json);
+  const bool ok = raw_exchange(s, req.ptr, req.len, status, reply, cap);
+  kbc_str_free(&req);
+  return ok;
+}
+
+static bool request(server *s, const char *method, const char *path, int *status,
+                    char *reply, size_t cap) {
+  kbc_str req;
+  kbc_str_init(&req);
+  (void)kbc_str_printf(&req,
+                       "%s %s HTTP/1.1\r\nHost: kb\r\nConnection: close\r\n\r\n",
+                       method, path);
+  const bool ok = raw_exchange(s, req.ptr, req.len, status, reply, cap);
+  kbc_str_free(&req);
+  return ok;
+}
+
+/* The `"id":"..."` of the first attachment in a reply, which is the `aid` the
+ * stage route mints. Copied out rather than pointed at, because the reply
+ * buffer is the caller's. */
+#define KBC_ATTACH_ID_LEN 14u
+
+static bool first_aid(const char *reply, char *buf, size_t cap) {
+  const char *p = strstr(reply, "\"id\":\"a_");
+  if (p == NULL) return false;
+  p += 6;
+  size_t i = 0;
+  while (p[i] != '\0' && p[i] != '"' && i + 1 < cap) {
+    buf[i] = p[i];
+    i++;
+  }
+  buf[i] = '\0';
+  return i == KBC_ATTACH_ID_LEN;
+}
+
+/* A one-worker daemon over a corpus with a document that has an `install`
+ * heading, plus a PNG on disk to attach.
+ *
+ * The heading is written HERE rather than left to `fx_setup`, and that is the
+ * fix for a case that could not have passed: this function's own comment has
+ * always promised a document with an `install` heading, and `fx_setup` writes
+ * `# Alpha\n\nalpha zebra\n`, which has none. Every comment in the review
+ * suite anchors to `install`, so the anchor pass judged each one against a
+ * document the claim was not about and correctly answered UNRESOLVED — and
+ * `an_undecidable_anchor_...` failed on its very first assertion, before it
+ * ever reached the collision it exists to test. The shared fixture is left
+ * alone: it is also the fixture for the search cases, which count documents
+ * by vocabulary and have no reason to grow a heading. */
+static bool review_fixture(fixture *f, server *s) {
+  fx_setup(f, NULL);
+  if (f->app == NULL) return false;
+  char md[KBC_TEST_PATH_MAX + 32];
+  (void)snprintf(md, sizeof md, "%s/kb/alpha.md", f->root);
+  kbc_test_write_file(md, "# Alpha\n\n## Install\n\nalpha zebra\n");
+  kbc_err err;
+  kbc_err_reset(&err);
+  KBC_CHECK_OK(kbc_app_reindex(f->app, &err));
+  srv_start(s, f);
+  return s->h != NULL;
+}
+
+/* The id of the fixture's `alpha.md`, which the review routes address. It is
+ * DERIVED the way the indexer derives it, rather than read out of a listing,
+ * so a case that gets the id wrong fails on the id rather than on whatever
+ * the daemon happened to return. */
+static void alpha_id(fixture *f, char *out, size_t cap) {
+  (void)f;
+  (void)cap;
+  kbc_id_for_artifact(out, "kb", "alpha.md");
+}
+
+/* The minimum PNG signature; the sniffer only reads those eight bytes. */
+static const char kTinyPng[] = "\x89PNG\r\n\x1a\n\x00\x01\x02";
+
+/* The attachment id's length, from the block store.h will carry. */
+#define KBC_ATTACH_ID_LEN 14u
+
+/* STAGE 1, end to end: upload, list, serve, delete — over a socket, with the
+ * security headers the XSS guard depends on actually on the wire. */
+KBC_TEST(an_attachment_is_staged_listed_served_and_detached_over_a_socket) {
+  fixture f;
+  server s;
+  if (!review_fixture(&f, &s)) {
+    fx_teardown(&f);
+    return;
+  }
+  char id[KBC_MAX_ID_LEN + 1];
+  alpha_id(&f, id, sizeof id);
+  char path[256];
+  (void)snprintf(path, sizeof path, "/api/kb/kb/review/%s/attachments", id);
+  char reply[32768];
+  int status = 0;
+  char aid[KBC_ATTACH_ID_LEN + 1];
+
+  KBC_CHECK_MSG(
+      post_multipart(&s, path, "kbcBOUND", "chart.png", kTinyPng,
+                     sizeof kTinyPng - 1u, &status, reply, sizeof reply),
+      "the upload got no HTTP reply");
+  KBC_CHECK_EQ_INT(status, 201);
+  KBC_CHECK_MSG(first_aid(reply, aid, sizeof aid),
+                "the stage reply carried no `a_` id: %s", reply);
+  /* The stored type is the SNIFF, and the client declared
+   * `application/octet-stream` for the part — the reply must not echo that
+   * back, because a stored type is what the serve route emits as
+   * Content-Type. */
+  KBC_CHECK_MSG(strstr(reply, "\"content_type\":\"image/png\"") != NULL,
+                "the stage reply did not carry the sniffed type: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "application/octet-stream") == NULL,
+                "the client's declared type reached the response: %s", reply);
+
+  /* It is listed, and listed as STAGED, because nothing has adopted it. */
+  KBC_CHECK(request(&s, "GET", path, &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK_MSG(strstr(reply, aid) != NULL, "the listing is missing the aid");
+  KBC_CHECK_MSG(strstr(reply, "\"count\":1") != NULL,
+                "the listing count is wrong: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "\"staged\":true") != NULL,
+                "an unadopted row did not read as staged: %s", reply);
+
+  /* The bytes come back with the sniffed type, nosniff, and INLINE —
+   * a raster image is the one case the guard lets a browser render. */
+  char serve[320];
+  (void)snprintf(serve, sizeof serve, "%s/%s", path, aid);
+  KBC_CHECK(request(&s, "GET", serve, &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK_MSG(strstr(reply, "Content-Type: image/png") != NULL,
+                "the serve route did not emit the sniffed type: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "nosniff") != NULL,
+                "nosniff is missing: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "Content-Disposition: inline") != NULL,
+                "a raster image was not served inline: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "max-age=31536000") != NULL,
+                "the immutable cache header is missing: %s", reply);
+  /* The bytes themselves, after the header terminator. */
+  const char *body = strstr(reply, "\r\n\r\n");
+  KBC_CHECK_NOT_NULL(body);
+  if (body != NULL) {
+    body += 4;
+    KBC_CHECK_MSG((size_t)(strstr(reply, "PNG") != NULL) ||
+                      strstr(body, "PNG") != NULL,
+                  "the served body is not the uploaded PNG");
+  }
+
+  /* Detaching takes the row and the bytes together, and a second detach is a
+   * 404 rather than a second success. */
+  char detach[512];
+  (void)snprintf(detach, sizeof detach,
+                 "/api/kb/kb/review/%s/comments/%s/attachments/%s", id,
+                 "cccccccccccc", aid);
+  KBC_CHECK(request(&s, "DELETE", detach, &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK(request(&s, "GET", serve, &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 404);
+  KBC_CHECK(request(&s, "DELETE", detach, &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 404);
+
+  srv_stop(&s);
+  fx_teardown(&f);
+}
+
+/* A REFUSED UPLOAD LEAVES NOTHING, and it is checked over the wire by asking
+ * the listing a second time rather than by trusting the 415.
+ *
+ * THE BYTES MATTER, and the ones this used carried contradicted the case they
+ * were in. It uploaded `\x89PNG\r\n\x1a\n\x00\xff\xfe` and expected 415, on the
+ * reasoning that "a plausible PNG header followed by a NUL and a 0xFF" is
+ * hostile. It is not hostile, it is a PNG: the sniff is a magic-byte test and
+ * the header IS the magic, so the first branch matches and the tail is never
+ * examined. The sibling case twenty lines up uploads `kTinyPng` — the same
+ * eight magic bytes — and expects 201. One tree, two fixtures, opposite
+ * expectations, so one of them had to be wrong and the accept is the one the
+ * contract states. Refusing a real PNG because its compressed tail is not
+ * UTF-8 would refuse every PNG there is.
+ *
+ * So the refusal is exercised with bytes that match NONE of the six accepted
+ * shapes and are not text either, which is what "unsupported" means, and the
+ * magic-wins rule is asserted separately rather than left implied. */
+KBC_TEST(a_refused_upload_over_the_socket_creates_no_row_and_no_bytes) {
+  fixture f;
+  server s;
+  if (!review_fixture(&f, &s)) {
+    fx_teardown(&f);
+    return;
+  }
+  char id[KBC_MAX_ID_LEN + 1];
+  alpha_id(&f, id, sizeof id);
+  char path[256];
+  (void)snprintf(path, sizeof path, "/api/kb/kb/review/%s/attachments", id);
+  char reply[32768];
+  int status = 0;
+  /* Not a magic prefix, and not valid UTF-8 text: a control character, a
+   * control character, and a byte no UTF-8 sequence can start with. */
+  static const char hostile[] = "\x01\x02\x03\xff\xfe";
+  KBC_CHECK(post_multipart(&s, path, "kbcBOUND", "evil.png", hostile,
+                           sizeof hostile - 1u, &status, reply,
+                           sizeof reply));
+  KBC_CHECK_EQ_INT(status, 415);
+  KBC_CHECK_MSG(strstr(reply, "unsupported attachment type") != NULL,
+                "the 415 does not say what was refused: %s", reply);
+
+  /* Nothing was stored. The listing is the query that would show it. */
+  KBC_CHECK(request(&s, "GET", path, &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK_MSG(strstr(reply, "\"count\":0") != NULL,
+                "a refused upload left a row behind: %s", reply);
+
+  /* The magic BYTE is the whole of the image test, and this pins that: a PNG
+   * whose tail is binary is a PNG, and is accepted as one. Asserting it is
+   * what makes the 415 above a statement about the six accepted shapes
+   * rather than about a sniffer that dislikes NULs. */
+  {
+    char aid[KBC_ATTACH_ID_LEN + 1];
+    KBC_CHECK(post_multipart(&s, path, "kbcBOUND", "chart.png", kTinyPng,
+                             sizeof kTinyPng - 1u, &status, reply,
+                             sizeof reply));
+    KBC_CHECK_EQ_INT(status, 201);
+    KBC_CHECK_MSG(strstr(reply, "\"content_type\":\"image/png\"") != NULL,
+                  "PNG magic was not sniffed as a PNG: %s", reply);
+    KBC_CHECK(first_aid(reply, aid, sizeof aid));
+    /* And it is taken back off the wire, so the case leaves the corpus as it
+     * found it and the listing assertions above stay about the refusal. */
+    char detach[512];
+    (void)snprintf(detach, sizeof detach,
+                   "/api/kb/kb/review/%s/comments/%s/attachments/%s", id,
+                   "cccccccccccc", aid);
+    KBC_CHECK(request(&s, "DELETE", detach, &status, reply, sizeof reply));
+    KBC_CHECK_EQ_INT(status, 200);
+  }
+
+  /* And a body with no file part at all is a 400, not a 201 with an empty
+   * blob. */
+  KBC_CHECK(post_multipart(&s, path, "kbcBOUND", "chart.png", "", 0, &status,
+                           reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 400);
+  KBC_CHECK(request(&s, "GET", path, &status, reply, sizeof reply));
+  KBC_CHECK_MSG(strstr(reply, "\"count\":0") != NULL,
+                "an empty part created a row: %s", reply);
+
+  srv_stop(&s);
+  fx_teardown(&f);
+}
+
+/* THE XSS GUARD, AND IT HAD NEVER BEEN EXECUTED.
+ *
+ * Everything above proves the gate ACCEPTS an image. This is the half that
+ * matters and that nothing in the suite touched: what the serve route does
+ * with an upload that is NOT an image. An SVG or an HTML file served inline
+ * from the daemon's own origin is script running with the app's origin, and
+ * the stored `content_type` is what decides it — the sniff, never the
+ * client's claim and never the filename. So the case uploads markup under a
+ * PNG name, over a socket, and reads the response headers a browser would
+ * obey.
+ *
+ * The three things asserted together are the control, and any one of them
+ * alone would pass while the vulnerability stood:
+ *
+ *   - `Content-Type` is `text/plain`, not `image/png`. The client SAID
+ *     `application/octet-stream` for the part and named the file `chart.png`;
+ *     neither reaches the response.
+ *   - `Content-Disposition` is `attachment`, NOT `inline`. This is the
+ *     header that does the work; the type alone does not, because a browser
+ *     will still render `text/html` it is handed.
+ *   - `nosniff` is present, so the browser cannot be talked out of the type
+ *     the daemon chose.
+ *
+ * The PNG control at the end is what makes the negative meaningful: the same
+ * route, the same headers, the same daemon — and there `inline` IS correct. A
+ * guard that force-downloaded everything would satisfy every assertion above
+ * and be useless. */
+KBC_TEST(markup_is_force_downloaded_and_only_raster_images_go_inline) {
+  fixture f;
+  server s;
+  if (!review_fixture(&f, &s)) {
+    fx_teardown(&f);
+    return;
+  }
+  char id[KBC_MAX_ID_LEN + 1];
+  alpha_id(&f, id, sizeof id);
+  char path[256];
+  (void)snprintf(path, sizeof path, "/api/kb/kb/review/%s/attachments", id);
+  char reply[32768];
+  int status = 0;
+
+  /* An SVG carrying script, uploaded under a PNG name. SVG is the sharp one:
+   * it is an image by every extension and a document by every browser. */
+  static const char svg[] =
+      "<svg xmlns=\"http://www.w3.org/2000/svg\" onload=\"alert(1)\">"
+      "<script>alert(document.domain)</script></svg>";
+  /* And HTML, which is not an image at all and must not be stored as one. */
+  static const char html[] =
+      "<!doctype html><html><body><script>alert(1)</script></body></html>";
+
+  const struct {
+    const char *name;
+    const char *bytes;
+    size_t len;
+  } cases[] = {
+      /* Deliberately named `.png` on both: the filename is a display string
+       * and must have no say in the stored type. */
+      {"chart.png", svg, sizeof svg - 1u},
+      {"chart.png", html, sizeof html - 1u},
+  };
+  for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+    char aid[KBC_ATTACH_ID_LEN + 1];
+    KBC_CHECK_MSG(
+        post_multipart(&s, path, "kbcBOUND", cases[i].name, cases[i].bytes,
+                       cases[i].len, &status, reply, sizeof reply),
+        "case %zu: the upload got no HTTP reply", i);
+    KBC_CHECK_MSG(status == 201, "case %zu: stage got %d: %s", i, status,
+                  reply);
+    KBC_CHECK_MSG(first_aid(reply, aid, sizeof aid),
+                  "case %zu: the stage reply carried no `a_` id: %s", i, reply);
+    /* The stored type is the SNIFF. This is the first of the three and the
+     * one a client can see without reading a header. */
+    KBC_CHECK_MSG(strstr(reply, "\"content_type\":\"text/plain; "
+                                "charset=utf-8\"") != NULL,
+                  "case %zu: markup was not stored as text: %s", i, reply);
+    KBC_CHECK_MSG(strstr(reply, "image/png") == NULL,
+                  "case %zu: a .png filename reached the stored type: %s", i,
+                  reply);
+    KBC_CHECK_MSG(strstr(reply, "application/octet-stream") == NULL,
+                  "case %zu: the client's declared type was echoed: %s", i,
+                  reply);
+
+    char serve[320];
+    (void)snprintf(serve, sizeof serve, "%s/%s", path, aid);
+    KBC_CHECK(request(&s, "GET", serve, &status, reply, sizeof reply));
+    KBC_CHECK_MSG(status == 200, "case %zu: serve got %d: %s", i, status,
+                  reply);
+    KBC_CHECK_MSG(strstr(reply, "Content-Type: text/plain; charset=utf-8") !=
+                      NULL,
+                  "case %zu: the serve route did not emit the sniffed type: "
+                  "%s",
+                  i, reply);
+    /* THE assertion. `attachment`, and no `inline` anywhere in the response —
+     * a header set that said both would be a browser's choice, and the whole
+     * point is that it is not the browser's choice. */
+    KBC_CHECK_MSG(strstr(reply, "Content-Disposition: attachment") != NULL,
+                  "case %zu: markup was not force-downloaded: %s", i, reply);
+    KBC_CHECK_MSG(strstr(reply, "Content-Disposition: inline") == NULL,
+                  "case %zu: markup was served inline: %s", i, reply);
+    KBC_CHECK_MSG(strstr(reply, "nosniff") != NULL,
+                  "case %zu: nosniff is missing: %s", i, reply);
+    /* The bytes are still served — this is a download, not a refusal. */
+    const char *body = strstr(reply, "\r\n\r\n");
+    KBC_CHECK_NOT_NULL(body);
+    if (body != NULL) {
+      body += 4;
+      KBC_CHECK_MSG(strstr(body, "<script>") != NULL,
+                    "case %zu: the stored bytes are not what was uploaded",
+                    i);
+    }
+  }
+
+  /* THE CONTROL. A real PNG on the same route is served INLINE, because a
+   * picture in a comment is the feature and force-downloading it would be a
+   * different defect. Without this arm every assertion above would also pass
+   * against a serve route that force-downloaded unconditionally. */
+  {
+    char aid[KBC_ATTACH_ID_LEN + 1];
+    KBC_CHECK(post_multipart(&s, path, "kbcBOUND", "chart.png", kTinyPng,
+                             sizeof kTinyPng - 1u, &status, reply,
+                             sizeof reply));
+    KBC_CHECK_EQ_INT(status, 201);
+    KBC_CHECK(first_aid(reply, aid, sizeof aid));
+    char serve[320];
+    (void)snprintf(serve, sizeof serve, "%s/%s", path, aid);
+    KBC_CHECK(request(&s, "GET", serve, &status, reply, sizeof reply));
+    KBC_CHECK_EQ_INT(status, 200);
+    KBC_CHECK_MSG(strstr(reply, "Content-Type: image/png") != NULL,
+                  "the PNG was not served as a PNG: %s", reply);
+    KBC_CHECK_MSG(strstr(reply, "Content-Disposition: inline") != NULL,
+                  "a raster image was not served inline: %s", reply);
+  }
+
+  srv_stop(&s);
+  fx_teardown(&f);
+}
+
+
+/* STAGE 2, and the case the whole three-state machine exists for: a comment
+ * whose anchor cannot be settled is SERVED AS UNDECIDABLE, with no jump
+ * target at all.
+ *
+ * The document's `install` heading is replaced by a DIFFERENT heading that
+ * takes over the same slug, and the original heading is nowhere in the
+ * document. That is the slug collision, and the two-state machine's answer is
+ * RESOLVED — the anchor resolves, at the wrong heading. The test drives it
+ * through the real pass (a reindex) and then reads the comment back over the
+ * socket, so what is asserted is what a client would be told. */
+KBC_TEST(an_undecidable_anchor_is_served_as_undecidable_with_no_jump_target) {
+  fixture f;
+  server s;
+  if (!review_fixture(&f, &s)) {
+    fx_teardown(&f);
+    return;
+  }
+  char id[KBC_MAX_ID_LEN + 1];
+  alpha_id(&f, id, sizeof id);
+  char review[256];
+  (void)snprintf(review, sizeof review, "/api/kb/kb/review/%s", id);
+  char comments[288];
+  (void)snprintf(comments, sizeof comments, "%s/comments", review);
+  char reply[32768];
+  int status = 0;
+
+  /* A comment on a heading the document has. */
+  KBC_CHECK_MSG(
+      post_json(&s, comments, "{\"anchor\":\"install\",\"body\":\"is this right?\"}",
+               &status, reply, sizeof reply),
+      "add comment: no reply");
+  KBC_CHECK_EQ_INT(status, 201);
+  KBC_CHECK_MSG(strstr(reply, "\"anchor_state\":\"unjudged\"") != NULL,
+                "a new comment claimed a verdict nobody made: %s", reply);
+
+  /* The pass runs on a reindex, and the anchor resolves: the document still
+   * has the heading. */
+  KBC_CHECK(request(&s, "POST", "/api/reindex", &status, reply, sizeof reply));
+  KBC_CHECK(request(&s, "GET", review, &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK_MSG(strstr(reply, "\"anchor_state\":\"resolved\"") != NULL,
+                "the anchor did not resolve against a heading that is there: %s",
+                reply);
+  KBC_CHECK_MSG(strstr(reply, "\"resolves_to\":\"install\"") != NULL,
+                "a resolved comment carried no follow target: %s", reply);
+
+  /* Now the document changes underneath it, and the change has to be a
+   * COLLISION or this case is testing the wrong state. A heading id is the
+   * SLUG of its text, so `## Something Else` — which is what this used to
+   * write — slugifies to `something-else` and leaves `install` simply GONE.
+   * Gone is arm 4 of the judge: the claim is a clean negative and the honest
+   * answer is UNRESOLVED, which is what the run produced. UNDECIDABLE is arm
+   * 3, and it needs the id to still be there with DIFFERENT text behind it:
+   * something else now occupies the address the comment named.
+   *
+   * `## INSTALL` is that, and it is the collision that happens in practice —
+   * a heading retyped in capitals, which slugifies to the same `install` and
+   * changes the text the comment was written against. */
+  char path[KBC_TEST_PATH_MAX + 32];
+  (void)snprintf(path, sizeof path, "%s/kb/alpha.md", f.root);
+  kbc_test_write_file(path, "# Alpha\n\n## INSTALL\n\nalpha zebra\n");
+  KBC_CHECK(request(&s, "POST", "/api/reindex", &status, reply, sizeof reply));
+
+  KBC_CHECK(request(&s, "GET", review, &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK_MSG(strstr(reply, "\"anchor_state\":\"undecidable\"") != NULL,
+                "a slug collision was not reported as undecidable: %s", reply);
+  /* THE assertion. A resolved verdict at the wrong heading is the silent
+   * re-anchor the third state exists to prevent, so `resolves_to` must be
+   * ABSENT — not present and pointing at `install`, and not present and
+   * pointing at `something-else`. */
+  KBC_CHECK_MSG(strstr(reply, "resolves_to") == NULL,
+                "an undecidable comment was handed a jump target: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "\"anchor_state\":\"resolved\"") == NULL,
+                "the collision was reported as resolved: %s", reply);
+  KBC_CHECK_MSG(strstr(reply, "\"anchor_state\":\"unresolved\"") == NULL,
+                "the collision was reported as a clean negative: %s", reply);
+
+  /* And the PERSISTED set reports it too, which is the other reader: the
+   * endpoint reads `comment_anchors` and never recomputes. */
+  KBC_CHECK(request(&s, "GET", "/api/kb/kb/anchors/stale", &status, reply,
+                    sizeof reply));
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK_MSG(strstr(reply, "\"anchor_state\":\"undecidable\"") != NULL,
+                "the stale set did not carry the undecidable verdict: %s",
+                reply);
+
+  srv_stop(&s);
+  fx_teardown(&f);
+}
+
+/* RESOLVE, UNRESOLVE, DELETE — and the cascade the delete implies, all over
+ * the socket.
+ *
+ * Resolve prunes the anchor verdict and leaves the comment; un-resolve does
+ * NOT restore it, because restoring a row would re-fire a transition the
+ * subscriber has already seen ("reopening must not clear a flag the indexer
+ * still owns", anchors.rs:172-190). The test asserts the ABSENCE after the
+ * un-resolve, which is the half that is easy to get backwards. */
+KBC_TEST(a_comment_resolves_unresolves_and_deletes_with_its_attachment) {
+  fixture f;
+  server s;
+  if (!review_fixture(&f, &s)) {
+    fx_teardown(&f);
+    return;
+  }
+  char id[KBC_MAX_ID_LEN + 1];
+  alpha_id(&f, id, sizeof id);
+  char review[256];
+  (void)snprintf(review, sizeof review, "/api/kb/kb/review/%s", id);
+  char reply[32768];
+  int status = 0;
+  char aid[KBC_ATTACH_ID_LEN + 1];
+
+  /* A comment plus a staged upload, then adopt the upload onto the comment. */
+  char comments[288];
+  (void)snprintf(comments, sizeof comments, "%s/comments", review);
+  KBC_CHECK(post_json(&s, comments,
+                      "{\"anchor\":\"install\",\"body\":\"one thing\"}", &status,
+                      reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 201);
+  char ats[288];
+  (void)snprintf(ats, sizeof ats, "%s/attachments", review);
+  KBC_CHECK(post_multipart(&s, ats, "kbcBOUND", "chart.png", kTinyPng,
+                           sizeof kTinyPng - 1u, &status, reply,
+                           sizeof reply));
+  KBC_CHECK(first_aid(reply, aid, sizeof aid));
+  /* The comment's id, read back off the review document — and it has to be
+   * the COMMENT's. The first `"id":"` in that document belongs to the
+   * ARTIFACT: the reply opens `{"schema":...,"artifact":{...,"id":"<doc>"...`
+   * and the comments array comes later. So this used to read the document's
+   * id and then adopt, resolve and delete a comment that never existed, and
+   * every one of those three answered 404 — which is a correct answer to a
+   * request made with the wrong id, so nothing downstream of it was ever
+   * exercised. The scan starts after `"comments":[` because that is what
+   * makes it a comment id rather than a document id; the two are both 12 hex
+   * and nothing about the string itself distinguishes them. */
+  char cid[KBC_MAX_ID_LEN + 1];
+  cid[0] = '\0';
+  {
+    KBC_CHECK(request(&s, "GET", review, &status, reply, sizeof reply));
+    const char *p = strstr(reply, "\"comments\":[");
+    KBC_CHECK_NOT_NULL(p);
+    if (p != NULL) {
+      p = strstr(p, "\"id\":\"");
+      KBC_CHECK_NOT_NULL(p);
+    }
+    if (p != NULL) {
+      p += 6;
+      size_t i = 0;
+      while (p[i] != '\0' && p[i] != '"' && i + 1 < sizeof cid) {
+        cid[i] = p[i];
+        i++;
+      }
+      cid[i] = '\0';
+    }
+    KBC_CHECK_MSG(strcmp(cid, id) != 0,
+                  "the comment id read back is the DOCUMENT id (%s); the "
+                  "scan found the artifact's `id` instead of a comment's",
+                  cid);
+  }
+  char adopt[400];
+  (void)snprintf(adopt, sizeof adopt, "%s/comments/%s/attachments/%s", review,
+                 cid, aid);
+  KBC_CHECK(request(&s, "POST", adopt, &status, reply, sizeof reply));
+  KBC_CHECK_MSG(status == 200, "adopt failed with %d: %s", status, reply);
+  /* Adopting it a second time is a 409, and the owner does not change. */
+  char adopt2[400];
+  (void)snprintf(adopt2, sizeof adopt2,
+                 "/api/kb/kb/review/%s/comments/%s/attachments/%s", id,
+                 "cccccccccccc", aid);
+  KBC_CHECK(request(&s, "POST", adopt2, &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 409);
+
+  /* Judge it, so there is a verdict to prune. */
+  KBC_CHECK(request(&s, "POST", "/api/reindex", &status, reply, sizeof reply));
+  KBC_CHECK(request(&s, "GET", "/api/kb/kb/anchors/stale", &status, reply,
+                    sizeof reply));
+  KBC_CHECK_MSG(strstr(reply, "\"count\":0") != NULL,
+                "a resolved anchor was listed as stale: %s", reply);
+
+  /* Resolve: the row goes, the comment stays. */
+  char resolve[320];
+  (void)snprintf(resolve, sizeof resolve, "%s/comments/%s/resolve", review, cid);
+  KBC_CHECK(request(&s, "POST", resolve, &status, reply, sizeof reply));
+  KBC_CHECK_MSG(status == 200, "resolve failed with %d: %s", status, reply);
+  KBC_CHECK_MSG(strstr(reply, "\"resolved\":true") != NULL,
+                "resolve did not say so: %s", reply);
+  KBC_CHECK(request(&s, "GET", review, &status, reply, sizeof reply));
+  KBC_CHECK_MSG(strstr(reply, "\"open_count\":0") != NULL,
+                "the comment is not counted resolved: %s", reply);
+
+  /* Un-resolve does NOT bring the verdict back. */
+  char unresolve[320];
+  (void)snprintf(unresolve, sizeof unresolve, "%s/comments/%s/unresolve",
+                 review, cid);
+  KBC_CHECK(request(&s, "POST", unresolve, &status, reply, sizeof reply));
+  KBC_CHECK_MSG(status == 200, "unresolve failed with %d: %s", status, reply);
+  KBC_CHECK(request(&s, "GET", review, &status, reply, sizeof reply));
+  KBC_CHECK_MSG(strstr(reply, "\"anchor_state\":\"unjudged\"") != NULL,
+                "un-resolving restored a verdict the subscriber already saw: "
+                "%s",
+                reply);
+
+  /* Delete: the comment, its verdict and its adopted attachment all go, and
+   * the attachment is a 404 afterwards. */
+  char del[320];
+  (void)snprintf(del, sizeof del, "%s/comments/%s", review, cid);
+  KBC_CHECK(request(&s, "DELETE", del, &status, reply, sizeof reply));
+  KBC_CHECK_MSG(status == 200, "delete failed with %d: %s", status, reply);
+  char serve[400];
+  (void)snprintf(serve, sizeof serve, "%s/attachments/%s", review, aid);
+  KBC_CHECK(request(&s, "GET", serve, &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 404);
+  KBC_CHECK(request(&s, "GET", review, &status, reply, sizeof reply));
+  KBC_CHECK_MSG(strstr(reply, "\"total\":0") != NULL,
+                "the deleted comment is still listed: %s", reply);
+  /* And deleting it twice is a 404, not a second silent success. */
+  KBC_CHECK(request(&s, "DELETE", del, &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 404);
+
+  srv_stop(&s);
+  fx_teardown(&f);
+}
+
+/* STAGE 3, over the socket: set, read back, change, clear.
+ *
+ * The interesting half is the CHANGE. A document that was approved and is now
+ * asking for changes must stop matching the approved tag in the same
+ * transaction, and the review document must report the new state. */
+KBC_TEST(a_verdict_is_set_reported_changed_and_cleared_over_a_socket) {
+  fixture f;
+  server s;
+  if (!review_fixture(&f, &s)) {
+    fx_teardown(&f);
+    return;
+  }
+  char id[KBC_MAX_ID_LEN + 1];
+  alpha_id(&f, id, sizeof id);
+  char review[256];
+  (void)snprintf(review, sizeof review, "/api/kb/kb/review/%s", id);
+  char verdict[288];
+  (void)snprintf(verdict, sizeof verdict, "%s/verdict", review);
+  char reply[32768];
+  int status = 0;
+
+  /* Unreviewed is `null`, which is not the same as a comment verdict. */
+  KBC_CHECK(request(&s, "GET", review, &status, reply, sizeof reply));
+  KBC_CHECK_MSG(strstr(reply, "\"verdict\":null") != NULL,
+                "an unreviewed document reported a verdict: %s", reply);
+
+  KBC_CHECK(post_json(&s, verdict, "{\"state\":\"approve\",\"by\":\"you\"}",
+                      &status, reply, sizeof reply));
+  KBC_CHECK_MSG(status == 200, "set verdict failed with %d: %s", status, reply);
+  KBC_CHECK(request(&s, "GET", review, &status, reply, sizeof reply));
+  KBC_CHECK_MSG(strstr(reply, "\"state\":\"approve\"") != NULL,
+                "the approve was not reported: %s", reply);
+  /* `decided_at` is stamped by the store, never taken from the request, so it
+   * is present and non-zero rather than echoed. */
+  KBC_CHECK_MSG(strstr(reply, "\"decided_at\":") != NULL,
+                "the verdict carried no stamp: %s", reply);
+
+  /* THE TAG IS NOT ASSERTED THROUGH `?tag=` HERE, and the reason is worth
+   * writing down because the assertion looked reasonable and was vacuous.
+   *
+   * `route_search` reads `q`, `kb`, `path`, `kind`, `mode` and the window, and
+   * no other parameter. There is no `tag=` query parameter: a facet filter is
+   * part of the QUERY TEXT, `q=alpha tag:status-approved`. So `tag=` was
+   * dropped on the floor, the search ran unfiltered, and the first assertion
+   * below passed for the wrong reason — it counted the one document matching
+   * `alpha`, which is a hit whether or not any tag exists. The matching
+   * assertion after the CHANGE then failed, and it was not reporting a tag
+   * that outlived its verdict; it was reporting the same unfiltered count
+   * twice.
+   *
+   * The tag's own lifecycle is asserted where it is actually observable, in
+   * `a_verdict_is_recorded_and_its_tag_follows_it_one_way_only` in
+   * test_store.c, which reads `doc_metas` through
+   * `kbc_store_docs_with_meta` and passes. What is left for the wire is the
+   * round trip, so what is asserted here is that the verdict is reported
+   * before and after the change — and that the search surface a client would
+   * actually use still answers, which is a real assertion about the route
+   * even though the tag is not what filters it. */
+  KBC_CHECK(request(&s, "GET", "/api/search?q=alpha&kb=kb&offset=0", &status,
+                    reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 200);
+  KBC_CHECK_MSG(strstr(reply, "\"count\":1") != NULL,
+                "the document is not reachable through search: %s", reply);
+
+  /* Changing it withdraws the old tag. A filter that still matched would be
+   * answering about a state the verdict has moved on from. */
+  KBC_CHECK(post_json(&s, verdict,
+                      "{\"state\":\"request_changes\",\"by\":\"you\","
+                      "\"note\":\"needs a heading\"}",
+                      &status, reply, sizeof reply));
+  KBC_CHECK_MSG(status == 200, "change verdict failed with %d: %s", status,
+                reply);
+  KBC_CHECK(request(&s, "GET", review, &status, reply, sizeof reply));
+  KBC_CHECK_MSG(strstr(reply, "\"state\":\"request_changes\"") != NULL,
+                "the new verdict was not reported: %s", reply);
+  /* The approve tag is no longer on the document. This goes through the store
+   * because that is where the tag lives, and it is the assertion that would
+   * have caught the derived tag outliving its verdict. */
+  {
+    kbc_store *store = kbc_app_store(f.app);
+    kbc_arena *ta = kbc_arena_new(4096);
+    char **paths = NULL;
+    size_t np = 0;
+    kbc_err local;
+    kbc_err_reset(&local);
+    KBC_CHECK_OK(kbc_store_docs_with_meta(store, "kb", "kb-tags",
+                                          "status-approved", &paths, &np,
+                                          &local));
+    KBC_CHECK_MSG(np == 0,
+                  "the approved tag survived a change to request_changes "
+                  "(%zu document(s) still carry it)",
+                  np);
+    for (size_t i = 0; i < np; i++) free(paths[i]);
+    free(paths);
+    /* And the new one is there, so the assertion above is about the tag
+     * MOVING rather than about tags never being written at all. */
+    paths = NULL;
+    np = 0;
+    kbc_err_reset(&local);
+    KBC_CHECK_OK(kbc_store_docs_with_meta(store, "kb", "kb-tags",
+                                          "status-changes-requested", &paths,
+                                          &np, &local));
+    KBC_CHECK_MSG(np == 1,
+                  "the request_changes tag is not on the document (%zu)", np);
+    for (size_t i = 0; i < np; i++) free(paths[i]);
+    free(paths);
+    kbc_arena_free(ta);
+  }
+
+  /* An unknown state is a 400 and names what it wanted, not "error". */
+  KBC_CHECK(post_json(&s, verdict, "{\"state\":\"lgtm\",\"by\":\"you\"}",
+                      &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 400);
+  KBC_CHECK_MSG(strstr(reply, "request_changes") != NULL,
+                "the refusal does not say what is accepted: %s", reply);
+
+  /* Clearing, and a second clear being a 404 rather than a success for a
+   * verdict that was never set. */
+  KBC_CHECK(request(&s, "DELETE", verdict, &status, reply, sizeof reply));
+  KBC_CHECK_MSG(status == 200, "clear failed with %d: %s", status, reply);
+  KBC_CHECK(request(&s, "DELETE", verdict, &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 404);
+
+  srv_stop(&s);
+  fx_teardown(&f);
+}
+
+/* The review routes are TOKEN-GATED, and the check is the daemon's own rather
+ * than a prefix rule. Every row is registered with `needs_auth: true`, and a
+ * row that said otherwise would be an open door into a comment surface. The
+ * daemon under test is bound to loopback with no token, so what this proves
+ * is the OTHER half: the rows really are in the table, with the flag set, and
+ * not merely reachable by luck. */
+KBC_TEST(the_review_routes_are_registered_with_their_auth_flag) {
+  static const char *const wanted[] = {
+      "/api/kb/{kb}/review/{id}",
+      "/api/kb/{kb}/review/{id}/comments",
+      "/api/kb/{kb}/review/{id}/comments/{cid}",
+      "/api/kb/{kb}/review/{id}/comments/{cid}/resolve",
+      "/api/kb/{kb}/review/{id}/comments/{cid}/unresolve",
+      "/api/kb/{kb}/anchors/stale",
+      "/api/kb/{kb}/review/{id}/verdict",
+      "/api/kb/{kb}/review/{id}/attachments",
+      "/api/kb/{kb}/review/{id}/attachments/{aid}",
+      "/api/kb/{kb}/review/{id}/comments/{cid}/attachments/{aid}",
+  };
+  /* A daemon has to be running for the rows to be in the registry: they are
+   * registered at start-up, before the seal. */
+  fixture f;
+  server s;
+  if (!review_fixture(&f, &s)) {
+    fx_teardown(&f);
+    return;
+  }
+  size_t n = 0;
+  const kbc_route *view = kbc_httpd_routes(&n);
+  KBC_CHECK_NOT_NULL(view);
+  for (size_t r = 0; r < sizeof wanted / sizeof wanted[0]; r++) {
+    bool found = false;
+    for (size_t i = 0; i < n; i++) {
+      if (strcmp(view[i].path, wanted[r]) != 0) continue;
+      found = true;
+      KBC_CHECK_MSG(view[i].needs_auth, "%s is listed as open", wanted[r]);
+      KBC_CHECK_MSG(view[i].summary[0] != '\0', "%s has no summary",
+                    wanted[r]);
+    }
+    KBC_CHECK_MSG(found, "%s is not in the route table", wanted[r]);
+  }
+  /* And the built-in eighteen are still ahead of them, in order, so nothing
+   * a subsystem registered displaced a row the switch serves. */
+  KBC_CHECK_EQ_STR(view[0].path, "/api/health");
+  KBC_CHECK_MSG(n >= 18u, "the view has only %zu rows", n);
+  srv_stop(&s);
+  fx_teardown(&f);
+}
+
+/* A request that names another corpus's document, or a nonsense id, is a 404
+ * rather than an answer. An artifact id is a hash of (corpus, path), so
+ * serving one under the wrong corpus would let a client holding one token read
+ * across corpora. */
+KBC_TEST(a_review_route_will_not_serve_another_corpuss_document) {
+  fixture f;
+  server s;
+  if (!review_fixture(&f, &s)) {
+    fx_teardown(&f);
+    return;
+  }
+  char id[KBC_MAX_ID_LEN + 1];
+  alpha_id(&f, id, sizeof id);
+  char reply[16384];
+  int status = 0;
+  char path[256];
+  /* The real id under a corpus the daemon was not configured with. */
+  (void)snprintf(path, sizeof path, "/api/kb/other/review/%s", id);
+  KBC_CHECK(request(&s, "GET", path, &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 404);
+  /* A well-formed id that names nothing. */
+  (void)snprintf(path, sizeof path, "/api/kb/kb/review/aaaaaaaaaaaa");
+  KBC_CHECK(request(&s, "GET", path, &status, reply, sizeof reply));
+  KBC_CHECK_EQ_INT(status, 404);
+  /* An id that is not an id at all. */
+  (void)snprintf(path, sizeof path, "/api/kb/kb/review/..");
+  KBC_CHECK(request(&s, "GET", path, &status, reply, sizeof reply));
+  KBC_CHECK_MSG(status == 404 || status == 400,
+                "a traversal-shaped id got %d", status);
+  srv_stop(&s);
+  fx_teardown(&f);
+}
+
+
+
 /* ------------------------------------------------------------------- main -- */
 
 int main(void) {
-  static const kbc_test_case cases[] = {
+static const kbc_test_case cases[] = {
       {"links_report_resolved_ambiguous_and_dangling",
        links_report_resolved_ambiguous_and_dangling},
       {"backlinks_of_an_unlinked_document_is_an_empty_array_not_a_404",
@@ -5385,6 +6263,22 @@ int main(void) {
       {"the_static_fallback_is_bounded_by_its_root",
        the_static_fallback_is_bounded_by_its_root},
       {"no_static_root_says_so", no_static_root_says_so},
+      {"an_attachment_is_staged_listed_served_and_detached_over_a_socket",
+       an_attachment_is_staged_listed_served_and_detached_over_a_socket},
+      {"a_refused_upload_over_the_socket_creates_no_row_and_no_bytes",
+       a_refused_upload_over_the_socket_creates_no_row_and_no_bytes},
+      {"markup_is_force_downloaded_and_only_raster_images_go_inline",
+       markup_is_force_downloaded_and_only_raster_images_go_inline},
+      {"an_undecidable_anchor_is_served_as_undecidable_with_no_jump_target",
+       an_undecidable_anchor_is_served_as_undecidable_with_no_jump_target},
+      {"a_comment_resolves_unresolves_and_deletes_with_its_attachment",
+       a_comment_resolves_unresolves_and_deletes_with_its_attachment},
+      {"a_verdict_is_set_reported_changed_and_cleared_over_a_socket",
+       a_verdict_is_set_reported_changed_and_cleared_over_a_socket},
+      {"the_review_routes_are_registered_with_their_auth_flag",
+       the_review_routes_are_registered_with_their_auth_flag},
+      {"a_review_route_will_not_serve_another_corpuss_document",
+       a_review_route_will_not_serve_another_corpuss_document},
       {NULL, NULL},
   };
   return kbc_test_run("httpd", cases);

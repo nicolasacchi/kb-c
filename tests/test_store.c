@@ -15,7 +15,7 @@
  * migration that bumps it has to be a deliberate edit in both places: a
  * binary that migrates past what its tests know about is the failure this
  * pin exists to make loud. */
-#define CURRENT_SCHEMA 13
+#define CURRENT_SCHEMA 15
 
 /* include/kbc/store.h is the orchestrator's file; the pending-links contract
  * is proposed there and these are the signatures it will carry. */
@@ -43,15 +43,10 @@ kbc_status kbc_store_docs_with_meta(kbc_store *s, const char *corpus,
                                     const char *key, const char *value,
                                     char ***paths_out, size_t *n_out,
                                     kbc_err *err);
+/* The attachment and verdict contract lives in include/kbc/store.h. It was
+ * hand-copied here while that header was the orchestrator's to edit, and
+ * it is gone rather than reconciled. */
 
-/* The anchor-state contract now lives in include/kbc/store.h. It used to be
- * mirrored here, because that header was the orchestrator's file and this
- * assignment could not edit it — and a hand-copied mirror of a frozen
- * contract is the drift a frozen header exists to prevent, not the mitigation
- * for it. The round-trip test that guarded the mirror
- * (`anchor_states_are_three_and_only_three`) STAYS: it was never a mirror
- * guard, it is the assertion that all three states are reachable and
- * distinguishable, which is worth having whether or not anything is mirrored. */
 /* ------------------------------------------------------------- helpers --- */
 
 /* kbc_store_open reads exactly one field of the config — db_path — so the
@@ -6258,9 +6253,862 @@ KBC_TEST(the_stale_set_is_a_ordered_page_and_not_a_verdict_on_absence) {
   kbc_test_rmrf(root);
 }
 
+/* =========================================================== attachments ==
+ *
+ * Every case below is about one of the four things the original specifies and
+ * a C port can silently get wrong: the GATE (what bytes are accepted and what
+ * the stored type is), the ID (random, never content-derived), the CASCADE
+ * (what a delete takes with it), and the ATOMICITY (a refused attach leaves
+ * nothing behind).
+ */
+
+/* A minimal PNG: the 8-byte signature and a little body. The sniffer only
+ * looks at the signature, and this is the shape the original's own test
+ * fixture uses. */
+static const unsigned char kPng[] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A,
+                                     0x0A, 0x00, 0x01, 0x02, 0x03};
+
+static kbc_status add_blob(kbc_store *s, const char *doc, const char *cid,
+                           const char *name, const void *body, size_t n,
+                           char *out, kbc_err *err) {
+  kbc_attachment_in in;
+  memset(&in, 0, sizeof in);
+  in.doc_id = doc;
+  in.comment_id = cid;
+  in.filename = name;
+  in.content_type = kbc_store_sniff_attachment(body, n);
+  in.author = "you";
+  in.body = body;
+  in.body_len = n;
+  if (in.content_type == NULL) {
+    (void)kbc_err_set(err, KBC_ERR_INVALID, "test: the bytes are not allowed");
+    return KBC_ERR_INVALID;
+  }
+  return kbc_store_add_attachment(s, &in, out, err);
+}
+
+/* A store with one document and nothing else. Every attachment case starts
+ * here so the row count assertions below are about attachments and not about
+ * whatever the previous case left behind. */
+static kbc_store *store_with_doc(const char *root, const char *db,
+                                 kbc_artifact *art, kbc_err *err) {
+  kbc_store *s = open_at(root, db, err);
+  if (s == NULL) return NULL;
+  fill(art, "cccccccccccc", "kb", "doc.md", KBC_KIND_ARTIFACT);
+  if (kbc_failed(kbc_store_upsert_artifact(s, art, err))) {
+    kbc_store_close(s);
+    return NULL;
+  }
+  return s;
+}
+
+/* The bytes and the row are ONE thing, and a body with an embedded NUL is the
+ * case that proves it: a reader that treated the column as a C string would
+ * answer a prefix and report the wrong size. */
+KBC_TEST(an_attachment_round_trips_byte_for_byte_including_a_nul) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_artifact art;
+  kbc_store *s = store_with_doc(root, "att.db", &art, &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(4096);
+  /* REAL PNG MAGIC, then a payload carrying an embedded NUL. The first
+   * version of this test used {'a', 0x00, 'b', 0xFF, 'c'} and named the file
+   * `chart.png` — but those bytes are not a PNG, so the sniffer refused them,
+   * the row was never written, and the test then read an empty buffer and
+   * memcmp'd a NULL pointer. A test whose fixture its own gate rejects is
+   * testing the wrong thing while looking like it tests the right one. */
+  static const unsigned char with_nul[] = {
+      0x89, 'P',  'N',  'G',  0x0D, 0x0A, 0x1A, 0x0A, /* PNG magic */
+      'I',  0x00, 'H',  'D',  'R',  0xFF, 'I',  'D',  /* the payload, NUL and all */
+  };
+  char aid[KBC_ATTACH_ID_LEN + 1];
+  KBC_CHECK_OK(add_blob(s, art.id, NULL, "chart.png", with_nul,
+                        sizeof with_nul, aid, &err));
+
+  kbc_attachment at;
+  memset(&at, 0, sizeof at);
+  KBC_CHECK_OK(kbc_store_get_attachment(s, a, aid, &at, &err));
+  KBC_CHECK_MSG(at.id != NULL && strcmp(at.id, aid) == 0,
+                "the id round-tripped as something else: %s",
+                at.id != NULL ? at.id : "(null)");
+  KBC_CHECK_EQ_INT(at.size_bytes, (int64_t)sizeof with_nul);
+  KBC_CHECK_MSG(at.staged, "a row with no comment_id must read as STAGED");
+  /* The SNIFFED type, not whatever the caller passed: the test named the file
+   * `chart.png` and the store holds `image/png` because the BYTES are a PNG.
+   * Nothing in this call could have told it otherwise. */
+  KBC_CHECK_EQ_STR(at.content_type, "image/png");
+  KBC_CHECK_EQ_STR(at.filename, "chart.png");
+
+  kbc_str bytes;
+  kbc_str_init(&bytes);
+  KBC_CHECK_OK(kbc_store_read_attachment(s, aid, &bytes, &err));
+  KBC_CHECK_EQ_INT((int64_t)bytes.len, (int64_t)sizeof with_nul);
+  /* Guarded on the length: `KBC_CHECK` records and CONTINUES, so an
+   * unconditional memcmp over a buffer the read refused dereferences NULL and
+   * takes the whole suite with it. */
+  if (bytes.len == sizeof with_nul) {
+    KBC_CHECK_MSG(memcmp(bytes.ptr, with_nul, sizeof with_nul) == 0,
+                  "the bytes did not survive the round trip");
+  }
+  kbc_str_free(&bytes);
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* RE-ATTACH OF THE SAME CONTENT. The original has NO content hash on an
+ * attachment and no dedup anywhere on the upload path: `prepare_entries` mints
+ * a fresh `new_attachment_id()` per file and the manifest is a plain map, so
+ * two uploads of identical bytes are two aids and two rows.
+ *
+ * This is the documented thing, and the reason it is worth a test is that
+ * "deduplicate it" is the obvious improvement and it would be a behaviour
+ * change: a second comment attaching the same image would suddenly share the
+ * first one's row, and detaching it would take the first comment's picture
+ * with it. The test pins the Rust's answer, not the tidy one. */
+KBC_TEST(re_attach_of_the_same_bytes_makes_a_second_row_not_a_hit_on_the_first) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_artifact art;
+  kbc_store *s = store_with_doc(root, "att.db", &art, &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(4096);
+  char first[KBC_ATTACH_ID_LEN + 1];
+  char second[KBC_ATTACH_ID_LEN + 1];
+  KBC_CHECK_OK(add_blob(s, art.id, NULL, "chart.png", kPng, sizeof kPng, first,
+                        &err));
+  KBC_CHECK_OK(add_blob(s, art.id, NULL, "chart.png", kPng, sizeof kPng, second,
+                        &err));
+  KBC_CHECK_MSG(strcmp(first, second) != 0,
+                "two uploads of identical bytes got one id: %s", first);
+
+  kbc_attachment *rows = NULL;
+  size_t n = 0;
+  KBC_CHECK_OK(kbc_store_list_attachments(s, a, art.id, 10, &rows, &n, &err));
+  KBC_CHECK_EQ_INT((int64_t)n, 2);
+
+  /* Both serve the same bytes, and neither serves the other's: the ids are
+   * keys and the bytes are per-row. */
+  kbc_str one;
+  kbc_str two;
+  kbc_str_init(&one);
+  kbc_str_init(&two);
+  KBC_CHECK_OK(kbc_store_read_attachment(s, first, &one, &err));
+  KBC_CHECK_OK(kbc_store_read_attachment(s, second, &two, &err));
+  KBC_CHECK_EQ_INT((int64_t)one.len, (int64_t)two.len);
+  KBC_CHECK_MSG(one.len == two.len && memcmp(one.ptr, two.ptr, one.len) == 0,
+                "two rows of the same bytes disagree on the bytes");
+  kbc_str_free(&one);
+  kbc_str_free(&two);
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* A REFUSED ATTACH LEAVES NOTHING. This is the invariant the whole storage
+ * shape exists for, and it is checked by counting ROWS after each refusal —
+ * not by checking the return value, which the other cases already do.
+ *
+ * Four refusals, and the last one is the interesting one: an attach to a
+ * document the store does not hold fails on the FOREIGN KEY, which is the
+ * only case where the insert was actually attempted. If any of them left a
+ * row behind, the count below would be non-zero. */
+KBC_TEST(a_refused_attach_leaves_no_row_and_no_bytes) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_artifact art;
+  kbc_store *s = store_with_doc(root, "att.db", &art, &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(4096);
+  kbc_attachment_in in;
+  char aid[KBC_ATTACH_ID_LEN + 1];
+  size_t n = 0;
+  kbc_attachment *rows = NULL;
+
+  /* Empty body. The original drops an empty part before it ever reaches the
+   * sniffer, so a zero-length row would be a blob that serves as an empty
+   * 200 — an answer about nothing. */
+  memset(&in, 0, sizeof in);
+  in.doc_id = art.id;
+  in.filename = "empty.png";
+  in.content_type = "image/png";
+  in.body = kPng;
+  in.body_len = 0;
+  KBC_CHECK_ERR(kbc_store_add_attachment(s, &in, aid, &err), KBC_ERR_INVALID);
+
+  /* Over the cap. The bound is checked before the bind, so the body is never
+   * copied. */
+  memset(&in, 0, sizeof in);
+  in.doc_id = art.id;
+  in.filename = "big.png";
+  in.content_type = "image/png";
+  in.body = kPng;
+  in.body_len = (size_t)KBC_ATTACH_MAX_BYTES + 1u;
+  KBC_CHECK_ERR(kbc_store_add_attachment(s, &in, aid, &err), KBC_ERR_INVALID);
+
+  /* A document the store does not hold. THIS is the one that reaches the
+   * INSERT and fails on the foreign key — the refusal the schema makes
+   * rather than the validation. */
+  memset(&in, 0, sizeof in);
+  in.doc_id = "dddddddddddd";
+  in.filename = "orphan.png";
+  in.content_type = "image/png";
+  in.body = kPng;
+  in.body_len = sizeof kPng;
+  KBC_CHECK_ERR(kbc_store_add_attachment(s, &in, aid, &err), KBC_ERR_CONFLICT);
+
+  KBC_CHECK_OK(kbc_store_list_attachments(s, a, art.id, 50, &rows, &n, &err));
+  KBC_CHECK_MSG(n == 0, "a refused attach left %zu row(s) behind", n);
+  /* And the whole table, not just this document's listing. */
+  KBC_CHECK_OK(kbc_store_list_attachments(s, a, NULL, 50, &rows, &n, &err));
+  KBC_CHECK_MSG(n == 0, "a refused attach left %zu row(s) in the table", n);
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* THE CASCADE, and which one it is.
+ *
+ * Deleting a comment takes its anchor verdict and every attachment it adopted
+ * — in ONE commit, because `attachments.comment_id` and
+ * `comment_anchors.comment_id` both say `ON DELETE CASCADE` and
+ * `kbc_store_open` runs `PRAGMA foreign_keys = ON`.
+ *
+ * The Rust does NOT do this. It removes the attachment from the comment's JSON
+ * and leaves the blob file on disk for the reference-counted `gc_plan` to reap
+ * on the next mutation. That difference is forced by the storage, not chosen:
+ * the original's owner is a file outside the database, so there is no
+ * transaction to join the delete to. The test asserts what THIS port does and
+ * says why, because "the bytes might still be there" is the failure a reader
+ * of the original's code would expect to find. */
+KBC_TEST(deleting_a_comment_cascades_to_its_verdict_and_its_attachments) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_artifact art;
+  kbc_store *s = store_with_doc(root, "att.db", &art, &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(8192);
+  kbc_comment *cs = NULL;
+  size_t n = 0;
+  KBC_CHECK_OK(kbc_store_add_comment(s, art.id, "install", "you", "on it",
+                                     &err));
+  KBC_CHECK_OK(kbc_store_list_comments(s, a, art.id, 10, &cs, &n, &err));
+  KBC_CHECK_EQ_INT((int64_t)n, 1);
+  char cid[KBC_MAX_ID_LEN + 1];
+  memcpy(cid, cs[0].id, sizeof cid);
+
+  /* Judge it so there IS a verdict to cascade, and adopt a blob so there IS
+   * an attachment: a cascade that has nothing to take proves nothing. */
+  const kbc_anchor_heading heads[] = {{"install", "Install"}};
+  kbc_anchor_judgement *js = NULL;
+  size_t nj = 0;
+  KBC_CHECK_OK(
+      kbc_store_judge_anchors(s, art.id, heads, 1, true, a, &js, &nj, &err));
+  char aid[KBC_ATTACH_ID_LEN + 1];
+  KBC_CHECK_OK(
+      add_blob(s, art.id, NULL, "chart.png", kPng, sizeof kPng, aid, &err));
+  KBC_CHECK_OK(kbc_store_adopt_attachment(s, aid, cid, &err));
+
+  kbc_attachment at;
+  memset(&at, 0, sizeof at);
+  KBC_CHECK_OK(kbc_store_get_attachment(s, a, aid, &at, &err));
+  KBC_CHECK_MSG(!at.staged, "the row was not adopted before the delete");
+  KBC_CHECK_OK(kbc_store_get_anchor(s, a, cid, &(kbc_anchor_row){0}, &err));
+
+  KBC_CHECK_OK(kbc_store_delete_comment(s, cid, &err));
+
+  /* The verdict is gone: the comment is the parent and the cascade is the
+   * schema's, not a sweep this function had to remember to run. */
+  kbc_anchor_row row;
+  KBC_CHECK_ERR(kbc_store_get_anchor(s, a, cid, &row, &err), KBC_ERR_NOTFOUND);
+  /* And the attachment, WITH its bytes — the row carried them, so there is
+   * nothing left on disk to reap. */
+  KBC_CHECK_ERR(kbc_store_get_attachment(s, a, aid, &at, &err),
+                KBC_ERR_NOTFOUND);
+  kbc_str bytes;
+  kbc_str_init(&bytes);
+  KBC_CHECK_ERR(kbc_store_read_attachment(s, aid, &bytes, &err),
+                KBC_ERR_NOTFOUND);
+  kbc_str_free(&bytes);
+
+  /* Deleting it twice is NOTFOUND, not a second silent success: a client
+   * that removed a comment it never had has made a mistake worth reporting. */
+  KBC_CHECK_ERR(kbc_store_delete_comment(s, cid, &err), KBC_ERR_NOTFOUND);
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* A STAGED row is NOT the original's `adopted: true`, and the difference is
+ * the whole of the grace window. Reaping an adopted row by age would delete
+ * a picture off a comment that still references it; reaping a staged one only
+ * ever removes an upload nobody claimed. */
+KBC_TEST(a_staged_upload_outlives_its_grace_and_an_adopted_one_never_does) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_artifact art;
+  kbc_store *s = store_with_doc(root, "att.db", &art, &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(8192);
+  char staged[KBC_ATTACH_ID_LEN + 1];
+  char kept[KBC_ATTACH_ID_LEN + 1];
+  KBC_CHECK_OK(
+      add_blob(s, art.id, NULL, "draft.png", kPng, sizeof kPng, staged, &err));
+  KBC_CHECK_OK(kbc_store_add_comment(s, art.id, "install", "you", "on it",
+                                     &err));
+  kbc_comment *cs = NULL;
+  size_t n = 0;
+  KBC_CHECK_OK(kbc_store_list_comments(s, a, art.id, 10, &cs, &n, &err));
+  KBC_CHECK_OK(
+      add_blob(s, art.id, cs[0].id, "kept.png", kPng, sizeof kPng, kept, &err));
+
+  /* The clock is the STAGED ROW'S OWN `created_at`, read back from the store,
+   * and not a constant. `kbc_store_add_attachment` stamps `created_at` with
+   * the wall clock, and the grace predicate is `created_at <= now - grace`, so
+   * a `now` from any other era asks the store to reap rows that are in its
+   * own FUTURE. This case used to pass 1700000000 — November 2023 — and
+   * asserted one row was reaped; nothing was, because both rows were created
+   * "now" and a 2023 cutoff is behind them. The count assertion then failed
+   * too, and so did the id assertion, because with nothing reaped the listing
+   * held two rows ordered by `created_at DESC, id ASC` and `id ASC` is over
+   * two random ids minted in the same second — which is why that assertion
+   * came and went between runs of an unchanged tree. Taking the clock from the
+   * row makes the case exact, hermetic, and independent of the wall. */
+  kbc_attachment staged_row;
+  memset(&staged_row, 0, sizeof staged_row);
+  KBC_CHECK_OK(kbc_store_get_attachment(s, a, staged, &staged_row, &err));
+  const int64_t now = staged_row.created_at;
+  int64_t reaped = -1;
+  /* Inside the window: the composer is still writing. Nothing is reaped, and
+   * NOT the adopted row either. */
+  KBC_CHECK_OK(kbc_store_prune_attachments(
+      s, now, KBC_ATTACH_GC_GRACE_SECONDS, &reaped, &err));
+  KBC_CHECK_EQ_INT(reaped, 0);
+  kbc_attachment *rows = NULL;
+  KBC_CHECK_OK(kbc_store_list_attachments(s, a, art.id, 10, &rows, &n, &err));
+  KBC_CHECK_EQ_INT((int64_t)n, 2);
+
+  /* Past it: the staged upload goes and the adopted row stays, and the count
+   * is 1 rather than 2. One second past the boundary is enough, which also
+   * pins the predicate as `created_at <= now - grace` rather than a strict
+   * inequality measured from somewhere else. */
+  KBC_CHECK_OK(kbc_store_prune_attachments(
+      s, now + KBC_ATTACH_GC_GRACE_SECONDS + 1, KBC_ATTACH_GC_GRACE_SECONDS,
+      &reaped, &err));
+  KBC_CHECK_EQ_INT(reaped, 1);
+  KBC_CHECK_OK(kbc_store_list_attachments(s, a, art.id, 10, &rows, &n, &err));
+  KBC_CHECK_EQ_INT((int64_t)n, 1);
+  KBC_CHECK_EQ_STR(rows[0].id, kept);
+  /* And the row that went is the STAGED one, named: a reaper that took the
+   * adopted row instead would satisfy the count and mean the opposite. */
+  kbc_attachment gone;
+  memset(&gone, 0, sizeof gone);
+  KBC_CHECK_ERR(kbc_store_get_attachment(s, a, staged, &gone, &err),
+                KBC_ERR_NOTFOUND);
+
+  /* A negative grace reaps NOTHING rather than everything, for
+   * prune_history's reason: a maintenance call whose arithmetic went wrong
+   * must not become the verb that destroys the most. */
+  KBC_CHECK_OK(
+      kbc_store_prune_attachments(s, now, -1, &reaped, &err));
+  KBC_CHECK_EQ_INT(reaped, 0);
+  KBC_CHECK_OK(kbc_store_list_attachments(s, a, art.id, 10, &rows, &n, &err));
+  KBC_CHECK_EQ_INT((int64_t)n, 1);
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* ADOPTION IS ONCE, and it is once because a shared blob has no owner. Two
+ * comments claiming one aid would make "detach this attachment" ambiguous,
+ * and the original refuses it too (`adopt_staged` errors on an id the
+ * manifest does not have, which after the first adoption is no longer the
+ * case for a second comment). */
+KBC_TEST(adoption_is_once_and_the_per_comment_cap_is_enforced) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_artifact art;
+  kbc_store *s = store_with_doc(root, "att.db", &art, &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(8192);
+  KBC_CHECK_OK(kbc_store_add_comment(s, art.id, "one", "you", "first", &err));
+  KBC_CHECK_OK(kbc_store_add_comment(s, art.id, "two", "you", "second", &err));
+  kbc_comment *cs = NULL;
+  size_t n = 0;
+  KBC_CHECK_OK(kbc_store_list_comments(s, a, art.id, 10, &cs, &n, &err));
+  KBC_CHECK_EQ_INT((int64_t)n, 2);
+  char c1[KBC_MAX_ID_LEN + 1];
+  char c2[KBC_MAX_ID_LEN + 1];
+  memcpy(c1, cs[0].id, sizeof c1);
+  memcpy(c2, cs[1].id, sizeof c2);
+
+  char aid[KBC_ATTACH_ID_LEN + 1];
+  KBC_CHECK_OK(
+      add_blob(s, art.id, NULL, "one.png", kPng, sizeof kPng, aid, &err));
+  KBC_CHECK_OK(kbc_store_adopt_attachment(s, aid, c1, &err));
+  /* The second adoption is refused and the row still belongs to the first
+   * comment — a conflict that changed the owner would be the silent
+   * re-parenting the `comment_id IS NULL` predicate exists to prevent. */
+  KBC_CHECK_ERR(kbc_store_adopt_attachment(s, aid, c2, &err),
+                KBC_ERR_CONFLICT);
+  kbc_attachment at;
+  memset(&at, 0, sizeof at);
+  KBC_CHECK_OK(kbc_store_get_attachment(s, a, aid, &at, &err));
+  KBC_CHECK_EQ_STR(at.comment_id, c1);
+
+  /* The cap. Twenty is `DEFAULT_MAX_PER_COMMENT`, and c1 is NOT empty when
+   * this starts: the adoption above put one row on it, and that row counts.
+   * The loop used to add twenty MORE, so the twentieth add was the
+   * twenty-first attachment on the comment and came back CONFLICT — which is
+   * the cap working, against a loop that had forgotten its own starting
+   * state. The count assertion underneath (`== 20`) was right all along and
+   * the loop that was supposed to reach it was one too long.
+   *
+   * Nineteen tops c1 up to exactly the cap, and the add after that is the
+   * twenty-first attachment, refused by name. */
+  for (unsigned i = 1; i < KBC_ATTACH_MAX_PER_COMMENT; i++) {
+    char id[KBC_ATTACH_ID_LEN + 1];
+    KBC_CHECK_OK(
+        add_blob(s, art.id, c1, "f.png", kPng, sizeof kPng, id, &err));
+  }
+  /* At the cap, and the count says so: the adopted row plus the nineteen. */
+  kbc_attachment *rows = NULL;
+  KBC_CHECK_OK(kbc_store_list_attachments(s, a, art.id, 100, &rows, &n, &err));
+  KBC_CHECK_EQ_INT((int64_t)n, KBC_ATTACH_MAX_PER_COMMENT);
+  /* One more is the twenty-first attachment and is refused, naming the
+   * comment and the number it already holds. */
+  char over[KBC_ATTACH_ID_LEN + 1];
+  KBC_CHECK_ERR(
+      add_blob(s, art.id, c1, "f.png", kPng, sizeof kPng, over, &err),
+      KBC_ERR_CONFLICT);
+  KBC_CHECK_MSG(strstr(err.msg, c1) != NULL,
+                "the cap conflict did not name the comment: %s", err.msg);
+  KBC_CHECK_OK(kbc_store_list_attachments(s, a, art.id, 100, &rows, &n, &err));
+  KBC_CHECK_EQ_INT((int64_t)n, KBC_ATTACH_MAX_PER_COMMENT);
+  /* The cap is per COMMENT, not per document: c2 has one row and is
+   * untouched by c1 hitting its limit, which is the half a per-document cap
+   * would get wrong and this assertion is here to keep. */
+  char for_c2[KBC_ATTACH_ID_LEN + 1];
+  KBC_CHECK_OK(
+      add_blob(s, art.id, c2, "g.png", kPng, sizeof kPng, for_c2, &err));
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* THE GATE, exercised through the three pure helpers the route calls. The
+ * cases are the ones a mutation would break: a client that declared
+ * `image/png` for HTML bytes must not get an image row, a name with a
+ * directory must not keep the directory, and a name with a quote must not be
+ * able to end a quoted header. */
+KBC_TEST(the_upload_gate_sniffs_bytes_and_never_a_claim) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_artifact art;
+  kbc_store *s = store_with_doc(root, "att.db", &art, &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(4096);
+
+  KBC_CHECK_EQ_STR(kbc_store_sniff_attachment(kPng, sizeof kPng), "image/png");
+  static const unsigned char jpeg[] = {0xFF, 0xD8, 0xFF, 0xE0};
+  KBC_CHECK_EQ_STR(kbc_store_sniff_attachment(jpeg, sizeof jpeg), "image/jpeg");
+  static const unsigned char gif[] = {'G', 'I', 'F', '8', '9', 'a', 0x00};
+  KBC_CHECK_EQ_STR(kbc_store_sniff_attachment(gif, sizeof gif), "image/gif");
+  static const unsigned char webp[] = {'R', 'I', 'F', 'F', 0, 0, 0, 0,
+                                       'W', 'E', 'B', 'P'};
+  KBC_CHECK_EQ_STR(kbc_store_sniff_attachment(webp, sizeof webp), "image/webp");
+  static const unsigned char pdf[] = {'%', 'P', 'D', 'F', '-', '1'};
+  KBC_CHECK_EQ_STR(kbc_store_sniff_attachment(pdf, sizeof pdf),
+                   "application/pdf");
+  /* `strlen`, NOT `sizeof`, and the difference is the whole of a bug this
+   * case used to have. `txt` is a `char[16]`, so `sizeof txt` is 16 and the
+   * sixteenth byte is the NUL TERMINATOR — a control character, which
+   * `is_plain_text` refuses for exactly the reason it refuses the `bin` case
+   * below. The two assertions were contradicting each other: one said a
+   * buffer holding a NUL is not text, the other handed the sniffer a buffer
+   * holding a NUL and expected text. The sniffer reads the BYTES it is given
+   * (the route passes the multipart part's own length, never a terminator), so
+   * the fix is to hand it the text and not the terminator. */
+  static const char txt[] = "just some text\n";
+  KBC_CHECK_EQ_STR(kbc_store_sniff_attachment(txt, strlen(txt)),
+                   "text/plain; charset=utf-8");
+  /* And the NUL is refused as text in its own right, so the pair above is a
+   * statement about the length rather than about a special case. */
+  KBC_CHECK_MSG(kbc_store_sniff_attachment(txt, sizeof txt) == NULL,
+                "a NUL-terminated buffer sniffed as text");
+
+  /* HTML is valid UTF-8, so it sniffs as TEXT and not as anything active.
+   * That is the XSS guard: an SVG or a script uploaded as `x.png` is stored
+   * as text/plain and the serve route force-downloads it. The bytes are
+   * markup, so this is also the case that proves the gate does not go looking
+   * for a "safe" type once it has decided the bytes are text. */
+  static const char html[] = "<script>alert(1)</script>";
+  KBC_CHECK_EQ_STR(kbc_store_sniff_attachment(html, strlen(html)),
+                   "text/plain; charset=utf-8");
+  /* SVG is the same shape and the same answer, and it is named separately
+   * because an SVG is the one "image" a browser will execute, so the
+   * force-download below is the control that matters for it. */
+  static const char svg[] =
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>";
+  KBC_CHECK_EQ_STR(kbc_store_sniff_attachment(svg, strlen(svg)),
+                   "text/plain; charset=utf-8");
+  KBC_CHECK_MSG(!kbc_store_attachment_inline("text/plain; charset=utf-8"),
+                "text may never be served inline");
+  KBC_CHECK_MSG(!kbc_store_attachment_inline("application/pdf"),
+                "a PDF may never be served inline");
+  KBC_CHECK(kbc_store_attachment_inline("image/png"));
+  KBC_CHECK(kbc_store_attachment_inline("image/webp"));
+
+  /* Truly binary unknown bytes are refused outright rather than stored as
+   * something a browser will guess at. */
+  static const unsigned char bin[] = {0x00, 0x01, 0x02, 0xFF, 0xFE};
+  KBC_CHECK_MSG(kbc_store_sniff_attachment(bin, sizeof bin) == NULL,
+                "unknown binary bytes were accepted as some type");
+  /* A lone C1 control (U+0085, NEL) is a control character in Rust's
+   * `char::is_control` and is refused here; a plain byte-level C0 check would
+   * let it through. */
+  static const unsigned char nel[] = {'a', 0xC2, 0x85, 'b'};
+  KBC_CHECK_MSG(kbc_store_sniff_attachment(nel, sizeof nel) == NULL,
+                "U+0085 was accepted as printable text");
+
+  /* The filename sanitizer, clause by clause. */
+  KBC_CHECK_EQ_STR(kbc_store_sanitize_filename(a, "../../etc/passwd"),
+                   "passwd");
+  KBC_CHECK_EQ_STR(kbc_store_sanitize_filename(a, "..\\..\\win.ini"), "win.ini");
+  KBC_CHECK_EQ_STR(kbc_store_sanitize_filename(a, "a\"b.png"), "a_b.png");
+  KBC_CHECK_EQ_STR(kbc_store_sanitize_filename(a, "  spaced.png  "),
+                   "spaced.png");
+  KBC_CHECK_EQ_STR(kbc_store_sanitize_filename(a, ".."), "file");
+  KBC_CHECK_EQ_STR(kbc_store_sanitize_filename(a, "."), "file");
+  KBC_CHECK_EQ_STR(kbc_store_sanitize_filename(a, ""), "file");
+  KBC_CHECK_EQ_STR(kbc_store_sanitize_filename(a, NULL), "file");
+  /* 120 CHARACTERS, not bytes. The cap axis is the thing under test, so the
+   * name has to be 130 CHARACTERS, and this case used not to be one: it wrote
+   * 130 x 0xC3 and then 130 x 0xA9, which is 130 lead bytes followed by 130
+   * continuation bytes and therefore not a UTF-8 string at all (0xC3 0xC3 is
+   * not a sequence). The sanitizer read that as 65 two-byte "characters" plus
+   * 130 stray bytes and reported 185, which looked like a byte cap counting
+   * the wrong thing. It was not: it was the cap counting the only characters
+   * the input actually contained. The sequences are INTERLEAVED below, which
+   * is what 130 e-acute characters are. */
+  {
+    /* 130 real 2-byte characters (U+00E9). 120 of them survive => 240 bytes,
+     * which is 120 CHARACTERS and not a 120-byte cap (that would be 60). */
+    kbc_str two_byte;
+    kbc_str_init(&two_byte);
+    for (unsigned i = 0; i < 130; i++) {
+      (void)kbc_str_append(&two_byte, "\xC3\xA9", 2);
+    }
+    const char *cut2 = kbc_store_sanitize_filename(a, two_byte.ptr);
+    KBC_CHECK_MSG(strlen(cut2) == 240u,
+                  "130 two-byte characters came back as %zu bytes, want 240",
+                  strlen(cut2));
+    KBC_CHECK_MSG(memcmp(cut2, "\xC3\xA9", 2) == 0 &&
+                      strlen(cut2) == 240u,
+                  "the cut did not land on a character boundary");
+    kbc_str_free(&two_byte);
+  }
+  {
+    /* 130 real 4-byte characters (U+1F600). This is the one that separates the
+     * two axes completely: 120 characters is 480 bytes, which is exactly the
+     * byte ceiling, and a 120-BYTE cap would have produced 30 characters. */
+    kbc_str four_byte;
+    kbc_str_init(&four_byte);
+    for (unsigned i = 0; i < 130; i++) {
+      (void)kbc_str_append(&four_byte, "\xF0\x9F\x98\x80", 4);
+    }
+    const char *cut4 = kbc_store_sanitize_filename(a, four_byte.ptr);
+    KBC_CHECK_MSG(strlen(cut4) == 480u,
+                  "130 four-byte characters came back as %zu bytes, want 480",
+                  strlen(cut4));
+    KBC_CHECK_MSG(strlen(cut4) % 4u == 0u,
+                  "the cut landed inside a 4-byte sequence (%zu bytes)",
+                  strlen(cut4));
+    kbc_str_free(&four_byte);
+  }
+  {
+    /* 121 four-byte characters is one past the cap, and it is the case that
+     * proves the BYTE ceiling holds too: 120 characters is already 480 bytes,
+     * so a 121st could not be appended without exceeding it, and the result
+     * must be 120 WHOLE sequences rather than 120 sequences and a half. */
+    kbc_str over;
+    kbc_str_init(&over);
+    for (unsigned i = 0; i < 121; i++) {
+      (void)kbc_str_append(&over, "\xF0\x9F\x98\x80", 4);
+    }
+    const char *cut5 = kbc_store_sanitize_filename(a, over.ptr);
+    KBC_CHECK_MSG(strlen(cut5) == 480u,
+                  "121 four-byte characters came back as %zu bytes, want 480",
+                  strlen(cut5));
+    KBC_CHECK_MSG(strlen(cut5) % 4u == 0u,
+                  "the byte ceiling truncated a sequence (%zu bytes)",
+                  strlen(cut5));
+    kbc_str_free(&over);
+  }
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* ============================================================= verdicts ==
+ *
+ * The tag is the thing worth testing, because the tag is DERIVED and a
+ * derived value that can drift is worse than no tag at all: a facet filter
+ * answering "which documents are approved" with a document whose verdict says
+ * request-changes is a search result nobody can audit.
+ */
+KBC_TEST(a_verdict_is_recorded_and_its_tag_follows_it_one_way_only) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_artifact art;
+  kbc_store *s = store_with_doc(root, "att.db", &art, &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(8192);
+  char **paths = NULL;
+  size_t np = 0;
+  kbc_verdict v;
+  memset(&v, 0, sizeof v);
+
+  /* Nobody has reviewed it: NOTFOUND, which is a DIFFERENT answer from a
+   * COMMENT verdict and must not be collapsed into one. */
+  KBC_CHECK_ERR(kbc_store_get_verdict(s, a, art.id, &v, &err),
+                KBC_ERR_NOTFOUND);
+
+  KBC_CHECK_OK(
+      kbc_store_set_verdict(s, art.id, KBC_VERDICT_APPROVE, "you", "ship it",
+                            &err));
+  KBC_CHECK_OK(kbc_store_get_verdict(s, a, art.id, &v, &err));
+  KBC_CHECK_EQ_INT((int)v.state, (int)KBC_VERDICT_APPROVE);
+  KBC_CHECK_EQ_STR(v.decided_by, "you");
+  KBC_CHECK_EQ_STR(v.note, "ship it");
+  KBC_CHECK_MSG(v.decided_at > 0, "decided_at was not stamped by the store");
+  KBC_CHECK_OK(kbc_store_docs_with_meta(s, "kb", "kb-tags", "status-approved",
+                                        &paths, &np, &err));
+  KBC_CHECK_EQ_INT((int64_t)np, 1);
+  free(paths[0]);
+  free(paths);
+
+  /* Changing it WITHDRAWS the old tag in the same transaction. A document
+   * that now asks for changes must stop matching `status-approved`, or the
+   * filter is answering about a state the verdict has moved on from. */
+  KBC_CHECK_OK(kbc_store_set_verdict(s, art.id, KBC_VERDICT_REQUEST_CHANGES,
+                                     "you", NULL, &err));
+  KBC_CHECK_OK(kbc_store_docs_with_meta(s, "kb", "kb-tags", "status-approved",
+                                        &paths, &np, &err));
+  KBC_CHECK_MSG(np == 0,
+                "the approved tag survived a change to request_changes");
+  KBC_CHECK_OK(kbc_store_docs_with_meta(
+      s, "kb", "kb-tags", "status-changes-requested", &paths, &np, &err));
+  KBC_CHECK_EQ_INT((int64_t)np, 1);
+  free(paths[0]);
+  free(paths);
+
+  /* A COMMENT verdict carries no pass/fail signal, so it writes NO tag and
+   * DROPS the one that was there. That is the original's rule and it is the
+   * half of the shortcut that is easy to get backwards. */
+  KBC_CHECK_OK(
+      kbc_store_set_verdict(s, art.id, KBC_VERDICT_COMMENT, "you", NULL, &err));
+  KBC_CHECK_OK(kbc_store_docs_with_meta(
+      s, "kb", "kb-tags", "status-changes-requested", &paths, &np, &err));
+  KBC_CHECK_MSG(np == 0, "a comment verdict left a pass/fail tag behind");
+
+  /* Clearing withdraws the row and 404s on a second clear rather than
+   * reporting a success for a verdict that was never set. */
+  KBC_CHECK_OK(kbc_store_clear_verdict(s, art.id, &err));
+  KBC_CHECK_ERR(kbc_store_get_verdict(s, a, art.id, &v, &err),
+                KBC_ERR_NOTFOUND);
+  KBC_CHECK_ERR(kbc_store_clear_verdict(s, art.id, &err), KBC_ERR_NOTFOUND);
+
+  /* A verdict on a document the store does not hold is NOTFOUND and writes
+   * no tag anywhere. */
+  KBC_CHECK_ERR(
+      kbc_store_set_verdict(s, "dddddddddddd", KBC_VERDICT_APPROVE, "you",
+                            NULL, &err),
+      KBC_ERR_NOTFOUND);
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* A RE-INGEST MUST NOT DELETE THE DERIVED TAG. `replace_metas` replaces a
+ * document's own facets whole, which is right for a tag the author removed
+ * and wrong for a tag the STORE owns: un-approving every document on every
+ * save is a facet filter that answers "which documents are approved" with
+ * nothing, while `verdicts` still says they were. */
+KBC_TEST(a_reingest_keeps_the_verdict_tag_and_still_replaces_the_authors_own) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_artifact art;
+  kbc_store *s = store_with_doc(root, "att.db", &art, &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(8192);
+  static const char *k1[] = {"kb-tags"};
+  static const char *v1[] = {"alpha"};
+  KBC_CHECK_OK(kbc_store_replace_metas(s, "kb", "doc.md", k1, v1, 1, &err));
+  KBC_CHECK_OK(
+      kbc_store_set_verdict(s, art.id, KBC_VERDICT_APPROVE, "you", NULL, &err));
+
+  /* The author changed their tags: `alpha` goes, `beta` arrives, and the
+   * derived tag is not theirs to lose. */
+  static const char *k2[] = {"kb-tags"};
+  static const char *v2[] = {"beta"};
+  KBC_CHECK_OK(kbc_store_replace_metas(s, "kb", "doc.md", k2, v2, 1, &err));
+  char **paths = NULL;
+  size_t np = 0;
+  KBC_CHECK_OK(kbc_store_docs_with_meta(s, "kb", "kb-tags", "alpha", &paths,
+                                        &np, &err));
+  KBC_CHECK_MSG(np == 0, "replace_metas did not replace the author's own tag");
+  KBC_CHECK_OK(kbc_store_docs_with_meta(s, "kb", "kb-tags", "status-approved",
+                                        &paths, &np, &err));
+  KBC_CHECK_MSG(np == 1, "a re-ingest deleted the derived verdict tag");
+  free(paths[0]);
+  free(paths);
+
+  /* Deleting the DOCUMENT is different: a verdict is a claim ABOUT a
+   * document, so the cascade takes the row, and the tag goes with the
+   * document rather than pointing at a path with nothing behind it. */
+  KBC_CHECK_OK(kbc_store_delete_artifact(s, art.id, &err));
+  KBC_CHECK_ERR(kbc_store_get_verdict(s, a, art.id, &(kbc_verdict){0}, &err),
+                KBC_ERR_NOTFOUND);
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
+/* A MOVE CARRIES BOTH, and the tag is re-PROJECTED rather than copied. The
+ * tag is keyed on (corpus, path) and a move changes the path, so without this
+ * the destination would have a verdict no filter can see and the old path
+ * would keep a tag for a document that is not there. */
+KBC_TEST(a_move_carries_the_attachments_and_re_projects_the_verdict_tag) {
+  char root[KBC_TEST_PATH_MAX];
+  kbc_test_tmpdir(root, sizeof root);
+  kbc_err err;
+  kbc_err_reset(&err);
+  kbc_artifact art;
+  kbc_store *s = store_with_doc(root, "att.db", &art, &err);
+  KBC_CHECK_NOT_NULL(s);
+  if (s == NULL) {
+    kbc_test_rmrf(root);
+    return;
+  }
+  kbc_arena *a = kbc_arena_new(8192);
+  kbc_artifact moved;
+  fill(&moved, "eeeeeeeeeeee", "kb", "moved.md", KBC_KIND_ARTIFACT);
+  KBC_CHECK_OK(kbc_store_upsert_artifact(s, &moved, &err));
+  KBC_CHECK_OK(
+      kbc_store_set_verdict(s, art.id, KBC_VERDICT_APPROVE, "you", NULL, &err));
+  char aid[KBC_ATTACH_ID_LEN + 1];
+  KBC_CHECK_OK(
+      add_blob(s, art.id, NULL, "chart.png", kPng, sizeof kPng, aid, &err));
+
+  KBC_CHECK_OK(
+      kbc_store_rekey_artifact(s, art.id, moved.id, "doc.md", "moved.md", &err));
+
+  /* The attachment follows the document and keeps its id: the id is minted
+   * and a move never remints it, which is what makes the re-keyed `doc_id`
+   * the only column that had to change. */
+  kbc_attachment *rows = NULL;
+  size_t n = 0;
+  KBC_CHECK_OK(kbc_store_list_attachments(s, a, moved.id, 10, &rows, &n, &err));
+  KBC_CHECK_EQ_INT((int64_t)n, 1);
+  KBC_CHECK_EQ_STR(rows[0].id, aid);
+  KBC_CHECK_OK(kbc_store_list_attachments(s, a, art.id, 10, &rows, &n, &err));
+  KBC_CHECK_MSG(n == 0, "the attachment is still on the old document id");
+
+  /* The verdict followed, and the tag moved with it. */
+  kbc_verdict v;
+  KBC_CHECK_OK(kbc_store_get_verdict(s, a, moved.id, &v, &err));
+  KBC_CHECK_EQ_INT((int)v.state, (int)KBC_VERDICT_APPROVE);
+  char **paths = NULL;
+  size_t np = 0;
+  KBC_CHECK_OK(kbc_store_docs_with_meta(s, "kb", "kb-tags", "status-approved",
+                                        &paths, &np, &err));
+  KBC_CHECK_EQ_INT((int64_t)np, 1);
+  KBC_CHECK_EQ_STR(paths[0], "moved.md");
+  free(paths[0]);
+  free(paths);
+  kbc_arena_free(a);
+  kbc_store_close(s);
+  kbc_test_rmrf(root);
+}
+
 int main(void) {
-  
-static const kbc_test_case cases[] = {
+  static const kbc_test_case cases[] = {
+      {"an_attachment_round_trips_byte_for_byte_including_a_nul",
+       an_attachment_round_trips_byte_for_byte_including_a_nul},
+      {"re_attach_of_the_same_bytes_makes_a_second_row_not_a_hit_on_the_first",
+       re_attach_of_the_same_bytes_makes_a_second_row_not_a_hit_on_the_first},
+      {"a_refused_attach_leaves_no_row_and_no_bytes",
+       a_refused_attach_leaves_no_row_and_no_bytes},
+      {"deleting_a_comment_cascades_to_its_verdict_and_its_attachments",
+       deleting_a_comment_cascades_to_its_verdict_and_its_attachments},
+      {"a_staged_upload_outlives_its_grace_and_an_adopted_one_never_does",
+       a_staged_upload_outlives_its_grace_and_an_adopted_one_never_does},
+      {"adoption_is_once_and_the_per_comment_cap_is_enforced",
+       adoption_is_once_and_the_per_comment_cap_is_enforced},
+      {"the_upload_gate_sniffs_bytes_and_never_a_claim",
+       the_upload_gate_sniffs_bytes_and_never_a_claim},
+      {"a_verdict_is_recorded_and_its_tag_follows_it_one_way_only",
+       a_verdict_is_recorded_and_its_tag_follows_it_one_way_only},
+      {"a_reingest_keeps_the_verdict_tag_and_still_replaces_the_authors_own",
+       a_reingest_keeps_the_verdict_tag_and_still_replaces_the_authors_own},
+      {"a_move_carries_the_attachments_and_re_projects_the_verdict_tag",
+       a_move_carries_the_attachments_and_re_projects_the_verdict_tag},
       {"open_creates_file_and_parents_is_idempotent",
        open_creates_file_and_parents_is_idempotent},
       {"schema_version_of_null_store_is_zero",
